@@ -37,7 +37,7 @@
 
 use crate::config::Config;
 use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
-use crate::store::{clamp_limit, SessionInfo, Store};
+use crate::store::{clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS};
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, Value};
 use tokio::runtime::Runtime;
@@ -47,12 +47,13 @@ use tokio::runtime::Runtime;
 /// works for local but splitting keeps both backends identical.
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS messages (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts        INTEGER NOT NULL,
-        sender    TEXT NOT NULL,
-        recipient TEXT NOT NULL,
-        subject   TEXT,
-        body      TEXT NOT NULL
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        sender      TEXT NOT NULL,
+        recipient   TEXT NOT NULL,
+        subject     TEXT,
+        body        TEXT NOT NULL,
+        in_reply_to INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -77,8 +78,9 @@ pub struct LibsqlStore {
 }
 
 /// Convert a libsql row column into our owned `Message`. Column order matches
-/// `SELECT *` / the explicit projections used below: id, ts, sender, recipient,
-/// subject, body.
+/// the explicit projections used below: id, ts, sender, recipient, subject,
+/// body, in_reply_to. Every projection now selects the 7th column so positional
+/// index 6 is always present.
 fn row_to_message(r: &libsql::Row) -> Result<Message> {
     Ok(Message {
         id: r.get::<i64>(0)?,
@@ -87,6 +89,7 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         recipient: r.get::<String>(3)?,
         subject: r.get::<Option<String>>(4)?,
         body: r.get::<String>(5)?,
+        in_reply_to: r.get::<Option<i64>>(6)?,
     })
 }
 
@@ -323,6 +326,8 @@ impl Store for LibsqlStore {
             }
             names.sort();
             names.dedup();
+            // Bound the per-name N+1 scan below (mirrors SqliteStore::sessions).
+            names.truncate(MAX_SESSIONS);
 
             let mut out = Vec::new();
             for n in names {
@@ -409,6 +414,96 @@ impl Store for LibsqlStore {
                 )
                 .await?;
             Ok(n)
+        })
+    }
+
+    fn reply_target(&self, sender: &str, in_reply_to: i64) -> Result<(String, Option<String>)> {
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT sender, recipient, subject FROM messages WHERE id = ?1",
+                    params(vec![in_reply_to.into()]),
+                )
+                .await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("message {in_reply_to} not found"))?;
+            let psender = row.get::<String>(0)?;
+            let precipient = row.get::<String>(1)?;
+            let psubject = row.get::<Option<String>>(2)?;
+            let recipient = if psender == sender {
+                precipient
+            } else {
+                psender
+            };
+            Ok((recipient, reply_subject(psubject.as_deref())))
+        })
+    }
+
+    fn set_in_reply_to(&self, message_id: i64, in_reply_to: i64) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE messages SET in_reply_to = ?1 WHERE id = ?2",
+                    params(vec![in_reply_to.into(), message_id.into()]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn thread(&self, root_id: i64, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let sql = "
+                WITH RECURSIVE t(id) AS (
+                    SELECT id FROM messages WHERE id = ?1
+                    UNION
+                    SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
+                )
+                SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to
+                FROM messages m JOIN t ON m.id = t.id
+                ORDER BY m.id ASC LIMIT ?2";
+            let mut rows = self
+                .conn
+                .query(sql, params(vec![root_id.into(), limit.into()]))
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().await? {
+                out.push(row_to_message(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn receipts(&self, message_id: i64) -> Result<Vec<(String, i64)>> {
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT reader, ts FROM reads WHERE message_id = ?1 ORDER BY ts ASC, reader ASC",
+                    params(vec![message_id.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().await? {
+                out.push((r.get::<String>(0)?, r.get::<i64>(1)?));
+            }
+            Ok(out)
+        })
+    }
+
+    fn touch_peer(&self, name: &str) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE peers SET last_seen = ?1 WHERE name = ?2",
+                    params(vec![now().into(), name.into()]),
+                )
+                .await?;
+            Ok(())
         })
     }
 

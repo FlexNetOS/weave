@@ -76,6 +76,13 @@ pub struct Message {
     pub recipient: String,
     pub subject: Option<String>,
     pub body: String,
+    /// Id of the message this one replies to, if any. `None` for top-level
+    /// messages. Additive + backward-compatible: pre-existing rows (and DBs
+    /// created before the `in_reply_to` column migration) read back as `None`.
+    /// `#[serde(default)]` keeps older JSON payloads (which omit the field)
+    /// deserializable.
+    #[serde(default)]
+    pub in_reply_to: Option<i64>,
 }
 
 /// A session that has registered itself, with where (if anywhere) it can be

@@ -35,13 +35,53 @@ const MAX_INJECT_CHARS: usize = 240;
 /// never hang the caller (the MCP server serves other sessions).
 const INJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How much of a message a caller wants delivered live into the recipient's pane.
+///
+/// Both modes type a *single submitted line* — the difference is what that line
+/// carries. `Full` injects the (sanitized, capped) message body; `Nudge` injects
+/// only a quiet fixed ping that tells the recipient to check their inbox, never
+/// the body itself. The authoritative copy always arrives via the store on the
+/// recipient's next hook drain regardless of mode, so a `Nudge` loses no content —
+/// it just keeps the body out of a busy pane / off-screen.
+///
+/// `Default` is `Full` to preserve today's behavior for callers that don't choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Nudge {
+    /// Inject the message body itself (current behavior).
+    #[default]
+    Full,
+    /// Inject only a short, content-free ping line.
+    Nudge,
+}
+
+/// The fixed text a `Nudge::Nudge` injects in place of the body. Deliberately
+/// generic and short: it must read sensibly when typed into any agent's prompt
+/// and must never leak the message content.
+const NUDGE_PING: &str = "[weave] new message — check your inbox";
+
+impl Nudge {
+    /// The literal text to inject for this mode given the real message `body`.
+    /// `Full` returns the body verbatim (sanitization/capping happen downstream
+    /// in `commands_for`); `Nudge` returns the fixed ping, ignoring `body`.
+    pub fn payload(self, body: &str) -> &str {
+        match self {
+            Nudge::Full => body,
+            Nudge::Nudge => NUDGE_PING,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mux {
     Tmux,
     Zellij,
     Kitty,
     Wezterm,
     Screen,
+    /// The absence of an injectable multiplexer — also the `Default`, so a
+    /// `Target::default()` is the same inert, non-injectable target as
+    /// `Target::none()`.
+    #[default]
     None,
 }
 
@@ -82,10 +122,19 @@ impl Mux {
 }
 
 /// Where a session can be injected.
-#[derive(Debug, Clone)]
+///
+/// `socket` is an OPTIONAL kitty remote-control socket address (the value of
+/// `KITTY_LISTEN_ON`, e.g. `unix:/tmp/mykitty` or `tcp:localhost:12345`). It is
+/// empty for every other backend and ignored by them; only kitty's `commands_for`
+/// arm consults it, passing `--to <socket>` so `kitten @` reaches a kitty that was
+/// launched with `--listen-on` rather than relying on the default control path.
+/// Defaulting it to empty keeps every existing constructor/caller working unchanged.
+#[derive(Debug, Clone, Default)]
 pub struct Target {
     pub mux: Mux,
     pub id: String,
+    /// kitty `--to` socket (from `KITTY_LISTEN_ON`); empty = use kitty's default.
+    pub socket: String,
 }
 
 impl Target {
@@ -93,6 +142,7 @@ impl Target {
         Target {
             mux: Mux::None,
             id: String::new(),
+            socket: String::new(),
         }
     }
 
@@ -104,6 +154,9 @@ impl Target {
         Target {
             mux: Mux::parse(&p.mux),
             id: p.target.clone(),
+            // Peers carry only mux + target today; a kitty socket, when needed,
+            // is supplied at detection time. Default to kitty's standard path.
+            socket: String::new(),
         }
     }
 }
@@ -114,30 +167,42 @@ pub fn detect_target() -> Target {
     // Order matters: a process can be inside tmux *and* a terminal; prefer the
     // multiplexer that owns the input line.
     if let Some(id) = nonempty_env("TMUX_PANE") {
-        return Target { mux: Mux::Tmux, id };
+        return Target {
+            mux: Mux::Tmux,
+            id,
+            socket: String::new(),
+        };
     }
     if let Some(id) = nonempty_env("ZELLIJ_SESSION_NAME") {
         return Target {
             mux: Mux::Zellij,
             id,
+            socket: String::new(),
         };
     }
     if let Some(id) = nonempty_env("WEZTERM_PANE") {
         return Target {
             mux: Mux::Wezterm,
             id,
+            socket: String::new(),
         };
     }
     if let Some(id) = nonempty_env("KITTY_WINDOW_ID") {
         return Target {
             mux: Mux::Kitty,
             id,
+            // kitty only answers remote-control requests when launched with
+            // `--listen-on`; it then exports the address as KITTY_LISTEN_ON.
+            // Capture it so we can pass `--to <socket>`; absent it, `kitten @`
+            // falls back to kitty's default control path (unchanged behavior).
+            socket: nonempty_env("KITTY_LISTEN_ON").unwrap_or_default(),
         };
     }
     if let Some(id) = nonempty_env("STY") {
         return Target {
             mux: Mux::Screen,
             id,
+            socket: String::new(),
         };
     }
     Target::none()
@@ -247,12 +312,24 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
         // kitty: requires remote control. Match the target window by id; send the
         // text, then a carriage return as a separate send-text. `--` guards against
         // a body beginning with `-` being parsed as a `send-text` option.
+        //
+        // When the target carries a socket (from KITTY_LISTEN_ON) we thread it in
+        // as `--to <socket>` *before* the `@`, so `kitten @` talks to the kitty that
+        // was launched with `--listen-on`. The `--to` global option must precede the
+        // `@` subcommand. Empty socket ⇒ omit it entirely (kitty's default path).
         Mux::Kitty => {
             let m = format!("id:{id}");
-            vec![
-                argv(&["kitten", "@", "send-text", "--match", &m, "--", text]),
-                argv(&["kitten", "@", "send-text", "--match", &m, "--", CR]),
-            ]
+            let to = &target.socket;
+            let build = |payload: &str| -> Vec<String> {
+                let mut a: Vec<&str> = vec!["kitten"];
+                if !to.is_empty() {
+                    a.push("--to");
+                    a.push(to);
+                }
+                a.extend_from_slice(&["@", "send-text", "--match", &m, "--", payload]);
+                argv(&a)
+            };
+            vec![build(text), build(CR)]
         }
         // wezterm: --no-paste avoids bracketed paste entirely; submit with CR.
         // `--` ends option parsing so a body beginning with `-` is content.
@@ -293,8 +370,86 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
     }
 }
 
+/// Mode-aware variant of [`commands_for`]: builds the injection commands for the
+/// chosen [`Nudge`] mode. `Nudge::Full` is exactly `commands_for(target, body)`;
+/// `Nudge::Nudge` injects the fixed ping instead of the body. Pure (unit-tested).
+pub fn commands_for_mode(target: &Target, body: &str, mode: Nudge) -> Vec<Vec<String>> {
+    commands_for(target, mode.payload(body))
+}
+
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// The argv that asks a mux whether `target` still exists (its session/pane is
+/// live). Pure + unit-tested. Returns `None` for backends with no cheap probe
+/// (`screen`, `None`) — callers treat "no probe" as "don't pre-gate".
+///
+/// These are read-only listing/has commands; we inspect only their exit status
+/// (or, for the panes/cli forms, scan stdout for the id) — see [`target_alive`].
+pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
+    if !target.injectable() {
+        return None;
+    }
+    let id = &target.id;
+    match target.mux {
+        // `tmux has-session -t <pane>` resolves the pane's session and exits 0 iff
+        // it exists. (A pane id like `%3` resolves through to its session.)
+        Mux::Tmux => Some(argv(&["tmux", "has-session", "-t", id])),
+        // zellij has no per-session "exists" verb; `list-sessions` enumerates them
+        // and we scan stdout for the name in `target_alive`.
+        Mux::Zellij => Some(argv(&["zellij", "list-sessions"])),
+        // wezterm: `cli list` prints all panes; we scan stdout for the pane id.
+        Mux::Wezterm => Some(argv(&["wezterm", "cli", "list"])),
+        // kitty: `kitten @ ls` (honoring --to) reports the window tree as JSON; a
+        // present window id means the target is live.
+        Mux::Kitty => {
+            let mut a: Vec<&str> = vec!["kitten"];
+            if !target.socket.is_empty() {
+                a.push("--to");
+                a.push(&target.socket);
+            }
+            a.extend_from_slice(&["@", "ls"]);
+            Some(argv(&a))
+        }
+        // screen has no cheap, scriptable existence check we trust here.
+        Mux::Screen | Mux::None => None,
+    }
+}
+
+/// Best-effort liveness pre-check: is `target`'s pane/session still around?
+///
+/// Used *opportunistically* — a `true` (or "no probe available") means "go
+/// ahead and try to inject"; only a confident `false` (the probe ran and the
+/// target was demonstrably absent) should steer a caller to skip injection and
+/// fall straight to next-turn delivery. Because it is advisory we fail OPEN:
+/// a missing mux binary, a probe error, or a timeout all return `true` so we
+/// never suppress a delivery just because the probe itself was unavailable.
+pub fn target_alive(target: &Target) -> bool {
+    let Some(cmd) = liveness_probe(target) else {
+        // No probe for this backend — don't gate; let inject try.
+        return true;
+    };
+    let bin = target.mux.binary();
+    if !have(bin) {
+        // Can't probe ⇒ don't suppress; inject() will surface a real error.
+        return true;
+    }
+    match target.mux {
+        // Exit-status probes: 0 ⇒ alive, non-zero ⇒ gone, error/timeout ⇒ assume alive.
+        Mux::Tmux => run_bounded(&cmd, INJECT_TIMEOUT).unwrap_or(true),
+        // Stdout-scan probes: the id must appear in the listing to count as alive,
+        // but any spawn/timeout failure leaves us unsure ⇒ assume alive.
+        Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
+            match run_capture(&cmd, INJECT_TIMEOUT) {
+                Ok(Some(out)) => out.contains(target.id.as_str()),
+                // Ran but produced nothing usable, or could not be run: don't gate.
+                Ok(None) | Err(_) => true,
+            }
+        }
+        // Unreachable (liveness_probe returned None for these), but be explicit.
+        Mux::Screen | Mux::None => true,
+    }
 }
 
 /// Is `bin` on PATH?
@@ -324,7 +479,23 @@ pub fn have(bin: &str) -> bool {
 /// return `Ok(true)`: the body is the recipient's to submit, and the authoritative
 /// copy still arrives on their next hook drain.
 pub fn inject(target: &Target, text: &str) -> Result<bool> {
-    let cmds = commands_for(target, text);
+    inject_mode(target, text, Nudge::Full)
+}
+
+/// Mode-aware injection. Identical to [`inject`] but lets the caller pick a quiet
+/// [`Nudge::Nudge`] ping instead of typing the full body (`Nudge::Full`, the
+/// behavior of plain `inject`). All the `Ok/Err` semantics of [`inject`] hold.
+///
+/// Transient-failure retry: the FIRST (text-typing) command is the make-or-break
+/// step — if it fails *before anything lands*, we retry it exactly once after a
+/// short backoff to ride out a momentary mux hiccup (server briefly busy, pane
+/// transitioning). The retry is safe precisely because a failed first command
+/// means nothing was typed, so re-typing cannot duplicate. We do NOT retry later
+/// submission steps: by then text is already in the pane and a re-run could append
+/// a stray duplicate / extra Enter. A retry that itself fails falls back exactly as
+/// before (propagate the error ⇒ caller does next-turn delivery).
+pub fn inject_mode(target: &Target, body: &str, mode: Nudge) -> Result<bool> {
+    let cmds = commands_for_mode(target, body, mode);
     if cmds.is_empty() {
         return Ok(false);
     }
@@ -332,15 +503,30 @@ pub fn inject(target: &Target, text: &str) -> Result<bool> {
     if !have(bin) {
         bail!("{bin} not found on PATH (mux '{}')", target.mux.as_str());
     }
+    // Opportunistic liveness pre-check: only a CONFIDENT "absent" skips injection
+    // (fails open — an unavailable/timed-out probe still lets us try). Avoids
+    // typing into a pane/session that has demonstrably gone away.
+    if !target_alive(target) {
+        bail!(
+            "target '{}' on {} is not alive; falling back to next-turn delivery",
+            target.id,
+            target.mux.as_str()
+        );
+    }
     for (i, cmd) in cmds.iter().enumerate() {
+        // The first command types the literal text; the rest submit it.
+        if i == 0 {
+            match run_with_one_retry(cmd, INJECT_TIMEOUT) {
+                Ok(true) => {}
+                // Retried once and still non-zero ⇒ nothing landed; fall back.
+                Ok(false) => bail!("`{}` exited non-zero (after one retry)", cmd.join(" ")),
+                // Retried once and still erroring ⇒ propagate; caller next-turns.
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
         match run_bounded(cmd, INJECT_TIMEOUT) {
             Ok(true) => {}
-            // The first command types the literal text. If it fails, nothing has
-            // landed — propagate so the caller cleanly falls back to next-turn.
-            Ok(false) if i == 0 => {
-                bail!("`{}` exited non-zero", cmd.join(" "));
-            }
-            Err(e) if i == 0 => return Err(e),
             // A later (submission) command failed, but the text is already typed.
             // Don't error — warn and keep going so callers don't double-deliver.
             Ok(false) => {
@@ -360,6 +546,37 @@ pub fn inject(target: &Target, text: &str) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Backoff between the first attempt and its single retry. Short enough not to
+/// add perceptible latency, long enough to outlast a momentary mux-server stall.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Run a command, retrying exactly once on a transient failure (non-zero exit OR
+/// spawn/timeout error). Returns the result of whichever attempt last ran. Only
+/// safe for idempotent commands — here, exclusively the text-typing first command,
+/// which on failure has typed nothing and so can be re-run without duplication.
+fn run_with_one_retry(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
+    match run_bounded(cmd, dur) {
+        Ok(true) => Ok(true),
+        first => {
+            // Transient hiccup: pause briefly, then make one more attempt whose
+            // outcome (success, clean non-zero, or error) we return verbatim.
+            if let Err(ref e) = first {
+                eprintln!(
+                    "[weave] inject step `{}` failed ({e}); retrying once",
+                    cmd.join(" ")
+                );
+            } else {
+                eprintln!(
+                    "[weave] inject step `{}` exited non-zero; retrying once",
+                    cmd.join(" ")
+                );
+            }
+            std::thread::sleep(RETRY_BACKOFF);
+            run_bounded(cmd, dur)
+        }
+    }
 }
 
 /// Run one mux command with a wall-clock cap. Returns Ok(true/false) for the exit
@@ -382,12 +599,51 @@ fn run_bounded(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
     }
 }
 
+/// Run a listing/probe command with a wall-clock cap and capture its stdout. Used
+/// by [`target_alive`] for the backends whose liveness is decided by scanning the
+/// output for the target id (zellij/wezterm/kitty). Returns:
+///   Ok(Some(stdout)) — ran to completion with exit 0; `stdout` is its output
+///   Ok(None)         — ran but exited non-zero (output not trustworthy)
+///   Err(..)          — could not spawn, or it exceeded `dur` (child killed)
+/// Mirrors `run_bounded`'s timeout/kill discipline so a wedged mux can't hang us.
+fn run_capture(cmd: &[String], dur: std::time::Duration) -> Result<Option<String>> {
+    use std::process::Stdio;
+    use std::time::Instant;
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // Child exited; drain whatever it wrote. wait_with_output is safe now
+            // that the process has finished, and reads the piped stdout to EOF.
+            let out = child.wait_with_output()?;
+            if status.success() {
+                return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            return Ok(None);
+        }
+        if start.elapsed() >= dur {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`{}` timed out after {:?}", cmd.join(" "), dur);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn t(mux: Mux, id: &str) -> Target {
-        Target { mux, id: id.into() }
+        Target {
+            mux,
+            id: id.into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -605,5 +861,183 @@ mod tests {
         let c = commands_for(&t(Mux::Tmux, "%3"), &big);
         // Building the String at all proves no panic on a non-char-boundary slice.
         assert!(c[0].last().unwrap().chars().count() <= MAX_INJECT_CHARS);
+    }
+
+    /// Build a kitty target carrying an explicit remote-control socket.
+    fn kitty_with_socket(id: &str, socket: &str) -> Target {
+        Target {
+            mux: Mux::Kitty,
+            id: id.into(),
+            socket: socket.into(),
+        }
+    }
+
+    /// With KITTY_LISTEN_ON present (socket non-empty) every kitty command must
+    /// thread `--to <socket>` in *before* the `@` subcommand, and the body must
+    /// still be the final argument guarded by `--`.
+    #[test]
+    fn kitty_honors_listen_socket() {
+        let sock = "unix:/tmp/mykitty";
+        let c = commands_for(&kitty_with_socket("7", sock), "hi");
+        assert_eq!(
+            c[0],
+            argv(&[
+                "kitten",
+                "--to",
+                sock,
+                "@",
+                "send-text",
+                "--match",
+                "id:7",
+                "--",
+                "hi"
+            ])
+        );
+        // CR submission carries the same --to.
+        assert_eq!(
+            c[1],
+            argv(&[
+                "kitten",
+                "--to",
+                sock,
+                "@",
+                "send-text",
+                "--match",
+                "id:7",
+                "--",
+                "\r"
+            ])
+        );
+        // `--to <socket>` precedes `@`.
+        let at = c[0].iter().position(|s| s == "@").unwrap();
+        let to = c[0].iter().position(|s| s == "--to").unwrap();
+        assert!(to < at, "--to must come before @: {:?}", c[0]);
+    }
+
+    /// Without a socket (default), kitty shaping is byte-for-byte the legacy form:
+    /// no `--to` is emitted, preserving backward compatibility.
+    #[test]
+    fn kitty_without_socket_is_unchanged() {
+        let c = commands_for(&kitty_with_socket("7", ""), "hi");
+        assert_eq!(
+            c[0],
+            argv(&["kitten", "@", "send-text", "--match", "id:7", "--", "hi"])
+        );
+        assert!(
+            !c[0].iter().any(|s| s == "--to"),
+            "no --to when socket is empty: {:?}",
+            c[0]
+        );
+    }
+
+    /// A leading-dash body must still land as content even with a socket present
+    /// (the `--` end-of-options guard is unaffected by `--to`).
+    #[test]
+    fn kitty_socket_leading_dash_body_is_content() {
+        let c = commands_for(&kitty_with_socket("7", "tcp:localhost:9"), "--help");
+        let first = &c[0];
+        assert_eq!(first.last().map(String::as_str), Some("--help"));
+        assert_eq!(
+            first.get(first.len() - 2).map(String::as_str),
+            Some("--"),
+            "body guarded by end-of-options --: {first:?}"
+        );
+    }
+
+    /// `Target::default()` / `from_peer` leave the socket empty, so plain
+    /// constructors keep producing the legacy kitty commands.
+    #[test]
+    fn target_socket_defaults_empty() {
+        assert!(Target::default().socket.is_empty());
+        assert!(Target::none().socket.is_empty());
+        let p = Peer {
+            name: "x".into(),
+            mux: "kitty".into(),
+            target: "7".into(),
+            cwd: None,
+            last_seen: 0,
+        };
+        assert!(Target::from_peer(&p).socket.is_empty());
+    }
+
+    /// `Nudge::Full` injects the body verbatim; `Nudge::Nudge` injects only the
+    /// fixed ping and never the body.
+    #[test]
+    fn nudge_flag_chooses_payload() {
+        let target = t(Mux::Tmux, "%3");
+        let full = commands_for_mode(&target, "secret body", Nudge::Full);
+        assert_eq!(full[0].last().unwrap(), "secret body");
+
+        let ping = commands_for_mode(&target, "secret body", Nudge::Nudge);
+        let typed = ping[0].last().unwrap();
+        assert_eq!(typed, NUDGE_PING);
+        assert!(
+            !typed.contains("secret"),
+            "nudge mode must not leak the body: {typed:?}"
+        );
+    }
+
+    /// `Full` is the default mode, and `commands_for_mode(.., Full)` equals plain
+    /// `commands_for`.
+    #[test]
+    fn nudge_default_is_full_and_matches_commands_for() {
+        assert_eq!(Nudge::default(), Nudge::Full);
+        let target = t(Mux::Zellij, "envctl");
+        assert_eq!(
+            commands_for_mode(&target, "hello", Nudge::Full),
+            commands_for(&target, "hello")
+        );
+    }
+
+    /// `Nudge::payload` returns the body for `Full` and the ping for `Nudge`.
+    #[test]
+    fn nudge_payload_selects_text() {
+        assert_eq!(Nudge::Full.payload("body"), "body");
+        assert_eq!(Nudge::Nudge.payload("body"), NUDGE_PING);
+    }
+
+    /// Liveness probe argv shaping per backend (pure, no mux required).
+    #[test]
+    fn liveness_probe_shapes_per_backend() {
+        assert_eq!(
+            liveness_probe(&t(Mux::Tmux, "%3")),
+            Some(argv(&["tmux", "has-session", "-t", "%3"]))
+        );
+        assert_eq!(
+            liveness_probe(&t(Mux::Zellij, "envctl")),
+            Some(argv(&["zellij", "list-sessions"]))
+        );
+        assert_eq!(
+            liveness_probe(&t(Mux::Wezterm, "2")),
+            Some(argv(&["wezterm", "cli", "list"]))
+        );
+        // kitty without socket: plain `kitten @ ls`.
+        assert_eq!(
+            liveness_probe(&t(Mux::Kitty, "7")),
+            Some(argv(&["kitten", "@", "ls"]))
+        );
+        // kitty with socket: `--to <socket>` before `@`.
+        assert_eq!(
+            liveness_probe(&kitty_with_socket("7", "unix:/tmp/k")),
+            Some(argv(&["kitten", "--to", "unix:/tmp/k", "@", "ls"]))
+        );
+        // No cheap probe for screen / none / un-injectable.
+        assert_eq!(liveness_probe(&t(Mux::Screen, "x")), None);
+        assert_eq!(liveness_probe(&Target::none()), None);
+        assert_eq!(
+            liveness_probe(&t(Mux::Tmux, "")),
+            None,
+            "empty id ⇒ no probe"
+        );
+    }
+
+    /// Backends without a probe are never gated: `target_alive` returns true so
+    /// injection is still attempted (advisory, fail-open).
+    #[test]
+    fn target_alive_is_open_for_unprobed_backends() {
+        // screen has no probe → always "alive" (don't suppress).
+        assert!(target_alive(&t(Mux::Screen, "1234.pts-0.host")));
+        // None / un-injectable → no probe → true (inject() itself no-ops on these).
+        assert!(target_alive(&Target::none()));
     }
 }

@@ -114,3 +114,127 @@ impl Config {
 fn nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
+
+/// The commented scaffold written by `weave config init`. Every key is commented
+/// out so the file is a documented template that still loads as an empty config
+/// (all fields default) until the user opts into a setting. Keeping the template
+/// here — next to the `Config` struct it documents — means the two cannot drift
+/// silently; a new field should be mirrored as a commented line below.
+pub const CONFIG_TEMPLATE: &str = "\
+# weave configuration — ~/.config/weave/config.toml
+#
+# Every setting below is OPTIONAL and shown commented-out with its default.
+# Uncomment and edit only what you want to override. Environment variables
+# (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
+# WEAVE_LIBSQL_AUTH_TOKEN) take precedence over anything set here.
+
+# Default identity for this machine/session. When unset, weave falls back to
+# the basename of the current directory (a *guess* that never marks mail read).
+# Set this so presence and read-tracking are reliable.
+# session = \"desktop\"
+
+# Storage backend: \"sqlite\" (default, bundled) or \"libsql\" (cross-machine sync).
+# The libsql backend must be compiled in (`--no-default-features --features libsql`).
+# backend = \"sqlite\"
+
+# Override the message database path. Default (sqlite): the XDG data dir,
+# i.e. ~/.local/share/weave/messages.db. For a LOCAL libsql backend this IS the
+# file path; it is ignored only when libsql_url (a remote) is set.
+# db = \"/path/to/messages.db\"
+
+# Live-injection nudge pushed into a peer's pane the instant a message is sent.
+# Placeholders: {from} (sender) and {body} (message text). Omit {body} for a
+# quiet \"you have mail\" ping that carries no content.
+# nudge_template = \"[weave] message from {from}: {body} (run weave_inbox to read)\"
+
+# Remote libSQL/Turso endpoint (only used when backend = \"libsql\").
+# libsql_url = \"libsql://your-db.turso.io\"
+
+# Auth token for the remote libSQL endpoint. Treat as a secret; weave redacts it
+# from debug output. Prefer the WEAVE_LIBSQL_AUTH_TOKEN env var over storing it here.
+# libsql_auth_token = \"...\"
+";
+
+/// Outcome of `weave config init`, so the CLI can report precisely what happened
+/// (created vs. left untouched) without re-statting the file.
+pub enum ConfigInit {
+    /// A fresh config was written at this path.
+    Created(PathBuf),
+    /// A config already existed here and was left untouched (never overwritten).
+    Existed(PathBuf),
+}
+
+/// Scaffold a commented `config.toml` at [`config_path`], creating parent dirs as
+/// needed. NEVER overwrites an existing file — an existing config is returned as
+/// [`ConfigInit::Existed`] so the user's settings (and any secrets) are safe.
+pub fn init_config_file() -> std::io::Result<ConfigInit> {
+    let path = config_path();
+    if path.exists() {
+        return Ok(ConfigInit::Existed(path));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // create_new = true makes this atomic against a racing writer: if another
+    // process creates the file between the exists() check and here, we fail with
+    // AlreadyExists rather than clobbering it.
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            f.write_all(CONFIG_TEMPLATE.as_bytes())?;
+            Ok(ConfigInit::Created(path))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(ConfigInit::Existed(path)),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scaffold must parse as valid TOML (every real line is commented, so it
+    /// deserializes to an all-default Config) — a malformed template would write a
+    /// file weave then refuses to load.
+    #[test]
+    fn template_is_valid_empty_toml() {
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses as TOML");
+        assert!(cfg.session.is_none());
+        assert!(cfg.backend.is_none());
+        assert!(cfg.db.is_none());
+        assert!(cfg.nudge_template.is_none());
+        assert!(cfg.libsql_url.is_none());
+        assert!(cfg.libsql_auth_token.is_none());
+    }
+
+    /// Every documented placeholder the nudge renderer understands should appear in
+    /// the template's nudge example, so the docs and the code agree.
+    #[test]
+    fn template_documents_nudge_placeholders() {
+        assert!(CONFIG_TEMPLATE.contains("{from}"));
+        assert!(CONFIG_TEMPLATE.contains("{body}"));
+    }
+
+    /// Each real config field should have a (commented) line in the template, so a
+    /// newly-added field is not silently left undocumented.
+    #[test]
+    fn template_mentions_every_field() {
+        for key in [
+            "session",
+            "backend",
+            "db",
+            "nudge_template",
+            "libsql_url",
+            "libsql_auth_token",
+        ] {
+            assert!(
+                CONFIG_TEMPLATE.contains(key),
+                "template is missing config key {key:?}"
+            );
+        }
+    }
+}

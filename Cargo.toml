@@ -10,6 +10,13 @@ repository = "local"
 name = "weave"
 path = "src/main.rs"
 
+# Criterion-driven benchmark harness lives in benches/weave_bench.rs.
+# `harness = false` disables the libtest harness so criterion's own
+# `main!` entrypoint is used instead.
+[[bench]]
+name = "weave_bench"
+harness = false
+
 # Dependencies are added via `cargo add` so versions resolve to current.
 
 [features]
@@ -32,6 +39,11 @@ lto = true
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+# Shell-completion and man-page generators for clap. Build-time only in spirit
+# (invoked from the CLI to emit completion scripts / a man page), but they read
+# clap's `Command`, so they live as regular deps alongside clap.
+clap_complete = "4.6.1"
+clap_mangen = "0.2.31"
 libsql = { version = "0.9.30", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -40,3 +52,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 tokio = { version = "1.52.3", features = ["rt"], optional = true }
 toml = "1.1.2"
+
+[dev-dependencies]
+# Property-based testing for the storage/inject invariants.
+proptest = "1.8.0"
+# Benchmarking harness; see the [[bench]] entry above. `html_reports` keeps the
+# default feature set explicit.
+criterion = { version = "0.7.0", features = ["html_reports"] }

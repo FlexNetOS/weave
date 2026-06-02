@@ -5,11 +5,18 @@
 //!   weave setup          wire weave into Claude Code (MCP + hooks)
 //!   weave uninstall      remove weave's Claude Code wiring
 //!   weave send           send a message (CLI)
+//!   weave reply          reply to a message, addressed to the original sender
 //!   weave inbox          read your inbox (CLI)
+//!   weave thread         print a message thread by its root id
+//!   weave receipts       show who has read a message, and when
+//!   weave watch          tail your inbox, printing new messages until Ctrl-C
 //!   weave peers          list registered peers (with presence)
 //!   weave sessions       list known sessions
 //!   weave register       register this session as an injectable peer
 //!   weave inject         manually inject text into a peer's pane (test)
+//!   weave config init    scaffold a commented ~/.config/weave/config.toml
+//!   weave completions    print a shell completion script (bash|zsh|fish)
+//!   weave man            print a roff man page to stdout
 //!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|notification
 
 // Backends statically link their own SQLite and cannot coexist; guard loudly.
@@ -37,11 +44,61 @@ use std::io::Read;
 use std::path::PathBuf;
 use store::{is_online, Store};
 
+/// `--version` provenance: the package version plus the storage backend(s)
+/// compiled into THIS binary. Because the `sqlite` and `libsql` backends are
+/// mutually exclusive (and a `compile_error!` enforces exactly one), this lists
+/// the single backend that is actually linked — so `weave --version` tells you at
+/// a glance whether you are running the bundled-sqlite or the libSQL build,
+/// without having to run `weave doctor` against a live store.
+fn long_version() -> &'static str {
+    // Computed once; clap wants a &'static str for `long_version`.
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        // cfg attributes on array elements drop out the backends not compiled in,
+        // so this is exactly the linked set — and avoids a Vec::new()+push pattern.
+        let backends: Vec<&str> = [
+            #[cfg(feature = "sqlite")]
+            "sqlite",
+            #[cfg(feature = "libsql")]
+            "libsql",
+        ]
+        .to_vec();
+        let backends = if backends.is_empty() {
+            // Unreachable in a valid build (a compile_error! guards the no-backend
+            // case), but keep the string total rather than panicking.
+            "none".to_string()
+        } else {
+            backends.join(", ")
+        };
+        format!("{}\nbackends: {}", env!("CARGO_PKG_VERSION"), backends)
+    })
+}
+
+/// Long `--help` preamble. Documents the exit-code contract so scripts wrapping
+/// weave (hooks, watchers, CI) can branch on the process status.
+const LONG_ABOUT: &str = "\
+Rust-native agent-to-agent session mesh with a native injector.
+
+weave lets independent Claude Code (or shell) sessions message one another and,
+where a multiplexer pane is known, injects a live nudge into the recipient.
+
+EXIT CODES
+  0   success
+  1   runtime error (bad arguments after parsing, store/IO failure, unknown
+      backend, missing peer, or any other anyhow error)
+  2   command-line usage error (clap: unknown flag/subcommand, missing required
+      argument, or a bad value)
+
+Note: a failed live injection is NOT an error — the message is still persisted
+and delivered on the recipient's next inbox drain, so weave exits 0.";
+
 #[derive(Parser)]
 #[command(
     name = "weave",
     version,
-    about = "Rust-native agent-to-agent session mesh with a native injector"
+    long_version = long_version(),
+    about = "Rust-native agent-to-agent session mesh with a native injector",
+    long_about = LONG_ABOUT
 )]
 struct Cli {
     #[command(subcommand)]
@@ -69,6 +126,53 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long)]
         body: String,
+    },
+    /// Reply to a message; the reply is auto-addressed to the original sender and
+    /// linked to the parent via in_reply_to (so it shows up in `weave thread`).
+    Reply {
+        /// id of the message you are replying to
+        #[arg(long = "in-reply-to")]
+        in_reply_to: i64,
+        /// your identity (defaults to config/$WEAVE_SESSION or basename of cwd)
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        body: String,
+    },
+    /// Print a message thread (a root message and everything chained to it).
+    Thread {
+        /// id of the thread root (the first message in the conversation)
+        #[arg(long)]
+        root: i64,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show read receipts for a message: who has read it, and when.
+    Receipts {
+        /// id of the message to inspect
+        #[arg(long)]
+        id: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tail your inbox: poll the store and print new messages until interrupted
+    /// (Ctrl-C). Messages are peeked (not marked read) so your normal hook drain
+    /// still delivers them.
+    Watch {
+        #[arg(long)]
+        me: Option<String>,
+        /// poll interval in seconds
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        /// also surface already-read messages on the first poll
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
     /// Read your inbox.
     Inbox {
@@ -123,9 +227,42 @@ enum Cmd {
         to: String,
         #[arg(long)]
         text: String,
+        /// inject a short content-free ping instead of the text itself
+        #[arg(long)]
+        quiet: bool,
     },
+    /// Configuration helpers.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Print a shell completion script to stdout (eval/source it in your shell).
+    Completions {
+        /// target shell
+        shell: CompletionShell,
+    },
+    /// Print a roff man page for weave to stdout.
+    Man,
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Scaffold a commented ~/.config/weave/config.toml. Never overwrites an
+    /// existing file, so it is safe to run repeatedly.
+    Init,
+}
+
+/// Shells we can emit completion scripts for. Kept as a local enum (rather than
+/// re-exporting clap_complete::Shell) so `weave completions <shell>` parses and
+/// `--help` lists the choices even in builds where the optional `cli-extras`
+/// crates are not compiled in; the actual generation is then feature-gated.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 /// Open the configured storage backend. Unknown backend names fail loudly rather
@@ -178,24 +315,50 @@ fn nonempty_env(key: &str) -> bool {
 
 /// Resolve this session's name: explicit > config/$WEAVE_SESSION > basename(cwd).
 fn resolve_me(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> String {
+    resolve_me_explicit(opt, cwd, cfg).0
+}
+
+/// Like [`resolve_me`], but also reports whether the identity was *explicit*
+/// (came from an explicit `--from`/`--me`/`--name` flag or from config/
+/// `$WEAVE_SESSION`) versus merely *guessed* from `basename(cwd)`. Presence
+/// refresh (`touch_peer`) and read-marking are only safe under an explicit
+/// identity — a guess could belong to another session.
+fn resolve_me_explicit(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> (String, bool) {
     if let Some(s) = opt {
         if !s.trim().is_empty() {
-            return s.trim().to_string();
+            return (s.trim().to_string(), true);
         }
     }
     if let Some(s) = &cfg.session {
         if !s.is_empty() {
-            return s.clone();
+            return (s.clone(), true);
         }
     }
     let cwd_path = cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    cwd_path
+    let name = cwd_path
         .file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    (name, false)
+}
+
+/// Refresh this session's presence (heartbeat) at the start of a command, but
+/// ONLY when the identity is explicit. We deliberately do NOT register a new peer
+/// here — `touch_peer` updates `last_seen` for a peer that already registered (via
+/// `weave register` or the session hook) and is a no-op otherwise, so simply
+/// reading your inbox keeps you showing "online" without inventing phantom peers
+/// or clobbering a registered pane's mux/target. A heartbeat failure must never
+/// sink the actual command, so errors are reported and swallowed.
+fn refresh_presence(store: &dyn Store, name: &str, explicit: bool) {
+    if !explicit {
+        return;
+    }
+    if let Err(e) = store.touch_peer(name) {
+        eprintln!("[weave] presence refresh failed for '{name}': {e}");
+    }
 }
 
 fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str) -> Result<()> {
@@ -264,6 +427,71 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on messages returned for a `thread` view.
+const MAX_THREAD: i64 = 1_000;
+
+/// Emit a shell completion script to stdout.
+fn print_completions(shell: CompletionShell) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::Shell;
+    let sh = match shell {
+        CompletionShell::Bash => Shell::Bash,
+        CompletionShell::Zsh => Shell::Zsh,
+        CompletionShell::Fish => Shell::Fish,
+    };
+    let mut cmd = Cli::command();
+    clap_complete::generate(sh, &mut cmd, "weave", &mut std::io::stdout());
+    Ok(())
+}
+
+/// Emit a roff man page for weave to stdout.
+fn print_man() -> Result<()> {
+    use clap::CommandFactory;
+    clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+    Ok(())
+}
+
+/// Poll the inbox and print new messages until interrupted (Ctrl-C). Always a
+/// PEEK (never marks read) so the normal hook drain still delivers them.
+fn watch(
+    store: &dyn Store,
+    _cfg: &Config,
+    me: &str,
+    _explicit: bool,
+    interval: u64,
+    all: bool,
+    limit: i64,
+) -> Result<()> {
+    eprintln!("[weave] watching inbox for '{me}' every {interval}s (Ctrl-C to stop)");
+    let mut seen: i64 = 0;
+    let mut first = true;
+    loop {
+        let include_read = all && first;
+        let (rows, _) = store.inbox(me, include_read, false, limit)?;
+        for m in &rows {
+            if m.id > seen {
+                let subj = m
+                    .subject
+                    .as_ref()
+                    .map(|s| format!(" | {s}"))
+                    .unwrap_or_default();
+                println!(
+                    "#{} [{}] {} -> {}{}\n  {}",
+                    m.id,
+                    model::fmt_ts(m.ts),
+                    m.sender,
+                    m.recipient,
+                    subj,
+                    m.body
+                );
+                seen = seen.max(m.id);
+            }
+        }
+        first = false;
+        std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
@@ -275,6 +503,29 @@ fn main() -> Result<()> {
             return setup::run(&exe);
         }
         Cmd::Uninstall => return setup::uninstall(),
+        Cmd::Config {
+            cmd: ConfigCmd::Init,
+        } => {
+            return match config::init_config_file()? {
+                config::ConfigInit::Created(p) => {
+                    println!("wrote config scaffold: {}", p.display());
+                    println!(
+                        "edit it to set `session`, `backend`, etc. (all keys start commented)"
+                    );
+                    Ok(())
+                }
+                config::ConfigInit::Existed(p) => {
+                    // Existing config is sacred (may hold secrets); report and exit 0.
+                    println!(
+                        "config already exists, leaving it untouched: {}",
+                        p.display()
+                    );
+                    Ok(())
+                }
+            };
+        }
+        Cmd::Completions { shell } => return print_completions(*shell),
+        Cmd::Man => return print_man(),
         _ => {}
     }
 
@@ -282,7 +533,9 @@ fn main() -> Result<()> {
     let store = store.as_ref();
 
     match cli.cmd {
-        Cmd::Setup | Cmd::Uninstall => unreachable!("handled above"),
+        Cmd::Setup | Cmd::Uninstall | Cmd::Config { .. } | Cmd::Completions { .. } | Cmd::Man => {
+            unreachable!("handled above")
+        }
 
         Cmd::Mcp { session } => {
             let def = session
@@ -297,10 +550,105 @@ fn main() -> Result<()> {
             subject,
             body,
         } => {
-            let from = resolve_me(from, None, &cfg);
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
             let mid = store.send(&from, &to, subject.as_deref(), &body)?;
             println!("sent #{mid}: {from} -> {to}");
             try_inject(store, &cfg, &from, &to, &body)?;
+        }
+
+        Cmd::Reply {
+            in_reply_to,
+            from,
+            body,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            // The store looks up the parent's sender/recipient to address the reply
+            // and stores the in_reply_to link; it returns the new message id.
+            let mid = store.reply(&from, in_reply_to, &body)?;
+            println!("replied #{mid} (in-reply-to #{in_reply_to}) from {from}");
+            // Live-nudge the recipient if we can determine who that is (the parent's
+            // other party). The new message row tells us its recipient.
+            if let Some(parent) = store
+                .thread(in_reply_to, MAX_THREAD)
+                .ok()
+                .and_then(|t| t.into_iter().find(|m| m.id == mid))
+            {
+                try_inject(store, &cfg, &from, &parent.recipient, &body)?;
+            }
+        }
+
+        Cmd::Thread { root, limit, json } => {
+            let rows = store.thread(root, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "root": root, "messages": rows
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!("thread #{root}: empty (no such root, or no messages)");
+            } else {
+                for m in &rows {
+                    let subj = m
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    // Show the reply linkage so the conversation structure is visible
+                    // in plain text without needing --json.
+                    let reply = m
+                        .in_reply_to
+                        .map(|r| format!(" (re #{r})"))
+                        .unwrap_or_default();
+                    println!(
+                        "#{}{} [{}] {} -> {}{}\n  {}",
+                        m.id,
+                        reply,
+                        model::fmt_ts(m.ts),
+                        m.sender,
+                        m.recipient,
+                        subj,
+                        m.body
+                    );
+                }
+            }
+        }
+
+        Cmd::Receipts { id, json } => {
+            let receipts = store.receipts(id)?;
+            if json {
+                let arr: Vec<_> = receipts
+                    .iter()
+                    .map(|(reader, ts)| serde_json::json!({"reader": reader, "ts": ts}))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "message_id": id, "receipts": arr
+                    }))?
+                );
+            } else if receipts.is_empty() {
+                println!("#{id}: no reads yet");
+            } else {
+                println!("#{id} read by:");
+                for (reader, ts) in &receipts {
+                    println!("  {reader} at {}", model::fmt_ts(*ts));
+                }
+            }
+        }
+
+        Cmd::Watch {
+            me,
+            interval,
+            all,
+            limit,
+        } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            watch(store, &cfg, &me, explicit, interval, all, limit)?;
         }
 
         Cmd::Inbox {
@@ -310,7 +658,8 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let me = resolve_me(me, None, &cfg);
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
             let (rows, remaining) = store.inbox(&me, all, !peek, limit)?;
             if json {
                 println!(
@@ -430,12 +779,17 @@ fn main() -> Result<()> {
             println!("registered '{me}' [{}] {}", t.mux.as_str(), tgt);
         }
 
-        Cmd::Inject { to, text } => {
+        Cmd::Inject { to, text, quiet } => {
             let peer = store
                 .get_peer(&to)?
                 .ok_or_else(|| anyhow::anyhow!("no registered peer '{to}'"))?;
             let t = inject::Target::from_peer(&peer);
-            let ok = inject::inject(&t, &text)?;
+            let mode = if quiet {
+                inject::Nudge::Nudge
+            } else {
+                inject::Nudge::Full
+            };
+            let ok = inject::inject_mode(&t, &text, mode)?;
             println!(
                 "{}",
                 if ok {
