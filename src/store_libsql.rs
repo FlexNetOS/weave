@@ -37,7 +37,7 @@
 
 use crate::config::Config;
 use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
-use crate::store::{SessionInfo, Store};
+use crate::store::{clamp_limit, SessionInfo, Store};
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, Value};
 use tokio::runtime::Runtime;
@@ -206,6 +206,7 @@ impl Store for LibsqlStore {
         mark_read: bool,
         limit: i64,
     ) -> Result<(Vec<Message>, i64)> {
+        let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
@@ -258,6 +259,7 @@ impl Store for LibsqlStore {
     }
 
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
@@ -374,6 +376,38 @@ impl Store for LibsqlStore {
             let n = self.total_messages_async().await?;
             self.conn.execute("DELETE FROM messages", ()).await?;
             self.conn.execute("DELETE FROM reads", ()).await?;
+            Ok(n)
+        })
+    }
+
+    fn gc(&self, older_than_secs: i64) -> Result<i64> {
+        let cutoff = now().saturating_sub(older_than_secs.max(0));
+        self.rt.block_on(async {
+            let n: i64 = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM messages WHERE ts < ?1",
+                        params(vec![cutoff.into()]),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(r) => r.get::<i64>(0)?,
+                    None => 0,
+                }
+            };
+            self.conn
+                .execute(
+                    "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
+                    params(vec![cutoff.into()]),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM messages WHERE ts < ?1",
+                    params(vec![cutoff.into()]),
+                )
+                .await?;
             Ok(n)
         })
     }

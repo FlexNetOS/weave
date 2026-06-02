@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{run, run_ok, McpServer, TestDb};
+use common::{run, run_hook, run_ok, McpServer, TestDb};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -392,4 +392,175 @@ fn binary_rejects_unknown_subcommand() {
         !err.is_empty(),
         "clap should print a usage/error message on stderr"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle hooks (weave hook session|prompt|stop) — the Claude Code integration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hook_session_registers_and_prompt_drains_marks_read() {
+    let db = TestDb::new();
+    // SessionStart registers a peer named from the payload cwd basename.
+    let (ok, _o, _e) = run_hook(&db, "session", r#"{"cwd":"/proj/alpha"}"#);
+    assert!(ok);
+    assert!(run_ok(&db, &["peers"]).contains("alpha"), "peer registered");
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "bob",
+            "--to",
+            "alpha",
+            "--body",
+            "hello-hook",
+        ],
+    );
+
+    // UserPromptSubmit drains to stdout AND (with an explicit payload cwd) marks read.
+    let (ok, out, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/alpha"}"#);
+    assert!(ok);
+    assert!(
+        out.contains("new message(s) for 'alpha'"),
+        "drain header: {out}"
+    );
+    assert!(
+        out.contains("from bob") && out.contains("hello-hook"),
+        "body surfaced: {out}"
+    );
+
+    // Second prompt: already drained+marked, nothing left.
+    let (_ok, out2, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/alpha"}"#);
+    assert!(
+        !out2.contains("hello-hook"),
+        "message must be marked read: {out2}"
+    );
+}
+
+#[test]
+fn hook_stop_peeks_and_does_not_consume() {
+    let db = TestDb::new();
+    run_hook(&db, "session", r#"{"cwd":"/proj/beta"}"#);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "x",
+            "--to",
+            "beta",
+            "--body",
+            "stoppayload",
+        ],
+    );
+
+    // Stop is a PEEK: two stops both re-surface the same message (never marked).
+    let (_o1, out1, _e1) = run_hook(&db, "stop", r#"{"cwd":"/proj/beta"}"#);
+    let (_o2, out2, _e2) = run_hook(&db, "stop", r#"{"cwd":"/proj/beta"}"#);
+    assert!(out1.contains("stoppayload"), "stop #1 surfaces: {out1}");
+    assert!(
+        out2.contains("stoppayload"),
+        "stop #2 still surfaces (not consumed): {out2}"
+    );
+
+    // prompt is the real drain.
+    let (_o, outp, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/beta"}"#);
+    assert!(outp.contains("stoppayload"));
+    let (_o, outp2, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/beta"}"#);
+    assert!(!outp2.contains("stoppayload"), "prompt consumed it");
+}
+
+#[test]
+fn hook_guessed_identity_peeks_only_and_warns() {
+    let db = TestDb::new();
+    let dir = std::env::temp_dir()
+        .join(format!("weave-guess-{}", std::process::id()))
+        .join("proj");
+    // Send to the dir basename "proj"; an empty-stdin hook guesses identity from cwd.
+    run_ok(
+        &db,
+        &["send", "--from", "bob", "--to", "proj", "--body", "guessme"],
+    );
+
+    // Empty payload => not explicit => peek + warning; message is NOT consumed.
+    let (_o1, out1, err1) = common::run_stdin_full(&db, &["hook", "prompt"], "", Some(&dir), &[]);
+    assert!(
+        err1.contains("no explicit session identity"),
+        "warns: {err1}"
+    );
+    assert!(out1.contains("guessme"), "still surfaces: {out1}");
+    let (_o2, out2, _e2) = common::run_stdin_full(&db, &["hook", "prompt"], "", Some(&dir), &[]);
+    assert!(
+        out2.contains("guessme"),
+        "guessed peek must not consume: {out2}"
+    );
+}
+
+#[test]
+fn hook_tolerates_garbage_and_unknown_events() {
+    let db = TestDb::new();
+    let (ok, _o, err) = run_hook(&db, "prompt", "not json {{{");
+    assert!(ok, "garbage payload must not fail the hook");
+    assert!(err.contains("not valid JSON"), "warns on bad JSON: {err}");
+
+    let (ok, out, _e) = run_hook(&db, "notification", "{}");
+    assert!(ok && out.trim().is_empty(), "notification is a no-op");
+
+    let (ok, _o, err) = run_hook(&db, "some-bogus-event", "{}");
+    assert!(ok, "unknown event exits 0");
+    assert!(
+        err.contains("unknown hook event"),
+        "warns on unknown event: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// New CLI surface: --json output, doctor, gc, backend selection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_commands_emit_valid_json() {
+    let db = TestDb::new();
+    run_ok(&db, &["send", "--from", "a", "--to", "b", "--body", "hi"]);
+    run_ok(&db, &["register", "--name", "z"]);
+
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox --json parses");
+    assert_eq!(v["messages"][0]["body"], "hi");
+
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let pv: serde_json::Value = serde_json::from_str(&peers).expect("peers --json parses");
+    assert!(pv.as_array().unwrap().iter().any(|p| p["name"] == "z"));
+
+    let sessions = run_ok(&db, &["sessions", "--json"]);
+    let sv: serde_json::Value = serde_json::from_str(&sessions).expect("sessions --json parses");
+    assert!(sv.is_array());
+}
+
+#[test]
+fn doctor_json_reports_backend() {
+    let db = TestDb::new();
+    let out = run_ok(&db, &["doctor", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(v["backend"], "sqlite");
+    assert!(v["db_path"].as_str().unwrap().contains("weave-it-"));
+}
+
+#[test]
+fn gc_runs_and_reports() {
+    let db = TestDb::new();
+    run_ok(&db, &["send", "--from", "a", "--to", "b", "--body", "x"]);
+    let out = run_ok(&db, &["gc", "--older-than-secs", "999999999"]);
+    assert!(out.contains("gc: deleted"), "gc reports a count: {out}");
+}
+
+#[test]
+fn unknown_backend_errors_loudly() {
+    let db = TestDb::new();
+    let (ok, _o, err) =
+        common::run_stdin_full(&db, &["sessions"], "", None, &[("WEAVE_BACKEND", "bogus")]);
+    assert!(!ok, "an unknown backend must fail, not silently default");
+    assert!(err.contains("unknown backend"), "clear error: {err}");
 }

@@ -30,8 +30,8 @@ cargo fmt --all             # format (CI-style check: cargo fmt --all -- --check
 If you touch the feature-gated libSQL backend, also build it:
 
 ```bash
-cargo build --features libsql
-cargo clippy --features libsql -- -D warnings
+cargo build --no-default-features --features libsql
+cargo clippy --no-default-features --features libsql -- -D warnings
 ```
 
 A change is ready when the default build is clean, clippy is warning-free, the

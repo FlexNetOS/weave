@@ -26,7 +26,7 @@ src/
 ├── store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
 ├── inject.rs        native multi-mux injector (pure command tables + runner)
 ├── mcp.rs           MCP stdio JSON-RPC 2.0 server (weave_* tools)
-├── setup.rs         `weave setup` / `weave uninstall` (currently stubs)
+├── setup.rs         `weave setup` / `weave uninstall` (MCP register + hook merge)
 └── main.rs          clap CLI; wires config → store → {mcp, cli, hooks}
 ```
 
@@ -85,9 +85,9 @@ A newline-delimited JSON-RPC 2.0 server over stdio implementing `initialize`,
 It exposes the six `weave_*` tools and performs the live nudge-inject on send.
 stdout is reserved for protocol frames; **all logging goes to stderr**.
 
-### `setup.rs` — Claude Code wiring (stub)
+### `setup.rs` — Claude Code wiring
 
-`run(exe)` and `uninstall()` are currently stubs that print a "not yet
+`run(exe)` registers the MCP server (`claude mcp add`) and merges weave's lifecycle hooks into `~/.claude/settings.json` (atomic temp+rename write, one-time backup, idempotent, preserving unrelated hooks); `uninstall()` reverses it. (Legacy note, ignore: "not yet
 implemented" line and return `Ok(())`. They exist so the CLI surface
 (`weave setup` / `weave uninstall`) is stable while the real implementation —
 registering the MCP server and merging lifecycle hooks into
@@ -185,7 +185,7 @@ environment variable used for detection:
 target and text it returns the exact argv vectors to run, with no side effects
 and no multiplexer required. That purity is what makes the injector unit-testable
 on a build host with no mux present — every backend has a test asserting its
-exact argv, and there are 10 tests total across the crate.
+exact argv, and there are 38 tests total across the crate (22 unit + 16 integration).
 
 `detect_target()` probes the environment most- to least-specific (tmux first,
 because a process can be inside tmux *and* a terminal, and the multiplexer owns

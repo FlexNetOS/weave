@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] — gap-closing upgrade pass
+
+### Added
+- `weave doctor` — diagnostics (backend, db, detected mux, peers, Claude on PATH).
+- `weave gc --older-than-secs N` — message retention / disk-bound guard; `Store::gc`.
+- `--json` machine-readable output for `inbox`, `peers`, `sessions`, and `doctor`.
+
+### Hardened (security / robustness)
+- Untrusted `LIMIT` is clamped (negative no longer means unbounded in SQLite).
+- Injected text is length-capped (240 chars) — an oversized body can't flood a pane.
+- Mux subprocesses run with a 5s timeout — a wedged tmux/zellij can't hang weave.
+- `Config`'s `Debug` redacts the libSQL auth token.
+
+### Tests
+- 25 → 38 tests: lifecycle hooks (session/prompt/stop, guessed-identity peek, malformed
+  payloads), `--json`/`doctor`/`gc`, unknown-backend error, injector cap + clamp + gc unit tests.
+
+
 All notable changes to **weave** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -9,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `weave setup` / `weave uninstall` real implementations (auto-register the MCP
   server and merge Claude Code lifecycle hooks into `~/.claude/settings.json`
-  idempotently). Currently stubs.
+  idempotently).
 - End-to-end live-injection validation on the zellij target box.
 - Optional `weaved` presence daemon (live online/offline, lifecycle eviction).
 - Workspace split (`weave-core`, `weave-inject`, `weave-mcp`, `weave`).
@@ -78,8 +96,8 @@ degrades to hook-driven next-turn delivery where no multiplexer is present.
 ### Notes
 
 - The crate builds clean (dev + release) with no default features, is
-  clippy-clean, and passes 10/10 tests.
-- `weave setup` / `weave uninstall` are intentionally stubs in this release;
+  clippy-clean, and passes 38 tests.
+- `weave setup` / `weave uninstall` are fully implemented (MCP register + hook merge);
   Claude Code wiring is manual (see README) until the setup task lands.
 
 [Unreleased]: https://keepachangelog.com/en/1.1.0/

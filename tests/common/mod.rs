@@ -136,6 +136,50 @@ pub fn run_ok(db: &TestDb, args: &[&str]) -> String {
     out
 }
 
+/// Run a `weave` subcommand feeding `stdin` to it, optionally pinning the child's
+/// working directory and adding extra env vars (applied AFTER scrub_env, so they
+/// win). Returns (success, stdout, stderr). Used for the lifecycle-hook commands,
+/// which read a JSON payload on stdin.
+pub fn run_stdin_full(
+    db: &TestDb,
+    args: &[&str],
+    stdin: &str,
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = weave_cmd(db, args);
+    if let Some(d) = cwd {
+        std::fs::create_dir_all(d).ok();
+        cmd.current_dir(d);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn weave {args:?}: {e}"));
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write child stdin");
+    let out = child.wait_with_output().expect("wait_with_output");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Convenience: feed a JSON hook payload to `weave hook <event>`.
+pub fn run_hook(db: &TestDb, event: &str, payload: &str) -> (bool, String, String) {
+    run_stdin_full(db, &["hook", event], payload, None, &[])
+}
+
 /// A live `weave mcp` server you talk to over newline-delimited JSON-RPC.
 ///
 /// Reads happen on a background thread that pushes whole lines down a channel,

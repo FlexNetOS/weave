@@ -26,6 +26,15 @@ use std::process::Command;
 /// A carriage return — the byte a TUI reads as "Enter".
 const CR: &str = "\r";
 
+/// Hard cap on injected characters. A nudge is a short ping; a hostile or huge
+/// message body must never flood the recipient's input line. Anything longer is
+/// truncated with an ellipsis (the full body still arrives via the store).
+const MAX_INJECT_CHARS: usize = 240;
+
+/// Wall-clock cap for a single mux subprocess. A wedged tmux/zellij server must
+/// never hang the caller (the MCP server serves other sessions).
+const INJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mux {
     Tmux,
@@ -174,7 +183,15 @@ fn sanitize(text: &str) -> String {
             }
         }
     }
-    out
+    // Cap length (by char, never splitting a UTF-8 codepoint) so an oversized
+    // body cannot flood the recipient's input line.
+    if out.chars().count() > MAX_INJECT_CHARS {
+        let mut capped: String = out.chars().take(MAX_INJECT_CHARS - 1).collect();
+        capped.push('…');
+        capped
+    } else {
+        out
+    }
 }
 
 /// The exact argv command(s) that inject `text` (followed by a paste-safe Enter)
@@ -316,11 +333,7 @@ pub fn inject(target: &Target, text: &str) -> Result<bool> {
         bail!("{bin} not found on PATH (mux '{}')", target.mux.as_str());
     }
     for (i, cmd) in cmds.iter().enumerate() {
-        let run = || -> Result<bool> {
-            let status = Command::new(&cmd[0]).args(&cmd[1..]).status()?;
-            Ok(status.success())
-        };
-        match run() {
+        match run_bounded(cmd, INJECT_TIMEOUT) {
             Ok(true) => {}
             // The first command types the literal text. If it fails, nothing has
             // landed — propagate so the caller cleanly falls back to next-turn.
@@ -347,6 +360,26 @@ pub fn inject(target: &Target, text: &str) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Run one mux command with a wall-clock cap. Returns Ok(true/false) for the exit
+/// status, or Err if it cannot be spawned or it exceeds `dur` (the child is killed
+/// so a wedged mux server cannot hang weave). Polls rather than pulling in a crate.
+fn run_bounded(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
+    use std::time::Instant;
+    let mut child = Command::new(&cmd[0]).args(&cmd[1..]).spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if start.elapsed() >= dur {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`{}` timed out after {:?}", cmd.join(" "), dur);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +584,26 @@ mod tests {
     fn control_chars_are_stripped() {
         let c = commands_for(&t(Mux::Tmux, "%3"), "a\tb\x1bc");
         assert_eq!(c[0].last().unwrap(), "abc");
+    }
+
+    /// An oversized body is capped (with an ellipsis) so it can't flood the
+    /// recipient's input line — the full copy still arrives via the store.
+    #[test]
+    fn oversized_text_is_capped() {
+        let big = "x".repeat(10_000);
+        let c = commands_for(&t(Mux::Tmux, "%3"), &big);
+        let typed = c[0].last().unwrap();
+        let n = typed.chars().count();
+        assert_eq!(n, MAX_INJECT_CHARS, "capped to MAX_INJECT_CHARS");
+        assert!(typed.ends_with('…'), "truncation marker present");
+    }
+
+    /// Multibyte content is capped on a char boundary (never splits a codepoint).
+    #[test]
+    fn cap_respects_utf8_boundaries() {
+        let big = "é".repeat(10_000);
+        let c = commands_for(&t(Mux::Tmux, "%3"), &big);
+        // Building the String at all proves no panic on a non-char-boundary slice.
+        assert!(c[0].last().unwrap().chars().count() <= MAX_INJECT_CHARS);
     }
 }

@@ -12,7 +12,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Deserialize, Default, Clone)]
 pub struct Config {
     pub session: Option<String>,
     pub backend: Option<String>,
@@ -20,6 +20,24 @@ pub struct Config {
     pub nudge_template: Option<String>,
     pub libsql_url: Option<String>,
     pub libsql_auth_token: Option<String>,
+}
+
+// Manual Debug that REDACTS the libSQL auth token so it can never leak via a
+// `{:?}` in a log line, panic message, or error context.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("session", &self.session)
+            .field("backend", &self.backend)
+            .field("db", &self.db)
+            .field("nudge_template", &self.nudge_template)
+            .field("libsql_url", &self.libsql_url)
+            .field(
+                "libsql_auth_token",
+                &self.libsql_auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 fn home() -> PathBuf {

@@ -40,6 +40,9 @@ pub trait Store: Send {
     fn total_messages(&self) -> Result<i64>;
     fn clear_inbox(&self, me: &str) -> Result<usize>;
     fn clear_all(&self) -> Result<i64>;
+    /// Delete messages (and their read-markers) older than `older_than_secs`.
+    /// Returns how many messages were removed. Retention / disk-bound guard.
+    fn gc(&self, older_than_secs: i64) -> Result<i64>;
     fn register_peer(&self, name: &str, mux: &str, target: &str, cwd: Option<&str>) -> Result<()>;
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
@@ -50,6 +53,22 @@ pub trait Store: Send {
 /// True if `last_seen` is within the online window relative to now.
 pub fn is_online(last_seen: i64) -> bool {
     now().saturating_sub(last_seen) <= ONLINE_TTL_SECS
+}
+
+/// Hard upper bound on a query `LIMIT`. A negative limit means *unbounded* in
+/// SQLite, so untrusted limits (from MCP/CLI) are clamped here to prevent an
+/// accidental or hostile unbounded fetch.
+pub const MAX_LIMIT: i64 = 10_000;
+
+/// Clamp an untrusted limit into `[0, MAX_LIMIT]`, mapping negatives to the cap
+/// (callers that want "a lot" pass a big/negative number; they get the cap, not
+/// an unbounded scan).
+pub fn clamp_limit(limit: i64) -> i64 {
+    if limit < 0 {
+        MAX_LIMIT
+    } else {
+        limit.min(MAX_LIMIT)
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -167,6 +186,7 @@ impl Store for SqliteStore {
         mark_read: bool,
         limit: i64,
     ) -> Result<(Vec<Message>, i64)> {
+        let limit = clamp_limit(limit);
         let sql = if include_read {
             format!(
                 "SELECT * FROM messages
@@ -215,6 +235,7 @@ impl Store for SqliteStore {
     }
 
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
         let mut rows: Vec<Message> = if let Some(p) = peer {
             let sql = format!(
                 "SELECT * FROM messages
@@ -312,6 +333,23 @@ impl Store for SqliteStore {
         Ok(n)
     }
 
+    fn gc(&self, older_than_secs: i64) -> Result<i64> {
+        let cutoff = now().saturating_sub(older_than_secs.max(0));
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE ts < ?1",
+            params![cutoff],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
+            params![cutoff],
+        )?;
+        tx.execute("DELETE FROM messages WHERE ts < ?1", params![cutoff])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     fn register_peer(&self, name: &str, mux: &str, target: &str, cwd: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO peers (name, mux, target, cwd, last_seen) VALUES (?1,?2,?3,?4,?5)
@@ -396,5 +434,49 @@ mod tests {
         s.send("c", "d", None, "x").unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn clamp_limit_bounds() {
+        assert_eq!(
+            clamp_limit(-1),
+            MAX_LIMIT,
+            "negative maps to the cap, not unbounded"
+        );
+        assert_eq!(clamp_limit(i64::MIN), MAX_LIMIT);
+        assert_eq!(clamp_limit(0), 0);
+        assert_eq!(clamp_limit(10), 10);
+        assert_eq!(clamp_limit(i64::MAX), MAX_LIMIT);
+    }
+
+    #[test]
+    fn negative_limit_is_not_unbounded() {
+        let s = mem();
+        for i in 0..5 {
+            s.send("a", "b", None, &format!("m{i}")).unwrap();
+        }
+        // A negative limit must NOT behave like SQLite's unbounded LIMIT -1.
+        let (rows, _) = s.inbox("b", true, false, -1).unwrap();
+        assert!(rows.len() <= MAX_LIMIT as usize);
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn gc_deletes_old_keeps_new() {
+        let s = mem();
+        let id_old = s.send("a", "b", None, "old").unwrap();
+        // Backdate the first message well past the threshold.
+        s.conn
+            .execute(
+                "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                params![id_old],
+            )
+            .unwrap();
+        s.send("a", "b", None, "new").unwrap();
+        let deleted = s.gc(3600).unwrap(); // older than 1h
+        assert_eq!(deleted, 1);
+        assert_eq!(s.total_messages().unwrap(), 1);
+        let (rows, _) = s.inbox("b", true, false, 50).unwrap();
+        assert_eq!(rows[0].body, "new");
     }
 }

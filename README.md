@@ -31,7 +31,7 @@ claude mcp add weave --scope user -- /path/to/weave mcp
 ```
 
 Wire lifecycle hooks in `~/.claude/settings.json` so sessions auto-register and
-auto-receive (an `weave setup` command to do this for you is on the roadmap):
+auto-receive (use `weave setup` to do all of this automatically):
 
 ```jsonc
 {
@@ -87,7 +87,7 @@ backends are mutually exclusive (each bundles SQLite); the default build uses sq
 
 ## Status
 
-v0.1.0 — both backends build clean (clippy `-D warnings`), **25 tests green** (17 unit + 8
+v0.1.0 — both backends build clean (clippy `-D warnings`), **38 tests green** (22 unit + 16
 integration), MCP + CLI + injector + setup automation working; libSQL backend runtime-verified.
 Live pane injection is validated by construction (pure command-builder unit tests + fake-mux
 integration test); end-to-end mux injection on real tmux/zellij is to be confirmed on the target box.

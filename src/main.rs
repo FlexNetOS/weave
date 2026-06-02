@@ -82,11 +82,34 @@ enum Cmd {
         peek: bool,
         #[arg(long, default_value_t = 50)]
         limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// List registered peers (with presence + injectability).
-    Peers,
+    Peers {
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// List known sessions with unread counts.
-    Sessions,
+    Sessions {
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete messages older than the given age (retention / disk guard).
+    Gc {
+        /// age threshold in seconds (default 30 days)
+        #[arg(long, default_value_t = 2_592_000)]
+        older_than_secs: i64,
+    },
+    /// Print diagnostics: backend, db path, detected mux, peers, Claude wiring.
+    Doctor {
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Register this session as an injectable peer (captures the current pane).
     Register {
         #[arg(long)]
@@ -192,6 +215,55 @@ fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str)
     Ok(())
 }
 
+/// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
+fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
+    let target = inject::detect_target();
+    let peers = store.list_peers()?;
+    let online = peers.iter().filter(|p| is_online(p.last_seen)).count();
+    let total = store.total_messages()?;
+    let claude = inject::have("claude");
+    let db = cfg.db_path();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "backend": store.backend(),
+                "db_path": db.to_string_lossy(),
+                "config_path": config::config_path().to_string_lossy(),
+                "current_mux": target.mux.as_str(),
+                "current_target": target.id,
+                "injectable_here": target.injectable(),
+                "total_messages": total,
+                "peers": peers.len(),
+                "peers_online": online,
+                "claude_on_path": claude,
+            }))?
+        );
+    } else {
+        let tgt = if target.id.is_empty() {
+            "-"
+        } else {
+            &target.id
+        };
+        println!("weave doctor");
+        println!("  version:        {}", env!("CARGO_PKG_VERSION"));
+        println!("  backend:        {}", store.backend());
+        println!("  db:             {}", db.display());
+        println!("  config:         {}", config::config_path().display());
+        println!(
+            "  this session:   mux={} target={} injectable={}",
+            target.mux.as_str(),
+            tgt,
+            target.injectable()
+        );
+        println!("  messages:       {total}");
+        println!("  peers:          {} ({online} online)", peers.len());
+        println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
@@ -236,10 +308,18 @@ fn main() -> Result<()> {
             all,
             peek,
             limit,
+            json,
         } => {
             let me = resolve_me(me, None, &cfg);
             let (rows, remaining) = store.inbox(&me, all, !peek, limit)?;
-            if rows.is_empty() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "me": me, "messages": rows, "remaining_unread": remaining
+                    }))?
+                );
+            } else if rows.is_empty() {
                 println!("inbox '{me}': empty");
             } else {
                 for m in &rows {
@@ -264,42 +344,74 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Peers => {
+        Cmd::Peers { json } => {
             let peers = store.list_peers()?;
-            if peers.is_empty() {
-                println!("no peers registered");
-            }
-            for p in peers {
-                let inj = if inject::Target::from_peer(&p).injectable() {
-                    "injectable"
-                } else {
-                    "no-inject"
-                };
-                let presence = if is_online(p.last_seen) {
-                    "online"
-                } else {
-                    "offline"
-                };
-                let tgt = if p.target.is_empty() { "-" } else { &p.target };
-                println!(
-                    "{} [{presence}] [{}] {} ({inj}) seen {}",
-                    p.name,
-                    p.mux,
-                    tgt,
-                    model::fmt_ts(p.last_seen)
-                );
+            if json {
+                let arr: Vec<_> = peers
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.name, "mux": p.mux, "target": p.target, "cwd": p.cwd,
+                            "last_seen": p.last_seen,
+                            "online": is_online(p.last_seen),
+                            "injectable": inject::Target::from_peer(p).injectable(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                if peers.is_empty() {
+                    println!("no peers registered");
+                }
+                for p in peers {
+                    let inj = if inject::Target::from_peer(&p).injectable() {
+                        "injectable"
+                    } else {
+                        "no-inject"
+                    };
+                    let presence = if is_online(p.last_seen) {
+                        "online"
+                    } else {
+                        "offline"
+                    };
+                    let tgt = if p.target.is_empty() { "-" } else { &p.target };
+                    println!(
+                        "{} [{presence}] [{}] {} ({inj}) seen {}",
+                        p.name,
+                        p.mux,
+                        tgt,
+                        model::fmt_ts(p.last_seen)
+                    );
+                }
             }
         }
 
-        Cmd::Sessions => {
+        Cmd::Sessions { json } => {
             let info = store.sessions()?;
-            if info.is_empty() {
-                println!("no sessions yet");
-            }
-            for (n, unread, last) in info {
-                println!("{n}: {unread} unread (last {})", model::fmt_ts(last));
+            if json {
+                let arr: Vec<_> = info
+                    .iter()
+                    .map(|(n, unread, last)| {
+                        serde_json::json!({"name": n, "unread": unread, "last_activity": last})
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                if info.is_empty() {
+                    println!("no sessions yet");
+                }
+                for (n, unread, last) in info {
+                    println!("{n}: {unread} unread (last {})", model::fmt_ts(last));
+                }
             }
         }
+
+        Cmd::Gc { older_than_secs } => {
+            let n = store.gc(older_than_secs)?;
+            println!("gc: deleted {n} message(s) older than {older_than_secs}s");
+        }
+
+        Cmd::Doctor { json } => doctor(store, &cfg, json)?,
 
         Cmd::Register { name, cwd } => {
             let me = resolve_me(name, cwd.as_deref(), &cfg);
