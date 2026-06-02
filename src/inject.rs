@@ -494,7 +494,51 @@ pub fn inject(target: &Target, text: &str) -> Result<bool> {
 /// submission steps: by then text is already in the pane and a re-run could append
 /// a stray duplicate / extra Enter. A retry that itself fails falls back exactly as
 /// before (propagate the error ⇒ caller does next-turn delivery).
+/// Is `id` a structurally valid target for `mux`? Targets are captured from the
+/// recipient's environment at register time, so they are attacker-influenceable;
+/// we accept only each mux's expected id shape (no whitespace, no option-smuggling
+/// characters, bounded length).
+pub fn id_valid(mux: Mux, id: &str) -> bool {
+    if id.is_empty() || id.len() > 128 {
+        return false;
+    }
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    match mux {
+        // tmux exports `$TMUX_PANE` as `%<n>`.
+        Mux::Tmux => {
+            id.starts_with('%') && id.len() > 1 && id[1..].bytes().all(|b| b.is_ascii_digit())
+        }
+        // zellij session name.
+        Mux::Zellij => id.len() <= 64 && id.chars().all(word),
+        // kitty window id / wezterm pane id are integers.
+        Mux::Kitty | Mux::Wezterm => id.bytes().all(|b| b.is_ascii_digit()),
+        // screen `$STY` is `<pid>.<tty>.<host>`.
+        Mux::Screen => {
+            let mut parts = id.splitn(2, '.');
+            let pid = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("");
+            !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && !rest.is_empty()
+                && rest.chars().all(|c| word(c) || c == '.')
+        }
+        Mux::None => false,
+    }
+}
+
 pub fn inject_mode(target: &Target, body: &str, mode: Nudge) -> Result<bool> {
+    // Defense against a poisoned peer registration: a target id is an
+    // attacker-influenceable string (it comes from the recipient's env at
+    // register time). Refuse to drive a mux with an id that doesn't match that
+    // mux's expected shape, so a crafted id can't redirect keystrokes to an
+    // arbitrary pane or smuggle extra arguments.
+    if !id_valid(target.mux, &target.id) {
+        bail!(
+            "refusing to inject: target id {:?} is not a valid {} target",
+            target.id,
+            target.mux.as_str()
+        );
+    }
     let cmds = commands_for_mode(target, body, mode);
     if cmds.is_empty() {
         return Ok(false);
@@ -1039,5 +1083,21 @@ mod tests {
         assert!(target_alive(&t(Mux::Screen, "1234.pts-0.host")));
         // None / un-injectable → no probe → true (inject() itself no-ops on these).
         assert!(target_alive(&Target::none()));
+    }
+
+    #[test]
+    fn id_valid_accepts_real_rejects_malicious() {
+        assert!(id_valid(Mux::Tmux, "%3"));
+        assert!(id_valid(Mux::Zellij, "envctl"));
+        assert!(id_valid(Mux::Kitty, "7"));
+        assert!(id_valid(Mux::Screen, "1234.pts-0.host"));
+        // malicious / malformed ids are refused
+        assert!(!id_valid(Mux::Tmux, "%3; rm -rf /"));
+        assert!(!id_valid(Mux::Zellij, "a b"));
+        assert!(!id_valid(Mux::Zellij, "--listen-on=evil"));
+        assert!(!id_valid(Mux::Wezterm, "1 2"));
+        assert!(!id_valid(Mux::Tmux, "3"));
+        assert!(!id_valid(Mux::None, "x"));
+        assert!(!id_valid(Mux::Kitty, ""));
     }
 }
