@@ -37,7 +37,9 @@
 
 use crate::config::Config;
 use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
-use crate::store::{check_body, clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS};
+use crate::store::{
+    check_body, check_ident, clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS,
+};
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, Value};
 use tokio::runtime::Runtime;
@@ -65,6 +67,7 @@ const SCHEMA: &[&str] = &[
         name      TEXT PRIMARY KEY,
         mux       TEXT NOT NULL,
         target    TEXT NOT NULL,
+        socket    TEXT NOT NULL DEFAULT '',
         cwd       TEXT,
         last_seen INTEGER NOT NULL
     )",
@@ -93,14 +96,15 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
     })
 }
 
-/// Column order: name, mux, target, cwd, last_seen.
+/// Column order: name, mux, target, socket, cwd, last_seen.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
     Ok(Peer {
         name: r.get::<String>(0)?,
         mux: r.get::<String>(1)?,
         target: r.get::<String>(2)?,
-        cwd: r.get::<Option<String>>(3)?,
-        last_seen: r.get::<i64>(4)?,
+        socket: r.get::<String>(3)?,
+        cwd: r.get::<Option<String>>(4)?,
+        last_seen: r.get::<i64>(5)?,
     })
 }
 
@@ -173,6 +177,23 @@ impl LibsqlStore {
                     .await
                     .context("adding in_reply_to column")?;
             }
+            // Migration: a DB created before kitty-socket persistence lacks
+            // `peers.socket`. Add it idempotently (mirrors SqliteStore::migrate)
+            // defaulting to '' for existing rows == socket unknown.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='socket'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN socket TEXT NOT NULL DEFAULT ''",
+                    (),
+                )
+                .await
+                .context("adding socket column")?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -209,6 +230,8 @@ impl Store for LibsqlStore {
         subject: Option<&str>,
         body: &str,
     ) -> Result<i64> {
+        check_ident("sender", sender)?;
+        check_ident("recipient", recipient)?;
         check_body(body)?;
         self.rt.block_on(async {
             self.conn
@@ -322,6 +345,27 @@ impl Store for LibsqlStore {
                 }
             };
             rows.reverse();
+            Ok(rows)
+        })
+    }
+
+    fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let sql = format!(
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                 WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+                 ORDER BY id ASC LIMIT ?3",
+                bc = BROADCAST_SQL
+            );
+            let mut it = self
+                .conn
+                .query(&sql, params(vec![me.into(), since_id.into(), limit.into()]))
+                .await?;
+            let mut rows: Vec<Message> = Vec::new();
+            while let Some(r) = it.next().await? {
+                rows.push(row_to_message(&r)?);
+            }
             Ok(rows)
         })
     }
@@ -496,6 +540,62 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn reply(&self, sender: &str, in_reply_to: i64, body: &str) -> Result<i64> {
+        // Atomic override of the trait default (which does send() +
+        // set_in_reply_to() in two round-trips): resolve the parent and INSERT a
+        // single row carrying in_reply_to, all inside ONE IMMEDIATE transaction
+        // so the parent cannot vanish mid-reply. Mirrors SqliteStore::reply.
+        check_ident("sender", sender)?;
+        check_body(body)?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+
+            // Parent lookup inside the transaction so it shares the snapshot with
+            // the insert below.
+            let (recipient, subject) = {
+                let mut rows = tx
+                    .query(
+                        "SELECT sender, recipient, subject FROM messages WHERE id = ?1",
+                        params(vec![in_reply_to.into()]),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("message {in_reply_to} not found"))?;
+                let psender = row.get::<String>(0)?;
+                let precipient = row.get::<String>(1)?;
+                let psubject = row.get::<Option<String>>(2)?;
+                let recipient = if psender == sender {
+                    precipient
+                } else {
+                    psender
+                };
+                (recipient, reply_subject(psubject.as_deref()))
+            };
+
+            tx.execute(
+                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params(vec![
+                    now().into(),
+                    sender.into(),
+                    recipient.into(),
+                    subject.into(),
+                    body.into(),
+                    in_reply_to.into(),
+                ]),
+            )
+            .await?;
+            let id = self.conn.last_insert_rowid();
+            tx.commit().await?;
+            Ok(id)
+        })
+    }
+
     fn thread(&self, root_id: i64, limit: i64) -> Result<Vec<Message>> {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
@@ -549,16 +649,25 @@ impl Store for LibsqlStore {
         })
     }
 
-    fn register_peer(&self, name: &str, mux: &str, target: &str, cwd: Option<&str>) -> Result<()> {
+    fn register_peer(
+        &self,
+        name: &str,
+        mux: &str,
+        target: &str,
+        socket: &str,
+        cwd: Option<&str>,
+    ) -> Result<()> {
+        check_ident("peer name", name)?;
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO peers (name, mux, target, cwd, last_seen) VALUES (?1,?2,?3,?4,?5)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, cwd=?4, last_seen=?5",
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen) VALUES (?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6",
                     params(vec![
                         name.into(),
                         mux.into(),
                         target.into(),
+                        socket.into(),
                         cwd.map(|s| s.to_string()).into(),
                         now().into(),
                     ]),
@@ -573,7 +682,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, cwd, last_seen FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -589,7 +698,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, cwd, last_seen FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -638,5 +747,291 @@ impl LibsqlStore {
             Some(r) => Ok(r.get::<i64>(0)?),
             None => Ok(0),
         }
+    }
+
+    /// Test-only: backdate a peer's `last_seen` by `secs` so presence and
+    /// touch-without-clobber paths can be exercised deterministically without
+    /// waiting wall-clock time. Mirrors the raw UPDATE the SqliteStore tests use
+    /// against their connection (which is private here, so this lives on the impl).
+    #[cfg(test)]
+    fn backdate_peer(&self, name: &str, secs: i64) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE peers SET last_seen = last_seen - ?1 WHERE name = ?2",
+                    params(vec![secs.into(), name.into()]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{clamp_limit, is_online, MAX_IDENT, MAX_LIMIT, ONLINE_TTL_SECS};
+
+    /// A local-file libsql store backed by a unique temp DB. This exercises the
+    /// REAL libsql backend (its own SQLite core, async-over-block_on bridge, and
+    /// the 5-arg `register_peer`/`socket` wiring) directly — coverage the
+    /// black-box integration suite drives only through the CLI binary.
+    fn mem() -> LibsqlStore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            db: Some(dir.join("t.db").to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        LibsqlStore::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn send_and_read_tracking() {
+        let s = mem();
+        s.send("desktop", "envctl", Some("hi"), "body1").unwrap();
+        s.send("desktop", "all", None, "bcast").unwrap();
+
+        let (rows, remaining) = s.inbox("envctl", false, true, 50).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(remaining, 0);
+
+        let (rows2, _) = s.inbox("envctl", false, true, 50).unwrap();
+        assert_eq!(rows2.len(), 0);
+
+        let (mine, _) = s.inbox("desktop", false, true, 50).unwrap();
+        assert_eq!(mine.len(), 0);
+    }
+
+    #[test]
+    fn peer_upsert_and_presence() {
+        let s = mem();
+        s.register_peer("envctl", "zellij", "envctl", "", Some("/home/x/envctl"))
+            .unwrap();
+        s.register_peer(
+            "envctl",
+            "tmux",
+            "%4",
+            "/run/kitty.sock",
+            Some("/home/x/envctl"),
+        )
+        .unwrap();
+        let p = s.get_peer("envctl").unwrap().unwrap();
+        assert_eq!(p.mux, "tmux");
+        assert_eq!(p.target, "%4");
+        assert_eq!(p.socket, "/run/kitty.sock");
+        assert!(is_online(p.last_seen));
+        assert!(!is_online(p.last_seen - ONLINE_TTL_SECS - 1));
+        assert_eq!(s.list_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn socket_persists_through_upsert() {
+        let s = mem();
+        s.register_peer("k", "kitty", "1", "/run/a.sock", Some("/w"))
+            .unwrap();
+        assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/a.sock");
+        // Upsert with a new socket overwrites it.
+        s.register_peer("k", "kitty", "1", "/run/b.sock", Some("/w"))
+            .unwrap();
+        assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/b.sock");
+        // list_peers also carries the socket.
+        let peers = s.list_peers().unwrap();
+        assert_eq!(peers[0].socket, "/run/b.sock");
+    }
+
+    #[test]
+    fn register_peer_rejects_invalid_name() {
+        let s = mem();
+        assert!(s.register_peer("", "tmux", "%1", "", None).is_err());
+        assert!(s
+            .register_peer(&"n".repeat(MAX_IDENT + 1), "tmux", "%1", "", None)
+            .is_err());
+        assert!(s.register_peer("ok", "tmux", "%1", "", None).is_ok());
+    }
+
+    #[test]
+    fn touch_peer_refreshes_without_clobbering() {
+        let s = mem();
+        s.register_peer("envctl", "tmux", "%7", "/run/k.sock", Some("/w"))
+            .unwrap();
+        // Backdate last_seen, then touch and confirm only last_seen advanced.
+        s.backdate_peer("envctl", 100_000).unwrap();
+        let before = s.get_peer("envctl").unwrap().unwrap();
+        s.touch_peer("envctl").unwrap();
+        let after = s.get_peer("envctl").unwrap().unwrap();
+        assert!(after.last_seen > before.last_seen);
+        assert_eq!(after.mux, "tmux");
+        assert_eq!(after.target, "%7");
+        assert_eq!(after.socket, "/run/k.sock");
+        assert_eq!(after.cwd.as_deref(), Some("/w"));
+
+        // Touching an unknown peer is a silent no-op (no row created).
+        s.touch_peer("ghost").unwrap();
+        assert!(s.get_peer("ghost").unwrap().is_none());
+    }
+
+    #[test]
+    fn history_scoped() {
+        let s = mem();
+        s.send("a", "b", None, "1").unwrap();
+        s.send("b", "a", None, "2").unwrap();
+        s.send("c", "d", None, "x").unwrap();
+        let h = s.history("a", Some("b"), 50).unwrap();
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn reply_addresses_back_and_links() {
+        let s = mem();
+        let root = s.send("a", "b", Some("hi"), "question?").unwrap();
+        let r1 = s.reply("b", root, "answer.").unwrap();
+
+        let (a_inbox, _) = s.inbox("a", true, false, 50).unwrap();
+        let reply = a_inbox.iter().find(|m| m.id == r1).expect("a got reply");
+        assert_eq!(reply.sender, "b");
+        assert_eq!(reply.recipient, "a");
+        assert_eq!(reply.subject.as_deref(), Some("Re: hi"));
+        assert_eq!(reply.in_reply_to, Some(root));
+
+        // A reply authored by the original sender goes to the other party too,
+        // and "Re:" is not stacked.
+        let r2 = s.reply("a", r1, "thanks!").unwrap();
+        let reply2 = s
+            .thread(root, 50)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == r2)
+            .unwrap();
+        assert_eq!(reply2.recipient, "b");
+        assert_eq!(reply2.subject.as_deref(), Some("Re: hi"));
+    }
+
+    #[test]
+    fn thread_collects_transitive_replies_in_order() {
+        let s = mem();
+        let root = s.send("a", "b", Some("topic"), "m0").unwrap();
+        let c1 = s.reply("b", root, "m1").unwrap();
+        let c2 = s.reply("a", c1, "m2").unwrap(); // nested reply-to-a-reply
+        let _other = s.send("a", "b", None, "unrelated").unwrap();
+
+        let thread = s.thread(root, 50).unwrap();
+        let ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![root, c1, c2],
+            "root + transitive replies, oldest-first"
+        );
+        assert!(thread.iter().all(|m| m.body != "unrelated"));
+    }
+
+    #[test]
+    fn receipts_reports_readers() {
+        let s = mem();
+        let id = s.send("a", "all", None, "ping").unwrap();
+        assert!(s.receipts(id).unwrap().is_empty(), "nobody has read yet");
+
+        s.inbox("b", false, true, 50).unwrap();
+        s.inbox("c", false, true, 50).unwrap();
+        let r = s.receipts(id).unwrap();
+        let readers: Vec<&str> = r.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(readers.contains(&"b"));
+        assert!(readers.contains(&"c"));
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|(_, ts)| *ts > 0));
+    }
+
+    #[test]
+    fn inbox_since_pages_forward_without_dropping_backlog() {
+        let s = mem();
+        let id1 = s.send("a", "b", None, "m1").unwrap();
+        let id2 = s.send("a", "b", None, "m2").unwrap();
+        let id3 = s.send("a", "all", None, "bcast").unwrap();
+
+        let all = s.inbox_since("b", 0, 50).unwrap();
+        let ids: Vec<i64> = all.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![id1, id2, id3]);
+
+        let fwd = s.inbox_since("b", id1, 50).unwrap();
+        let ids: Vec<i64> = fwd.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![id2, id3]);
+
+        // Does not mark anything read.
+        let (unread, _) = s.inbox("b", false, false, 50).unwrap();
+        assert_eq!(unread.len(), 3);
+
+        // Excludes the caller's own messages.
+        assert!(s.inbox_since("a", 0, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_deletes_old_keeps_new() {
+        let s = mem();
+        let id_old = s.send("a", "b", None, "old").unwrap();
+        // Backdate the first message well past the threshold.
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                    params(vec![id_old.into()]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .unwrap();
+        s.send("a", "b", None, "new").unwrap();
+        let deleted = s.gc(3600).unwrap(); // older than 1h
+        assert_eq!(deleted, 1);
+        assert_eq!(s.total_messages().unwrap(), 1);
+        let (rows, _) = s.inbox("b", true, false, 50).unwrap();
+        assert_eq!(rows[0].body, "new");
+    }
+
+    #[test]
+    fn negative_limit_is_not_unbounded() {
+        let s = mem();
+        for i in 0..5 {
+            s.send("a", "b", None, &format!("m{i}")).unwrap();
+        }
+        // A negative limit must NOT behave like SQLite's unbounded LIMIT -1.
+        let (rows, _) = s.inbox("b", true, false, -1).unwrap();
+        assert!(rows.len() <= MAX_LIMIT as usize);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(clamp_limit(-1), MAX_LIMIT);
+    }
+
+    #[test]
+    fn clear_inbox_and_clear_all() {
+        let s = mem();
+        s.send("a", "b", None, "1").unwrap();
+        s.send("a", "b", None, "2").unwrap();
+        // clear_inbox marks b's unread read (returns the count marked).
+        assert_eq!(s.clear_inbox("b").unwrap(), 2);
+        let (unread, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(unread.is_empty());
+        // The messages still exist until clear_all wipes them.
+        assert_eq!(s.total_messages().unwrap(), 2);
+        assert_eq!(s.clear_all().unwrap(), 2);
+        assert_eq!(s.total_messages().unwrap(), 0);
+    }
+
+    #[test]
+    fn send_rejects_invalid_idents() {
+        let s = mem();
+        assert!(s.send("", "b", None, "x").is_err(), "empty sender rejected");
+        assert!(
+            s.send("a", "", None, "x").is_err(),
+            "empty recipient rejected"
+        );
+        assert!(
+            s.send("a", "b\nc", None, "x").is_err(),
+            "control char in recipient rejected"
+        );
+        assert!(s.send("a", "b", None, "x").is_ok());
     }
 }

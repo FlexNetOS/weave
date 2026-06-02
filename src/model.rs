@@ -94,6 +94,13 @@ pub struct Peer {
     pub mux: String,
     /// tmux pane id (e.g. "%3") or zellij session name; empty for "none".
     pub target: String,
+    /// Multiplexer control socket (e.g. kitty's `KITTY_LISTEN_ON`); empty when
+    /// unknown or not applicable. Additive + backward-compatible: pre-existing
+    /// rows (and DBs created before the `socket` column migration) read back as
+    /// `""`. `#[serde(default)]` keeps older JSON payloads (which omit the
+    /// field) deserializable.
+    #[serde(default)]
+    pub socket: String,
     pub cwd: Option<String>,
     pub last_seen: i64,
 }

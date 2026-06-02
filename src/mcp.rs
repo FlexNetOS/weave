@@ -4,7 +4,7 @@
 //!
 //! stdout is reserved for protocol messages; all logging goes to stderr.
 
-use crate::inject::{self, Target};
+use crate::inject::{self, Nudge, Target};
 use crate::model::{self, fmt_ts};
 use crate::store::{is_online, Store};
 use anyhow::Result;
@@ -22,7 +22,21 @@ pub fn log(msg: &str) {
 
 /// Run the server loop until stdin closes. `me_default` seeds the identity for
 /// tools when the caller omits `me`/`from` (e.g. from $WEAVE_SESSION).
-pub fn run(store: &dyn Store, me_default: Option<String>) -> Result<()> {
+///
+/// `nudge_template` is the user's configured live-injection nudge template
+/// (`cfg.nudge_template`, plumbed from `main.rs` where the `Config` is in scope).
+/// It mirrors the CLI's `Config::nudge` semantics: the `{from}` and `{body}`
+/// placeholders are substituted, and — crucially — a template that omits `{body}`
+/// is treated as a *quiet* preference, so the live push becomes a content-free
+/// ping (via [`inject::inject_mode`] with [`Nudge::Nudge`]) instead of typing the
+/// message body into the recipient's pane. `None` falls back to the built-in
+/// default template (which embeds the body, i.e. a `Nudge::Full` push), preserving
+/// today's behavior for callers that don't pass one.
+pub fn run(
+    store: &dyn Store,
+    me_default: Option<String>,
+    nudge_template: Option<&str>,
+) -> Result<()> {
     log(&format!(
         "starting; backend={} default_session={:?}",
         store.backend(),
@@ -52,7 +66,7 @@ pub fn run(store: &dyn Store, me_default: Option<String>) -> Result<()> {
                 continue;
             }
         };
-        if let Some(resp) = handle(store, &me_default, &req) {
+        if let Some(resp) = handle(store, &me_default, nudge_template, &req) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
             // cleanly; any other io error is logged and we keep serving.
@@ -136,7 +150,12 @@ fn ident(args: &Value, key: &str, def: &Option<String>) -> Result<String, String
     ))
 }
 
-fn handle(store: &dyn Store, me_default: &Option<String>, req: &Value) -> Option<String> {
+fn handle(
+    store: &dyn Store,
+    me_default: &Option<String>,
+    nudge_template: Option<&str>,
+    req: &Value,
+) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").cloned();
     let params = req.get("params").cloned().unwrap_or(json!({}));
@@ -177,7 +196,7 @@ fn handle(store: &dyn Store, me_default: &Option<String>, req: &Value) -> Option
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(store, me_default, name, &args) {
+            match call_tool(store, me_default, nudge_template, name, &args) {
                 Ok(text) => Some(reply(
                     &id,
                     json!({ "content": [{"type":"text","text": text}], "isError": false }),
@@ -199,17 +218,18 @@ fn handle(store: &dyn Store, me_default: &Option<String>, req: &Value) -> Option
 fn call_tool(
     store: &dyn Store,
     me_default: &Option<String>,
+    nudge_template: Option<&str>,
     name: &str,
     args: &Value,
 ) -> Result<String, String> {
     match name {
-        "weave_send" => tool_send(store, me_default, args),
+        "weave_send" => tool_send(store, me_default, nudge_template, args),
         "weave_inbox" => tool_inbox(store, me_default, args),
         "weave_history" => tool_history(store, me_default, args),
         "weave_sessions" => tool_sessions(store, me_default, args),
         "weave_clear" => tool_clear(store, me_default, args),
         "weave_peers" => tool_peers(store),
-        "weave_reply" => tool_reply(store, me_default, args),
+        "weave_reply" => tool_reply(store, me_default, nudge_template, args),
         "weave_thread" => tool_thread(store, args),
         "weave_receipts" => tool_receipts(store, args),
         "weave_doctor" => tool_doctor(store),
@@ -218,7 +238,41 @@ fn call_tool(
     }
 }
 
-fn tool_send(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+/// The built-in default nudge template, used when the user has not configured a
+/// `nudge_template`. Kept in sync with `Config::nudge`'s default so MCP and CLI
+/// pushes read identically out of the box. Placeholders: `{from}`, `{body}`.
+const DEFAULT_NUDGE_TEMPLATE: &str =
+    "[weave] message from {from}: {body} (run weave_inbox to read)";
+
+/// Render the live-injection nudge for a message and decide its injection mode
+/// from the user's configured template (mirrors `Config::nudge`):
+///   * `{from}`/`{body}` placeholders are substituted into the returned line;
+///   * if the template contains `{body}`, the rendered line carries the content
+///     and we inject it verbatim ([`Nudge::Full`]);
+///   * if the template OMITS `{body}`, the user has opted into a quiet preference,
+///     so we return [`Nudge::Nudge`] — [`inject::inject_mode`] then types only its
+///     fixed content-free ping, never the body, regardless of the rendered text.
+///
+/// `template` is the user's `cfg.nudge_template` (`None` ⇒ [`DEFAULT_NUDGE_TEMPLATE`],
+/// which embeds `{body}` and therefore yields a `Full` push, preserving the
+/// historical behavior).
+fn build_nudge(template: Option<&str>, from: &str, body: &str) -> (String, Nudge) {
+    let tmpl = template.unwrap_or(DEFAULT_NUDGE_TEMPLATE);
+    let mode = if tmpl.contains("{body}") {
+        Nudge::Full
+    } else {
+        Nudge::Nudge
+    };
+    let rendered = tmpl.replace("{from}", from).replace("{body}", body);
+    (rendered, mode)
+}
+
+fn tool_send(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     // `to` is bounded just like `from`: reject empty/whitespace and cap length.
     let to_raw = args
@@ -248,9 +302,8 @@ fn tool_send(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<St
         if let Ok(Some(peer)) = store.get_peer(to) {
             let target = Target::from_peer(&peer);
             if target.injectable() {
-                let nudge =
-                    format!("[weave] message from {from}: {body} (run weave_inbox to read)");
-                match inject::inject(&target, &nudge) {
+                let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                match inject::inject_mode(&target, &nudge, mode) {
                     Ok(true) => out.push_str(&format!(
                         " Injected live nudge into {} target '{}'.",
                         target.mux.as_str(),
@@ -443,7 +496,12 @@ fn tool_peers(store: &dyn Store) -> Result<String, String> {
 /// Reply to an existing message. The recipient is derived by the store from the
 /// parent message (it addresses the reply back to the parent's other party), so
 /// the caller supplies only their identity, the parent id, and the body.
-fn tool_reply(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+fn tool_reply(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     let in_reply_to = args
         .get("in_reply_to")
@@ -470,9 +528,8 @@ fn tool_reply(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
             if let Ok(Some(peer)) = store.get_peer(&to) {
                 let target = Target::from_peer(&peer);
                 if target.injectable() {
-                    let nudge =
-                        format!("[weave] reply from {from}: {body} (run weave_inbox to read)");
-                    match inject::inject(&target, &nudge) {
+                    let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                    match inject::inject_mode(&target, &nudge, mode) {
                         Ok(true) => out.push_str(&format!(
                             " Injected live nudge into {} target '{}'.",
                             target.mux.as_str(),
