@@ -1,0 +1,13 @@
+docs/sessions-handoff.md
+docs/sessions-handoff.pdf
+examples/hf-resume-output.json
+manifest.txt
+roadmap/backlog.yaml
+schemas/packet.schema.json
+schemas/session.schema.json
+schemas/task.schema.json
+templates/.handoff/hooks/hooks.toml
+templates/.handoff/policies/rules.toml
+templates/.handoff/skills/session-resume.skill.md
+templates/.handoff/tasks/TASK-0001.task.yaml
+templates/AGENTS.md

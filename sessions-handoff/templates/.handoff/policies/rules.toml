@@ -1,0 +1,35 @@
+[policy]
+schema = "handoff.policy.rules.v1"
+default_write_mode = "deny_without_claim"
+default_network_mode = "deny_unless_task_allows"
+default_dependency_mode = "deny_without_audit_event"
+
+[leases]
+heartbeat_seconds = 30
+stale_after_seconds = 300
+force_release_after_seconds = 1800
+require_disjoint_write_scopes = true
+
+[handoff]
+require_checkpoint = true
+require_test_evidence = true
+allow_test_waiver = true
+require_drift_audit = true
+require_next_command = true
+
+[drift]
+block_out_of_scope_write = true
+block_objective_change_without_adr = true
+block_acceptance_change_without_reclaim = true
+block_architecture_change_without_adr = true
+
+[commands.blocked]
+patterns = [
+  "rm -rf /",
+  "git reset --hard",
+  "git clean -fdx",
+  "sudo rm",
+  "chmod -R 777",
+  "curl * | sh",
+  "wget * | sh"
+]

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "handoff.packet.v2",
+  "title": "Handoff Packet V2",
+  "type": "object",
+  "required": ["schema", "packet_id", "session_id", "task_id", "task_status", "claimed_paths", "changed_files", "commands", "tests", "drift_report", "next_command"],
+  "properties": {
+    "schema": { "const": "handoff.packet.v2" },
+    "packet_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "task_status": { "type": "string" },
+    "branch": { "type": "string" },
+    "worktree": { "type": "string" },
+    "claimed_paths": { "type": "array", "items": { "type": "string" } },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "commands": { "type": "array", "items": { "type": "object" } },
+    "tests": { "type": "array", "items": { "type": "object" } },
+    "drift_report": {
+      "type": "object",
+      "required": ["status", "out_of_scope_files", "missing_evidence"],
+      "properties": {
+        "status": { "enum": ["pass", "soft_fail", "hard_fail"] },
+        "out_of_scope_files": { "type": "array", "items": { "type": "string" } },
+        "missing_evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "next_task_id": { "type": ["string", "null"] },
+    "next_command": { "type": "string" }
+  },
+  "additionalProperties": true
+}

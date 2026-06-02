@@ -1,0 +1,25 @@
+schema: handoff.task.v1
+id: TASK-0001
+title: Bootstrap Rust-native handoff workspace
+status: backlog
+priority: P0
+objective: Create the initial Rust workspace, hf CLI stub, xtask runner, root AGENTS.md, .handoff skeleton, schemas, and policy templates.
+path_scope:
+  - Cargo.toml
+  - rust-toolchain.toml
+  - AGENTS.md
+  - crates/**
+  - .handoff/**
+  - docs/**
+acceptance_criteria:
+  - Workspace uses Rust 2024 edition and resolver 3.
+  - hf CLI compiles.
+  - hf init is idempotent.
+  - .handoff/active.md exists.
+  - Root AGENTS.md directs agents to run hf resume first.
+test_commands:
+  - cargo fmt --check
+  - cargo clippy --workspace --all-targets -- -D warnings
+  - cargo test --workspace
+dependencies: []
+blocked_by: []

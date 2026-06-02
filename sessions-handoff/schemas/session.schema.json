@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "handoff.session_event.v1",
+  "title": "Handoff Session Event",
+  "type": "object",
+  "required": ["schema", "event_id", "session_id", "agent_id", "event_type", "timestamp"],
+  "properties": {
+    "schema": { "const": "handoff.session_event.v1" },
+    "event_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "task_id": { "type": ["string", "null"] },
+    "event_type": {
+      "enum": [
+        "session_started", "session_resumed", "task_claimed", "lease_heartbeat",
+        "command_run", "files_changed", "checkpoint_created", "tests_run",
+        "drift_audited", "handoff_created", "lease_released", "session_stopped"
+      ]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" },
+    "digest": { "type": "string" }
+  },
+  "additionalProperties": false
+}

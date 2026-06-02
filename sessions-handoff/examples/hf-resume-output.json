@@ -1,0 +1,19 @@
+{
+  "schema": "handoff.resume.v2",
+  "project_name": "Handoff Ledger",
+  "northstar": "Integrity, reversibility, capability gain.",
+  "active_objective": "Build Rust-native repo-local session handoff for AI agents.",
+  "active_task": {
+    "id": "TASK-0001",
+    "title": "Bootstrap Rust-native handoff workspace",
+    "status": "claimed"
+  },
+  "branch": "agent/TASK-0001/agent-a/20260602T170000Z",
+  "worktree": "../.worktrees/repo/TASK-0001-agent-a",
+  "claimed_paths": ["Cargo.toml", "crates/**", ".handoff/**", "docs/**"],
+  "blocked_paths": [],
+  "latest_packet": ".handoff/packets/latest.md",
+  "drift_status": "pass",
+  "required_tests": ["cargo test --workspace"],
+  "next_command": "hf start"
+}
