@@ -100,6 +100,23 @@ pub fn is_online(last_seen: i64) -> bool {
 /// accidental or hostile unbounded fetch.
 pub const MAX_LIMIT: i64 = 10_000;
 
+/// Hard upper bound on a stored message body (bytes). Peer-supplied bodies are
+/// untrusted; unbounded ones are a disk + token/RAM DoS once re-rendered into
+/// another agent's context. Enforced at the store layer so CLI/MCP/hook are all
+/// covered.
+pub const MAX_BODY: usize = 65_536;
+
+/// Reject an over-length body before it is stored (shared by both backends).
+pub fn check_body(body: &str) -> Result<()> {
+    if body.len() > MAX_BODY {
+        anyhow::bail!(
+            "message body is too long ({} bytes; max {MAX_BODY}).",
+            body.len()
+        );
+    }
+    Ok(())
+}
+
 /// Clamp an untrusted limit into `[0, MAX_LIMIT]`, mapping negatives to the cap
 /// (callers that want "a lot" pass a big/negative number; they get the cap, not
 /// an unbounded scan).
@@ -286,6 +303,7 @@ impl Store for SqliteStore {
         subject: Option<&str>,
         body: &str,
     ) -> Result<i64> {
+        check_body(body)?;
         self.conn.execute(
             "INSERT INTO messages (ts, sender, recipient, subject, body) VALUES (?1,?2,?3,?4,?5)",
             params![now(), sender, recipient, subject, body],

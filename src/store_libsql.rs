@@ -37,7 +37,7 @@
 
 use crate::config::Config;
 use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
-use crate::store::{clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS};
+use crate::store::{check_body, clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS};
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, Value};
 use tokio::runtime::Runtime;
@@ -209,6 +209,7 @@ impl Store for LibsqlStore {
         subject: Option<&str>,
         body: &str,
     ) -> Result<i64> {
+        check_body(body)?;
         self.rt.block_on(async {
             self.conn
                 .execute(

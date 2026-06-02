@@ -216,3 +216,12 @@ fn db_file_is_not_world_or_group_readable() {
         mode & 0o777
     );
 }
+
+#[test]
+fn oversized_body_is_rejected() {
+    let db = TestDb::new();
+    let big = "x".repeat(70_000); // > MAX_BODY (65536)
+    let (ok, _o, err) = common::run(&db, &["send", "--from", "a", "--to", "b", "--body", &big]);
+    assert!(!ok, "an oversized body must be rejected, not stored");
+    assert!(err.contains("too long"), "clear error: {err}");
+}

@@ -182,16 +182,26 @@ pub fn init_config_file() -> std::io::Result<ConfigInit> {
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // The config may hold a libSQL auth token — keep the dir private (0700).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     // create_new = true makes this atomic against a racing writer: if another
     // process creates the file between the exists() check and here, we fail with
-    // AlreadyExists rather than clobbering it.
+    // AlreadyExists rather than clobbering it. mode(0600) so a token in the file is
+    // never world/group readable.
     use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
         Ok(mut f) => {
             f.write_all(CONFIG_TEMPLATE.as_bytes())?;
             Ok(ConfigInit::Created(path))
