@@ -1,0 +1,32 @@
+[package]
+name = "weave"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native agent-to-agent session mesh with a native injector (tmux + zellij)"
+license = "MIT OR Apache-2.0"
+repository = "local"
+
+[[bin]]
+name = "weave"
+path = "src/main.rs"
+
+# Dependencies are added via `cargo add` so versions resolve to current.
+
+[features]
+# Default backend is the bundled SQLite (rusqlite). Enable `libsql` to build the
+# Turso/libSQL backend (cross-machine sync). The optional dep + module are wired
+# by the libSQL backend task.
+default = []
+libsql = []
+
+[profile.release]
+strip = true
+lto = true
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "1.1.2"
