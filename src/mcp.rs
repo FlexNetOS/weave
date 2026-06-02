@@ -6,7 +6,7 @@
 
 use crate::inject::{self, Target};
 use crate::model::{self, fmt_ts};
-use crate::store::{clamp_limit, is_online, Store, MAX_LIMIT};
+use crate::store::{is_online, Store};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -462,29 +462,27 @@ fn tool_reply(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
     let mut out = format!("Replied to #{in_reply_to} as message #{mid} from '{from}'.");
 
     // Native push: nudge the reply's recipient if it resolved to a registered
-    // injectable peer. We look the recipient up from the freshly-stored reply so
-    // the address matches whatever the store derived from the parent.
-    if let Ok(rows) = store.thread(in_reply_to, clamp_limit(MAX_LIMIT)) {
-        if let Some(reply_msg) = rows.iter().find(|m| m.id == mid) {
-            let to = &reply_msg.recipient;
-            if !model::is_broadcast(to) {
-                if let Ok(Some(peer)) = store.get_peer(to) {
-                    let target = Target::from_peer(&peer);
-                    if target.injectable() {
-                        let nudge =
-                            format!("[weave] reply from {from}: {body} (run weave_inbox to read)");
-                        match inject::inject(&target, &nudge) {
-                            Ok(true) => out.push_str(&format!(
-                                " Injected live nudge into {} target '{}'.",
-                                target.mux.as_str(),
-                                target.id
-                            )),
-                            Ok(false) => {}
-                            Err(err) => out.push_str(&format!(
-                                " (peer registered on {} but inject failed: {err}; it'll arrive on their next turn)",
-                                target.mux.as_str()
-                            )),
-                        }
+    // injectable peer. The recipient is exactly what `reply_target` derived from
+    // the parent (no need to re-scan the whole thread, which also capped at
+    // MAX_LIMIT and could miss deep threads).
+    if let Ok((to, _subject)) = store.reply_target(&from, in_reply_to) {
+        if !model::is_broadcast(&to) {
+            if let Ok(Some(peer)) = store.get_peer(&to) {
+                let target = Target::from_peer(&peer);
+                if target.injectable() {
+                    let nudge =
+                        format!("[weave] reply from {from}: {body} (run weave_inbox to read)");
+                    match inject::inject(&target, &nudge) {
+                        Ok(true) => out.push_str(&format!(
+                            " Injected live nudge into {} target '{}'.",
+                            target.mux.as_str(),
+                            target.id
+                        )),
+                        Ok(false) => {}
+                        Err(err) => out.push_str(&format!(
+                            " (peer registered on {} but inject failed: {err}; it'll arrive on their next turn)",
+                            target.mux.as_str()
+                        )),
                     }
                 }
             }

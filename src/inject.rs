@@ -452,14 +452,55 @@ pub fn target_alive(target: &Target) -> bool {
     }
 }
 
-/// Is `bin` on PATH?
-pub fn have(bin: &str) -> bool {
-    if bin.is_empty() {
-        return false;
+/// Fixed, trusted directories to resolve a mux binary from. A bare binary name
+/// resolved via ambient `$PATH` lets a fake `tmux`/`zellij` placed early on PATH
+/// execute inside weave's process (which may hold a libSQL auth token) on a
+/// remote-triggered send. We only run a mux found by ABSOLUTE path in one of these
+/// system/user-tool dirs.
+fn trusted_dirs() -> Vec<std::path::PathBuf> {
+    let mut v: Vec<std::path::PathBuf> =
+        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+    // Explicit opt-in for a mux installed in a nonstandard dir (the user vouches
+    // for it by setting this); also how tests point at a fake mux.
+    if let Some(extra) = std::env::var_os("WEAVE_MUX_DIR") {
+        v.extend(std::env::split_paths(&extra));
     }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = std::path::PathBuf::from(home);
+        v.push(h.join(".cargo/bin"));
+        v.push(h.join(".local/bin"));
+        v.push(h.join(".nix-profile/bin"));
+    }
+    v
+}
+
+/// Resolve `bin` to an absolute path inside a trusted dir, or `None`.
+pub fn resolve_trusted(bin: &str) -> Option<std::path::PathBuf> {
+    if bin.is_empty() {
+        return None;
+    }
+    trusted_dirs()
+        .into_iter()
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
+}
+
+/// Is `bin` available as a TRUSTED absolute path (not just anywhere on $PATH)?
+pub fn have(bin: &str) -> bool {
+    resolve_trusted(bin).is_some()
+}
+
+/// Rewrite a command's argv[0] (a bare mux binary name) to its trusted absolute
+/// path, so `Command::new` spawns the trusted binary rather than re-resolving via
+/// ambient `$PATH`. Returns `None` if the binary isn't in a trusted dir.
+fn trusted_argv(cmd: &[String]) -> Option<Vec<String>> {
+    let abs = resolve_trusted(&cmd[0])?;
+    let mut out = cmd.to_vec();
+    out[0] = abs.to_string_lossy().into_owned();
+    Some(out)
 }
 
 /// Inject `text` into `target`. Returns:
@@ -628,6 +669,9 @@ fn run_with_one_retry(cmd: &[String], dur: std::time::Duration) -> Result<bool> 
 /// so a wedged mux server cannot hang weave). Polls rather than pulling in a crate.
 fn run_bounded(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
     use std::time::Instant;
+    // Spawn the mux binary by TRUSTED absolute path, never via ambient $PATH.
+    let cmd = trusted_argv(cmd)
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a trusted directory", cmd[0]))?;
     let mut child = Command::new(&cmd[0]).args(&cmd[1..]).spawn()?;
     let start = Instant::now();
     loop {
@@ -653,6 +697,9 @@ fn run_bounded(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
 fn run_capture(cmd: &[String], dur: std::time::Duration) -> Result<Option<String>> {
     use std::process::Stdio;
     use std::time::Instant;
+    // Spawn the probe binary by TRUSTED absolute path, never via ambient $PATH.
+    let cmd = trusted_argv(cmd)
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a trusted directory", cmd[0]))?;
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdout(Stdio::piped())

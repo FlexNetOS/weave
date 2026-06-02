@@ -244,6 +244,9 @@ fn weave_with_fake_path(
     let orig = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", fake_dir.display(), orig);
     cmd.env("PATH", new_path);
+    // The injector only runs a mux from a TRUSTED dir (never ambient $PATH); the
+    // fake-mux dir is trusted explicitly via WEAVE_MUX_DIR (the test opt-in).
+    cmd.env("WEAVE_MUX_DIR", fake_dir);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
