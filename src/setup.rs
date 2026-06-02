@@ -7,7 +7,11 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The lifecycle hooks weave installs, as (Claude event name, hook argument).
@@ -151,6 +155,32 @@ fn read_settings() -> Result<Value> {
     }
 }
 
+/// Create/truncate `path` with the given bytes, forcing owner-only `0o600`
+/// permissions atomically at open time via `O_CREAT` + `mode`. Used for both the
+/// `.bak` snapshot and the `.tmp` staging file: settings.json env blocks can carry
+/// secrets (API keys, tokens), so these derived files must never be created
+/// world- or group-readable, not even for the brief window before a later
+/// `set_permissions`. `OpenOptions::mode` is applied by the kernel only when the
+/// file is newly created, so we also explicitly tighten it afterwards in case the
+/// path already existed (e.g. a stale `.tmp` from a previous crash).
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {} (0o600)", path.display()))?;
+    // Defend against a pre-existing file whose mode O_CREAT left untouched.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0o600 {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    f.flush()
+        .with_context(|| format!("flushing {}", path.display()))?;
+    Ok(())
+}
+
 /// Write settings.json pretty-printed, creating parent dirs as needed. Adds a
 /// trailing newline to match conventional editors.
 ///
@@ -158,6 +188,12 @@ fn read_settings() -> Result<Value> {
 /// `rename` it over the target, so a crash or full disk mid-write can never leave
 /// the user's settings truncated. Before the first time weave mutates an existing
 /// settings file we also drop a one-time `settings.json.weave.bak` snapshot.
+///
+/// Both the `.bak` and `.tmp` files are created with owner-only `0o600`
+/// permissions because settings.json env blocks can carry secrets. We capture the
+/// original file's mode before the rename and re-apply it to the renamed result so
+/// the live settings file keeps whatever permissions the user chose (we don't
+/// silently force the live file to 0o600 — only the derived sidecar files).
 fn write_settings(v: &Value) -> Result<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
@@ -165,12 +201,20 @@ fn write_settings(v: &Value) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
+    // Capture the pre-existing file's mode (if any) so we can preserve it on the
+    // renamed result; the .tmp file is created 0o600 and rename keeps the tmp's
+    // mode, which would otherwise tighten the live file unexpectedly.
+    let original_mode: Option<u32> = std::fs::metadata(&path)
+        .ok()
+        .map(|m| m.permissions().mode());
+
     // One-time backup of the pre-existing file (best-effort, never created twice).
+    // The snapshot may contain secrets, so write it 0o600.
     if path.exists() {
         let bak = path.with_extension("json.weave.bak");
         if !bak.exists() {
             if let Ok(original) = std::fs::read(&path) {
-                let _ = std::fs::write(&bak, original);
+                let _ = write_private(&bak, &original);
             }
         }
     }
@@ -179,37 +223,149 @@ fn write_settings(v: &Value) -> Result<()> {
     out.push('\n');
 
     // Write to a sibling temp file then rename over the target (atomic on POSIX).
+    // The temp file is created 0o600 so secrets are never briefly world-readable.
     let tmp = path.with_extension("json.weave.tmp");
-    std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
+    write_private(&tmp, out.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| {
         let _ = std::fs::remove_file(&tmp);
         format!("replacing {}", path.display())
     })?;
+
+    // Restore the original file's permissions on the renamed result. If the file
+    // is brand new (no original mode) we leave it at the tmp's 0o600, which is a
+    // safe default for a file that may hold secrets.
+    if let Some(mode) = original_mode {
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+    }
     Ok(())
 }
 
+/// Single-quote a string for safe use as one POSIX shell word, escaping any
+/// embedded single quotes via the standard `'\''` idiom. `foo` → `'foo'`,
+/// `a'b` → `'a'\''b'`. A path containing a space (e.g. a `cargo run` target under
+/// `~/My Projects/`) would otherwise word-split and the hook would silently never
+/// run — quoting makes it a single argument.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// The command string weave installs for a given hook argument.
+///
+/// The exe is single-quoted so a path containing spaces or other shell-special
+/// characters is passed as one word; without this an exe like
+/// `/home/u/My Projects/weave` would word-split and the hook would never fire.
 fn hook_command(exe: &str, arg: &str) -> String {
-    format!("{exe} hook {arg}")
+    format!("{} hook {arg}", shell_single_quote(exe))
+}
+
+/// True iff `prefix` (the text that precedes `weave hook <event>` in an UNQUOTED
+/// command) names weave's binary via a clean path component, i.e. either:
+///   * empty            → bare `weave hook stop`, or
+///   * a clean absolute path ending in `/` → `/home/u/.cargo/bin/weave hook stop`.
+///
+/// We reject anything containing shell operators (`&&`, `;`, `|`) or interior
+/// whitespace runs so a crafted hook like `echo x && /weave hook stop` or
+/// `: ;/weave hook stop` is never mistaken for ours. A clean absolute path starts
+/// with `/`, ends with `/`, and contains no whitespace or shell metacharacters.
+fn is_clean_unquoted_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    // Must be an absolute path component boundary.
+    if !prefix.starts_with('/') || !prefix.ends_with('/') {
+        return false;
+    }
+    !prefix.chars().any(is_shellish) && !prefix.contains("//")
+}
+
+/// Characters that, if present in a path prefix, mean we must NOT treat the
+/// command as weave's own (they signal command chaining, word-splitting, or
+/// redirection rather than a plain binary path).
+fn is_shellish(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '&' | ';'
+                | '|'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '$'
+                | '`'
+                | '\\'
+                | '*'
+                | '?'
+                | '\''
+                | '"'
+        )
 }
 
 /// True if this command string is one of weave's own hooks, i.e. exactly
 /// `<exe> hook <session|prompt|stop>` where `<exe>`'s basename is `weave`.
 ///
+/// Two installed shapes are recognized so uninstall/idempotency keep working
+/// across versions:
+///   * the current QUOTED form `'<exe>' hook <event>` (T2), and
+///   * the legacy UNQUOTED form `<exe> hook <event>` written by older weave.
+///
 /// We match the precise installed shape (not a loose `contains("weave hook")`) so
 /// we never delete an unrelated user hook such as `/usr/bin/myweave hook-runner`
 /// or `echo 'run weave hook' && other`. The `weave` token must be a whole path
-/// component: the text before it is empty (bare `weave hook stop`) or ends with a
-/// path separator (`/home/u/.cargo/bin/weave hook stop`).
+/// component, and (for the unquoted form) the path prefix must be clean — empty or
+/// a shell-operator-free absolute path. See [`is_clean_unquoted_prefix`].
 fn is_weave_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
     ["session", "prompt", "stop"].iter().any(|event| {
+        // Quoted form: '<exe>' hook <event>, where <exe> ends in (…/)weave.
+        let quoted_suffix = format!("weave' hook {event}");
+        if let Some(prefix) = cmd.strip_suffix(&quoted_suffix) {
+            // `prefix` is everything up to and including the opening quote and the
+            // path before `weave`. It must be `'…/` or `'` (bare) with a clean,
+            // operator-free absolute path inside the quotes.
+            if let Some(inner) = prefix.strip_prefix('\'') {
+                // No stray unescaped quote may appear inside the path.
+                return is_clean_quoted_inner(inner);
+            }
+            return false;
+        }
+
+        // Legacy unquoted form: <exe> hook <event>.
         let suffix = format!("weave hook {event}");
         match cmd.strip_suffix(&suffix) {
-            Some(prefix) => prefix.is_empty() || prefix.ends_with('/'),
+            Some(prefix) => is_clean_unquoted_prefix(prefix),
             None => false,
         }
     })
+}
+
+/// Validate the path that appears inside the single quotes of the quoted hook
+/// form, i.e. the text between the opening `'` and the literal `weave` token
+/// (e.g. `/home/u/.cargo/bin/` or `` for a bare `'weave' hook stop`). It must be
+/// empty or an absolute path ending in `/`, with no embedded single quote (an
+/// unescaped `'` would have closed the quoting, so a `'\''` escape inside a real
+/// exe path is intentionally not recognized here — such a path cannot be a clean
+/// binary location and is treated as foreign).
+fn is_clean_quoted_inner(inner: &str) -> bool {
+    if inner.is_empty() {
+        return true;
+    }
+    if !inner.starts_with('/') || !inner.ends_with('/') {
+        return false;
+    }
+    !inner.contains('\'') && !inner.contains("//")
 }
 
 /// Merge weave's lifecycle hooks into settings.json idempotently. Returns the
@@ -356,10 +512,11 @@ fn prune_hooks() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_weave_command;
+    use super::{hook_command, is_weave_command, shell_single_quote};
 
     #[test]
     fn matches_only_real_weave_hooks() {
+        // Legacy UNQUOTED form (written by older weave) still recognized.
         assert!(is_weave_command("weave hook session"));
         assert!(is_weave_command("/home/u/.cargo/bin/weave hook stop"));
         assert!(is_weave_command("/usr/local/bin/weave hook prompt"));
@@ -368,5 +525,62 @@ mod tests {
         assert!(!is_weave_command("echo 'about to run weave hook' && other"));
         assert!(!is_weave_command("weave hook notification")); // not an installed event
         assert!(!is_weave_command("weave mcp"));
+    }
+
+    #[test]
+    fn matches_current_quoted_form() {
+        // Current QUOTED form (T2): '<exe>' hook <event>.
+        assert!(is_weave_command("'weave' hook session"));
+        assert!(is_weave_command("'/home/u/.cargo/bin/weave' hook stop"));
+        assert!(is_weave_command("'/usr/local/bin/weave' hook prompt"));
+        // A path with a space is legitimate INSIDE the quotes.
+        assert!(is_weave_command("'/home/u/My Projects/weave' hook stop"));
+        // Quoted look-alikes must NOT match.
+        assert!(!is_weave_command("'/usr/bin/myweave' hook session"));
+        assert!(!is_weave_command("'weave' mcp"));
+        assert!(!is_weave_command("'weave' hook notification"));
+    }
+
+    #[test]
+    fn rejects_unquoted_prefixes_with_shell_operators_or_whitespace() {
+        // T3: an unquoted prefix containing shell operators or whitespace must be
+        // rejected even though it ends in `weave hook <event>`.
+        assert!(!is_weave_command("echo x && /weave hook stop"));
+        assert!(!is_weave_command(": ;/weave hook stop"));
+        assert!(!is_weave_command("a | /usr/bin/weave hook stop"));
+        assert!(!is_weave_command("/usr/bin/ weave hook stop")); // interior whitespace
+        assert!(!is_weave_command("rm -rf /; weave hook stop"));
+        assert!(!is_weave_command("/opt/$X/weave hook stop")); // variable expansion
+        assert!(!is_weave_command("/opt//weave hook stop")); // empty path component
+        assert!(!is_weave_command("relative/path/weave hook stop")); // not absolute
+                                                                     // The bare and clean-absolute forms remain accepted.
+        assert!(is_weave_command("weave hook stop"));
+        assert!(is_weave_command("/opt/bin/weave hook stop"));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_correctly() {
+        assert_eq!(shell_single_quote("foo"), "'foo'");
+        assert_eq!(shell_single_quote("a b"), "'a b'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn hook_command_quotes_and_round_trips() {
+        // Plain path.
+        let cmd = hook_command("/home/u/.cargo/bin/weave", "stop");
+        assert_eq!(cmd, "'/home/u/.cargo/bin/weave' hook stop");
+        assert!(is_weave_command(&cmd));
+
+        // Path with a space — the whole point of quoting.
+        let spaced = hook_command("/home/u/My Projects/weave", "session");
+        assert_eq!(spaced, "'/home/u/My Projects/weave' hook session");
+        assert!(is_weave_command(&spaced));
+
+        // Bare exe name.
+        let bare = hook_command("weave", "prompt");
+        assert_eq!(bare, "'weave' hook prompt");
+        assert!(is_weave_command(&bare));
     }
 }

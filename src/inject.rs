@@ -154,9 +154,12 @@ impl Target {
         Target {
             mux: Mux::parse(&p.mux),
             id: p.target.clone(),
-            // Peers carry only mux + target today; a kitty socket, when needed,
-            // is supplied at detection time. Default to kitty's standard path.
-            socket: String::new(),
+            // Carry the peer's stored kitty remote-control socket (the value of
+            // KITTY_LISTEN_ON captured at register time) so a cross-session inject
+            // can reach a kitty launched with `--listen-on`. Empty for every other
+            // backend (and for a kitty on its default control path), which keeps the
+            // legacy `kitten @` shaping byte-for-byte unchanged.
+            socket: p.socket.clone(),
         }
     }
 }
@@ -439,16 +442,100 @@ pub fn target_alive(target: &Target) -> bool {
         // Exit-status probes: 0 ⇒ alive, non-zero ⇒ gone, error/timeout ⇒ assume alive.
         Mux::Tmux => run_bounded(&cmd, INJECT_TIMEOUT).unwrap_or(true),
         // Stdout-scan probes: the id must appear in the listing to count as alive,
-        // but any spawn/timeout failure leaves us unsure ⇒ assume alive.
+        // but any spawn/timeout failure leaves us unsure ⇒ assume alive. We match on
+        // a token/field boundary, never a raw substring, so an id like "2" does not
+        // spuriously match "12", a column header, or a timestamp digit run.
         Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
             match run_capture(&cmd, INJECT_TIMEOUT) {
-                Ok(Some(out)) => out.contains(target.id.as_str()),
+                Ok(Some(out)) => id_present(target.mux, &out, target.id.as_str()),
                 // Ran but produced nothing usable, or could not be run: don't gate.
                 Ok(None) | Err(_) => true,
             }
         }
         // Unreachable (liveness_probe returned None for these), but be explicit.
         Mux::Screen | Mux::None => true,
+    }
+}
+
+/// Does the target `id` appear in probe `out` as a *whole token / field*, not as a
+/// bare substring? `out.contains(id)` was unsafe: an id of "2" substring-matches
+/// "12", a pane in another column, an epoch timestamp, etc., wrongly reporting a
+/// dead target as alive (or — worse for fail-open intent — masking a real id with a
+/// coincidental digit run). Boundary-aware matching per backend:
+///   - zellij  `list-sessions` — session names are word-like, one per line possibly
+///     with surrounding decoration; whitespace-tokenize and require an exact token.
+///   - wezterm `cli list`      — columnar text; the integer pane id is its own
+///     whitespace-delimited field, so the same exact-token rule isolates it.
+///   - kitty   `kitten @ ls`   — JSON window tree; the window id is a numeric value
+///     of an `"id"` field. Parse the JSON and look for that exact integer field
+///     rather than scanning text, so "2" can't match inside "12345" or a timestamp.
+///
+/// Fail-open is preserved by the caller: this only ever runs on a successful probe
+/// capture; an empty/garbled capture never reaches here (it returns `true` upstream).
+fn id_present(mux: Mux, out: &str, id: &str) -> bool {
+    match mux {
+        // Exact whitespace-delimited token anywhere in the listing.
+        Mux::Zellij | Mux::Wezterm => out.split_whitespace().any(|tok| tok == id),
+        // Kitty emits JSON; an integer window id appears as `"id": <n>`. Match that
+        // field exactly. Fall back to exact-token matching if the output isn't the
+        // JSON we expect (defensive: a future kitty format change shouldn't make us
+        // suppress a live target — only a confident absence gates).
+        Mux::Kitty => {
+            if let Ok(want) = id.parse::<i64>() {
+                if let Some(found) = json_has_id(out, want) {
+                    return found;
+                }
+            }
+            // Couldn't parse the id as an int or couldn't parse the JSON: don't
+            // claim a confident absence — defer to a boundary-safe token scan.
+            out.split_whitespace()
+                .any(|tok| tok.trim_matches(|c| c == ',' || c == ':') == id)
+        }
+        // The remaining backends never reach here (target_alive handles them).
+        Mux::Tmux | Mux::Screen | Mux::None => out.contains(id),
+    }
+}
+
+/// Scan kitty `kitten @ ls` JSON for a window whose `"id"` field equals `want`.
+/// Returns `Some(true/false)` when the text is recognizably the kitty JSON (we can
+/// make a confident judgement) and `None` when it doesn't look like that JSON at all
+/// (caller should fall back rather than trust a parse we couldn't perform).
+///
+/// We avoid pulling in a JSON crate: kitty prints `"id": <int>` (with optional
+/// whitespace after the colon) for every os-window / tab / window node. We hunt for
+/// the literal key, then read the integer that follows and compare it as a whole
+/// number — so id 2 matches `"id": 2` but never `"id": 12345` or a `"last_focused":`
+/// timestamp. Presence of at least one `"id"` key is our signal the text really is
+/// the expected JSON.
+fn json_has_id(out: &str, want: i64) -> Option<bool> {
+    let mut saw_any_id = false;
+    let mut rest = out;
+    while let Some(pos) = rest.find("\"id\"") {
+        // Advance past the matched key.
+        let after_key = &rest[pos + "\"id\"".len()..];
+        // Expect a colon (allowing whitespace before it), then an integer.
+        let after_colon = after_key.trim_start();
+        if let Some(num_str) = after_colon.strip_prefix(':') {
+            let digits: String = num_str
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            if let Ok(val) = digits.parse::<i64>() {
+                saw_any_id = true;
+                if val == want {
+                    return Some(true);
+                }
+            }
+        }
+        rest = after_key;
+    }
+    // Recognized the JSON (had at least one numeric "id") but never matched ⇒ a
+    // confident absence. Didn't recognize it at all ⇒ None so the caller falls back.
+    if saw_any_id {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1046,9 +1133,44 @@ mod tests {
             mux: "kitty".into(),
             target: "7".into(),
             cwd: None,
+            socket: String::new(),
             last_seen: 0,
         };
         assert!(Target::from_peer(&p).socket.is_empty());
+    }
+
+    /// `from_peer` copies a peer's stored kitty socket into the Target so a
+    /// cross-session inject can reach a kitty launched with `--listen-on`.
+    #[test]
+    fn from_peer_carries_kitty_socket() {
+        let p = Peer {
+            name: "k".into(),
+            mux: "kitty".into(),
+            target: "7".into(),
+            cwd: None,
+            socket: "unix:/tmp/mykitty".into(),
+            last_seen: 0,
+        };
+        let target = Target::from_peer(&p);
+        assert_eq!(target.socket, "unix:/tmp/mykitty");
+        assert_eq!(target.mux, Mux::Kitty);
+        assert_eq!(target.id, "7");
+        // And that socket actually threads through to the shaped commands.
+        let c = commands_for(&target, "hi");
+        assert_eq!(
+            c[0],
+            argv(&[
+                "kitten",
+                "--to",
+                "unix:/tmp/mykitty",
+                "@",
+                "send-text",
+                "--match",
+                "id:7",
+                "--",
+                "hi"
+            ])
+        );
     }
 
     /// `Nudge::Full` injects the body verbatim; `Nudge::Nudge` injects only the
@@ -1146,5 +1268,95 @@ mod tests {
         assert!(!id_valid(Mux::Tmux, "3"));
         assert!(!id_valid(Mux::None, "x"));
         assert!(!id_valid(Mux::Kitty, ""));
+    }
+
+    /// Liveness scanning must match the target id on a token/field boundary, never
+    /// as a raw substring: an id of "2" must NOT be satisfied by "12" / a timestamp
+    /// / a longer pane id, but MUST match when "2" stands alone as its own field.
+    #[test]
+    fn id_present_matches_on_token_boundary() {
+        // wezterm `cli list` is columnar: the pane id is its own whitespace field.
+        let wez = "WINID TABID PANEID TITLE\n0 0 12 vim\n0 0 2 bash\n";
+        assert!(
+            id_present(Mux::Wezterm, wez, "2"),
+            "standalone pane id 2 must match"
+        );
+        assert!(
+            id_present(Mux::Wezterm, wez, "12"),
+            "standalone pane id 12 must match"
+        );
+        // An id present only as a substring of another field must NOT match.
+        let only12 = "WINID TABID PANEID TITLE\n0 0 12 vim\n";
+        assert!(
+            !id_present(Mux::Wezterm, only12, "2"),
+            "id 2 must not substring-match 12: {only12:?}"
+        );
+
+        // zellij `list-sessions`: session names are word tokens, one per line.
+        let zj = "envctl [Created 1h ago]\ndesktop [Created 2m ago]\n";
+        assert!(id_present(Mux::Zellij, zj, "envctl"));
+        assert!(id_present(Mux::Zellij, zj, "desktop"));
+        assert!(
+            !id_present(Mux::Zellij, zj, "env"),
+            "a prefix of a session name must not match"
+        );
+    }
+
+    /// kitty `kitten @ ls` is JSON; the window id must match the numeric `"id"`
+    /// field exactly — never a substring of a longer id, and never a coincidental
+    /// digit run inside a timestamp field like `last_focused`.
+    #[test]
+    fn id_present_kitty_parses_json_id() {
+        let json = r#"[
+          {"id": 1, "tabs": [
+            {"id": 3, "windows": [
+              {"id": 2, "last_focused": 1717000002, "title": "claude"},
+              {"id": 12345, "last_focused": 1717000012, "title": "shell"}
+            ]}
+          ]}
+        ]"#;
+        // Exact window id present.
+        assert!(id_present(Mux::Kitty, json, "2"), "window id 2 is present");
+        assert!(
+            id_present(Mux::Kitty, json, "12345"),
+            "window id 12345 is present"
+        );
+        // An id that appears ONLY as a digit run inside a timestamp must not match.
+        assert!(
+            !id_present(Mux::Kitty, json, "1717000002"),
+            "a last_focused timestamp must not count as a window id"
+        );
+        // An absent id, even though its digits substring-match a present id.
+        assert!(
+            !id_present(Mux::Kitty, json, "234"),
+            "234 substrings 12345 but is not an id field"
+        );
+        assert!(
+            !id_present(Mux::Kitty, json, "9"),
+            "absent window id must not match"
+        );
+    }
+
+    /// `json_has_id` distinguishes a confident absence (recognized JSON, no match →
+    /// Some(false)) from unrecognized output (no numeric id field → None, so the
+    /// caller can fall back rather than wrongly gate).
+    #[test]
+    fn json_has_id_confidence() {
+        let json = r#"{"id": 7, "tabs": []}"#;
+        assert_eq!(json_has_id(json, 7), Some(true));
+        assert_eq!(json_has_id(json, 8), Some(false), "recognized but absent");
+        // Output with no numeric "id" field at all ⇒ None (unrecognized, fall back).
+        assert_eq!(json_has_id("not json at all", 7), None);
+        assert_eq!(json_has_id("", 7), None);
+    }
+
+    /// When kitty output isn't the expected JSON, `id_present` falls back to a
+    /// boundary-safe token scan (trimming JSON punctuation) rather than gating.
+    #[test]
+    fn id_present_kitty_falls_back_on_non_json() {
+        // A degenerate/plain line (not the id JSON) carrying the id as a token.
+        assert!(id_present(Mux::Kitty, "window 7 active", "7"));
+        // The id as a bare substring of a longer token must still not match.
+        assert!(!id_present(Mux::Kitty, "window 77 active", "7"));
     }
 }

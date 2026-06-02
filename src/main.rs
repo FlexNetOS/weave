@@ -453,6 +453,18 @@ fn print_man() -> Result<()> {
 
 /// Poll the inbox and print new messages until interrupted (Ctrl-C). Always a
 /// PEEK (never marks read) so the normal hook drain still delivers them.
+///
+/// Strictly id-ascending high-water paging via [`Store::inbox_since`]: we track
+/// the highest id we have printed (`last`) and on each tick fetch *only* messages
+/// with `id > last`, oldest-first. When a single tick's backlog exceeds `limit`
+/// we page within that tick (loop until a short page) so a burst larger than the
+/// page size is never silently dropped — every message is printed exactly once,
+/// in id order, and `last` only ever moves forward.
+///
+/// `all` seeds the starting high-water mark: by default we begin at the current
+/// max delivered id (so watch shows only messages that arrive *after* it starts);
+/// with `--all` we begin at 0 so the existing backlog is surfaced on the first
+/// pass too. Either way subsequent ticks only ever see strictly-newer ids.
 fn watch(
     store: &dyn Store,
     _cfg: &Config,
@@ -463,13 +475,41 @@ fn watch(
     limit: i64,
 ) -> Result<()> {
     eprintln!("[weave] watching inbox for '{me}' every {interval}s (Ctrl-C to stop)");
-    let mut seen: i64 = 0;
-    let mut first = true;
+    // Page size for one inbox_since call. A non-positive --limit would make no
+    // forward progress (and clamp_limit maps negatives to a huge cap), so floor
+    // it to a sane minimum for paging.
+    let page = if limit <= 0 { 50 } else { limit };
+
+    // Seed the high-water mark. Without --all, jump past the existing backlog so
+    // watch reports only what lands after it starts; the seed peek is a single
+    // bounded fetch from the front (id-asc) advanced to the last row.
+    let mut last: i64 = 0;
+    if !all {
+        // Drain forward once (without printing) to discover the current max id.
+        loop {
+            let rows = store.inbox_since(me, last, page)?;
+            let n = rows.len();
+            if let Some(m) = rows.last() {
+                last = last.max(m.id);
+            }
+            if n < page as usize {
+                break;
+            }
+        }
+    }
+
     loop {
-        let include_read = all && first;
-        let (rows, _) = store.inbox(me, include_read, false, limit)?;
-        for m in &rows {
-            if m.id > seen {
+        // Page within the tick until a short page: a backlog larger than `page`
+        // is fully drained this tick rather than trickled one page per interval.
+        loop {
+            let rows = store.inbox_since(me, last, page)?;
+            let n = rows.len();
+            for m in &rows {
+                // inbox_since is strictly id>last ascending, but guard anyway so a
+                // backend that returns an inclusive/duplicate row can't reprint.
+                if m.id <= last {
+                    continue;
+                }
                 let subj = m
                     .subject
                     .as_ref()
@@ -484,10 +524,13 @@ fn watch(
                     subj,
                     m.body
                 );
-                seen = seen.max(m.id);
+                last = last.max(m.id);
+            }
+            // Short page ⇒ caught up for now; stop paging until the next tick.
+            if n < page as usize {
+                break;
             }
         }
-        first = false;
         std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
     }
 }
@@ -541,7 +584,11 @@ fn main() -> Result<()> {
             let def = session
                 .filter(|s| !s.is_empty())
                 .or_else(|| cfg.session.clone());
-            mcp::run(store, def)?;
+            // Plumb the configured nudge template (if any) into the MCP server so
+            // its live-injection nudges honor the same `nudge_template` the CLI
+            // uses. `None` ⇒ the server falls back to its built-in default text.
+            let nudge_tpl = cfg.nudge_template().map(str::to_owned);
+            mcp::run(store, def, nudge_tpl.as_deref())?;
         }
 
         Cmd::Send {
@@ -700,7 +747,8 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|p| {
                         serde_json::json!({
-                            "name": p.name, "mux": p.mux, "target": p.target, "cwd": p.cwd,
+                            "name": p.name, "mux": p.mux, "target": p.target,
+                            "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
                             "online": is_online(p.last_seen),
                             "injectable": inject::Target::from_peer(p).injectable(),
@@ -770,7 +818,10 @@ fn main() -> Result<()> {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
             });
-            store.register_peer(&me, t.mux.as_str(), &t.id, cwd_val.as_deref())?;
+            // Persist the captured kitty control socket (KITTY_LISTEN_ON; empty for
+            // every other backend) so a remote sender can reach a `--listen-on`
+            // kitty via `kitten --to <socket>` without re-detecting it.
+            store.register_peer(&me, t.mux.as_str(), &t.id, &t.socket, cwd_val.as_deref())?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
             } else {
@@ -836,8 +887,25 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
     match event {
         "session" => {
             let t = inject::detect_target();
-            store.register_peer(&me, t.mux.as_str(), &t.id, cwd)?;
+            // Pass the captured kitty control socket through (empty for non-kitty);
+            // see the Register arm. A poisoned/empty socket is harmless — only the
+            // kitty injector consults it.
+            store.register_peer(&me, t.mux.as_str(), &t.id, &t.socket, cwd)?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
+            // S2 — opportunistic retention sweep. Best-effort: a GC failure must
+            // never sink the session hook (which also drives presence/registration),
+            // so errors are reported and swallowed. A configured retention of 0
+            // disables the sweep entirely.
+            let retention = cfg.retention();
+            if retention > 0 {
+                match store.gc(retention) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[weave] gc: pruned {n} message(s) older than {retention}s")
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[weave] gc skipped (non-fatal): {e}"),
+                }
+            }
         }
         // UserPromptSubmit: Claude Code injects this hook's stdout into the model
         // as additionalContext, so the printed messages are actually delivered.

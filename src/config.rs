@@ -12,6 +12,11 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Default message-retention window: 30 days in seconds. A `session` hook GC pass
+/// (see `Config::retention`) deletes messages older than this. Mirrors the
+/// `weave gc` CLI default so the opportunistic and explicit sweeps agree.
+pub const DEFAULT_RETENTION_SECS: i64 = 2_592_000;
+
 #[derive(Deserialize, Default, Clone)]
 pub struct Config {
     pub session: Option<String>,
@@ -20,6 +25,11 @@ pub struct Config {
     pub nudge_template: Option<String>,
     pub libsql_url: Option<String>,
     pub libsql_auth_token: Option<String>,
+    /// Age threshold (seconds) for the opportunistic GC run at SessionStart.
+    /// `None` ⇒ the [`DEFAULT_RETENTION_SECS`] default (30 days). A value of `0`
+    /// disables the auto-GC entirely (messages are kept until an explicit
+    /// `weave gc`). Negative values are treated as `0` (disabled).
+    pub retention_secs: Option<i64>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -36,6 +46,7 @@ impl std::fmt::Debug for Config {
                 "libsql_auth_token",
                 &self.libsql_auth_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("retention_secs", &self.retention_secs)
             .finish()
     }
 }
@@ -77,7 +88,28 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_LIBSQL_AUTH_TOKEN") {
             cfg.libsql_auth_token = Some(v);
         }
+        // Retention override: a non-numeric value is ignored (leaves the config /
+        // default in place) rather than silently disabling GC.
+        if let Some(v) = nonempty("WEAVE_RETENTION_SECS").and_then(|s| s.parse::<i64>().ok()) {
+            cfg.retention_secs = Some(v);
+        }
         cfg
+    }
+
+    /// Resolved retention window (seconds) for the opportunistic SessionStart GC.
+    /// Falls back to [`DEFAULT_RETENTION_SECS`] when unset; a configured `0` (or
+    /// any negative value, clamped to `0`) disables the auto-GC. The caller treats
+    /// `0` as "skip the sweep entirely".
+    pub fn retention(&self) -> i64 {
+        self.retention_secs.unwrap_or(DEFAULT_RETENTION_SECS).max(0)
+    }
+
+    /// The configured nudge template, if any. Plumbed into the MCP server so its
+    /// live-injection nudges honor the same `nudge_template` the CLI uses (the
+    /// template carries `{from}`/`{body}` placeholders; see [`Config::nudge`]).
+    /// `None` ⇒ the server uses its built-in default nudge text.
+    pub fn nudge_template(&self) -> Option<&str> {
+        self.nudge_template.as_deref()
     }
 
     pub fn backend(&self) -> String {
@@ -155,6 +187,12 @@ pub const CONFIG_TEMPLATE: &str = "\
 # quiet \"you have mail\" ping that carries no content.
 # nudge_template = \"[weave] message from {from}: {body} (run weave_inbox to read)\"
 
+# Auto-retention: at SessionStart weave opportunistically deletes messages older
+# than this many seconds (best-effort; failures are ignored). Default 2592000
+# (30 days), matching the `weave gc` default. Set 0 to disable the auto-sweep and
+# keep messages until you run `weave gc` yourself. Overridable via WEAVE_RETENTION_SECS.
+# retention_secs = 2592000
+
 # Remote libSQL/Turso endpoint (only used when backend = \"libsql\").
 # libsql_url = \"libsql://your-db.turso.io\"
 
@@ -227,6 +265,7 @@ mod tests {
         assert!(cfg.nudge_template.is_none());
         assert!(cfg.libsql_url.is_none());
         assert!(cfg.libsql_auth_token.is_none());
+        assert!(cfg.retention_secs.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -248,11 +287,39 @@ mod tests {
             "nudge_template",
             "libsql_url",
             "libsql_auth_token",
+            "retention_secs",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
                 "template is missing config key {key:?}"
             );
         }
+    }
+
+    /// `retention()` resolves to the 30-day default when unset, honors an explicit
+    /// value, treats `0` as "disabled" (kept as 0 so the caller can skip), and
+    /// clamps negatives to `0` rather than passing a negative age to gc.
+    #[test]
+    fn retention_resolves_default_disable_and_clamp() {
+        let base = Config::default();
+        assert_eq!(base.retention(), DEFAULT_RETENTION_SECS);
+
+        let disabled = Config {
+            retention_secs: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(disabled.retention(), 0, "0 disables the auto-sweep");
+
+        let custom = Config {
+            retention_secs: Some(3600),
+            ..Config::default()
+        };
+        assert_eq!(custom.retention(), 3600);
+
+        let negative = Config {
+            retention_secs: Some(-5),
+            ..Config::default()
+        };
+        assert_eq!(negative.retention(), 0, "negative clamps to disabled");
     }
 }

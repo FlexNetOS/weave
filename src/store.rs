@@ -36,6 +36,12 @@ pub trait Store: Send {
         limit: i64,
     ) -> Result<(Vec<Message>, i64)>;
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>>;
+    /// Messages addressed to `me` (direct or broadcast) with `id > since_id` and
+    /// `sender != me`, oldest-first, capped at `limit`. Lets `weave watch` page
+    /// strictly forward from the last id it saw without dropping backlog (unlike
+    /// `inbox`, which is unread-scoped and newest-first). Read-only: never marks
+    /// anything read.
+    fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>>;
     fn sessions(&self) -> Result<Vec<SessionInfo>>;
     fn total_messages(&self) -> Result<i64>;
     fn clear_inbox(&self, me: &str) -> Result<usize>;
@@ -43,7 +49,14 @@ pub trait Store: Send {
     /// Delete messages (and their read-markers) older than `older_than_secs`.
     /// Returns how many messages were removed. Retention / disk-bound guard.
     fn gc(&self, older_than_secs: i64) -> Result<i64>;
-    fn register_peer(&self, name: &str, mux: &str, target: &str, cwd: Option<&str>) -> Result<()>;
+    fn register_peer(
+        &self,
+        name: &str,
+        mux: &str,
+        target: &str,
+        socket: &str,
+        cwd: Option<&str>,
+    ) -> Result<()>;
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
     /// Backend label for diagnostics.
@@ -117,6 +130,31 @@ pub fn check_body(body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Hard upper bound on an identity label (sender/recipient/peer name) in chars.
+/// Identities are echoed into other agents' prompts and used as map keys, so an
+/// unbounded one is a token/RAM/UI hazard. 128 chars is generous for any real
+/// session name.
+pub const MAX_IDENT: usize = 128;
+
+/// Validate an identity label (sender, recipient, or peer name) before it is
+/// stored. Rejects empty, over-length (> [`MAX_IDENT`] chars), or
+/// control-character-bearing values. `label` names the field for the error
+/// message. Shared by both backends so CLI/MCP/hook are all covered at the store
+/// layer. Additive: only previously-invalid input is now refused.
+pub fn check_ident(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} must not be empty.");
+    }
+    let chars = value.chars().count();
+    if chars > MAX_IDENT {
+        anyhow::bail!("{label} is too long ({chars} chars; max {MAX_IDENT}).");
+    }
+    if value.chars().any(|c| c.is_control()) {
+        anyhow::bail!("{label} must not contain control characters.");
+    }
+    Ok(())
+}
+
 /// Clamp an untrusted limit into `[0, MAX_LIMIT]`, mapping negatives to the cap
 /// (callers that want "a lot" pass a big/negative number; they get the cap, not
 /// an unbounded scan).
@@ -170,6 +208,7 @@ CREATE TABLE IF NOT EXISTS peers (
     name      TEXT PRIMARY KEY,
     mux       TEXT NOT NULL,
     target    TEXT NOT NULL,
+    socket    TEXT NOT NULL DEFAULT '',
     cwd       TEXT,
     last_seen INTEGER NOT NULL
 );
@@ -218,8 +257,9 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         name: r.get(0)?,
         mux: r.get(1)?,
         target: r.get(2)?,
-        cwd: r.get(3)?,
-        last_seen: r.get(4)?,
+        socket: r.get(3)?,
+        cwd: r.get(4)?,
+        last_seen: r.get(5)?,
     })
 }
 
@@ -243,6 +283,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     // new column defaults to NULL for every existing row (== top-level message).
     if !column_exists(conn, "messages", "in_reply_to")? {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER;")?;
+    }
+    // peers.socket — present on fresh DBs via SCHEMA, added here for DBs created
+    // before kitty-socket persistence existed. Defaults to '' for every existing
+    // row (== socket unknown), matching `Peer::socket`'s empty default.
+    if !column_exists(conn, "peers", "socket")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN socket TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(())
 }
@@ -303,6 +349,8 @@ impl Store for SqliteStore {
         subject: Option<&str>,
         body: &str,
     ) -> Result<i64> {
+        check_ident("sender", sender)?;
+        check_ident("recipient", recipient)?;
         check_body(body)?;
         self.conn.execute(
             "INSERT INTO messages (ts, sender, recipient, subject, body) VALUES (?1,?2,?3,?4,?5)",
@@ -398,6 +446,21 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        let sql = format!(
+            "SELECT * FROM messages
+             WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+             ORDER BY id ASC LIMIT ?3",
+            bc = BROADCAST_SQL
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![me, since_id, limit], row_to_message)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     fn sessions(&self) -> Result<Vec<SessionInfo>> {
         let mut names: Vec<String> = Vec::new();
         {
@@ -486,11 +549,19 @@ impl Store for SqliteStore {
         Ok(n)
     }
 
-    fn register_peer(&self, name: &str, mux: &str, target: &str, cwd: Option<&str>) -> Result<()> {
+    fn register_peer(
+        &self,
+        name: &str,
+        mux: &str,
+        target: &str,
+        socket: &str,
+        cwd: Option<&str>,
+    ) -> Result<()> {
+        check_ident("peer name", name)?;
         self.conn.execute(
-            "INSERT INTO peers (name, mux, target, cwd, last_seen) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, cwd=?4, last_seen=?5",
-            params![name, mux, target, cwd, now()],
+            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen) VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6",
+            params![name, mux, target, socket, cwd, now()],
         )?;
         Ok(())
     }
@@ -498,7 +569,7 @@ impl Store for SqliteStore {
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name, mux, target, cwd, last_seen FROM peers WHERE name=?1")?;
+            .prepare("SELECT name, mux, target, socket, cwd, last_seen FROM peers WHERE name=?1")?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
             Some(p) => Ok(Some(p?)),
@@ -509,7 +580,7 @@ impl Store for SqliteStore {
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name, mux, target, cwd, last_seen FROM peers ORDER BY name")?;
+            .prepare("SELECT name, mux, target, socket, cwd, last_seen FROM peers ORDER BY name")?;
         let rows = stmt
             .query_map([], row_to_peer)?
             .collect::<rusqlite::Result<_>>()?;
@@ -640,13 +711,20 @@ mod tests {
     #[test]
     fn peer_upsert_and_presence() {
         let s = mem();
-        s.register_peer("envctl", "zellij", "envctl", Some("/home/x/envctl"))
+        s.register_peer("envctl", "zellij", "envctl", "", Some("/home/x/envctl"))
             .unwrap();
-        s.register_peer("envctl", "tmux", "%4", Some("/home/x/envctl"))
-            .unwrap();
+        s.register_peer(
+            "envctl",
+            "tmux",
+            "%4",
+            "/run/kitty.sock",
+            Some("/home/x/envctl"),
+        )
+        .unwrap();
         let p = s.get_peer("envctl").unwrap().unwrap();
         assert_eq!(p.mux, "tmux");
         assert_eq!(p.target, "%4");
+        assert_eq!(p.socket, "/run/kitty.sock");
         assert!(is_online(p.last_seen));
         assert!(!is_online(p.last_seen - ONLINE_TTL_SECS - 1));
         assert_eq!(s.list_peers().unwrap().len(), 1);
@@ -773,7 +851,8 @@ mod tests {
     #[test]
     fn touch_peer_refreshes_without_clobbering() {
         let s = mem();
-        s.register_peer("envctl", "tmux", "%7", Some("/w")).unwrap();
+        s.register_peer("envctl", "tmux", "%7", "/run/k.sock", Some("/w"))
+            .unwrap();
         // Backdate last_seen, then touch and confirm only last_seen advanced.
         s.conn
             .execute(
@@ -787,6 +866,7 @@ mod tests {
         assert!(after.last_seen > before.last_seen);
         assert_eq!(after.mux, "tmux");
         assert_eq!(after.target, "%7");
+        assert_eq!(after.socket, "/run/k.sock");
         assert_eq!(after.cwd.as_deref(), Some("/w"));
 
         // Touching an unknown peer is a silent no-op (no row created).
@@ -802,6 +882,94 @@ mod tests {
         assert_eq!(reply_subject(Some("Re: hi")).as_deref(), Some("Re: hi"));
         assert_eq!(reply_subject(Some("RE: hi")).as_deref(), Some("RE: hi"));
         assert_eq!(reply_subject(Some("re: hi")).as_deref(), Some("re: hi"));
+    }
+
+    #[test]
+    fn check_ident_rejects_bad_and_accepts_good() {
+        assert!(check_ident("sender", "desktop").is_ok());
+        assert!(check_ident("sender", "").is_err(), "empty rejected");
+        assert!(
+            check_ident("sender", &"x".repeat(MAX_IDENT)).is_ok(),
+            "exactly MAX_IDENT chars is allowed"
+        );
+        assert!(
+            check_ident("sender", &"x".repeat(MAX_IDENT + 1)).is_err(),
+            "over MAX_IDENT chars rejected"
+        );
+        assert!(
+            check_ident("sender", "a\nb").is_err(),
+            "control char rejected"
+        );
+        assert!(
+            check_ident("sender", "a\tb").is_err(),
+            "tab is a control char and rejected"
+        );
+    }
+
+    #[test]
+    fn send_rejects_invalid_idents() {
+        let s = mem();
+        assert!(s.send("", "b", None, "x").is_err(), "empty sender rejected");
+        assert!(
+            s.send("a", "", None, "x").is_err(),
+            "empty recipient rejected"
+        );
+        assert!(
+            s.send("a", "b\nc", None, "x").is_err(),
+            "control char in recipient rejected"
+        );
+        // A valid send still works (no regression).
+        assert!(s.send("a", "b", None, "x").is_ok());
+    }
+
+    #[test]
+    fn register_peer_rejects_invalid_name() {
+        let s = mem();
+        assert!(s.register_peer("", "tmux", "%1", "", None).is_err());
+        assert!(s
+            .register_peer(&"n".repeat(MAX_IDENT + 1), "tmux", "%1", "", None)
+            .is_err());
+        assert!(s.register_peer("ok", "tmux", "%1", "", None).is_ok());
+    }
+
+    #[test]
+    fn socket_persists_through_upsert() {
+        let s = mem();
+        s.register_peer("k", "kitty", "1", "/run/a.sock", Some("/w"))
+            .unwrap();
+        assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/a.sock");
+        // Upsert with a new socket overwrites it.
+        s.register_peer("k", "kitty", "1", "/run/b.sock", Some("/w"))
+            .unwrap();
+        assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/b.sock");
+        // list_peers also carries the socket.
+        let peers = s.list_peers().unwrap();
+        assert_eq!(peers[0].socket, "/run/b.sock");
+    }
+
+    #[test]
+    fn inbox_since_pages_forward_without_dropping_backlog() {
+        let s = mem();
+        let id1 = s.send("a", "b", None, "m1").unwrap();
+        let id2 = s.send("a", "b", None, "m2").unwrap();
+        let id3 = s.send("a", "all", None, "bcast").unwrap();
+
+        // From 0: everything addressed to b, oldest-first, sender != b.
+        let all = s.inbox_since("b", 0, 50).unwrap();
+        let ids: Vec<i64> = all.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![id1, id2, id3]);
+
+        // Strictly forward from id1: id1 excluded.
+        let fwd = s.inbox_since("b", id1, 50).unwrap();
+        let ids: Vec<i64> = fwd.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![id2, id3]);
+
+        // Does not mark anything read: a real inbox still sees them unread.
+        let (unread, _) = s.inbox("b", false, false, 50).unwrap();
+        assert_eq!(unread.len(), 3);
+
+        // Excludes the caller's own messages.
+        assert!(s.inbox_since("a", 0, 50).unwrap().is_empty());
     }
 
     #[test]

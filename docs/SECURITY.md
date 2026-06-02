@@ -303,3 +303,27 @@ issue that violates a stated guarantee — a shell-injection path, an unbounded
 resource sink, a permissions regression, or a way for stored/injected text to
 escape its "data, not code" contract — please open an issue describing the
 reproduction and the guarantee it breaks.
+
+## Dependency advisories (Dependabot)
+
+As of this writing GitHub flags 5 advisories, **all transitive dependencies of the
+OPTIONAL `libsql` backend** and pinned by `libsql 0.9.30`:
+
+| Severity | Crate | Path |
+|---|---|---|
+| high / medium / low ×4 | `rustls-webpki` (0.102.8) | `libsql → hyper-rustls 0.25 → rustls 0.22 → rustls-webpki ^0.102` |
+| low | `libsql-sqlite3-parser` (0.13.0) | `libsql` |
+
+**Scope / exposure:**
+- The **default (sqlite) build pulls none of these** — `cargo tree -e no-dev` shows
+  zero `rustls-webpki`. The shipped binary + the RTX-5090 wizard artifact are the
+  default build, so they are unaffected.
+- `rustls-webpki` is the **remote-TLS** path: it is only reached when the libSQL
+  backend is built AND configured with a remote `libsql_url`. Local-file libSQL does
+  not use it. The local message mesh (the actual product today) never touches it.
+
+**Why not patched here:** the fixed `rustls-webpki ≥ 0.103.13` requires `rustls 0.23+`,
+which requires `hyper-rustls 0.26+`, which requires an upstream `libsql` release that
+bumps its TLS stack. `cargo update`/`--precise` cannot satisfy it against `libsql
+0.9.30`. Tracked for when libSQL ships a rustls-0.23 build; until then the exposure is
+confined to the unused remote-libSQL TLS path.
