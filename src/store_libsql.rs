@@ -159,6 +159,31 @@ impl LibsqlStore {
                     .await
                     .context("creating libsql schema")?;
             }
+            // Migration: a DB created before threading lacks `in_reply_to`. Add it
+            // idempotently (mirrors SqliteStore::migrate) so thread/reply work on
+            // pre-existing stores instead of failing "no such column".
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('messages') WHERE name='in_reply_to'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER", ())
+                    .await
+                    .context("adding in_reply_to column")?;
+            }
+            // A local libsql DB file must not be world/group readable (message
+            // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
+            #[cfg(unix)]
+            if !is_remote {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mut perm = meta.permissions();
+                    perm.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&path, perm);
+                }
+            }
             Ok::<_, anyhow::Error>((db, conn))
         })?;
 
@@ -213,14 +238,14 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
@@ -267,7 +292,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -282,7 +307,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -378,9 +403,21 @@ impl Store for LibsqlStore {
 
     fn clear_all(&self) -> Result<i64> {
         self.rt.block_on(async {
-            let n = self.total_messages_async().await?;
-            self.conn.execute("DELETE FROM messages", ()).await?;
-            self.conn.execute("DELETE FROM reads", ()).await?;
+            // Both deletes in ONE transaction so a crash can't orphan `reads`.
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let n: i64 = {
+                let mut rows = tx.query("SELECT COUNT(*) FROM messages", ()).await?;
+                match rows.next().await? {
+                    Some(r) => r.get::<i64>(0)?,
+                    None => 0,
+                }
+            };
+            tx.execute("DELETE FROM messages", ()).await?;
+            tx.execute("DELETE FROM reads", ()).await?;
+            tx.commit().await?;
             Ok(n)
         })
     }
@@ -388,9 +425,14 @@ impl Store for LibsqlStore {
     fn gc(&self, older_than_secs: i64) -> Result<i64> {
         let cutoff = now().saturating_sub(older_than_secs.max(0));
         self.rt.block_on(async {
+            // COUNT + both DELETEs in ONE IMMEDIATE transaction: accurate count and
+            // no orphaned `reads` on a mid-operation crash (mirrors SqliteStore).
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let n: i64 = {
-                let mut rows = self
-                    .conn
+                let mut rows = tx
                     .query(
                         "SELECT COUNT(*) FROM messages WHERE ts < ?1",
                         params(vec![cutoff.into()]),
@@ -401,18 +443,17 @@ impl Store for LibsqlStore {
                     None => 0,
                 }
             };
-            self.conn
-                .execute(
-                    "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
-                    params(vec![cutoff.into()]),
-                )
-                .await?;
-            self.conn
-                .execute(
-                    "DELETE FROM messages WHERE ts < ?1",
-                    params(vec![cutoff.into()]),
-                )
-                .await?;
+            tx.execute(
+                "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
+                params(vec![cutoff.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM messages WHERE ts < ?1",
+                params(vec![cutoff.into()]),
+            )
+            .await?;
+            tx.commit().await?;
             Ok(n)
         })
     }

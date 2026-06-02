@@ -544,7 +544,13 @@ fn doctor_json_reports_backend() {
     let db = TestDb::new();
     let out = run_ok(&db, &["doctor", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
-    assert_eq!(v["backend"], "sqlite");
+    // The backend reported is whichever was compiled in (sqlite by default, libsql
+    // under --no-default-features --features libsql); both are valid.
+    let backend = v["backend"].as_str().unwrap_or("");
+    assert!(
+        backend == "sqlite" || backend == "libsql",
+        "doctor backend should be a known store, got {backend:?}"
+    );
     assert!(v["db_path"].as_str().unwrap().contains("weave-it-"));
 }
 
@@ -563,4 +569,53 @@ fn unknown_backend_errors_loudly() {
         common::run_stdin_full(&db, &["sessions"], "", None, &[("WEAVE_BACKEND", "bogus")]);
     assert!(!ok, "an unknown backend must fail, not silently default");
     assert!(err.contains("unknown backend"), "clear error: {err}");
+}
+
+#[test]
+fn reply_thread_receipts_roundtrip() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--subject",
+            "hi",
+            "--body",
+            "hello",
+        ],
+    );
+    // Reply to #1 from b — auto-addressed back to the original sender (a).
+    run_ok(
+        &db,
+        &[
+            "reply",
+            "--in-reply-to",
+            "1",
+            "--from",
+            "b",
+            "--body",
+            "reply-body",
+        ],
+    );
+    // Thread view shows both the root and the reply.
+    let thr = run_ok(&db, &["thread", "--root", "1"]);
+    assert!(
+        thr.contains("hello") && thr.contains("reply-body"),
+        "thread: {thr}"
+    );
+    // `a` drains its inbox (sees reply #2) -> a read receipt is recorded for #2.
+    let ai = run_ok(&db, &["inbox", "--me", "a"]);
+    assert!(
+        ai.contains("reply-body"),
+        "a should receive the reply: {ai}"
+    );
+    let rec = run_ok(&db, &["receipts", "--id", "2"]);
+    assert!(
+        rec.contains('a'),
+        "receipts for #2 should list reader a: {rec}"
+    );
 }

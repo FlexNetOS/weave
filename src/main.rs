@@ -122,9 +122,9 @@ enum Cmd {
         from: Option<String>,
         #[arg(long)]
         to: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         subject: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: String,
     },
     /// Reply to a message; the reply is auto-addressed to the original sender and
@@ -136,7 +136,7 @@ enum Cmd {
         /// your identity (defaults to config/$WEAVE_SESSION or basename of cwd)
         #[arg(long)]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: String,
     },
     /// Print a message thread (a root message and everything chained to it).
@@ -225,7 +225,7 @@ enum Cmd {
     Inject {
         #[arg(long)]
         to: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         text: String,
         /// inject a short content-free ping instead of the text itself
         #[arg(long)]

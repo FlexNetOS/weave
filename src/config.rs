@@ -81,7 +81,15 @@ impl Config {
     }
 
     pub fn backend(&self) -> String {
-        self.backend.clone().unwrap_or_else(|| "sqlite".to_string())
+        // Default to the backend actually compiled in: a libsql-only build (no
+        // `sqlite` feature) defaults to libsql rather than erroring on "sqlite".
+        self.backend.clone().unwrap_or_else(|| {
+            if cfg!(feature = "sqlite") {
+                "sqlite".to_string()
+            } else {
+                "libsql".to_string()
+            }
+        })
     }
 
     /// Resolved DB path: config/env override, else the XDG default.
