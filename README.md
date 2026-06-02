@@ -79,12 +79,15 @@ falls back cleanly (caller uses next-turn delivery) if the pane/session is gone.
 
 ## Storage
 
-SQLite (rusqlite, bundled) at `~/.local/share/weave/messages.db` (override with `WEAVE_DB`).
-The on-disk format is **libSQL-compatible**; a Turso/libSQL backend is a planned, swap-in
-option behind a `Store` trait (see TASKS.md M2/M4).
+SQLite (rusqlite, bundled) at `~/.local/share/weave/messages.db` (override with `WEAVE_DB`),
+behind a backend-agnostic `Store` trait. A **libSQL/Turso backend** is also implemented
+(`--no-default-features --features libsql`) for cross-machine sync — async client driven from the
+sync API via an embedded tokio runtime; local-file or remote (`libsql_url` + auth token). The
+backends are mutually exclusive (each bundles SQLite); the default build uses sqlite.
 
 ## Status
 
-v0.1.0 MVP — builds clean, 5/5 tests green, MCP + CLI + injector working. Live pane
-injection is validated by construction (unit tests) here; end-to-end mux injection is to be
-confirmed on the zellij target box.
+v0.1.0 — both backends build clean (clippy `-D warnings`), **25 tests green** (17 unit + 8
+integration), MCP + CLI + injector + setup automation working; libSQL backend runtime-verified.
+Live pane injection is validated by construction (pure command-builder unit tests + fake-mux
+integration test); end-to-end mux injection on real tmux/zellij is to be confirmed on the target box.

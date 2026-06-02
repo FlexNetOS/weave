@@ -5,10 +5,16 @@
 //! for cross-machine sync (see `store_libsql.rs`). The on-disk SQLite format is
 //! libSQL-compatible, so the file is portable between backends.
 
-use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
+use crate::model::{now, Message, Peer};
 use anyhow::Result;
-use rusqlite::{params, Connection, Row};
+
+#[cfg(feature = "sqlite")]
+use crate::model::{is_broadcast, BROADCAST_SQL};
+#[cfg(feature = "sqlite")]
+use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
+#[cfg(feature = "sqlite")]
 use std::path::Path;
+#[cfg(feature = "sqlite")]
 use std::time::Duration;
 
 /// A peer is considered "online" if its last heartbeat is within this window.
@@ -29,7 +35,6 @@ pub trait Store: Send {
         mark_read: bool,
         limit: i64,
     ) -> Result<(Vec<Message>, i64)>;
-    fn unread_count(&self, me: &str) -> Result<i64>;
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>>;
     fn sessions(&self) -> Result<Vec<SessionInfo>>;
     fn total_messages(&self) -> Result<i64>;
@@ -47,6 +52,7 @@ pub fn is_online(last_seen: i64) -> bool {
     now().saturating_sub(last_seen) <= ONLINE_TTL_SECS
 }
 
+#[cfg(feature = "sqlite")]
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,10 +77,12 @@ CREATE TABLE IF NOT EXISTS peers (
 );
 ";
 
+#[cfg(feature = "sqlite")]
 pub struct SqliteStore {
     conn: Connection,
 }
 
+#[cfg(feature = "sqlite")]
 fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
     Ok(Message {
         id: r.get("id")?,
@@ -86,6 +94,21 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
+/// Count unread messages for `me` against an arbitrary connection (the live
+/// connection or an open transaction), so the count can share a transaction with
+/// the inbox read+mark for a consistent snapshot.
+#[cfg(feature = "sqlite")]
+fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM messages m
+         WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
+        bc = BROADCAST_SQL
+    );
+    Ok(conn.query_row(&sql, params![me], |r| r.get(0))?)
+}
+
+#[cfg(feature = "sqlite")]
 fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
     Ok(Peer {
         name: r.get(0)?,
@@ -96,6 +119,7 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
     })
 }
 
+#[cfg(feature = "sqlite")]
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -109,8 +133,14 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
+
+    /// Unread messages for `me` (inherent helper; used by `sessions`).
+    fn unread_count(&self, me: &str) -> Result<i64> {
+        unread_count_conn(&self.conn, me)
+    }
 }
 
+#[cfg(feature = "sqlite")]
 impl Store for SqliteStore {
     fn backend(&self) -> &'static str {
         "sqlite"
@@ -153,37 +183,35 @@ impl Store for SqliteStore {
                 bc = BROADCAST_SQL
             )
         };
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows: Vec<Message> = stmt
-            .query_map(params![me, limit], row_to_message)?
-            .collect::<rusqlite::Result<_>>()?;
+
+        // Run the SELECT, the read-marking, and the remaining count inside ONE
+        // IMMEDIATE transaction so the returned rows, the marks, and `remaining`
+        // are a single consistent snapshot — a concurrent writer cannot slip a
+        // message in between the read and the count.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
+        let mut rows: Vec<Message> = {
+            let mut stmt = tx.prepare(&sql)?;
+            let v = stmt
+                .query_map(params![me, limit], row_to_message)?
+                .collect::<rusqlite::Result<_>>()?;
+            v
+        };
         rows.reverse();
 
         if mark_read && !rows.is_empty() {
             let ts = now();
-            let tx = self.conn.unchecked_transaction()?;
-            {
-                let mut ins = tx.prepare(
-                    "INSERT OR IGNORE INTO reads (message_id, reader, ts) VALUES (?1,?2,?3)",
-                )?;
-                for m in &rows {
-                    ins.execute(params![m.id, me, ts])?;
-                }
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO reads (message_id, reader, ts) VALUES (?1,?2,?3)",
+            )?;
+            for m in &rows {
+                ins.execute(params![m.id, me, ts])?;
             }
-            tx.commit()?;
         }
-        let remaining = self.unread_count(me)?;
-        Ok((rows, remaining))
-    }
 
-    fn unread_count(&self, me: &str) -> Result<i64> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM messages m
-             WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
-               AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
-            bc = BROADCAST_SQL
-        );
-        Ok(self.conn.query_row(&sql, params![me], |r| r.get(0))?)
+        let remaining = unread_count_conn(&tx, me)?;
+        tx.commit()?;
+        Ok((rows, remaining))
     }
 
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
@@ -226,7 +254,9 @@ impl Store for SqliteStore {
             }
         }
         {
-            let mut stmt = self.conn.prepare("SELECT DISTINCT recipient FROM messages")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT recipient FROM messages")?;
             for n in stmt.query_map([], |r| r.get::<_, String>(0))? {
                 let n = n?;
                 if !is_broadcast(&n) {
@@ -264,8 +294,9 @@ impl Store for SqliteStore {
         let ts = now();
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut ins = tx
-                .prepare("INSERT OR IGNORE INTO reads (message_id, reader, ts) VALUES (?1,?2,?3)")?;
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO reads (message_id, reader, ts) VALUES (?1,?2,?3)",
+            )?;
             for m in &rows {
                 ins.execute(params![m.id, me, ts])?;
             }
@@ -312,7 +343,7 @@ impl Store for SqliteStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
 

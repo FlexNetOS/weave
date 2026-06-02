@@ -18,10 +18,16 @@
 - [ ] Wizard integration: build `weave` in the RTX-5090 image, run `weave setup`
 - [ ] Decide retirement of `mcp-broker` / `repowire` once weave is proven
 
-## M2 — Storage backend
-- [ ] Extract a `Store` trait (so the backend is swappable)
-- [ ] **DECISION (open): rusqlite vs libSQL/Turso crate.** Current = rusqlite (sync, bundled, fast compile; on-disk file is already libSQL-compatible). The Turso `libsql` crate is **async (tokio)** and pulls a heavy dep tree; it only adds value for **remote DBs / embedded replicas / encryption** — all M4 cross-machine concerns. Recommendation: keep rusqlite for local; adopt libSQL behind the trait **when M4 (cross-machine) lands**. No lock-in: the file is interchangeable.
-- [ ] (If/when adopted) feature-gate `libsql` backend; introduce a tokio runtime only in that path
+## M2 — Storage backend (DONE ✅)
+- [x] Extract a `Store` trait (backend-agnostic; app holds `Box<dyn Store>`)
+- [x] `SqliteStore` (rusqlite, bundled) — default `sqlite` feature
+- [x] **libSQL/Turso backend** (`store_libsql.rs`, `libsql` feature) — async client driven from
+  the sync `Store` trait via an embedded current-thread tokio runtime (`block_on`). Local-file mode
+  (`Builder::new_local`) + remote mode (`Builder::new_remote` with auth token). Same schema/SQL/semantics.
+- [x] **Mutually-exclusive features** — rusqlite and libsql each bundle SQLite, so they collide at
+  link time. `default=["sqlite"]`, `sqlite=["dep:rusqlite"]`, `libsql=["dep:libsql","dep:tokio"]`;
+  a `compile_error!` rejects both at once. Build libSQL with `--no-default-features --features libsql`.
+- [x] Verified: both backends build, clippy `-D`, run (send/inbox/read-tracking/broadcast/sessions match).
 
 ## M3 — Robustness & reach
 - [ ] Optional `weaved` presence daemon: online/offline, lifecycle eviction (pane-exited/session-closed), so `weave_peers` shows live status

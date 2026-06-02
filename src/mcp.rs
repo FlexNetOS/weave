@@ -31,7 +31,16 @@ pub fn run(store: &dyn Store, me_default: Option<String>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
-        let line = line?;
+        // A per-line read error (e.g. invalid UTF-8 on the wire) must not be
+        // fatal to the whole server. Log and skip it; one bad line cannot crash
+        // the loop.
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                log(&format!("stdin read error (skipping line): {e}"));
+                continue;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -44,8 +53,16 @@ pub fn run(store: &dyn Store, me_default: Option<String>) -> Result<()> {
             }
         };
         if let Some(resp) = handle(store, &me_default, &req) {
-            writeln!(stdout, "{resp}")?;
-            stdout.flush()?;
+            // A write/flush failure to a single client read must not tear down
+            // the server. BrokenPipe means the client closed its read end → stop
+            // cleanly; any other io error is logged and we keep serving.
+            if let Err(e) = writeln!(stdout, "{resp}").and_then(|()| stdout.flush()) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    log("stdout closed (broken pipe); exiting");
+                    return Ok(());
+                }
+                log(&format!("stdout write error (continuing): {e}"));
+            }
         }
     }
     log("stdin closed; exiting");
@@ -120,7 +137,11 @@ fn handle(store: &dyn Store, me_default: &Option<String>, req: &Value) -> Option
                 )),
             }
         }
-        _ => Some(reply_err(&id, -32601, &format!("Method not found: {method}"))),
+        _ => Some(reply_err(
+            &id,
+            -32601,
+            &format!("Method not found: {method}"),
+        )),
     }
 }
 
@@ -173,7 +194,8 @@ fn tool_send(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<St
         if let Ok(Some(peer)) = store.get_peer(to) {
             let target = Target::from_peer(&peer);
             if target.injectable() {
-                let nudge = format!("[weave] new message from {from} — run weave_inbox to read");
+                let nudge =
+                    format!("[weave] message from {from}: {body} (run weave_inbox to read)");
                 match inject::inject(&target, &nudge) {
                     Ok(true) => out.push_str(&format!(
                         " Injected live nudge into {} target '{}'.",
@@ -204,9 +226,15 @@ fn tool_inbox(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
     };
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
 
-    let (rows, remaining) = store.inbox(&me, include_read, mark_read, limit).map_err(e)?;
+    let (rows, remaining) = store
+        .inbox(&me, include_read, mark_read, limit)
+        .map_err(e)?;
     if rows.is_empty() {
-        let kind = if include_read { "messages" } else { "unread messages" };
+        let kind = if include_read {
+            "messages"
+        } else {
+            "unread messages"
+        };
         return Ok(format!("Inbox for '{me}': no {kind}."));
     }
     let mut out = format!("Inbox for '{me}' — {} message(s):", rows.len());
@@ -290,10 +318,7 @@ fn tool_sessions(store: &dyn Store, def: &Option<String>, _args: &Value) -> Resu
     if info.is_empty() {
         return Ok("No sessions seen yet — the store is empty.".into());
     }
-    let mut out = format!(
-        "Known sessions ({}), {total} message(s) total:",
-        info.len()
-    );
+    let mut out = format!("Known sessions ({}), {total} message(s) total:", info.len());
     for (n, unread, last) in info {
         let mine = if !me.is_empty() && n == me {
             "  <- you"
@@ -314,7 +339,11 @@ fn tool_clear(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
         .and_then(|v| v.as_str())
         .unwrap_or("inbox");
     if scope == "all" {
-        if !args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if !args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return Err(
                 "scope='all' wipes ALL messages for EVERY session irreversibly. \
                  Re-call with \"confirm\": true."

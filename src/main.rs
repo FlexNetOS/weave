@@ -12,6 +12,15 @@
 //!   weave inject         manually inject text into a peer's pane (test)
 //!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|notification
 
+// Backends statically link their own SQLite and cannot coexist; guard loudly.
+#[cfg(all(feature = "sqlite", feature = "libsql"))]
+compile_error!(
+    "features `sqlite` and `libsql` are mutually exclusive (both statically link SQLite). \
+     Build the libSQL backend with `--no-default-features --features libsql`."
+);
+#[cfg(not(any(feature = "sqlite", feature = "libsql")))]
+compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
+
 mod config;
 mod inject;
 mod mcp;
@@ -96,23 +105,52 @@ enum Cmd {
     Hook { event: String },
 }
 
-/// Open the configured storage backend.
+/// Open the configured storage backend. Unknown backend names fail loudly rather
+/// than silently defaulting to sqlite — a typo'd WEAVE_BACKEND (e.g. "sqlitee",
+/// "turso") would otherwise land messages in a different store than intended.
 fn open_store(cfg: &Config) -> Result<Box<dyn Store>> {
-    match cfg.backend().as_str() {
+    let backend = cfg.backend();
+    match backend.as_str() {
+        "sqlite" => {
+            #[cfg(feature = "sqlite")]
+            {
+                Ok(Box::new(store::SqliteStore::open(&cfg.db_path())?))
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                anyhow::bail!(
+                    "backend 'sqlite' requires building weave with the `sqlite` feature (default)"
+                )
+            }
+        }
         "libsql" => {
             #[cfg(feature = "libsql")]
             {
+                // For LOCAL libsql the db/WEAVE_DB path IS the file. It is only
+                // ignored when a remote libsql_url is set — warn just for that case.
+                if cfg.libsql_url.is_some() && (cfg.db.is_some() || nonempty_env("WEAVE_DB")) {
+                    eprintln!(
+                        "[weave] note: libsql_url is set (remote backend), so the \
+                         db/WEAVE_DB path override is ignored."
+                    );
+                }
                 Ok(Box::new(store_libsql::LibsqlStore::open(cfg)?))
             }
             #[cfg(not(feature = "libsql"))]
             {
-                anyhow::bail!(
-                    "backend 'libsql' requires building weave with `--features libsql`"
-                )
+                anyhow::bail!("backend 'libsql' requires building weave with `--features libsql`")
             }
         }
-        _ => Ok(Box::new(store::SqliteStore::open(&cfg.db_path())?)),
+        other => anyhow::bail!(
+            "unknown backend '{other}' (set WEAVE_BACKEND / config `backend` to 'sqlite' or 'libsql')"
+        ),
     }
+}
+
+/// Read a non-empty environment variable, mirroring `config::nonempty`.
+#[cfg(feature = "libsql")]
+fn nonempty_env(key: &str) -> bool {
+    std::env::var(key).ok().filter(|s| !s.is_empty()).is_some()
 }
 
 /// Resolve this session's name: explicit > config/$WEAVE_SESSION > basename(cwd).
@@ -137,14 +175,14 @@ fn resolve_me(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str) -> Result<()> {
+fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str) -> Result<()> {
     if model::is_broadcast(to) {
         return Ok(());
     }
     if let Some(peer) = store.get_peer(to)? {
         let t = inject::Target::from_peer(&peer);
         if t.injectable() {
-            match inject::inject(&t, &cfg.nudge(from)) {
+            match inject::inject(&t, &cfg.nudge(from, body)) {
                 Ok(true) => println!("injected into {} '{}'", t.mux.as_str(), t.id),
                 Ok(false) => {}
                 Err(err) => eprintln!("inject failed ({err}); will arrive on next turn"),
@@ -161,9 +199,7 @@ fn main() -> Result<()> {
     // Commands that don't need the store.
     match &cli.cmd {
         Cmd::Setup => {
-            let exe = std::env::current_exe()?
-                .to_string_lossy()
-                .into_owned();
+            let exe = std::env::current_exe()?.to_string_lossy().into_owned();
             return setup::run(&exe);
         }
         Cmd::Uninstall => return setup::uninstall(),
@@ -192,7 +228,7 @@ fn main() -> Result<()> {
             let from = resolve_me(from, None, &cfg);
             let mid = store.send(&from, &to, subject.as_deref(), &body)?;
             println!("sent #{mid}: {from} -> {to}");
-            try_inject(store, &cfg, &from, &to)?;
+            try_inject(store, &cfg, &from, &to, &body)?;
         }
 
         Cmd::Inbox {
@@ -288,7 +324,14 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no registered peer '{to}'"))?;
             let t = inject::Target::from_peer(&peer);
             let ok = inject::inject(&t, &text)?;
-            println!("{}", if ok { "injected" } else { "peer not injectable" });
+            println!(
+                "{}",
+                if ok {
+                    "injected"
+                } else {
+                    "peer not injectable"
+                }
+            );
         }
 
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
@@ -298,10 +341,31 @@ fn main() -> Result<()> {
 
 fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
     let mut buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut buf);
-    let v: serde_json::Value = serde_json::from_str(&buf).unwrap_or(serde_json::json!({}));
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        eprintln!("[weave] hook stdin read error: {e}");
+    }
+    // Track whether the payload actually parsed: a garbled/empty payload means we
+    // cannot trust `cwd` for identity, and must not guess one for a read-marking
+    // drain (which would consume another session's inbox).
+    let (v, payload_ok) = if buf.trim().is_empty() {
+        (serde_json::json!({}), false)
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&buf) {
+            Ok(v) => (v, true),
+            Err(e) => {
+                eprintln!("[weave] hook payload is not valid JSON ({e}); ignoring its fields");
+                (serde_json::json!({}), false)
+            }
+        }
+    };
     let cwd = v.get("cwd").and_then(|x| x.as_str());
     let me = resolve_me(None, cwd, cfg);
+
+    // An identity is "explicit" (trustworthy) when it comes from config/$WEAVE_SESSION
+    // or from a `cwd` the payload actually supplied — NOT from basename(current_dir()),
+    // which in a hook is not guaranteed to be the project dir.
+    let explicit_identity = cfg.session.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+        || (payload_ok && cwd.is_some());
 
     match event {
         "session" => {
@@ -309,8 +373,29 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             store.register_peer(&me, t.mux.as_str(), &t.id, cwd)?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
         }
+        // UserPromptSubmit: Claude Code injects this hook's stdout into the model
+        // as additionalContext, so the printed messages are actually delivered.
+        // Only here do we mark messages read — the drain and the delivery are the
+        // same event.
+        //
+        // Stop: Claude Code does NOT add Stop-hook stdout to the model context on a
+        // normal exit, so anything we print here is never seen. We therefore PEEK
+        // (mark_read=false) so the messages remain unread and the next
+        // UserPromptSubmit drain re-surfaces and marks them. Marking them read here
+        // would silently consume them — concrete message loss.
         "prompt" | "stop" => {
-            let (rows, _) = store.inbox(&me, false, true, 50)?;
+            let mut mark_read = event == "prompt";
+            // Never mark messages read under a guessed identity: if we had to fall
+            // back to basename(current_dir()) (no config session, no payload cwd),
+            // peek instead so we cannot permanently consume another session's inbox.
+            if mark_read && !explicit_identity {
+                eprintln!(
+                    "[weave] no explicit session identity (set WEAVE_SESSION or config `session`); \
+                     peeking inbox for guessed '{me}' without marking read"
+                );
+                mark_read = false;
+            }
+            let (rows, _) = store.inbox(&me, false, mark_read, 50)?;
             if !rows.is_empty() {
                 println!("[weave] {} new message(s) for '{me}':", rows.len());
                 for m in &rows {

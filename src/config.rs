@@ -4,7 +4,7 @@
 //! session        = "desktop"      # default identity for this machine/session
 //! backend        = "sqlite"       # "sqlite" (default) | "libsql"
 //! db             = "/path/to/messages.db"
-//! nudge_template = "[weave] msg from {from} — run weave_inbox"
+//! nudge_template = "[weave] msg from {from}: {body} — run weave_inbox"
 //! libsql_url        = "libsql://..."   # only for backend = "libsql"
 //! libsql_auth_token = "..."
 //! ```
@@ -78,11 +78,17 @@ impl Config {
             .join("messages.db")
     }
 
-    /// The live-injection nudge text for a message from `from`.
-    pub fn nudge(&self, from: &str) -> String {
+    /// The live-injection nudge text for a message from `from` carrying `body`.
+    ///
+    /// The default nudge embeds the message body so the recipient sees the actual
+    /// content the instant it is pushed into their pane (the persisted copy still
+    /// arrives on their next hook drain). A custom `nudge_template` may use the
+    /// `{from}` and `{body}` placeholders; a template without `{body}` simply
+    /// omits the live body (e.g. a quiet "you have mail" ping).
+    pub fn nudge(&self, from: &str, body: &str) -> String {
         match &self.nudge_template {
-            Some(t) => t.replace("{from}", from),
-            None => format!("[weave] new message from {from} — run weave_inbox to read"),
+            Some(t) => t.replace("{from}", from).replace("{body}", body),
+            None => format!("[weave] message from {from}: {body} (run weave_inbox to read)"),
         }
     }
 }

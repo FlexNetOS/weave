@@ -13,11 +13,17 @@ path = "src/main.rs"
 # Dependencies are added via `cargo add` so versions resolve to current.
 
 [features]
-# Default backend is the bundled SQLite (rusqlite). Enable `libsql` to build the
-# Turso/libSQL backend (cross-machine sync). The optional dep + module are wired
-# by the libSQL backend task.
-default = []
-libsql = []
+# Backends are MUTUALLY EXCLUSIVE: rusqlite (bundled) and libsql each statically
+# link their own SQLite C core, so enabling both produces duplicate-symbol link
+# errors. Pick one:
+#   default build           -> sqlite  (rusqlite, bundled)
+#   --no-default-features --features libsql  -> libSQL/Turso (cross-machine sync)
+# A compile_error! in main.rs guards against enabling both at once.
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+# The async libsql client is driven from sync code via an embedded current-thread
+# tokio runtime, so the `libsql` feature pulls in both the libsql client and tokio.
+libsql = ["dep:libsql", "dep:tokio"]
 
 [profile.release]
 strip = true
@@ -26,7 +32,11 @@ lto = true
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+libsql = { version = "0.9.30", optional = true }
+rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# `preserve_order` keeps the user's settings.json key order intact on rewrite, so
+# `weave setup`/`uninstall` only diff weave's own additions/removals.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+tokio = { version = "1.52.3", features = ["rt"], optional = true }
 toml = "1.1.2"

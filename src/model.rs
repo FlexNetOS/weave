@@ -6,10 +6,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Recipient aliases that mean "deliver to every session". Single source of truth.
 pub const BROADCAST: &[&str] = &["all", "*", "everyone", "broadcast"];
 
-/// SQL fragment for the broadcast set. Built from [`BROADCAST`] so it can never
-/// drift from the Rust check. The values are compile-time constants (never user
-/// input), so embedding them as SQL literals is safe.
+/// SQL fragment for the broadcast set, e.g. `('all','*','everyone','broadcast')`,
+/// interpolated into the `recipient IN {bc}` delivery/unread/history filters.
+///
+/// This is a manually-maintained mirror of [`BROADCAST`]. It is `const` (so it can
+/// be `format!`-interpolated cheaply) rather than generated at runtime, but the
+/// `broadcast_sql_matches_broadcast` unit test asserts it stays byte-identical to
+/// [`broadcast_sql`], which IS derived from [`BROADCAST`]. So a drift between the
+/// Rust check and the SQL filter is caught at test time, not in production. The
+/// values are compile-time constants (never user input), so embedding them as SQL
+/// literals is safe.
 pub const BROADCAST_SQL: &str = "('all','*','everyone','broadcast')";
+
+/// Build the broadcast SQL fragment from [`BROADCAST`], single-quote-escaping each
+/// alias. This is the source of truth that [`BROADCAST_SQL`] must equal; it exists
+/// to back the `broadcast_sql_matches_broadcast` drift guard (hence test-only).
+#[cfg(test)]
+pub fn broadcast_sql() -> String {
+    let inner = BROADCAST
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("({inner})")
+}
 
 pub fn is_broadcast(name: &str) -> bool {
     BROADCAST.contains(&name)
@@ -69,4 +89,30 @@ pub struct Peer {
     pub target: String,
     pub cwd: Option<String>,
     pub last_seen: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-maintained `BROADCAST_SQL` literal must stay byte-identical to the
+    /// fragment derived from `BROADCAST`. If anyone edits one without the other,
+    /// the Rust `is_broadcast` check and the SQL `recipient IN {bc}` filters would
+    /// disagree and corrupt delivery — this guard makes that drift a test failure.
+    #[test]
+    fn broadcast_sql_matches_broadcast() {
+        assert_eq!(BROADCAST_SQL, broadcast_sql());
+    }
+
+    /// Every alias the Rust path treats as broadcast must appear in the SQL set.
+    #[test]
+    fn every_broadcast_alias_is_in_sql() {
+        for alias in BROADCAST {
+            assert!(is_broadcast(alias));
+            assert!(
+                broadcast_sql().contains(&format!("'{alias}'")),
+                "alias {alias:?} missing from broadcast_sql()"
+            );
+        }
+    }
 }

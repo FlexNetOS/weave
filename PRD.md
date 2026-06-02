@@ -1,6 +1,8 @@
 # weave — Product Requirements Document
 
-**Status:** v0.1.0 (working MVP)
+**Status:** v0.1.0 — delivered. Multi-mux native injector (5 muxes), Store trait with BOTH
+sqlite (default) and libSQL/Turso (feature) backends, MCP server, CLI, lifecycle-hook
+auto-delivery, `weave setup` automation, 25 tests, CI, docs, shipped in the RTX-5090 wizard.
 **Owner:** drdave
 **One-liner:** A Rust-native agent-to-agent session mesh with a native injector — let coding-agent sessions (Claude Code, etc.) message each other and push *into* a running session's terminal pane, no Python and no external daemon required.
 
