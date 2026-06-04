@@ -101,6 +101,13 @@ is user-facing.
 If you change a `Store` method signature, update every backend that implements
 the trait so the default and `--features libsql` builds both compile.
 
+**Prefer growing the trait additively.** When a `Store` method needs more data,
+add a new method (e.g. `register_peer_full` alongside `register_peer`) rather than
+changing an existing method's arity. Keep the old method as a trait *default* that
+forwards to the new one with sensible defaults, so every existing call site and
+test compiles untouched while both backends gain the richer path. This is the
+standard pattern for future `Store` signature growth.
+
 ## Commit messages
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):

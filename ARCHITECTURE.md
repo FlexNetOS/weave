@@ -34,16 +34,23 @@ Dependency direction (top depends on bottom):
 
 ```
 main ──▶ mcp ──▶ store ──▶ model
-  │       │        │         ▲
+  │       │        │  │      ▲
   │       └────────┴── inject ┘   (inject and mcp both use model::Peer)
-  └──▶ config        (config feeds main; main feeds store + injector nudge text)
+  └──▶ config ◀── store          (store calls config::this_host / peer_db_paths)
 ```
+
+`config` is the lowest layer above `model`: `store`'s liveness (`is_alive` →
+`this_host`) and federation (`federated_*` → `peer_db_paths`) read it downward.
+The direction never reverses.
 
 ### `model.rs` — core types, no I/O
 
 - `Message { id, ts, sender, recipient, subject: Option, body }`
-- `Peer { name, mux, target, cwd: Option, last_seen }` — a session that has
-  registered itself plus where (if anywhere) it can be injected.
+- `Peer { name, mux, target, cwd: Option, last_seen, pid: Option<i64>, host }` —
+  a session that has registered itself plus where (if anywhere) it can be
+  injected. `pid`/`host` are captured at registration so liveness can be checked
+  by probing the owning process (see §6); both are additive (`#[serde(default)]`)
+  so older rows deserialize cleanly.
 - `now() -> i64` — UNIX seconds; timestamps are stored as integers so weave
   needs **no date crate**.
 - `fmt_ts(i64) -> String` — formats UNIX seconds as `YYYY-MM-DDTHH:MM:SSZ` (UTC)
@@ -56,34 +63,56 @@ main ──▶ mcp ──▶ store ──▶ model
 
 ### `config.rs` — configuration
 
-`Config { session, backend, db, nudge_template, libsql_url, libsql_auth_token }`,
-all `Option`. `Config::load()` reads `~/.config/weave/config.toml`
+`Config { session, backend, db, nudge_template, libsql_url, libsql_auth_token,
+peer_dbs }`, all `Option`. `Config::load()` reads `~/.config/weave/config.toml`
 (`$XDG_CONFIG_HOME` honored) if present, then overlays environment variables:
 `WEAVE_SESSION`, `WEAVE_BACKEND`, `WEAVE_DB`, `WEAVE_LIBSQL_URL`,
-`WEAVE_LIBSQL_AUTH_TOKEN` (env wins over file). Helpers:
+`WEAVE_LIBSQL_AUTH_TOKEN`, `WEAVE_PEER_DBS` (env wins over file). Helpers:
 
 - `backend()` → defaults to `"sqlite"`.
 - `db_path()` → config/`WEAVE_DB` override, else
   `$XDG_DATA_HOME/weave/messages.db` (default `~/.local/share/weave/messages.db`).
+- `default_db_path()` → the XDG default path, used by `doctor` to flag a
+  non-default `WEAVE_DB` (the `db_is_default` field).
 - `nudge(from, body)` → the live-injection nudge text, from `nudge_template`
   (with `{from}`/`{body}` substituted) or a built-in default that embeds the body.
+- `this_host()` → a stable per-machine host label (`$HOSTNAME` → first line of
+  `/etc/hostname` → `"local"`), trimmed, control-char-stripped, and capped at
+  `MAX_HOST_LEN` (128). Used as the `peers.host` value (§6) so liveness only
+  probes a PID for a peer on *this* host.
+- `peer_db_paths()` → the validated, deduped, capped (`MAX_PEER_DBS` = 16) list
+  of extra read-only store paths for federation (§9), unioned from `peer_dbs` and
+  `WEAVE_PEER_DBS`; the local `db_path()` is dropped (no self-federation).
+  Default (unset) ⇒ empty ⇒ identical-to-today behavior.
 
 ### `store.rs` — persistence
 
 Owns the `Store` trait (§2), the bundled `SqliteStore`, the SQL schema, the
-`ONLINE_TTL_SECS` presence window (900 s), and `is_online(last_seen)`.
+`ONLINE_TTL_SECS` presence window (900 s), `is_online(last_seen)`, and the
+liveness layer on top of it: `is_alive(peer)` and `pid_alive(pid)` (§6). It also
+owns the read-only federation aggregator — `open_readonly`, the
+`federated_peers` / `federated_sessions` / `federation_status` free functions, and
+the pure `merge_peer_views` / `merge_session_views` dedup/tie-break (§9).
 
 ### `inject.rs` — native injector
 
 The `Mux` enum, `Target { mux, id }`, environment detection, the pure
-per-mux command tables, and the runner. Detailed in §3.
+per-mux command tables, and the runner. Detailed in §3. Also exposes the pure
+`capability(&Target) -> Capability` verdict (`Live` / `RegisteredNotAlive` /
+`NotInjectable`) composed from `injectable()` + the liveness probe — this is what
+`weave connect` / `weave_connect` report (§4). It adds no new spawn path: the
+probe is the existing fail-open `target_alive` and the verdict is a pure value.
 
 ### `mcp.rs` — MCP server
 
 A newline-delimited JSON-RPC 2.0 server over stdio implementing `initialize`,
 `ping`, `tools/list`, `tools/call`, and empty `resources/list` / `prompts/list`.
-It exposes the six `weave_*` tools and performs the live nudge-inject on send.
+It exposes the `weave_*` tools and performs the live nudge-inject on send.
 stdout is reserved for protocol frames; **all logging goes to stderr**.
+`weave_attach` (zero-restart self-adoption — re-capture the pane and upsert the
+caller's own peer row) and `weave_connect` (the §4 capability verdict) sit
+alongside the messaging tools; the peers/sessions/doctor tools also surface
+read-only federation (§9) when extra stores are configured.
 
 ### `setup.rs` — Claude Code wiring
 
@@ -244,6 +273,25 @@ is no relay and no broker process in the middle. The `peers` table is the
 registry that maps `name → (mux, pane/session id)`, captured from the
 environment (`$TMUX_PANE`, `$ZELLIJ_SESSION_NAME`, etc.) at `SessionStart`.
 
+**Registration / adoption seam.** Registration is an upsert keyed on the
+session's *own* resolved identity, so it can run at three moments:
+`weave hook session` at `SessionStart`, the explicit `weave register`, and
+`weave attach` / `weave_attach` — the **zero-restart adoption** path. A session
+that started outside a multiplexer (or before `weave setup`) can re-capture its
+current pane and upsert its own row at any time without restarting; the upsert
+binds the caller's own validated identity, so there is no argument path to
+overwrite another peer's row. All three capture the process `pid` + `host`
+(§6) for liveness.
+
+**Connect handshake.** Before sending, a caller can probe reachability with
+`weave connect --to <peer>` / `weave_connect`. It looks up the peer, builds a
+`Target`, and reports the pure `inject::capability()` verdict — `Live`,
+`RegisteredNotAlive`, or `NotInjectable`. This **reuses the existing injector**
+(no new injector, no new spawn path): the verdict is computed from `injectable()`
+plus the fail-open liveness probe. A not-alive or non-injectable verdict is **not
+an error** — those messages still arrive via the recipient's next store drain;
+only a non-existent peer is an error.
+
 Send path (MCP `weave_send`, mirrored by the `weave send` CLI):
 
 1. `store.send(from, to, subject, body)` persists the message and returns its id.
@@ -275,7 +323,7 @@ stdin (for `cwd`), resolves the session identity, and acts:
 
 | Hook event | Claude Code trigger | Action |
 |---|---|---|
-| `session` | `SessionStart` | `detect_target()` + `register_peer(name, mux, id, cwd)` — the session becomes an injectable peer. |
+| `session` | `SessionStart` | `detect_target()` + `register_peer_full(name, mux, id, cwd, pid, host)` — the session becomes an injectable peer, capturing its PID + host for liveness (§6). |
 | `prompt` | `UserPromptSubmit` | Drain unread (`inbox` with `mark_read`) and print each to **stdout**, which Claude Code folds into the agent's context. |
 | `stop` | `Stop` | Same drain as `prompt`. |
 | `notification` | `Notification` | Reserved for future use (no-op today). |
@@ -296,7 +344,8 @@ Three tables, created idempotently:
 messages (id INTEGER PK AUTOINCREMENT, ts INTEGER, sender TEXT, recipient TEXT,
           subject TEXT NULL, body TEXT)
 reads    (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id, reader))
-peers    (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL, last_seen INTEGER)
+peers    (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
+          last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '')
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
@@ -305,8 +354,35 @@ peers    (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL, last_seen
   broadcast deliverable exactly once per reader and keeps each session's "unread"
   independent.
 - **`peers`** — the injection registry: where each named session can be reached,
-  plus `last_seen` for presence (`is_online` = `last_seen` within
-  `ONLINE_TTL_SECS` = 900 s).
+  plus `last_seen`, `pid`, and `host` for presence. The `pid`/`host` columns are
+  added by an **additive, idempotent migration** (guarded, mirroring the `socket`
+  precedent) in **both** backends, so a pre-existing DB upgrades in place and an
+  old row reads `pid:NULL` / `host:""`.
+
+### Presence: `is_alive` vs `is_online`
+
+`is_online(last_seen)` is the pure recency guard (within `ONLINE_TTL_SECS` =
+900 s). **Presence display now means *alive*, not "wrote recently":**
+
+```text
+is_alive(peer) = is_online(peer.last_seen)
+               ∧ match peer.pid {
+                     Some(pid) if peer.host == this_host() => pid_alive(pid),
+                     _                                      => true,   // fail open
+                 }
+```
+
+- A peer on **this host** with a known PID is confirmed by probing the process;
+  `pid_alive` is a Linux `/proc/<pid>` existence check (no new dependency) and
+  **degrades to assume-alive** off Linux via `cfg`.
+- The probe **fails open** for a remote / cross-machine peer (`host != this_host()`,
+  e.g. a Turso/libSQL shared DB) or an unknown PID (`pid:NULL`) — a peer we cannot
+  probe must never read dead. So a dead local session drops from presence the
+  moment its process exits, while a remote peer still relies on the TTL.
+
+Read paths keep `last_seen` warm: `weave peers` and a long-lived `weave watch`
+each refresh presence (heartbeat-on-read, explicit-identity only) so a session
+stays visible even with no message traffic.
 
 Unread for `me` = messages addressed to `me` or to a broadcast alias, not sent by
 `me`, with no matching `reads` row for `me`. Timestamps are UNIX seconds
@@ -351,6 +427,15 @@ injected and stored text is handled**, not on network attackers.
   authentication — appropriate for a single-user local mesh. weave does not
   defend one local session against another impersonating it; that is out of
   scope for the local-trust model (and would be the job of a future relay tier).
+- **Cross-store access is read-only (Tier-1).** Federation (§9) opens foreign
+  stores with `SQLITE_OPEN_READ_ONLY` and never writes them, so aggregating
+  another project's peers/sessions cannot mutate that project's store and stays
+  inside the single-local-trust-domain assumption. **Cross-store *write* / inject
+  (Tier-2) is deliberately deferred**: the moment store A could mutate store B,
+  "identity is advisory" stops being acceptable, so Tier-2 is gated on an approved
+  trust model (the recommended design is a broker-mediated request-pull where only
+  a store's owner ever writes it — preserving every invariant without a new
+  dependency, daemon, shell, or crypto). No Tier-2 code exists today.
 
 ---
 
@@ -389,3 +474,42 @@ keep what worked and drop the operational weight.
   relay and chat bridges are deliberate non-goals for now; the libSQL-compatible
   on-disk format leaves a clean path to Turso replicas if cross-machine ever
   becomes a real need.
+
+---
+
+## 9. Read-only multi-store federation (Tier-1)
+
+A session normally sees only its own `WEAVE_DB`. Federation lets `weave peers` /
+`weave sessions` (CLI and the matching MCP tools) **aggregate peers and sessions
+across several stores read-only**, so an agent can see sessions living in other
+projects' mailboxes without those projects sharing one DB.
+
+- **Configuration.** `WEAVE_PEER_DBS` (comma- or path-list-separated) and/or
+  `peer_dbs = [...]` in `config.toml` list extra store files. They are unioned,
+  validated, deduped, the local store is dropped (no self-federation), and the
+  list is capped at `MAX_PEER_DBS` (16). Unset ⇒ empty ⇒ behavior identical to
+  a single-store run (the listings are byte-identical).
+- **Read-only by construction.** Each foreign store is opened via
+  `open_readonly` (`SQLITE_OPEN_READ_ONLY`, no `CREATE`, no schema, no migration,
+  no permission hardening) on **both** backends — the storage engine rejects any
+  write, so the guarantee is structural, not a convention. libSQL 0.9 exposes the
+  same `SQLITE_OPEN_READ_ONLY` open, so neither backend is gated off.
+- **Aggregation + dedup.** `federated_peers` / `federated_sessions` open each
+  extra store read-only, list it, and feed the rows through the pure
+  `merge_peer_views` / `merge_session_views`. Peers dedup on `(name, host)`
+  (tie-break: alive > not-alive, then newer `last_seen`, then local origin);
+  sessions dedup on `name`, keeping `max(last_activity)` and **never summing
+  unread** (a foreign store's unread is not in this session's local inbox — Tier-1
+  has no cross-store inbox). Presence reuses §6 `is_alive` unchanged (a foreign
+  peer on a different host fails open to TTL).
+- **Origin tagging.** Foreign rows are tagged ` (via <store-label>)` in text and
+  carry additive `origin` / `foreign` fields in `--json`; local rows are
+  unchanged (regression-safe). `doctor` reports configured / ok / skipped store
+  counts.
+- **Failure isolation.** An unreadable / missing / non-weave / locked extra store
+  is **skipped** — a note goes to stderr (MCP keeps stdout clean) and the local
+  listing still returns with exit 0. One bad path never breaks the command.
+
+**Tier-2 (cross-store write / send / inject) is not implemented** — it is design
+only, deferred behind the trust-model gate described in §7. Federation today is
+read-only aggregation; to *message* across stores, share one `WEAVE_DB`.

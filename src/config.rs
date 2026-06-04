@@ -12,6 +12,21 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Platform path-list separator accepted in `WEAVE_PEER_DBS` (in addition to the
+/// canonical comma): `;` on Windows, `:` elsewhere — matching `PATH` semantics.
+/// NOT the path *component* separator (`/`), which must never split a list entry.
+#[cfg(windows)]
+const PEER_DBS_LIST_SEP: char = ';';
+#[cfg(not(windows))]
+const PEER_DBS_LIST_SEP: char = ':';
+
+/// Hard ceiling on how many extra read-only stores Tier-1 federation will open
+/// in one `weave peers`/`sessions` call. Each extra store is an open + N+1 list
+/// fan-out, so an unbounded (or hostile) `WEAVE_PEER_DBS` could turn one listing
+/// into thousands of file opens. Entries beyond this cap are dropped with a
+/// stderr note. Generous for any real multi-project mesh.
+pub const MAX_PEER_DBS: usize = 16;
+
 /// Default message-retention window: 30 days in seconds. A `session` hook GC pass
 /// (see `Config::retention`) deletes messages older than this. Mirrors the
 /// `weave gc` CLI default so the opportunistic and explicit sweeps agree.
@@ -30,6 +45,14 @@ pub struct Config {
     /// disables the auto-GC entirely (messages are kept until an explicit
     /// `weave gc`). Negative values are treated as `0` (disabled).
     pub retention_secs: Option<i64>,
+    /// Additional, **read-only** store files to aggregate peers/sessions from
+    /// (Tier-1 federation). Each entry is a path to another weave SQLite/libsql
+    /// local DB file; weave opens them read-only to *see* their peers/sessions
+    /// without ever writing them. `None`/empty ⇒ single-store behavior identical
+    /// to today. Overlaid by `WEAVE_PEER_DBS` (comma- or path-separator list).
+    /// `#[serde(default)]` keeps configs that omit the key loading unchanged.
+    #[serde(default)]
+    pub peer_dbs: Option<Vec<String>>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -47,6 +70,7 @@ impl std::fmt::Debug for Config {
                 &self.libsql_auth_token.as_ref().map(|_| "<redacted>"),
             )
             .field("retention_secs", &self.retention_secs)
+            .field("peer_dbs", &self.peer_dbs)
             .finish()
     }
 }
@@ -57,12 +81,66 @@ fn home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// The XDG-default store path (`$XDG_DATA_HOME/weave/messages.db`, else
+/// `~/.local/share/weave/messages.db`), ignoring any config/env `db` override.
+/// Exposed so diagnostics (`weave doctor` / `weave_doctor`) can warn when the
+/// *resolved* `db_path()` points somewhere other than this well-known store — the
+/// most common "why can't I see the other session's peers" cause is each session
+/// pointing at a different `WEAVE_DB`.
+pub fn default_db_path() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".local/share"))
+        .join("weave")
+        .join("messages.db")
+}
+
 pub fn config_path() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".config"))
         .join("weave")
         .join("config.toml")
+}
+
+/// Upper bound (chars) on a derived host identifier. A host label is persisted on
+/// every peer row and is only used to gate "is this PID mine to probe", so it
+/// needs to be stable per machine, not long. We cap + control-char-sanitize it the
+/// same way identities are bounded so a hostile `$HOSTNAME` / `/etc/hostname` can
+/// never inject an unbounded or control-bearing value into the store.
+pub const MAX_HOST_LEN: usize = 128;
+
+/// A stable per-machine host identifier, used (with a peer's PID) to gate real
+/// process-liveness: a PID is only probed when `peer.host == this_host()`.
+///
+/// Resolution order: `$HOSTNAME` → first line of `/etc/hostname` → `"local"`.
+/// The result is trimmed, has any control characters stripped, and is truncated
+/// to [`MAX_HOST_LEN`] chars on a UTF-8 boundary; if sanitizing empties it, we
+/// fall back to `"local"`. This keeps the value bounded and control-free, treating
+/// it like an identity cap (it never reaches a shell or SQL literal — it is bound
+/// as a parameter — but bounding it keeps the store and any display safe).
+pub fn this_host() -> String {
+    let raw = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let raw = raw.or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            .filter(|s| !s.trim().is_empty())
+    });
+    let host = raw.unwrap_or_else(|| "local".to_string());
+    let cleaned: String = host
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_HOST_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        "local".to_string()
+    } else {
+        cleaned
+    }
 }
 
 impl Config {
@@ -93,7 +171,87 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_RETENTION_SECS").and_then(|s| s.parse::<i64>().ok()) {
             cfg.retention_secs = Some(v);
         }
+        // Federation peer stores: WEAVE_PEER_DBS is a list of extra read-only DB
+        // file paths. The canonical separator is the COMMA (documented), and we
+        // also accept the platform path-list separator (`:` on unix, `;` on
+        // windows) for convenience. We deliberately do NOT split on the path
+        // COMPONENT separator (`/`), which would shred any absolute path. The env
+        // list is UNIONED onto any config `peer_dbs` (env appended), matching the
+        // env-augments-config posture elsewhere. Validation/cap/dedup happens in
+        // `peer_db_paths`.
+        if let Some(v) = nonempty("WEAVE_PEER_DBS") {
+            let env_paths: Vec<String> = v
+                .split([',', PEER_DBS_LIST_SEP])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !env_paths.is_empty() {
+                let mut merged = cfg.peer_dbs.take().unwrap_or_default();
+                merged.extend(env_paths);
+                cfg.peer_dbs = Some(merged);
+            }
+        }
         cfg
+    }
+
+    /// Resolve the validated, deduplicated list of **read-only** extra store paths
+    /// to aggregate (Tier-1 federation). Pure path resolution (no I/O beyond the
+    /// already-loaded config/env):
+    ///
+    /// - drops blank entries and any path containing a NUL byte (a classic
+    ///   injection canary that cannot be a real file path);
+    /// - **drops any path equal to the local [`db_path`](Self::db_path)** — after
+    ///   canonicalizing both where possible — so the local store is never opened a
+    ///   second time / double-counted;
+    /// - deduplicates (canonical-aware) while preserving first-seen order;
+    /// - caps the count at [`MAX_PEER_DBS`], printing a one-line stderr note when
+    ///   truncating so the drop is diagnosable (never stdout).
+    ///
+    /// Default (no env, no config key) ⇒ `[]` ⇒ behavior identical to today.
+    pub fn peer_db_paths(&self) -> Vec<PathBuf> {
+        let raw = match &self.peer_dbs {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        let local = self.db_path();
+        // Canonicalize the local path once for comparison; fall back to the raw
+        // path if it does not exist yet (canonicalize requires existence).
+        let local_canon = std::fs::canonicalize(&local).unwrap_or_else(|_| local.clone());
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        // Track seen canonical keys so `./messages.db` and its absolute form do
+        // not both slip through.
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for entry in raw {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Reject a NUL byte before constructing a PathBuf used to open a file.
+            if trimmed.contains('\0') {
+                eprintln!("[weave] skipping invalid WEAVE_PEER_DBS entry (contains NUL byte)");
+                continue;
+            }
+            let path = PathBuf::from(trimmed);
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            // Never read the local store twice.
+            if key == local_canon {
+                continue;
+            }
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            out.push(path);
+        }
+        if out.len() > MAX_PEER_DBS {
+            eprintln!(
+                "[weave] {} federated peer stores configured; capping at {MAX_PEER_DBS}",
+                out.len()
+            );
+            out.truncate(MAX_PEER_DBS);
+        }
+        out
     }
 
     /// Resolved retention window (seconds) for the opportunistic SessionStart GC.
@@ -129,11 +287,7 @@ impl Config {
         if let Some(p) = &self.db {
             return PathBuf::from(p);
         }
-        std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home().join(".local/share"))
-            .join("weave")
-            .join("messages.db")
+        default_db_path()
     }
 
     /// The live-injection nudge text for a message from `from` carrying `body`.
@@ -199,6 +353,14 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Auth token for the remote libSQL endpoint. Treat as a secret; weave redacts it
 # from debug output. Prefer the WEAVE_LIBSQL_AUTH_TOKEN env var over storing it here.
 # libsql_auth_token = \"...\"
+
+# Federation (READ-ONLY): additional store files to aggregate peers/sessions
+# from, so `weave peers`/`weave sessions` can SEE sessions living in other
+# projects' stores. These are opened read-only and NEVER written. Default empty
+# (single-store). Overridable via WEAVE_PEER_DBS (comma- or path-separated).
+# Foreign entries are origin-tagged in the listings; you cannot send across
+# stores (Tier 1 is read-only). Capped at 16 stores.
+# peer_dbs = [\"/path/to/other-project/messages.db\"]
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -266,6 +428,7 @@ mod tests {
         assert!(cfg.libsql_url.is_none());
         assert!(cfg.libsql_auth_token.is_none());
         assert!(cfg.retention_secs.is_none());
+        assert!(cfg.peer_dbs.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -288,6 +451,7 @@ mod tests {
             "libsql_url",
             "libsql_auth_token",
             "retention_secs",
+            "peer_dbs",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
@@ -321,5 +485,64 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(negative.retention(), 0, "negative clamps to disabled");
+    }
+
+    /// `peer_db_paths` is default-empty (no federation configured ⇒ `[]`, the
+    /// identical-to-today path), and once configured it trims blanks, drops the
+    /// local `db_path`, dedups, and caps at `MAX_PEER_DBS`.
+    #[test]
+    fn peer_db_paths_default_empty_validates_and_caps() {
+        // Default ⇒ no federation.
+        assert!(Config::default().peer_db_paths().is_empty());
+
+        // Blank entries are dropped; valid distinct entries survive in order.
+        let cfg = Config {
+            db: Some("/tmp/weave-local-only.db".to_string()),
+            peer_dbs: Some(vec![
+                "  ".to_string(),
+                "/tmp/weave-extra-a.db".to_string(),
+                "".to_string(),
+                "/tmp/weave-extra-b.db".to_string(),
+            ]),
+            ..Config::default()
+        };
+        let paths = cfg.peer_db_paths();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/weave-extra-a.db"),
+                PathBuf::from("/tmp/weave-extra-b.db"),
+            ],
+            "blanks dropped, order preserved"
+        );
+
+        // A NUL byte entry is rejected (injection canary), not opened.
+        let nul = Config {
+            db: Some("/tmp/weave-local-only.db".to_string()),
+            peer_dbs: Some(vec!["/tmp/ok.db".to_string(), "/tmp/b\0ad.db".to_string()]),
+            ..Config::default()
+        };
+        assert_eq!(nul.peer_db_paths(), vec![PathBuf::from("/tmp/ok.db")]);
+
+        // The local db_path is never double-counted, and duplicates collapse.
+        let dedup = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            peer_dbs: Some(vec![
+                "/tmp/weave-self.db".to_string(), // == local, dropped
+                "/tmp/dup.db".to_string(),
+                "/tmp/dup.db".to_string(), // duplicate
+            ]),
+            ..Config::default()
+        };
+        assert_eq!(dedup.peer_db_paths(), vec![PathBuf::from("/tmp/dup.db")]);
+
+        // The count is capped at MAX_PEER_DBS even for a hostile-length list.
+        let many: Vec<String> = (0..1000).map(|i| format!("/tmp/peer-{i}.db")).collect();
+        let capped = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            peer_dbs: Some(many),
+            ..Config::default()
+        };
+        assert_eq!(capped.peer_db_paths().len(), MAX_PEER_DBS);
     }
 }

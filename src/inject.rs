@@ -457,6 +457,43 @@ pub fn target_alive(target: &Target) -> bool {
     }
 }
 
+/// The delivery capability of a target, as a structured verdict for the `connect`
+/// handshake. Composed purely from the existing [`Target::injectable`] and
+/// [`target_alive`] checks — it adds NO new injector or spawn path.
+///
+/// The verdict is advisory and degrades gracefully: only [`Capability::Live`]
+/// promises a live nudge; the other two are NOT errors. A registered-but-not-alive
+/// or non-injectable peer still receives every message via the store on its next
+/// hook drain, matching weave's degrade-to-store contract. Because `target_alive`
+/// is fail-open, a probe that cannot run yields `Live` (assume reachable, try) —
+/// never a false `RegisteredNotAlive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Injectable (real mux + valid-looking id) and the liveness probe did not
+    /// report the pane/session as gone ⇒ a live nudge can be pushed now.
+    Live,
+    /// Injectable, but the liveness probe confidently reported the target absent
+    /// ⇒ skip the live nudge, deliver via the store on next turn.
+    RegisteredNotAlive,
+    /// No injectable pane (`mux=none` or empty id) ⇒ store-only delivery.
+    NotInjectable,
+}
+
+/// Pure capability verdict for `target`, composed from [`Target::injectable`] +
+/// [`target_alive`]. Pure (the only side effect is `target_alive`'s read-only,
+/// fail-open probe) so it is unit-testable and safe to call before deciding
+/// whether to knock or queue.
+pub fn capability(target: &Target) -> Capability {
+    if !target.injectable() {
+        return Capability::NotInjectable;
+    }
+    if target_alive(target) {
+        Capability::Live
+    } else {
+        Capability::RegisteredNotAlive
+    }
+}
+
 /// Does the target `id` appear in probe `out` as a *whole token / field*, not as a
 /// bare substring? `out.contains(id)` was unsafe: an id of "2" substring-matches
 /// "12", a pane in another column, an epoch timestamp, etc., wrongly reporting a
@@ -1145,6 +1182,8 @@ mod tests {
             cwd: None,
             socket: String::new(),
             last_seen: 0,
+            pid: None,
+            host: String::new(),
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -1160,6 +1199,8 @@ mod tests {
             cwd: None,
             socket: "unix:/tmp/mykitty".into(),
             last_seen: 0,
+            pid: None,
+            host: String::new(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");
@@ -1262,6 +1303,45 @@ mod tests {
         assert!(target_alive(&t(Mux::Screen, "1234.pts-0.host")));
         // None / un-injectable → no probe → true (inject() itself no-ops on these).
         assert!(target_alive(&Target::none()));
+    }
+
+    /// Truth table for the pure `capability()` verdict, composed from
+    /// `injectable()` + `target_alive()`. We assert every combination that is
+    /// deterministic without a live mux on the runner:
+    ///
+    /// - `mux=none`  ⇒ NotInjectable (not injectable, regardless of id).
+    /// - injectable + empty id ⇒ NotInjectable (empty id is not injectable).
+    /// - injectable + unprobed backend ⇒ Live (fail-open: `target_alive` has no
+    ///   probe for `screen`, so it returns true ⇒ verdict Live, never a false
+    ///   `RegisteredNotAlive`). This is the load-bearing fail-open case the plan
+    ///   calls out; it mirrors `target_alive_is_open_for_unprobed_backends`.
+    ///
+    /// The confident-`RegisteredNotAlive` branch requires a probe that runs and
+    /// reports the target *absent*; that needs a (fake) mux and is covered
+    /// end-to-end by the `connect` fake-mux integration test, not here.
+    #[test]
+    fn capability_truth_table() {
+        // Non-injectable: mux=none ⇒ NotInjectable.
+        assert_eq!(capability(&Target::none()), Capability::NotInjectable);
+        // Non-injectable: a real mux but an empty id is not injectable.
+        assert_eq!(
+            capability(&t(Mux::Tmux, "")),
+            Capability::NotInjectable,
+            "empty id ⇒ not injectable ⇒ NotInjectable"
+        );
+        // Injectable + unprobed backend (screen has no liveness probe) ⇒ fail-open
+        // to Live, never RegisteredNotAlive.
+        let screen = t(Mux::Screen, "1234.pts-0.host");
+        assert!(screen.injectable());
+        assert!(
+            target_alive(&screen),
+            "screen has no probe ⇒ target_alive fail-open true"
+        );
+        assert_eq!(
+            capability(&screen),
+            Capability::Live,
+            "injectable + fail-open alive ⇒ Live"
+        );
     }
 
     /// `WEAVE_MUX_DIR` must take precedence over the hardcoded system dirs so an

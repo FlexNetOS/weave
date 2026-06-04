@@ -44,10 +44,22 @@ fastest layer and carry most of the injector and store coverage.
   `LIMIT -1`), `gc` (deletes old, keeps new), reply auto-addressing + `Re:`
   prefixing + `in_reply_to` linking, transitive `thread` collection, read
   `receipts`, `touch_peer` (refresh without clobbering mux/target/cwd), and the
-  `0600` DB file mode. Because these touch backend internals (`s.conn.execute`,
-  the concrete `SqliteStore`), the module is gated to the `sqlite` feature — see
-  the dual-backend note below for how the *same* behaviors are still verified
-  under libSQL.
+  `0600` DB file mode. It also covers the presence and federation layers:
+  `register_peer_full` round-trips `pid`/`host` (and the 5-arg `register_peer`
+  default forwards `pid:None`/`host:""`); a legacy DB without the `pid`/`host`
+  columns migrates in place; the `is_alive` matrix (local-dead-PID ⇒ offline,
+  remote-host / NULL-pid ⇒ fail-open alive, stale `last_seen` ⇒ offline) and
+  `pid_alive` (own PID alive, absurd PID dead on Linux, cfg-degrade otherwise);
+  and the federation surface — `open_readonly` reads but cannot write (and never
+  creates a missing file), `federated_peers` unions local + foreign and isolates a
+  bad store, plus the pure `merge_peer_views` / `merge_session_views`
+  dedup/tie-break (these live in `store::federation_tests`, which is **not**
+  feature-gated, so they run under both backends). Because the store-internals
+  tests touch backend internals (`s.conn.execute`, the concrete `SqliteStore`),
+  that module is gated to the `sqlite` feature — see the dual-backend note below
+  for how the *same* behaviors (including the mirrored `register_peer_full`,
+  migration, `is_alive` matrix, and the libSQL `open_readonly` read-only proof)
+  are still verified under libSQL.
 
 - **`src/inject.rs`** (23 tests) — `commands_for` / `commands_for_mode` are
   **pure** functions returning the exact argv table for each mux, so the entire
@@ -62,7 +74,10 @@ fastest layer and carry most of the injector and store coverage.
   never leaks the body; liveness probes shape per backend and are fail-open for
   unprobed backends; and **`id_valid` rejects malicious target ids**
   (`%3; rm -rf /`, `--listen-on=evil`, embedded spaces) — the injector
-  target-validation guard.
+  target-validation guard. The pure `capability()` verdict has its own truth table:
+  `mux=none` / empty id ⇒ `NotInjectable`; an injectable + unprobed backend ⇒
+  **fail-open `Live`** (never a false `RegisteredNotAlive`) — the verdict that
+  backs `weave connect` / `weave_connect`.
 
 - **`src/model.rs`** — the broadcast alias set is exposed as both a Rust check
   (`is_broadcast`) and a SQL literal (`BROADCAST_SQL`). A drift guard asserts the
@@ -72,7 +87,11 @@ fastest layer and carry most of the injector and store coverage.
 
 - **`src/config.rs`** — the `config.toml` scaffold parses as valid (all-default)
   TOML, documents every nudge placeholder, and mentions every real config field
-  so a newly-added field can't be left undocumented.
+  (including the federation `peer_dbs` key) so a newly-added field can't be left
+  undocumented. `peer_db_paths()` is unit-tested for parse (comma / path-list
+  separator), NUL-entry rejection, dropping the local `db_path()` (no
+  self-federation), order-preserving dedup, and the `MAX_PEER_DBS` (16) cap; the
+  default (no env, no key) resolves to an empty list (identical-to-today).
 
 - **`src/setup.rs`** — `is_weave_command` matches only real installed
   `weave hook <event>` lines (and absolute-path forms) while rejecting
@@ -99,7 +118,14 @@ Coverage:
   roundtrip proves delivery + read tracking, an unknown method returns a proper
   JSON-RPC error object, and closing stdin exits the server cleanly. Reads run on
   a background thread behind a 10s timeout so a wedged binary fails the test
-  instead of hanging the suite.
+  instead of hanging the suite. The presence/federation tools are covered too:
+  `weave_attach` upserts a peer that `weave_peers` then lists, and rejects an
+  empty / oversized `me` with `isError`; `weave_connect` returns the live /
+  not-injectable verdict with `isError:false` (queued is not an error) and
+  `isError:true` only for a non-existent peer; `weave_peers` / `weave_sessions`
+  reflect a federated extra store (origin-tagged `(via …)`), and a bad extra store
+  mixed in still returns `isError:false` while `weave_doctor` reports the
+  extra-store count.
 
 - **CLI roundtrips.** `send`→`inbox` (body delivered, default read consumes, an
   unrelated recipient sees nothing), `register`→`peers` (registered outside a mux
@@ -117,7 +143,25 @@ Coverage:
   carries the right shape; `doctor --json` reports the compiled-in backend and db
   path; `gc --older-than-secs` reports a count; an unknown `WEAVE_BACKEND` fails
   loudly instead of silently defaulting; an unknown subcommand exits non-zero
-  with a clap usage message.
+  with a clap usage message. `doctor --json` also carries `db_is_default` (false
+  under a temp `WEAVE_DB`, with the hint line in the text form; true when the
+  resolved path equals `config::default_db_path()`).
+
+- **Presence & live-connect.** `weave attach` under a fake mux flips a `no-inject`
+  peer to `injectable` in `peers --json` (zero-restart adoption); `peers --json`
+  carries `pid` / `host` / `alive` (a still-live process reads `alive:true`; a
+  recent-but-dead local PID reads `online:false`/`alive:false` on Linux, the
+  cfg-guarded A2 path); `weave connect --to` prints the `live` /
+  `not injectable (mux=none)` verdict strings and **exits 0** for a queued
+  (non-injectable) peer, non-zero for a non-existent one.
+
+- **Read-only federation.** With `WEAVE_PEER_DBS` set to a second store, a foreign
+  peer/session surfaces in `peers`/`sessions --json` with `origin`=<store label>
+  and `foreign:true` (local rows `origin:"local"`/`foreign:false`, pre-Tier-1 keys
+  intact); a foreign session's `unread` is **not summed** into the local set; an
+  unset `WEAVE_PEER_DBS` is byte-identical local-only output with **no** `(via …)`
+  tag; a bad / non-weave extra path is skipped (exit 0, local peer still listed,
+  skip note on **stderr only**).
 
 ## 3. Security tests (`tests/security.rs`)
 
@@ -141,6 +185,26 @@ between semi-trusted agent sessions:
 
 - **At-rest secrecy.** After a send creates the DB, `mode & 0o077 == 0` — message
   bodies never leak to other local users.
+
+- **Own-row-only adoption.** `weave attach --name attacker` cannot overwrite a
+  *victim*'s `(mux, target)` — the upsert is keyed to the caller's own resolved
+  identity, so the victim's row is byte-for-byte unchanged and the attacker gets
+  its own distinct row. An oversized `attach --name` is rejected (`too long`,
+  non-zero exit) and persists no row.
+
+- **Host identity is bounded.** A hostile `$HOSTNAME` (embedded newline / tab /
+  CR / ESC / bell + a multi-thousand-char run) persists a `host` that is
+  `≤ MAX_HOST_LEN` (128) and control-char-free; a control-only `$HOSTNAME`
+  sanitizes to empty and falls back to the stable `"local"` label, so
+  `this_host()` can never inject an unbounded or control-bearing value into a row.
+
+- **Federation never writes the foreign store.** After a federated `peers` +
+  `sessions` + `doctor`, the foreign store's **main DB file is byte-identical**
+  (sha256), no rollback journal is created, and the WAL carries no committed write
+  — the structural `SQLITE_OPEN_READ_ONLY` guarantee, proven on **both** backends.
+  An oversized `WEAVE_PEER_DBS` (1000 entries) does not fan out 1000 opens (the
+  `MAX_PEER_DBS` cap holds), and a traversal-style junk path is opened read-only /
+  fails to open and is **never created**.
 
 ## 4. Property-based tests (`tests/prop.rs`)
 
@@ -237,6 +301,17 @@ store *semantics* are still covered, just through the black-box CLI/MCP roundtri
 rather than in-process calls. (Roadmap Phase 1 adds a generic
 `assert_store_conformance(&dyn Store)` suite so both backends share one
 in-process conformance harness.)
+
+Where a store change must be proven *structurally* per backend, the libSQL module
+(`src/store_libsql.rs`, `#[cfg(test)]`) carries the **mirror** of the sqlite
+store-unit tests: `register_peer_full` round-trips `pid`/`host`, the legacy
+`pid`/`host` migration runs in place, the `is_alive` matrix (incl. the remote-host
+fail-open / Turso shared-DB case), and the `open_readonly` read-only proof (a write
+through the RO handle is engine-rejected and the foreign DB file stays
+byte-identical). So both the sqlite count and the libSQL count grow together when
+a mirrored store layer is added — the backends differ only in the count of their
+own store-unit module, never in covered behavior. The pure `merge_*_views`
+federation tests are not feature-gated and run under both.
 
 CI enforces the libSQL column as a real, blocking gate: a dedicated job runs
 `cargo clippy --no-default-features --features libsql -- -D warnings` and

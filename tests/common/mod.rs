@@ -125,6 +125,36 @@ pub fn run(db: &TestDb, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// Like [`run`] but with extra environment variables applied AFTER [`scrub_env`]
+/// (so they win — e.g. `WEAVE_PEER_DBS` for Tier-1 federation tests). Returns
+/// (success, stdout, stderr).
+pub fn run_env(db: &TestDb, args: &[&str], extra_env: &[(&str, &str)]) -> (bool, String, String) {
+    let mut cmd = weave_cmd(db, args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn weave {args:?}: {e}"));
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Like [`run_ok`] but with extra environment variables (see [`run_env`]).
+/// Asserts success and returns stdout.
+pub fn run_ok_env(db: &TestDb, args: &[&str], extra_env: &[(&str, &str)]) -> String {
+    let (ok, out, err) = run_env(db, args, extra_env);
+    assert!(
+        ok,
+        "`weave {args:?}` (env {extra_env:?}) exited non-zero\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+    out
+}
+
 /// Like [`run`] but asserts success and returns stdout. The full output is shown
 /// on failure for easy debugging.
 pub fn run_ok(db: &TestDb, args: &[&str]) -> String {
@@ -194,7 +224,17 @@ pub struct McpServer {
 impl McpServer {
     /// Spawn `weave mcp` against `db` and return a handle ready for requests.
     pub fn spawn(db: &TestDb) -> Self {
-        let mut child = weave_cmd(db, &["mcp"])
+        Self::spawn_env(db, &[])
+    }
+
+    /// Spawn `weave mcp` against `db` with extra env applied after [`scrub_env`]
+    /// (so they win — e.g. `WEAVE_PEER_DBS` for federation tests).
+    pub fn spawn_env(db: &TestDb, extra_env: &[(&str, &str)]) -> Self {
+        let mut cmd = weave_cmd(db, &["mcp"]);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
