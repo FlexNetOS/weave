@@ -33,11 +33,76 @@ pub fn log(msg: &str) {
 /// message body into the recipient's pane. `None` falls back to the built-in
 /// default template (which embeds the body, i.e. a `Nudge::Full` push), preserving
 /// today's behavior for callers that don't pass one.
+/// Tier-2 pull + consent settings the MCP inbox drain needs, bundled so the long
+/// `handle`/`call_tool`/`tool_inbox` chain threads ONE value instead of three.
+/// Carries the validated `pull_from` sources plus the decision-5 consent state
+/// (`inject_pulled` master toggle + the optional `allow_inject_from` finer gate)
+/// so the drain can fire the caller-side consent nudge into THIS session's OWN
+/// pane. This keeps the full `Config` out of `mcp` (the deliberate non-plumbing
+/// noted below) while still letting the drain gate the nudge correctly.
+pub struct PullConsent {
+    /// Validated `pull_from` source paths (the delivery allow-list).
+    pub from: Vec<PathBuf>,
+    /// Decision-5 master toggle (default true): fire the consent nudge on a
+    /// pulled message from an allow-listed source. `false` ⇒ pure queue-only.
+    pub inject_pulled: bool,
+    /// Optional finer gate; `None` ⇒ "same as `from`" (every pull source is
+    /// inject-eligible). When `Some`, only listed sources trigger the nudge.
+    pub allow_inject_from: Option<Vec<PathBuf>>,
+    /// Tier-2 signed-identity strictness (2d, `Config::strict_verify`): when true an
+    /// unsigned/unverifiable pulled intent is dropped rather than committed under the
+    /// advisory model. Forwarded to `pull_from_store`; inert without the `sign`
+    /// feature. A forged signature is always rejected regardless.
+    pub strict_verify: bool,
+}
+
+impl PullConsent {
+    /// Is `source` (an `allow`-listed pull path) permitted to trigger the consent
+    /// nudge? Mirrors `Config::inject_allowed_from`: unset gate ⇒ every source is
+    /// eligible; set gate ⇒ canonical-aware membership in the subset.
+    fn inject_allowed_from(&self, source: &std::path::Path) -> bool {
+        let allow = match &self.allow_inject_from {
+            None => return true,
+            Some(list) => list,
+        };
+        let key = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        allow.iter().any(|p| {
+            let pk = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            pk == key
+        })
+    }
+}
+
+/// Sign a cross-store intent's canonical `(from,to,body)` with this session's
+/// configured signing key (only with `--features sign`), returning the hex
+/// signature for `outbox.sig`, or `""` when no key is configured / the feature is
+/// off. A load error is non-fatal (logs to stderr, sends unsigned). The private key
+/// is never logged. Mirror of `main::sign_intent_if_keyed`.
+#[cfg(feature = "sign")]
+fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
+    match crate::sign::load_signing_key() {
+        Ok(Some(key)) => crate::sign::sign_intent(&key, from, to, body),
+        Ok(None) => String::new(),
+        Err(err) => {
+            log(&format!(
+                "could not load signing key (sending unsigned): {err}"
+            ));
+            String::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "sign"))]
+fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
+    String::new()
+}
+
 pub fn run(
     store: &dyn Store,
     me_default: Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: Vec<PathBuf>,
+    pull: PullConsent,
 ) -> Result<()> {
     log(&format!(
         "starting; backend={} default_session={:?}",
@@ -68,7 +133,7 @@ pub fn run(
                 continue;
             }
         };
-        if let Some(resp) = handle(store, &me_default, nudge_template, &extra_dbs, &req) {
+        if let Some(resp) = handle(store, &me_default, nudge_template, &extra_dbs, &pull, &req) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
             // cleanly; any other io error is logged and we keep serving.
@@ -152,11 +217,13 @@ fn ident(args: &Value, key: &str, def: &Option<String>) -> Result<String, String
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: &[PathBuf],
+    pull: &PullConsent,
     req: &Value,
 ) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -199,7 +266,15 @@ fn handle(
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(store, me_default, nudge_template, extra_dbs, name, &args) {
+            match call_tool(
+                store,
+                me_default,
+                nudge_template,
+                extra_dbs,
+                pull,
+                name,
+                &args,
+            ) {
                 Ok(text) => Some(reply(
                     &id,
                     json!({ "content": [{"type":"text","text": text}], "isError": false }),
@@ -218,17 +293,20 @@ fn handle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_tool(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: &[PathBuf],
+    pull: &PullConsent,
     name: &str,
     args: &Value,
 ) -> Result<String, String> {
     match name {
         "weave_send" => tool_send(store, me_default, nudge_template, args),
-        "weave_inbox" => tool_inbox(store, me_default, args),
+        "weave_outbox" => tool_outbox(store, args),
+        "weave_inbox" => tool_inbox(store, me_default, pull, args),
         "weave_history" => tool_history(store, me_default, args),
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
@@ -295,6 +373,40 @@ fn tool_send(
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let subject = subject.as_deref();
 
+    // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
+    // lives in a FOREIGN store, so deposit an intent into OUR OWN outbox rather
+    // than attempt any foreign write (owner-only-writes). No local inbox row, no
+    // inject — we cannot reach the recipient's pane across stores; the receiver
+    // pulls and commits it on its next drain.
+    if let Some(store_path) = args
+        .get("to_store")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        if model::is_broadcast(to) {
+            return Err(
+                "cross-store broadcast is not supported; send to a named recipient \
+                 (Tier-2 is directed-only)."
+                    .to_string(),
+            );
+        }
+        let to_host = args
+            .get("to_host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        // Signed identity (2d): sign the canonical (from,to,body) with this
+        // session's key when one is configured (and the `sign` feature is built),
+        // so the receiver can verify `from` is unforgeable. "" otherwise (advisory).
+        let sig = sign_intent_if_keyed(&from, to, body);
+        let id = store
+            .enqueue_intent(to, to_host, &from, subject, body, &sig)
+            .map_err(e)?;
+        return Ok(format!(
+            "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
+        ));
+    }
+
     let mid = store.send(&from, to, subject, body).map_err(e)?;
     let dest = if model::is_broadcast(to) {
         "broadcast"
@@ -327,8 +439,61 @@ fn tool_send(
     Ok(out)
 }
 
-fn tool_inbox(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+/// List pending cross-store intents in this store's outbox (Tier-2, read-only).
+fn tool_outbox(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
+    let intents = store.outbox_all(limit).map_err(e)?;
+    if intents.is_empty() {
+        return Ok("Outbox empty (no pending cross-store intents).".to_string());
+    }
+    let mut out = format!("{} pending intent(s):\n", intents.len());
+    for i in &intents {
+        let subj = i
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        let host = if i.to_host.is_empty() {
+            String::new()
+        } else {
+            format!("@{}", i.to_host)
+        };
+        out.push_str(&format!(
+            "#{} {} -> {}{}{}: {}\n",
+            i.id, i.from, i.to, host, subj, i.body
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_inbox(
+    store: &dyn Store,
+    def: &Option<String>,
+    pull: &PullConsent,
+    args: &Value,
+) -> Result<String, String> {
     let me = ident(args, "me", def)?;
+    // Tier-2: pull cross-store intents into the local inbox BEFORE reading, so a
+    // federated message is delivered in this same drain. Best-effort — a pull
+    // failure must not fail the inbox read; diagnostics go to stderr (never
+    // stdout, which carries only JSON-RPC frames).
+    if !pull.from.is_empty() {
+        match store::pull_from_store(store, &me, &pull.from, pull.strict_verify) {
+            Ok(p) if p.committed > 0 => {
+                log(&format!(
+                    "pulled {} cross-store message(s) for '{me}'",
+                    p.committed
+                ));
+                // Decision-5 consent nudge (DEFAULT ON), fired CALLER-SIDE here in
+                // `mcp` (which depends on both `store` and `inject`) so
+                // `pull_from_store` never gains a `store → inject` edge. Diagnostics
+                // → stderr only (stdout carries JSON-RPC frames). Best-effort.
+                nudge_pulled(store, pull, &me, &p.committed_sources);
+            }
+            Ok(_) => {}
+            Err(err) => log(&format!("pull skipped (non-fatal): {err}")),
+        }
+    }
     let include_read = args
         .get("include_read")
         .and_then(|v| v.as_bool())
@@ -383,6 +548,45 @@ fn tool_inbox(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
         out.push_str(&format!("\n\n({})", footer.join("; ")));
     }
     Ok(out)
+}
+
+/// Tier-2 consent nudge (decision 5, DEFAULT ON) for the MCP inbox drain: after a
+/// pull commits cross-store messages, fire the EXISTING paste-safe content-free
+/// [`inject::Nudge::Nudge`] into THIS session's OWN registered pane (never a
+/// foreign pane, never the body). Mirrors `main::nudge_pulled`. Done caller-side
+/// so `store::pull_from_store` never gains a `store → inject` edge.
+///
+/// Gating: no-op unless `pull.inject_pulled` is on (the single off-switch ⇒ pure
+/// queue-only) AND at least one committed source passes `inject_allowed_from`.
+/// Falls back silently to queue-only when this session's pane is not injectable
+/// (`mux=none`) or not alive. Best-effort: any failure is logged to STDERR (never
+/// stdout, which carries only JSON-RPC frames) and never breaks the drain.
+fn nudge_pulled(store: &dyn Store, pull: &PullConsent, me: &str, committed_sources: &[PathBuf]) {
+    if !pull.inject_pulled {
+        return;
+    }
+    if !committed_sources
+        .iter()
+        .any(|src| pull.inject_allowed_from(src))
+    {
+        return;
+    }
+    let peer = match store.get_peer(me) {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(err) => {
+            log(&format!("pull-nudge skipped (non-fatal): {err}"));
+            return;
+        }
+    };
+    let target = Target::from_peer(&peer);
+    if !target.injectable() || !inject::target_alive(&target) {
+        return;
+    }
+    match inject::inject_mode(&target, "", inject::Nudge::Nudge) {
+        Ok(_) => {}
+        Err(err) => log(&format!("pull-nudge inject failed (non-fatal): {err}")),
+    }
 }
 
 fn tool_history(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
@@ -821,13 +1025,22 @@ fn tools() -> Value {
     json!([
         {
             "name": "weave_send",
-            "description": "Send a message to another agent session. 'to' = a session name, or 'all'/'*' to broadcast. If the recipient is a registered injectable peer (tmux/zellij), a live nudge is pushed into its pane immediately; otherwise it arrives on the recipient's next turn.",
+            "description": "Send a message to another agent session. 'to' = a session name, or 'all'/'*' to broadcast. If the recipient is a registered injectable peer (tmux/zellij), a live nudge is pushed into its pane immediately; otherwise it arrives on the recipient's next turn. Cross-store (Tier-2): pass 'to_store' = a path to another store to queue the message as an intent in YOUR OWN outbox; the recipient pulls and commits it on its next drain (no foreign write, no broadcast).",
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"Recipient session name, or 'all'."},
                 "subject":{"type":"string"},
-                "body":{"type":"string"}
+                "body":{"type":"string"},
+                "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
+                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."}
             },"required":["to","body"]}
+        },
+        {
+            "name": "weave_outbox",
+            "description": "List pending cross-store intents in your outbox (Tier-2). Read-only self-inspection of messages you queued for recipients in other stores that have not yet been pulled.",
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer"}
+            },"required":[]}
         },
         {
             "name": "weave_inbox",

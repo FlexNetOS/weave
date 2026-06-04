@@ -5,7 +5,7 @@
 //! for cross-machine sync (see `store_libsql.rs`). The on-disk SQLite format is
 //! libSQL-compatible, so the file is portable between backends.
 
-use crate::model::{now, Message, Peer};
+use crate::model::{now, Intent, Message, Peer};
 use anyhow::Result;
 
 // Re-export the libsql backend's federation aggregators under `store::` so the
@@ -13,7 +13,9 @@ use anyhow::Result;
 // regardless of which (mutually-exclusive) backend is compiled in. The sqlite
 // backend defines these free functions inline below.
 #[cfg(feature = "libsql")]
-pub use crate::store_libsql::{federated_peers, federated_sessions, federation_status};
+pub use crate::store_libsql::{
+    federated_peers, federated_sessions, federation_status, pull_from_store,
+};
 
 #[cfg(feature = "sqlite")]
 use crate::model::{is_broadcast, BROADCAST_SQL};
@@ -136,6 +138,67 @@ pub trait Store: Send {
     /// Stamp an already-inserted message's `in_reply_to` column. Internal seam
     /// for the default `reply` impl.
     fn set_in_reply_to(&self, message_id: i64, in_reply_to: i64) -> Result<()>;
+
+    /// Tier-2: append a cross-store delivery **intent** to THIS store's own
+    /// `outbox`, returning its new local intent id. Owner-only-writes: this is the
+    /// sender writing its OWN store; it never touches the recipient's store. The
+    /// recipient pulls it read-only and commits it locally. `sig` is reserved for
+    /// signed identity (2d) and is `""` in 2a/2b.
+    ///
+    /// `allow(dead_code)`: weave is a binary crate, so a `pub` trait method whose
+    /// only callers are tests / a not-yet-wired CLI arm is otherwise flagged
+    /// unused. This is intentional Tier-2 surface, exercised by the store unit
+    /// tests, not dead code.
+    #[allow(dead_code)]
+    fn enqueue_intent(
+        &self,
+        to: &str,
+        to_host: &str,
+        from: &str,
+        subject: Option<&str>,
+        body: &str,
+        sig: &str,
+    ) -> Result<i64>;
+
+    /// Tier-2: read intents from THIS store's `outbox` addressed to `for_recipient`
+    /// with `id > since_id`, oldest-first (ascending id), capped at `limit`. A
+    /// read-only SELECT — used on the read-only foreign handle by
+    /// [`pull_from_store`] to scan a source for messages addressed to the puller.
+    #[allow(dead_code)]
+    fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>>;
+
+    /// Tier-2: list ALL pending intents in THIS store's `outbox` (any recipient),
+    /// oldest-first, capped at `limit`. Backs the `weave outbox` self-inspector.
+    #[allow(dead_code)]
+    fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>>;
+
+    /// Tier-2 receiver-side dedup cursor: the highest source-outbox intent id this
+    /// store has already committed from `source` (canonical path label). `0` when
+    /// nothing has been pulled from that source yet. Read from the LOCAL store.
+    #[allow(dead_code)]
+    fn pull_cursor_get(&self, source: &str) -> Result<i64>;
+
+    /// Advance (upsert) this store's per-source pull cursor to `last_id`. Written
+    /// to the LOCAL store only, after committing the corresponding intent.
+    #[allow(dead_code)]
+    fn pull_cursor_set(&self, source: &str, last_id: i64) -> Result<()>;
+
+    /// Tier-2 (2d): register (upsert) a peer/session's hex-encoded ed25519 public
+    /// key in the `keys` table, used to VERIFY signed intents claiming to be from
+    /// that identity. The table is plain data (present in every build); only the
+    /// SIGN/VERIFY crypto is behind the `sign` feature, so a `sign`-built receiver
+    /// can read a key registered by any build. Bound `params!`.
+    #[allow(dead_code)]
+    fn register_key(&self, identity: &str, pubkey: &str) -> Result<()>;
+
+    /// Fetch the registered public key for `identity` (hex), or `None` if unknown.
+    #[allow(dead_code)]
+    fn get_key(&self, identity: &str) -> Result<Option<String>>;
+
+    /// List all registered `(identity, pubkey)` pairs, ordered by identity. Backs
+    /// `weave key list`.
+    #[allow(dead_code)]
+    fn list_keys(&self) -> Result<Vec<(String, String)>>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -383,6 +446,35 @@ pub fn check_ident(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an optional cross-store host hint before it is stored on an intent.
+/// Empty is allowed (== unspecified). A non-empty host is bounded to
+/// [`crate::config::MAX_HOST_LEN`] chars and must be control-character-free, the
+/// same discipline as a derived host label, so a hostile foreign `to_host` cannot
+/// smuggle an unbounded or control-bearing value through the outbox.
+pub fn check_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Ok(());
+    }
+    let chars = host.chars().count();
+    if chars > crate::config::MAX_HOST_LEN {
+        anyhow::bail!(
+            "to_host is too long ({chars} chars; max {}).",
+            crate::config::MAX_HOST_LEN
+        );
+    }
+    if host.chars().any(|c| c.is_control()) {
+        anyhow::bail!("to_host must not contain control characters.");
+    }
+    Ok(())
+}
+
+/// Tier-2 DoS bound: the maximum number of intents [`pull_from_store`] commits
+/// from a single source in one drain. A flood in a source's outbox cannot make
+/// one receiver drain unbounded — the per-source high-water cursor means the rest
+/// arrive on subsequent drains (never lost). Mirrors the per-call ceilings
+/// [`MAX_SESSIONS`] / `MAX_PEER_DBS`.
+pub const MAX_PULL_PER_DRAIN: i64 = 256;
+
 /// Clamp an untrusted limit into `[0, MAX_LIMIT]`, mapping negatives to the cap
 /// (callers that want "a lot" pass a big/negative number; they get the cap, not
 /// an unbounded scan).
@@ -442,6 +534,24 @@ CREATE TABLE IF NOT EXISTS peers (
     pid       INTEGER,
     host      TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS outbox (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    to_peer   TEXT NOT NULL,
+    to_host   TEXT NOT NULL DEFAULT '',
+    from_peer TEXT NOT NULL,
+    subject   TEXT,
+    body      TEXT NOT NULL,
+    sig       TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS pull_cursor (
+    source  TEXT PRIMARY KEY,
+    last_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS keys (
+    identity TEXT PRIMARY KEY,
+    pubkey   TEXT NOT NULL
+);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -495,6 +605,22 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
     })
 }
 
+/// Map an `outbox` row to an [`Intent`]. Column order matches the explicit
+/// projections used below: id, ts, to_peer, to_host, from_peer, subject, body, sig.
+#[cfg(feature = "sqlite")]
+fn row_to_intent(r: &Row) -> rusqlite::Result<Intent> {
+    Ok(Intent {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        to: r.get(2)?,
+        to_host: r.get(3)?,
+        from: r.get(4)?,
+        subject: r.get(5)?,
+        body: r.get(6)?,
+        sig: r.get(7)?,
+    })
+}
+
 /// True if table `table` already has a column named `column`. Uses
 /// `pragma_table_info` so a migration can be made idempotent (an `ALTER TABLE
 /// ADD COLUMN` would otherwise error if the column is already present).
@@ -536,6 +662,31 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "peers", "host")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT '';")?;
     }
+    // Tier-2 tables: present on fresh DBs via SCHEMA, created here for DBs made
+    // before cross-store delivery existed. `CREATE TABLE IF NOT EXISTS` is itself
+    // idempotent, so this is a clean additive upgrade for a legacy store; the
+    // `sig` column is reserved now so signed identity (2d) needs no further
+    // outbox migration.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS outbox (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        INTEGER NOT NULL,
+            to_peer   TEXT NOT NULL,
+            to_host   TEXT NOT NULL DEFAULT '',
+            from_peer TEXT NOT NULL,
+            subject   TEXT,
+            body      TEXT NOT NULL,
+            sig       TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS pull_cursor (
+            source  TEXT PRIMARY KEY,
+            last_id INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS keys (
+            identity TEXT PRIMARY KEY,
+            pubkey   TEXT NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -693,6 +844,245 @@ pub fn federated_sessions(
         }
     }
     Ok(merge_session_views(views))
+}
+
+/// A digest of one [`pull_from_store`] run, for the drain to log to stderr and to
+/// drive the caller-side Tier-2 consent nudge (decision 5).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pulled {
+    /// Intents committed into the LOCAL inbox this run.
+    pub committed: usize,
+    /// Sources that were skipped (missing / locked / non-weave / no outbox).
+    pub sources_skipped: usize,
+    /// The `allow` source paths that committed at least one intent this run, in
+    /// first-seen order. The CALLER (main/mcp) uses these to gate the consent
+    /// nudge per source (`Config::inject_allowed_from`) WITHOUT `store` ever
+    /// depending on `inject` — the inject decision is made caller-side, keeping
+    /// the `store → inject` edge from forming. These are the original (un-
+    /// canonicalized) `allow` paths so the caller can canonical-compare them
+    /// against `allow_inject_from`.
+    pub committed_sources: Vec<std::path::PathBuf>,
+}
+
+/// Tier-2 cross-store delivery (receiver side). For each `allow`-listed source
+/// store, open it **read-only** (the ONLY foreign touch), read the intents
+/// addressed to `me` since this store's per-source cursor, and **commit each into
+/// the LOCAL store via the normal [`Store::send`]** — the receiver assigns its own
+/// id/ts, anchoring ordering/dedup locally (owner-only-writes).
+///
+/// Structural owner-only-writes guarantee: the foreign store is opened ONLY via
+/// [`SqliteStore::open_readonly`] (SQLite rejects any write), and EVERY write this
+/// function performs — the committed inbox rows and the cursor advance — is to
+/// `local`. The source file is never written, migrated, or created.
+///
+/// Authorization is receiver-side: a source NOT in `allow` is never opened, so it
+/// can never deliver. Each committed intent's `from`/`to` is re-validated
+/// (`check_ident`) — untrusted foreign data is bounded again at commit (defense in
+/// depth) — and a failing intent is skipped (logged) rather than aborting the
+/// batch. Idempotency: the per-source cursor is a strict high-water mark on the
+/// source's outbox id, advanced after each commit, so a re-drain starts past
+/// already-committed intents and never double-delivers.
+///
+/// Best-effort: an unreadable / locked / missing / non-weave / no-`outbox` source
+/// is logged to **stderr** and skipped (the `federated_peers` failure-isolation
+/// pattern) — it never breaks the local inbox drain. Per-source commits are bounded
+/// by [`MAX_PULL_PER_DRAIN`] (the rest arrive on later drains, never lost).
+///
+/// `strict` (`Config::strict_verify`, 2d) controls the signed-identity fallback:
+/// when set, an unsigned/unverifiable intent is dropped rather than committed under
+/// the advisory model. A tampered/forged signature is rejected regardless. `strict`
+/// is inert in a build without the `sign` feature.
+#[cfg(feature = "sqlite")]
+pub fn pull_from_store(
+    local: &dyn Store,
+    me: &str,
+    allow: &[std::path::PathBuf],
+    strict: bool,
+) -> Result<Pulled> {
+    let mut out = Pulled::default();
+    for path in allow {
+        let source = canonical_source(path);
+        let foreign = match SqliteStore::open_readonly(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                out.sources_skipped += 1;
+                continue;
+            }
+        };
+        let since = local.pull_cursor_get(&source)?;
+        let intents = match foreign.list_outbox(me, since, MAX_PULL_PER_DRAIN) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                out.sources_skipped += 1;
+                continue;
+            }
+        };
+        let n = commit_pulled(local, me, &source, strict, intents)?;
+        out.committed += n;
+        if n > 0 {
+            out.committed_sources.push(path.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Commit a batch of pulled intents (ascending id) into the LOCAL store and
+/// advance the per-source cursor after each. Shared by both backends' free fns so
+/// the dedup/validation/ordering rule is single-sourced.
+///
+/// Each intent is re-validated and committed via `local.send`; the cursor is set
+/// to that intent's id immediately after, so a crash mid-batch resumes strictly
+/// past the last committed intent (idempotent — never double-delivers). An intent
+/// failing validation/commit is logged and skipped; the cursor still advances past
+/// it so a poison row cannot wedge the source forever.
+///
+/// Signed identity (2d, `sign` feature): if an intent carries a signature, it is
+/// verified against the sender's registered public key (`local.get_key(from)`)
+/// over the canonical `(from,to,body)` bytes BEFORE commit — a tampered/forged
+/// signature is ALWAYS rejected (never committed), regardless of `strict`. An
+/// UNSIGNED or unverifiable-because-no-registered-key intent falls back to the
+/// advisory allowlist + origin-attribution model and is committed — UNLESS `strict`
+/// (config `strict_verify`) is set, in which case it is dropped with a stderr note.
+/// In a build without the `sign` feature, `strict` is irrelevant and `sig` is
+/// ignored (advisory model, exactly as 2a–2c). Verification reads only `local` (the
+/// receiver's own key table); the source store is never written.
+pub fn commit_pulled(
+    local: &dyn Store,
+    me: &str,
+    source: &str,
+    strict: bool,
+    intents: Vec<Intent>,
+) -> Result<usize> {
+    // `strict` is only consulted on the `sign` path; mark it used otherwise.
+    #[cfg(not(feature = "sign"))]
+    let _ = strict;
+    let mut committed = 0usize;
+    for intent in intents {
+        // Defense in depth: re-validate untrusted foreign data at the commit seam
+        // (the source's enqueue already capped it, but the receiver does not trust
+        // the source). A bad intent is skipped, not fatal — but the cursor still
+        // advances past it so it cannot wedge the source.
+        let valid = check_ident("sender", &intent.from).is_ok()
+            && check_ident("recipient", &intent.to).is_ok()
+            && check_body(&intent.body).is_ok()
+            && intent.to == me;
+        // Signed identity (2d): gate the commit on signature verification when the
+        // `sign` feature is built. A tampered sig is always rejected; an unsigned /
+        // no-registered-key intent is dropped only under `strict_verify`. Without
+        // the feature, `ok` is just structural validity (advisory model, as 2a–2c).
+        #[cfg(feature = "sign")]
+        let ok = valid && verify_pulled_intent(local, source, strict, &intent);
+        #[cfg(not(feature = "sign"))]
+        let ok = valid;
+        if ok {
+            match local.send(&intent.from, me, intent.subject.as_deref(), &intent.body) {
+                Ok(_) => committed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "[weave] skipping intent #{} from source '{source}': {e}",
+                        intent.id
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[weave] skipping malformed/misaddressed intent #{} from source '{source}'",
+                intent.id
+            );
+        }
+        // Advance the high-water cursor past this intent regardless of commit
+        // outcome: a poison/misaddressed row must not block later intents.
+        local.pull_cursor_set(source, intent.id)?;
+    }
+    Ok(committed)
+}
+
+/// Signed-identity commit gate (2d, `sign` feature). Decides whether a structurally
+/// valid intent may be committed under the verification policy:
+///
+/// - **Signed (`sig` non-empty):** verify it against the sender's registered public
+///   key over the canonical `(from,to,body)` bytes. A valid signature ⇒ commit
+///   (the strongest case: `from` is unforgeable). A signature present but invalid —
+///   tampered, forged, or no registered key to check it against — is ALWAYS rejected
+///   (never committed), regardless of `strict`: an actively-bad signature is a hard
+///   fail, not a fallback case.
+/// - **Unsigned (`sig` empty):** fall back to the advisory allowlist + origin-
+///   attribution model and COMMIT — UNLESS `strict` (`strict_verify`) is set, in
+///   which case it is dropped with a stderr note. (In strict mode the receiver only
+///   accepts intents it can cryptographically attribute.)
+///
+/// Reads only `local` (the receiver's own `keys` table); never touches the source.
+#[cfg(feature = "sign")]
+fn verify_pulled_intent(local: &dyn Store, source: &str, strict: bool, intent: &Intent) -> bool {
+    if intent.sig.is_empty() {
+        // Unsigned: advisory model unless strict.
+        if strict {
+            eprintln!(
+                "[weave] dropping unsigned intent #{} from source '{source}' (strict_verify on)",
+                intent.id
+            );
+            return false;
+        }
+        return true;
+    }
+    // Signed: a present signature MUST verify, or it is rejected outright.
+    let pubkey = match local.get_key(&intent.from) {
+        Ok(Some(pk)) => pk,
+        Ok(None) => {
+            // A signature we cannot check: under strict, reject (no attribution);
+            // otherwise fall back to advisory (commit) — the sig is simply ignored,
+            // matching the unsigned fallback. We do NOT treat "no key" as a forgery.
+            if strict {
+                eprintln!(
+                    "[weave] dropping signed intent #{} from '{}' via source '{source}': \
+                     no registered key for sender (strict_verify on)",
+                    intent.id, intent.from
+                );
+                return false;
+            }
+            return true;
+        }
+        Err(e) => {
+            eprintln!(
+                "[weave] dropping signed intent #{} from source '{source}': key lookup failed: {e}",
+                intent.id
+            );
+            return false;
+        }
+    };
+    match crate::sign::verify_intent(&pubkey, &intent.sig, &intent.from, &intent.to, &intent.body) {
+        Ok(true) => true,
+        Ok(false) => {
+            // A present-but-invalid signature is ALWAYS rejected (spoof/tamper),
+            // strict or not.
+            eprintln!(
+                "[weave] REJECTING intent #{} from '{}' via source '{source}': signature \
+                 verification failed (possible forgery)",
+                intent.id, intent.from
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "[weave] dropping intent #{} from source '{source}': verify error: {e}",
+                intent.id
+            );
+            false
+        }
+    }
+}
+
+/// Canonical per-source label for the `pull_cursor` key: the canonicalized path
+/// string (falling back to the lossy path string when the file cannot be
+/// canonicalized), so `./a.db` and its absolute form share one cursor — the same
+/// canonicalization discipline `peer_db_paths` uses for dedup.
+pub fn canonical_source(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(feature = "sqlite")]
@@ -1037,6 +1427,105 @@ impl Store for SqliteStore {
             params![now(), name],
         )?;
         Ok(())
+    }
+
+    fn enqueue_intent(
+        &self,
+        to: &str,
+        to_host: &str,
+        from: &str,
+        subject: Option<&str>,
+        body: &str,
+        sig: &str,
+    ) -> Result<i64> {
+        check_ident("recipient", to)?;
+        check_ident("sender", from)?;
+        check_host(to_host)?;
+        check_body(body)?;
+        self.conn.execute(
+            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![now(), to, to_host, from, subject, body, sig],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
+        let limit = clamp_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox
+             WHERE to_peer = ?1 AND id > ?2
+             ORDER BY id ASC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![for_recipient, since_id, limit], row_to_intent)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>> {
+        let limit = clamp_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox
+             ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], row_to_intent)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn pull_cursor_get(&self, source: &str) -> Result<i64> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_id FROM pull_cursor WHERE source = ?1",
+                params![source],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v.unwrap_or(0))
+    }
+
+    fn pull_cursor_set(&self, source: &str, last_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pull_cursor (source, last_id) VALUES (?1, ?2)
+             ON CONFLICT(source) DO UPDATE SET last_id = ?2",
+            params![source, last_id],
+        )?;
+        Ok(())
+    }
+
+    fn register_key(&self, identity: &str, pubkey: &str) -> Result<()> {
+        check_ident("identity", identity)?;
+        self.conn.execute(
+            "INSERT INTO keys (identity, pubkey) VALUES (?1, ?2)
+             ON CONFLICT(identity) DO UPDATE SET pubkey = ?2",
+            params![identity, pubkey],
+        )?;
+        Ok(())
+    }
+
+    fn get_key(&self, identity: &str) -> Result<Option<String>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pubkey FROM keys WHERE identity = ?1",
+                params![identity],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v)
+    }
+
+    fn list_keys(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT identity, pubkey FROM keys ORDER BY identity")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 }
 
@@ -1767,5 +2256,368 @@ mod tests {
         assert!(them.origin.is_foreign());
         let me = views.iter().find(|v| v.peer.name == "me").unwrap();
         assert_eq!(me.origin, Origin::Local);
+    }
+
+    // ---- Tier-2: outbox enqueue/list, pull cursor, and the pull driver ----
+
+    /// `enqueue_intent` round-trips every column (incl. an empty reserved `sig`),
+    /// and `list_outbox` returns only matching recipients with `id > since`, capped
+    /// and oldest-first.
+    #[test]
+    fn enqueue_and_list_outbox_roundtrip() {
+        let s = mem();
+        let i1 = s
+            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "")
+            .unwrap();
+        let _i2 = s
+            .enqueue_intent("carol", "", "alice", None, "for carol", "")
+            .unwrap();
+        let i3 = s
+            .enqueue_intent("bob", "", "alice", None, "body3", "")
+            .unwrap();
+
+        // Self-inspection sees all three, oldest-first.
+        let all = s.outbox_all(50).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, i1);
+        assert_eq!(all[0].to, "bob");
+        assert_eq!(all[0].to_host, "boxB");
+        assert_eq!(all[0].from, "alice");
+        assert_eq!(all[0].subject.as_deref(), Some("hi"));
+        assert_eq!(all[0].body, "body1");
+        assert_eq!(all[0].sig, "", "sig reserved empty in 2a");
+
+        // list_outbox filters by recipient and id>since.
+        let for_bob = s.list_outbox("bob", 0, 50).unwrap();
+        let ids: Vec<i64> = for_bob.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![i1, i3], "only bob's intents, oldest-first");
+        let after_first = s.list_outbox("bob", i1, 50).unwrap();
+        assert_eq!(
+            after_first.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![i3],
+            "strictly id>since"
+        );
+    }
+
+    /// `enqueue_intent` rejects oversized/invalid input (caps applied at the
+    /// outbox seam, mirroring `send`).
+    #[test]
+    fn enqueue_intent_enforces_caps() {
+        let s = mem();
+        assert!(s.enqueue_intent("", "", "a", None, "x", "").is_err());
+        assert!(s.enqueue_intent("b", "", "", None, "x", "").is_err());
+        assert!(
+            s.enqueue_intent("b", "h\nx", "a", None, "x", "").is_err(),
+            "control char in to_host rejected"
+        );
+        let big = "x".repeat(MAX_BODY + 1);
+        assert!(s.enqueue_intent("b", "", "a", None, &big, "").is_err());
+        assert!(s.enqueue_intent("b", "", "a", None, "ok", "").is_ok());
+    }
+
+    /// The per-source pull cursor defaults to 0 and round-trips through set/get.
+    #[test]
+    fn pull_cursor_default_and_roundtrip() {
+        let s = mem();
+        assert_eq!(s.pull_cursor_get("/some/src.db").unwrap(), 0);
+        s.pull_cursor_set("/some/src.db", 42).unwrap();
+        assert_eq!(s.pull_cursor_get("/some/src.db").unwrap(), 42);
+        // Upsert overwrites.
+        s.pull_cursor_set("/some/src.db", 99).unwrap();
+        assert_eq!(s.pull_cursor_get("/some/src.db").unwrap(), 99);
+        // Distinct sources are independent.
+        assert_eq!(s.pull_cursor_get("/other.db").unwrap(), 0);
+    }
+
+    /// CRASH-WINDOW / at-least-once bound. The cursor is advanced
+    /// commit-then-advance PER INTENT (not one batch transaction), so the only way
+    /// to re-deliver is a crash *between* a local commit and its cursor advance.
+    /// This test simulates exactly that partial-progress state — commit happened,
+    /// cursor not yet advanced past it — by rewinding the cursor one intent, then
+    /// re-running the pull. It asserts the re-delivery is bounded to EXACTLY the
+    /// one un-acknowledged intent (at-least-once, one-intent window), NOT the whole
+    /// batch, and that with the cursor correctly persisted the re-pull delivers
+    /// zero (the normal path is duplicate-free).
+    #[test]
+    fn pull_cursor_crash_window_is_bounded_to_one_intent() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-crash-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+
+        // A enqueues THREE intents for bob (ids 1,2,3).
+        {
+            let a = SqliteStore::open(&a_path).unwrap();
+            for n in 0..3 {
+                a.enqueue_intent("bob", "", "alice", None, &format!("m{n}"), "")
+                    .unwrap();
+            }
+        }
+        let b = SqliteStore::open(&b_path).unwrap();
+        let allow = vec![a_path.clone()];
+        let source = canonical_source(&a_path);
+
+        // Normal pull commits all three; cursor now at 3.
+        assert_eq!(
+            pull_from_store(&b, "bob", &allow, false).unwrap().committed,
+            3
+        );
+        assert_eq!(b.pull_cursor_get(&source).unwrap(), 3);
+        assert_eq!(b.inbox("bob", false, false, 50).unwrap().0.len(), 3);
+
+        // Normal re-pull is duplicate-free (cursor persisted past every intent).
+        assert_eq!(
+            pull_from_store(&b, "bob", &allow, false).unwrap().committed,
+            0,
+            "normal re-drain must deliver nothing (no crash) — duplicate-free"
+        );
+        assert_eq!(b.inbox("bob", false, false, 50).unwrap().0.len(), 3);
+
+        // Simulate a crash that committed intent #3 into the inbox but died BEFORE
+        // advancing the cursor past it: rewind the cursor to 2. The next drain
+        // re-reads ONLY id>2 (i.e. just #3), so the at-least-once re-delivery is
+        // bounded to that single un-acknowledged intent — never the whole batch.
+        b.pull_cursor_set(&source, 2).unwrap();
+        let replay = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(
+            replay.committed, 1,
+            "a crash before the cursor advance re-delivers AT MOST the one \
+             un-acknowledged intent (at-least-once, bounded), not the whole batch"
+        );
+        // The inbox now shows one duplicate of #3 (4 rows) — the documented, bounded
+        // at-least-once cost of a real crash; the cursor is back to 3.
+        assert_eq!(b.inbox("bob", false, false, 50).unwrap().0.len(), 4);
+        assert_eq!(b.pull_cursor_get(&source).unwrap(), 3);
+    }
+
+    /// End-to-end pull: A enqueues an intent for B; B pulls read-only and commits
+    /// it into B's own inbox; a re-pull is idempotent (no double-delivery); A is
+    /// byte-unchanged across the pull (the owner-only-writes structural proof).
+    #[test]
+    fn pull_from_store_commits_once_and_leaves_source_unchanged() {
+        let dir = std::env::temp_dir().join(format!("weave-pull-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+
+        // A enqueues an intent addressed to "bob" (B's identity).
+        {
+            let a = SqliteStore::open(&a_path).unwrap();
+            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "")
+                .unwrap();
+        }
+        // Snapshot A's bytes BEFORE B pulls.
+        let before = std::fs::read(&a_path).unwrap();
+
+        let b = SqliteStore::open(&b_path).unwrap();
+        let allow = vec![a_path.clone()];
+        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(pulled.committed, 1);
+
+        // The message landed in B's inbox, attributed to A's `from`.
+        let (rows, _) = b.inbox("bob", false, false, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender, "alice");
+        assert_eq!(rows[0].body, "hello bob");
+
+        // Re-pull is idempotent: cursor blocks the already-committed intent.
+        let again = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(again.committed, 0, "re-drain must not double-deliver");
+        let (rows2, _) = b.inbox("bob", false, false, 50).unwrap();
+        assert_eq!(rows2.len(), 1, "still exactly one inbox row");
+
+        // OWNER-ONLY-WRITES: A's file is byte-identical after the pulls.
+        let after = std::fs::read(&a_path).unwrap();
+        assert_eq!(
+            before, after,
+            "pulling must leave the source store byte-unchanged"
+        );
+    }
+
+    /// An unreadable/missing source is skipped (best-effort), and an intent
+    /// addressed to someone else is not committed.
+    #[test]
+    fn pull_skips_bad_source_and_misaddressed_intents() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-pull2-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+        {
+            let a = SqliteStore::open(&a_path).unwrap();
+            // Addressed to carol, NOT to bob — must never reach bob's inbox.
+            a.enqueue_intent("carol", "", "alice", None, "not for bob", "")
+                .unwrap();
+        }
+        let b = SqliteStore::open(&b_path).unwrap();
+        let allow = vec![dir.join("missing.db"), a_path.clone()];
+        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(pulled.committed, 0);
+        assert_eq!(pulled.sources_skipped, 1, "missing source skipped");
+        let (rows, _) = b.inbox("bob", false, false, 50).unwrap();
+        assert!(rows.is_empty(), "a misaddressed intent is never committed");
+    }
+
+    /// A legacy DB created before Tier-2 (no `outbox`/`pull_cursor`) gains both
+    /// tables on open and is fully usable.
+    #[test]
+    fn legacy_db_gains_tier2_tables() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-t2-legacy-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        // A pre-Tier-2 store: only messages exists.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                    sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT, body TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        // The new tables exist and work.
+        let id = s.enqueue_intent("bob", "", "alice", None, "x", "").unwrap();
+        assert!(id > 0);
+        assert_eq!(s.pull_cursor_get("src").unwrap(), 0);
+        s.pull_cursor_set("src", 7).unwrap();
+        assert_eq!(s.pull_cursor_get("src").unwrap(), 7);
+        // The 2d `keys` table is also present on the upgraded legacy store.
+        assert!(s.get_key("alice").unwrap().is_none());
+        s.register_key("alice", "deadbeef").unwrap();
+        assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("deadbeef"));
+    }
+
+    /// The `keys` table round-trips a registered pubkey through get/list, upserts on
+    /// conflict, and rejects an invalid identity. The table is plain data — present
+    /// in every build regardless of the `sign` feature.
+    #[test]
+    fn keys_register_get_list_roundtrip() {
+        let s = mem();
+        assert!(s.get_key("alice").unwrap().is_none(), "unknown key ⇒ None");
+        s.register_key("alice", "aa11").unwrap();
+        s.register_key("bob", "bb22").unwrap();
+        assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
+
+        // Upsert overwrites the pubkey for an existing identity.
+        s.register_key("alice", "cc33").unwrap();
+        assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("cc33"));
+
+        // list_keys returns all pairs ordered by identity.
+        let keys = s.list_keys().unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                ("alice".to_string(), "cc33".to_string()),
+                ("bob".to_string(), "bb22".to_string()),
+            ]
+        );
+
+        // An invalid identity is rejected at the seam.
+        assert!(s.register_key("", "00").is_err());
+        assert!(s.register_key("a\nb", "00").is_err());
+    }
+
+    /// Signed-identity commit gate (2d, `sign` feature) end-to-end through
+    /// `pull_from_store`:
+    ///   - a VALID signature ⇒ committed;
+    ///   - a FORGED/tampered signature ⇒ ALWAYS rejected (strict or not);
+    ///   - an UNSIGNED intent ⇒ committed under advisory (default), DROPPED under
+    ///     strict_verify.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn signed_pull_verifies_commits_and_rejects_forgery() {
+        use crate::sign::{sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let signer = SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey = to_hex(signer.verifying_key().as_bytes());
+
+        // Helper: enqueue an intent into a fresh source store, return its path.
+        fn src_with(
+            dir: &std::path::Path,
+            tag: &str,
+            from: &str,
+            body: &str,
+            sig: &str,
+        ) -> std::path::PathBuf {
+            let p = dir.join(format!("{tag}.db"));
+            let a = SqliteStore::open(&p).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            p
+        }
+
+        let dir = std::env::temp_dir().join(format!("weave-sign-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (1) Valid signature from "alice" — B has alice's key registered.
+        let good_sig = sign_intent(&signer, "alice", "bob", "hi");
+        let good = src_with(&dir, "good", "alice", "hi", &good_sig);
+
+        // (2) Forged: a signature that does NOT match the (from,to,body).
+        let forged = src_with(&dir, "forged", "alice", "tampered", &good_sig);
+
+        // (3) Unsigned intent.
+        let unsigned = src_with(&dir, "unsigned", "carol", "plain", "");
+
+        // --- non-strict receiver ---
+        {
+            let b = SqliteStore::open(&dir.join("b1.db")).unwrap();
+            b.register_key("alice", &pubkey).unwrap();
+            // Valid sig commits.
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&good), false)
+                    .unwrap()
+                    .committed,
+                1,
+                "a valid signature commits"
+            );
+            // Forged sig is rejected even in non-strict mode.
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&forged), false)
+                    .unwrap()
+                    .committed,
+                0,
+                "a forged signature is ALWAYS rejected"
+            );
+            // Unsigned commits under advisory fallback.
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&unsigned), false)
+                    .unwrap()
+                    .committed,
+                1,
+                "unsigned commits under advisory (non-strict)"
+            );
+        }
+
+        // --- strict receiver ---
+        {
+            let b = SqliteStore::open(&dir.join("b2.db")).unwrap();
+            b.register_key("alice", &pubkey).unwrap();
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&good), true)
+                    .unwrap()
+                    .committed,
+                1,
+                "a valid signature commits even under strict"
+            );
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&forged), true)
+                    .unwrap()
+                    .committed,
+                0,
+                "a forged signature is rejected under strict too"
+            );
+            assert_eq!(
+                pull_from_store(&b, "bob", std::slice::from_ref(&unsigned), true)
+                    .unwrap()
+                    .committed,
+                0,
+                "an unsigned intent is DROPPED under strict_verify"
+            );
+        }
     }
 }

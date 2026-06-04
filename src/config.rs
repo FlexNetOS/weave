@@ -27,6 +27,13 @@ const PEER_DBS_LIST_SEP: char = ':';
 /// stderr note. Generous for any real multi-project mesh.
 pub const MAX_PEER_DBS: usize = 16;
 
+/// Hard ceiling on how many `pull_from` source stores Tier-2 cross-store delivery
+/// will pull intents from in one drain. Each source is a read-only open + an
+/// `outbox` SELECT + per-intent local commit, so an unbounded (or hostile)
+/// `WEAVE_PULL_FROM` could turn one drain into thousands of file opens. Entries
+/// beyond this cap are dropped with a stderr note. Mirrors [`MAX_PEER_DBS`].
+pub const MAX_PULL_FROM: usize = 16;
+
 /// Default message-retention window: 30 days in seconds. A `session` hook GC pass
 /// (see `Config::retention`) deletes messages older than this. Mirrors the
 /// `weave gc` CLI default so the opportunistic and explicit sweeps agree.
@@ -53,6 +60,49 @@ pub struct Config {
     /// `#[serde(default)]` keeps configs that omit the key loading unchanged.
     #[serde(default)]
     pub peer_dbs: Option<Vec<String>>,
+    /// Tier-2 cross-store **delivery** sources: store files this session will pull
+    /// directed intents FROM and **commit into its own inbox** (via the normal
+    /// local `Store::send`). This is a STRICTLY HIGHER trust grant than
+    /// [`peer_dbs`](Self::peer_dbs): `peer_dbs` only lets weave *see* other stores'
+    /// peers/sessions (read-only, cannot mutate my inbox), whereas `pull_from`
+    /// lets an allow-listed source deliver a message into my inbox. The two are
+    /// kept DISTINCT so adding a store merely to view it never silently upgrades it
+    /// into a delivery source (a privilege-escalation footgun). A path may appear
+    /// in both lists. `None`/empty ⇒ no Tier-2 delivery (identical to today).
+    /// Overlaid by `WEAVE_PULL_FROM` (comma- or path-separator list).
+    /// `#[serde(default)]` keeps configs that omit the key loading unchanged.
+    #[serde(default)]
+    pub pull_from: Option<Vec<String>>,
+    /// Tier-2 consent (DEFAULT ON): when a pull commits a message from an
+    /// allow-listed source, also fire the existing paste-safe **content-free**
+    /// nudge into THIS session's OWN registered pane (never a foreign pane). The
+    /// body already landed in the inbox on commit; the nudge is only a "check your
+    /// inbox" ping. `None` ⇒ **enabled** ([`inject_pulled`](Self::inject_pulled)).
+    /// Set `false` for pure queue-only delivery (the single off-switch — the
+    /// message still delivers, just without the live nudge). Overlaid by
+    /// `WEAVE_INJECT_PULLED` (a truthy/falsy value).
+    #[serde(default)]
+    pub inject_pulled: Option<bool>,
+    /// Optional finer gate on which pull sources may trigger the consent nudge.
+    /// When set, ONLY a source whose path is in this list injects (others still
+    /// deliver to the inbox, just silently — never a keystroke). When unset, EVERY
+    /// [`pull_from`](Self::pull_from) source is inject-eligible, since being on the
+    /// pull list is already the higher trust grant: the recommended relationship is
+    /// "same as the pull set" (anyone you already accept delivery from can also
+    /// nudge you), with this list available to NARROW that to a subset. `None` ⇒
+    /// "same as pull_from". Overlaid by `WEAVE_ALLOW_INJECT_FROM` (comma- or
+    /// path-separator list). Capped at [`MAX_PULL_FROM`].
+    #[serde(default)]
+    pub allow_inject_from: Option<Vec<String>>,
+    /// Tier-2 signed identity (2d, only meaningful in a `--features sign` build):
+    /// when `true`, a pulled cross-store intent that is UNSIGNED or cannot be
+    /// cryptographically attributed to its claimed `from` is DROPPED rather than
+    /// committed under the advisory allowlist model. `None`/`false` ⇒ the advisory
+    /// fallback (commit unsigned intents, exactly as 2a–2c). A tampered/forged
+    /// signature is ALWAYS rejected regardless of this flag. Inert without the
+    /// `sign` feature. Overlaid by `WEAVE_STRICT_VERIFY` (a truthy/falsy value).
+    #[serde(default)]
+    pub strict_verify: Option<bool>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -71,6 +121,10 @@ impl std::fmt::Debug for Config {
             )
             .field("retention_secs", &self.retention_secs)
             .field("peer_dbs", &self.peer_dbs)
+            .field("pull_from", &self.pull_from)
+            .field("inject_pulled", &self.inject_pulled)
+            .field("allow_inject_from", &self.allow_inject_from)
+            .field("strict_verify", &self.strict_verify)
             .finish()
     }
 }
@@ -191,6 +245,52 @@ impl Config {
                 cfg.peer_dbs = Some(merged);
             }
         }
+        // Tier-2 delivery sources: WEAVE_PULL_FROM is a list of store paths this
+        // session will pull directed intents from. Same split rules and
+        // env-unions-config posture as WEAVE_PEER_DBS above. Validation/cap/dedup
+        // happens in `pull_from_paths`.
+        if let Some(v) = nonempty("WEAVE_PULL_FROM") {
+            let env_paths: Vec<String> = v
+                .split([',', PEER_DBS_LIST_SEP])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !env_paths.is_empty() {
+                let mut merged = cfg.pull_from.take().unwrap_or_default();
+                merged.extend(env_paths);
+                cfg.pull_from = Some(merged);
+            }
+        }
+        // Tier-2 consent toggle: WEAVE_INJECT_PULLED overrides the config/default.
+        // Accepts the usual truthy/falsy spellings; an unrecognized value is
+        // IGNORED (leaves the config/default in place) rather than silently
+        // flipping the switch. Default (unset config + unset env) ⇒ ON.
+        if let Some(v) = nonempty("WEAVE_INJECT_PULLED").and_then(|s| parse_bool(&s)) {
+            cfg.inject_pulled = Some(v);
+        }
+        // Tier-2 finer inject gate: WEAVE_ALLOW_INJECT_FROM is a list of source
+        // paths permitted to trigger the consent nudge. Same split rules and
+        // env-unions-config posture as WEAVE_PULL_FROM. Validation/cap/dedup
+        // happens in `allow_inject_from_paths`.
+        if let Some(v) = nonempty("WEAVE_ALLOW_INJECT_FROM") {
+            let env_paths: Vec<String> = v
+                .split([',', PEER_DBS_LIST_SEP])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !env_paths.is_empty() {
+                let mut merged = cfg.allow_inject_from.take().unwrap_or_default();
+                merged.extend(env_paths);
+                cfg.allow_inject_from = Some(merged);
+            }
+        }
+        // Tier-2 signed-identity strictness: WEAVE_STRICT_VERIFY overrides the
+        // config/default. Accepts the usual truthy/falsy spellings; an unrecognized
+        // value is IGNORED (leaves the config/default in place). Default ⇒ OFF
+        // (advisory fallback). Inert without the `sign` feature.
+        if let Some(v) = nonempty("WEAVE_STRICT_VERIFY").and_then(|s| parse_bool(&s)) {
+            cfg.strict_verify = Some(v);
+        }
         cfg
     }
 
@@ -209,7 +309,85 @@ impl Config {
     ///
     /// Default (no env, no config key) ⇒ `[]` ⇒ behavior identical to today.
     pub fn peer_db_paths(&self) -> Vec<PathBuf> {
-        let raw = match &self.peer_dbs {
+        self.resolve_store_list(self.peer_dbs.as_deref(), MAX_PEER_DBS, "WEAVE_PEER_DBS")
+    }
+
+    /// Resolve the validated, deduplicated list of Tier-2 **delivery** source
+    /// stores (`pull_from`). Identical validation discipline to [`peer_db_paths`]
+    /// (trim, reject NUL, drop the local `db_path`, canonical-dedup, cap at
+    /// [`MAX_PULL_FROM`] with a stderr note), but keyed off the DISTINCT
+    /// `pull_from` list — being a read-only *visibility* source (`peer_dbs`) does
+    /// not make a store a *delivery* source. Default (no env, no config key) ⇒
+    /// `[]` ⇒ no cross-store delivery (identical-to-today).
+    pub fn pull_from_paths(&self) -> Vec<PathBuf> {
+        self.resolve_store_list(self.pull_from.as_deref(), MAX_PULL_FROM, "WEAVE_PULL_FROM")
+    }
+
+    /// Tier-2 consent (decision 5): whether a pulled message from an allow-listed
+    /// source also fires the content-free live nudge into THIS session's OWN pane.
+    /// **Defaults to `true`** — this is the one place the PRD's default-off is
+    /// intentionally overridden. `inject_pulled = false` ⇒ pure queue-only delivery
+    /// (the single off-switch). Residual risk: with the default on, any peer you
+    /// pull from can, by default, type a capped paste-safe nudge into your live
+    /// pane; documented in the config template, README, and ARCHITECTURE.
+    pub fn inject_pulled(&self) -> bool {
+        self.inject_pulled.unwrap_or(true)
+    }
+
+    /// Tier-2 signed-identity strictness (2d): whether an unsigned/unverifiable
+    /// pulled intent is dropped (`true`) rather than committed under the advisory
+    /// model. **Defaults to `false`** (advisory fallback, identical to 2a–2c). Only
+    /// consulted on the pull/commit path of a `--features sign` build; a forged
+    /// signature is rejected regardless of this flag.
+    pub fn strict_verify(&self) -> bool {
+        self.strict_verify.unwrap_or(false)
+    }
+
+    /// The validated, deduplicated `allow_inject_from` subset (when set). Resolved
+    /// with the SAME discipline as [`pull_from_paths`] (trim, NUL-reject, drop the
+    /// local db, canonical-dedup, cap at [`MAX_PULL_FROM`]). `None` ⇒ "same as the
+    /// pull set" and this returns `None` so the caller treats every pull source as
+    /// inject-eligible. See [`inject_allowed_from`](Self::inject_allowed_from).
+    pub fn allow_inject_from_paths(&self) -> Option<Vec<PathBuf>> {
+        self.allow_inject_from
+            .as_deref()
+            .map(|raw| self.resolve_store_list(Some(raw), MAX_PULL_FROM, "WEAVE_ALLOW_INJECT_FROM"))
+    }
+
+    /// Is `source` permitted to trigger the consent nudge? When
+    /// `allow_inject_from` is unset, EVERY pull source is inject-eligible (the
+    /// recommended "same as pull_from" default — being on the pull list is already
+    /// the higher trust grant). When set, the source must be in it (canonical-aware
+    /// comparison), so the list NARROWS the inject-eligible set to a subset of the
+    /// pull set. This gate is checked caller-side, AFTER `inject_pulled()`, so a
+    /// non-eligible source can never cause a keystroke in this pane.
+    pub fn inject_allowed_from(&self, source: &std::path::Path) -> bool {
+        let allow = match self.allow_inject_from_paths() {
+            // Unset ⇒ same as pull set: every pulled source is eligible.
+            None => return true,
+            Some(list) => list,
+        };
+        let key = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        allow.iter().any(|p| {
+            let pk = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            pk == key
+        })
+    }
+
+    /// Shared resolver for a list of foreign store paths (used by both
+    /// [`peer_db_paths`] and [`pull_from_paths`]): trims blanks, rejects any entry
+    /// containing a NUL byte (an injection canary that cannot be a real path),
+    /// drops the local [`db_path`](Self::db_path) (canonical-aware) so the local
+    /// store is never opened twice, deduplicates canonically while preserving
+    /// first-seen order, and caps the count at `cap` with a one-line stderr note
+    /// when truncating. `list_label` names the source list for that note.
+    fn resolve_store_list(
+        &self,
+        raw: Option<&[String]>,
+        cap: usize,
+        list_label: &str,
+    ) -> Vec<PathBuf> {
+        let raw = match raw {
             Some(v) => v,
             None => return Vec::new(),
         };
@@ -229,7 +407,7 @@ impl Config {
             }
             // Reject a NUL byte before constructing a PathBuf used to open a file.
             if trimmed.contains('\0') {
-                eprintln!("[weave] skipping invalid WEAVE_PEER_DBS entry (contains NUL byte)");
+                eprintln!("[weave] skipping invalid {list_label} entry (contains NUL byte)");
                 continue;
             }
             let path = PathBuf::from(trimmed);
@@ -244,12 +422,12 @@ impl Config {
             seen.push(key);
             out.push(path);
         }
-        if out.len() > MAX_PEER_DBS {
+        if out.len() > cap {
             eprintln!(
-                "[weave] {} federated peer stores configured; capping at {MAX_PEER_DBS}",
+                "[weave] {} {list_label} stores configured; capping at {cap}",
                 out.len()
             );
-            out.truncate(MAX_PEER_DBS);
+            out.truncate(cap);
         }
         out
     }
@@ -309,6 +487,17 @@ fn nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+/// Parse a boolean env value with the usual truthy/falsy spellings (case- and
+/// whitespace-insensitive). Returns `None` for anything unrecognized so the
+/// caller can leave the config/default untouched rather than silently flip it.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// The commented scaffold written by `weave config init`. Every key is commented
 /// out so the file is a documented template that still loads as an empty config
 /// (all fields default) until the user opts into a setting. Keeping the template
@@ -361,6 +550,43 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Foreign entries are origin-tagged in the listings; you cannot send across
 # stores (Tier 1 is read-only). Capped at 16 stores.
 # peer_dbs = [\"/path/to/other-project/messages.db\"]
+
+# Cross-store DELIVERY sources (Tier-2): store files this session will PULL
+# directed messages from and COMMIT into its own inbox on its next drain. This is
+# a STRICTLY HIGHER trust grant than peer_dbs (which is read-only visibility):
+# only a source listed here may deliver a message into your inbox, and only the
+# RECEIVER (you) ever writes your own store — a sender deposits an intent into its
+# OWN outbox, which you pull read-only. Delivery is next-drain (pull-latency-
+# bound), not instant. Default empty (no cross-store delivery). Overridable via
+# WEAVE_PULL_FROM (comma- or path-separated). Capped at 16 stores. A path may
+# appear in both peer_dbs and pull_from.
+# pull_from = [\"/path/to/other-project/messages.db\"]
+
+# Consent for live injection on a PULLED cross-store message (DEFAULT: true).
+# When a pull commits a message from an allow-listed source, weave ALSO fires a
+# content-free paste-safe nudge (\"check your inbox\") into YOUR OWN pane — never a
+# foreign pane, and never the message body. RESIDUAL RISK: with this on (the
+# default), any peer you pull from can, by default, type a capped nudge into your
+# live pane. Set false for pure queue-only delivery (the message still arrives in
+# your inbox on the next drain; only the live nudge is suppressed). Overridable via
+# WEAVE_INJECT_PULLED.
+# inject_pulled = true
+
+# OPTIONAL finer gate: restrict which pull sources may trigger the consent nudge.
+# When unset, EVERY pull_from source is inject-eligible (same as the pull set —
+# being on the pull list is already the higher trust grant). When set, only a
+# source listed here injects; the others still deliver to your inbox, just without
+# the live nudge. Use this to NARROW the inject set to a trusted subset.
+# Overridable via WEAVE_ALLOW_INJECT_FROM (comma- or path-separated). Capped at 16.
+# allow_inject_from = [\"/path/to/other-project/messages.db\"]
+
+# Signed sender identity strictness (only meaningful in a `--features sign` build).
+# When true, a pulled cross-store intent that is UNSIGNED or cannot be verified
+# against the sender's registered public key is DROPPED instead of committed under
+# the advisory allowlist model. A TAMPERED/FORGED signature is always rejected
+# regardless of this setting. Default false (advisory fallback — unsigned intents
+# still deliver). See `weave key`. Overridable via WEAVE_STRICT_VERIFY.
+# strict_verify = false
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -429,6 +655,10 @@ mod tests {
         assert!(cfg.libsql_auth_token.is_none());
         assert!(cfg.retention_secs.is_none());
         assert!(cfg.peer_dbs.is_none());
+        assert!(cfg.pull_from.is_none());
+        assert!(cfg.inject_pulled.is_none());
+        assert!(cfg.allow_inject_from.is_none());
+        assert!(cfg.strict_verify.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -452,6 +682,10 @@ mod tests {
             "libsql_auth_token",
             "retention_secs",
             "peer_dbs",
+            "pull_from",
+            "inject_pulled",
+            "allow_inject_from",
+            "strict_verify",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
@@ -544,5 +778,136 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(capped.peer_db_paths().len(), MAX_PEER_DBS);
+    }
+
+    /// `pull_from_paths` is the Tier-2 delivery-source analogue of
+    /// `peer_db_paths`: default-empty, trims blanks, drops the local `db_path`,
+    /// dedups, and caps at `MAX_PULL_FROM`. It is resolved from the DISTINCT
+    /// `pull_from` list, NOT from `peer_dbs` (a read-only visibility source is not
+    /// automatically a delivery source).
+    #[test]
+    fn pull_from_paths_default_empty_validates_and_caps() {
+        // Default ⇒ no Tier-2 delivery.
+        assert!(Config::default().pull_from_paths().is_empty());
+
+        // pull_from is DISTINCT from peer_dbs: a store only in peer_dbs is not a
+        // delivery source.
+        let only_peer = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            peer_dbs: Some(vec!["/tmp/visible-only.db".to_string()]),
+            ..Config::default()
+        };
+        assert!(
+            only_peer.pull_from_paths().is_empty(),
+            "a peer_dbs-only store is not a pull_from delivery source"
+        );
+
+        // Blanks dropped, order preserved, local dropped, dups collapse.
+        let cfg = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            pull_from: Some(vec![
+                "  ".to_string(),
+                "/tmp/src-a.db".to_string(),
+                "".to_string(),
+                "/tmp/weave-self.db".to_string(), // == local, dropped
+                "/tmp/src-b.db".to_string(),
+                "/tmp/src-b.db".to_string(), // duplicate
+            ]),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.pull_from_paths(),
+            vec![
+                PathBuf::from("/tmp/src-a.db"),
+                PathBuf::from("/tmp/src-b.db"),
+            ]
+        );
+
+        // NUL byte rejected (injection canary).
+        let nul = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            pull_from: Some(vec!["/tmp/ok.db".to_string(), "/tmp/b\0ad.db".to_string()]),
+            ..Config::default()
+        };
+        assert_eq!(nul.pull_from_paths(), vec![PathBuf::from("/tmp/ok.db")]);
+
+        // Capped at MAX_PULL_FROM.
+        let many: Vec<String> = (0..1000).map(|i| format!("/tmp/src-{i}.db")).collect();
+        let capped = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            pull_from: Some(many),
+            ..Config::default()
+        };
+        assert_eq!(capped.pull_from_paths().len(), MAX_PULL_FROM);
+    }
+
+    /// `inject_pulled()` is the decision-5 master toggle: DEFAULT ON when unset,
+    /// honoring an explicit false (the single off-switch) and an explicit true.
+    #[test]
+    fn inject_pulled_defaults_on_and_honors_toggle() {
+        // Decision 5: unset ⇒ ON (the PRD's default-off is intentionally flipped).
+        assert!(Config::default().inject_pulled());
+
+        let off = Config {
+            inject_pulled: Some(false),
+            ..Config::default()
+        };
+        assert!(!off.inject_pulled(), "false ⇒ pure queue-only");
+
+        let on = Config {
+            inject_pulled: Some(true),
+            ..Config::default()
+        };
+        assert!(on.inject_pulled());
+    }
+
+    /// `strict_verify()` defaults OFF (advisory fallback) and honors an explicit
+    /// toggle — the 2d signed-identity strictness flag.
+    #[test]
+    fn strict_verify_defaults_off_and_honors_toggle() {
+        assert!(
+            !Config::default().strict_verify(),
+            "default ⇒ advisory fallback"
+        );
+        let strict = Config {
+            strict_verify: Some(true),
+            ..Config::default()
+        };
+        assert!(strict.strict_verify());
+        let off = Config {
+            strict_verify: Some(false),
+            ..Config::default()
+        };
+        assert!(!off.strict_verify());
+    }
+
+    /// `inject_allowed_from` gate: unset `allow_inject_from` ⇒ every source is
+    /// inject-eligible ("same as pull_from"); when set, only listed sources are
+    /// eligible and a non-listed source is NEVER eligible (no keystroke path).
+    #[test]
+    fn inject_allowed_from_gates_to_subset() {
+        // Unset ⇒ same as pull set: any source is eligible.
+        let same_as_pull = Config::default();
+        assert!(same_as_pull.inject_allowed_from(std::path::Path::new("/tmp/any-src.db")));
+
+        // Set ⇒ only the listed subset is eligible; others deliver but never inject.
+        let narrowed = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            allow_inject_from: Some(vec!["/tmp/trusted.db".to_string()]),
+            ..Config::default()
+        };
+        assert!(narrowed.inject_allowed_from(std::path::Path::new("/tmp/trusted.db")));
+        assert!(
+            !narrowed.inject_allowed_from(std::path::Path::new("/tmp/other.db")),
+            "a source not in allow_inject_from never injects"
+        );
+
+        // A blank/empty allow_inject_from list resolves to an empty set ⇒ nothing
+        // is eligible (an explicit-but-empty narrow, distinct from unset).
+        let empty = Config {
+            allow_inject_from: Some(vec![]),
+            ..Config::default()
+        };
+        assert!(!empty.inject_allowed_from(std::path::Path::new("/tmp/any.db")));
     }
 }

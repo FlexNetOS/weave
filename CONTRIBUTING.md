@@ -34,6 +34,14 @@ cargo build --no-default-features --features libsql
 cargo clippy --no-default-features --features libsql -- -D warnings
 ```
 
+If you touch the optional `sign` backend (signed cross-store identity), build and
+test that feature on **both** backends too — it composes with each:
+
+```bash
+cargo test --features sign
+cargo test --no-default-features --features "libsql sign"
+```
+
 A change is ready when the default build is clean, clippy is warning-free, the
 formatter reports no diff, and all tests pass.
 
@@ -52,8 +60,12 @@ formatter reports no diff, and all tests pass.
 - **Doc comments** (`//!` module headers, `///` on public items) explain *why*,
   not just *what* — match the existing tone in `src/`.
 - **No new heavyweight dependencies** in the default build. Date/time is handled
-  without a date crate on purpose; keep it that way. Anything pulling tokio or a
-  large tree belongs behind a feature flag (as libSQL is).
+  without a date crate on purpose; keep it that way. Anything pulling a new
+  dependency belongs behind a feature flag so the default static binary stays
+  dependency-light — `libsql` (tokio) and `sign` (`ed25519-dalek`/`getrandom`) are
+  the precedents: each crate is `optional` and gated, so a default `cargo tree`
+  shows neither. New optional deps should follow the same pattern (and, where it
+  matters, a test asserting absence from the default shippable graph).
 - Prefer pure, unit-testable functions (like `commands_for`) over functions that
   both compute and perform I/O.
 

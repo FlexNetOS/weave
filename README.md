@@ -57,6 +57,11 @@ weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
+
+# Cross-store delivery (Tier-2): deposit a message for a recipient in another store
+weave send --from desktop --to envctl --to-store /path/to/other/messages.db --body "ship it"
+weave outbox                         # inspect pending cross-store intents you queued (--json)
+weave pull --me envctl               # pull + commit intents from your pull_from sources now
 ```
 
 Identity resolution: `--from/--me/--name` > `$WEAVE_SESSION` > basename of cwd.
@@ -76,11 +81,19 @@ peers that can't be probed locally.
 
 ## MCP tools
 
-`weave_send` · `weave_inbox` · `weave_history` · `weave_sessions` · `weave_clear` · `weave_peers`
+`weave_send` · `weave_outbox` · `weave_inbox` · `weave_history` · `weave_sessions` · `weave_clear`
+· `weave_peers` · `weave_reply` · `weave_thread` · `weave_receipts` · `weave_doctor` · `weave_whoami`
 · `weave_attach` · `weave_connect`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
+
+**Cross-store (Tier-2).** Pass `to_store` (a path to another store) to `weave_send` to queue
+the message as a directed intent in **your own** outbox — the recipient pulls and commits it
+into its inbox on its next drain (no foreign write; broadcast is refused with a cross-store
+target). `weave_outbox` is a read-only self-inspection of intents you have queued that have
+not yet been pulled. On the receiving side, a `weave_inbox` drain with `WEAVE_PULL_FROM`
+configured pulls and commits eligible intents in the same call.
 
 `weave_attach` adopts the calling session into the store without a restart (re-captures the
 current pane and upserts the caller's own peer row only). `weave_connect` reports the same
@@ -109,16 +122,82 @@ backends are mutually exclusive (each bundles SQLite); the default build uses sq
 
 `weave peers` / `weave sessions` can aggregate peers and sessions from **other
 projects' stores** read-only. Point `WEAVE_PEER_DBS` at a comma- (or path-)
-separated list of extra DB files (or set `peer_dbs = [...]` under `[federation]`
-in `config.toml`); foreign rows are origin-tagged (` (via <store>)` in text, plus
-`origin`/`foreign` fields in `--json`) and deduped on `(name, host)`. Foreign
-stores are opened with `SQLITE_OPEN_READ_ONLY` and are **never written**; an
-unreadable store is skipped (note on stderr), not fatal. Default (unset) behavior
-is unchanged — the listings are byte-identical to a single-store run.
+separated list of extra DB files (or set `peer_dbs = [...]` in `config.toml`);
+foreign rows are origin-tagged (` (via <store>)` in text, plus `origin`/`foreign`
+fields in `--json`) and deduped on `(name, host)`. Foreign stores are opened with
+`SQLITE_OPEN_READ_ONLY` and are **never written**; an unreadable store is skipped
+(note on stderr), not fatal. Default (unset) behavior is unchanged — the listings
+are byte-identical to a single-store run.
 
-For agents that want to *message* each other rather than just see each other,
-share a single `WEAVE_DB` (one mailbox). **Cross-store *write* / send (Tier-2) is
-planned but not yet shipped** — federation today is read-only aggregation only.
+`peer_dbs` is read-only *visibility* only; it can never deliver a message into your
+inbox. To accept cross-store *delivery* you grant the strictly-higher `pull_from`
+trust (below).
+
+### Cross-store delivery (Tier-2)
+
+Agents in **different stores** can message each other without sharing one
+`WEAVE_DB`. The model is **owner-only-writes**: a sender never writes the
+recipient's store.
+
+- **Send** queues a directed *intent* in the **sender's own** outbox
+  (`weave send --to-store <recipient-store> --to <name>`). The recipient's store is
+  not touched. Inspect pending intents with `weave outbox`.
+- **Receive** by listing the sender's store as a delivery source —
+  `WEAVE_PULL_FROM=/path/to/sender/messages.db` (comma- or path-separated), or
+  `pull_from = [...]` in `config.toml`. On each drain (hook/`weave watch`) or an
+  explicit `weave pull`, weave opens each allowed source **read-only**, commits the
+  intents addressed to you into **your own** inbox (your store assigns the id and
+  timestamp), and advances a per-source cursor. `pull_from` is **distinct** from
+  `peer_dbs` (delivery vs. visibility) and capped at 16 sources.
+- **Delivery is next-drain** (pull-latency-bound), not instant, and **idempotent**:
+  a normal re-drain never duplicates. The single edge case is a crash *between*
+  committing a message and advancing the cursor, which re-delivers **at most one**
+  intent on the next drain (a bounded at-least-once guarantee).
+
+#### Live nudge on a pulled message — DEFAULT ON (consent)
+
+When a pull commits a message from an allow-listed source, weave **also fires a
+content-free, paste-safe nudge** ("check your inbox") into **your own** pane by
+default. The message body is never in the keystroke, only ever your own pane is
+touched (never a foreign pane), and the sender can never inject.
+
+**Residual risk:** with this default on, **any peer you add to `pull_from` can, by
+default, type a capped nudge into your live pane.** Accepting cross-store delivery
+from a source therefore also grants it a live-pane ping. To narrow or disable it:
+
+- `WEAVE_INJECT_PULLED=false` (or `inject_pulled = false`) — pure queue-only: the
+  message still arrives in your inbox on the next drain; only the live nudge is
+  suppressed.
+- `WEAVE_ALLOW_INJECT_FROM=...` (or `allow_inject_from = [...]`) — restrict the
+  nudge to a trusted subset of your pull sources; other sources still deliver to
+  your inbox, just without a keystroke.
+
+### Signed sender identity (optional `sign` feature)
+
+The **default build is crypto-free** — no `ed25519-dalek` in its dependency tree.
+Cross-store `from` attribution is advisory unless you opt into signed identity by
+building with the `sign` feature:
+
+```bash
+cargo build --release --features sign         # composes with libsql too: --features "libsql sign"
+```
+
+A `--features sign` build adds the `weave key` subcommand and verifies signatures
+on pull/commit using Ed25519 over the canonical `(from, to, body)`:
+
+```bash
+weave key gen --me desktop          # generate a keypair; private key stored 0600, public key registered + printed
+weave key show --me desktop         # print this session's public key (never the private key)
+weave key add envctl <hex-pubkey>   # register a peer's public key so their signed intents verify
+weave key list                      # list registered (identity, public key) pairs (--json)
+```
+
+The private key lives at `~/.config/weave/ed25519.key` (mode `0600`) and is never
+logged or printed. A signed intent makes the cross-store `from` **unforgeable**; a
+**tampered or spoofed signature is always rejected** regardless of mode. An unsigned
+intent (or one with no registered key to check) falls back to the advisory model and
+still commits — unless you set `WEAVE_STRICT_VERIFY=1` (or `strict_verify = true`),
+which **drops** unsigned/unverifiable intents instead of committing them.
 
 ## Status
 

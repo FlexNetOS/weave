@@ -31,6 +31,14 @@ sqlite = ["dep:rusqlite"]
 # The async libsql client is driven from sync code via an embedded current-thread
 # tokio runtime, so the `libsql` feature pulls in both the libsql client and tokio.
 libsql = ["dep:libsql", "dep:tokio"]
+# OPTIONAL signed sender identity (Tier-2 phase 2d). Mirrors the `libsql` optional
+# pattern: the crypto crate is `optional`, so the DEFAULT build pulls in NOTHING
+# extra — `cargo tree` on the default build never shows `ed25519-dalek`. Only a
+# `--features sign` build links the signer/verifier. Composes with BOTH backends
+# (`sqlite sign` and `libsql sign`). `getrandom` is pulled only here, to seed key
+# GENERATION (verification needs no RNG); it is a tiny, std-backed crate already in
+# the dependency universe, so it adds no heavyweight tree.
+sign = ["dep:ed25519-dalek", "dep:getrandom"]
 
 [profile.release]
 strip = true
@@ -44,6 +52,15 @@ clap = { version = "4.6.1", features = ["derive"] }
 # clap's `Command`, so they live as regular deps alongside clap.
 clap_complete = "4.6.1"
 clap_mangen = "0.2.31"
+# Signed sender identity (Tier-2 phase 2d) — OPTIONAL, gated behind the `sign`
+# feature so the default static binary gains nothing. Ed25519 is the standard for
+# compact, deterministic signatures over a short canonical message; dalek v2 is the
+# most widely-audited pure-Rust impl and decouples the RNG so VERIFICATION needs no
+# RNG at all. Key GENERATION fills 32 secret bytes from the OS CSPRNG via
+# `getrandom` (a tiny, std-backed crate) and constructs the key with
+# `SigningKey::from_bytes`, so we avoid coupling to dalek's `rand_core` version.
+ed25519-dalek = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
 libsql = { version = "0.9.30", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }

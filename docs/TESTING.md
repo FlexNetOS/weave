@@ -54,7 +54,18 @@ fastest layer and carry most of the injector and store coverage.
   creates a missing file), `federated_peers` unions local + foreign and isolates a
   bad store, plus the pure `merge_peer_views` / `merge_session_views`
   dedup/tie-break (these live in `store::federation_tests`, which is **not**
-  feature-gated, so they run under both backends). Because the store-internals
+  feature-gated, so they run under both backends). The Tier-2 store layer is
+  covered here too: `enqueue_intent` + `list_outbox` roundtrip and cap enforcement;
+  `pull_cursor` default/roundtrip; `pull_from_store` commits once and leaves the
+  source **byte-unchanged** (owner-only-writes) and is idempotent on re-pull; the
+  per-source cursor is duplicate-free on a clean re-drain and bounded to **exactly
+  one** intent across a simulated crash-before-advance; a misaddressed / bad-source
+  intent is skipped without wedging the source; a legacy (pre-Tier-2) DB gains the
+  `outbox` / `pull_cursor` / `keys` tables on open. The signed-identity store layer
+  (gated `#[cfg(feature = "sign")]`) covers the `keys` register/get/list roundtrip
+  and `signed_pull_verifies_commits_and_rejects_forgery` (valid signature commits;
+  a forged signature is **always** rejected; an unsigned intent commits advisory but
+  is dropped under `strict_verify`). Because the store-internals
   tests touch backend internals (`s.conn.execute`, the concrete `SqliteStore`),
   that module is gated to the `sqlite` feature — see the dual-backend note below
   for how the *same* behaviors (including the mirrored `register_peer_full`,
@@ -87,11 +98,25 @@ fastest layer and carry most of the injector and store coverage.
 
 - **`src/config.rs`** — the `config.toml` scaffold parses as valid (all-default)
   TOML, documents every nudge placeholder, and mentions every real config field
-  (including the federation `peer_dbs` key) so a newly-added field can't be left
-  undocumented. `peer_db_paths()` is unit-tested for parse (comma / path-list
+  (including the federation `peer_dbs` and the Tier-2 `pull_from` / `inject_pulled`
+  / `allow_inject_from` / `strict_verify` keys) so a newly-added field can't be
+  left undocumented. `peer_db_paths()` is unit-tested for parse (comma / path-list
   separator), NUL-entry rejection, dropping the local `db_path()` (no
   self-federation), order-preserving dedup, and the `MAX_PEER_DBS` (16) cap; the
   default (no env, no key) resolves to an empty list (identical-to-today).
+  `pull_from_paths()` mirrors that discipline against the **distinct** `pull_from`
+  list (a `peer_dbs`-only store is **not** a delivery source) capped at
+  `MAX_PULL_FROM` (16); `inject_pulled()` defaults **on** and honors the toggle;
+  `strict_verify()` defaults **off** and honors the toggle; `inject_allowed_from()`
+  gates to the configured subset (unset ⇒ every pull source eligible; explicit-empty
+  ⇒ none).
+
+- **`src/sign.rs`** (gated `#[cfg(feature = "sign")]`) — the optional Ed25519
+  module: sign↔verify round-trip + tamper detection, wrong-key rejection,
+  malformed-input-is-`false`-not-error, canonical-encoding unambiguity/stability
+  (length-prefixed, so `("ab","c")` ≠ `("a","bc")`), the hex codec, `check_pubkey`
+  bounds, and a **proptest** property (any `(from, to, body)` verifies; any
+  single-field mutation fails). These compile out of the default/libsql builds.
 
 - **`src/setup.rs`** — `is_weave_command` matches only real installed
   `weave hook <event>` lines (and absolute-path forms) while rejecting
@@ -163,6 +188,35 @@ Coverage:
   tag; a bad / non-weave extra path is skipped (exit 0, local peer still listed,
   skip note on **stderr only**).
 
+- **Cross-store delivery (Tier-2).** Two temp stores driven by the real binary:
+  `send --to-store` writes an intent into the sender's `outbox` (`outbox --json`)
+  while the sender's inbox stays empty; the receiver with `WEAVE_PULL_FROM` set
+  `pull`s it into its own inbox with a receiver-assigned id and the sender's `from`
+  attribution; a second pull commits **0** (idempotent). Dedup is keyed on the
+  intent **id, not content** (two same-body intents both deliver); an unlisted
+  source delivers nothing; a misaddressed intent (`to` ≠ me) is not committed; a
+  missing / junk source is skipped while a good source still delivers; a plain local
+  `send` writes **no** outbox row; a cross-store broadcast is rejected. The MCP
+  surface mirrors this: `weave_send` with `to_store` returns `isError:false`
+  "Queued intent" and `weave_outbox` lists it (broadcast ⇒ `isError`); a
+  `weave_inbox` drain with `WEAVE_PULL_FROM` pulls cross-store messages in the same
+  call.
+
+- **Consent injection on a pulled message (Tier-2, fake mux).** Default-on fires
+  the content-free nudge into the receiver's **own** pane (the body never appears in
+  the recorded `send-keys` argv); `WEAVE_INJECT_PULLED=false` ⇒ pure queue-only (no
+  `send-keys`, message still delivered); `allow_inject_from` narrows so a pull source
+  not in the subset delivers but never keystrokes; a `mux=none` receiver falls open
+  to queue-only; an inject failure is non-fatal to delivery; the MCP `weave_inbox`
+  drain nudges by default under the fake mux.
+
+- **Signed cross-store identity (Tier-2, `#[cfg(feature = "sign")]`).** Driving the
+  built `--features sign` binary with per-actor `XDG_CONFIG_HOME` temp dirs and
+  on-disk key files: `weave key gen` (sender) → `weave key add` (register the
+  sender's pubkey on the receiver) → signed `send --to-store` → `pull` commits with
+  verified `sender` attribution even under `WEAVE_STRICT_VERIFY=1`; `weave key gen`
+  never prints the private key.
+
 ## 3. Security tests (`tests/security.rs`)
 
 Same black-box harness, focused on the properties that make weave safe to run
@@ -205,6 +259,28 @@ between semi-trusted agent sessions:
   An oversized `WEAVE_PEER_DBS` (1000 entries) does not fan out 1000 opens (the
   `MAX_PEER_DBS` cap holds), and a traversal-style junk path is opened read-only /
   fails to open and is **never created**.
+
+- **Pull never writes the source store (Tier-2 owner-only-writes).** While the
+  receiver actively pulls + commits (twice), the source's **main DB is
+  byte-identical** (sha256), the WAL is empty/absent, and no rollback journal is
+  created — the structural read-only guarantee, proven on **both** backends. A
+  non-allow-listed source delivers nothing; an over-`MAX_BODY` body and an oversized
+  recipient are rejected **at enqueue** (nothing in the outbox); a hostile
+  1000-entry `WEAVE_PULL_FROM` is capped at `MAX_PULL_FROM` (16); a cross-store
+  broadcast is refused for all four aliases.
+
+- **Consent inject is hard-gated (Tier-2, fake mux).** Even with
+  `WEAVE_INJECT_PULLED=true` (most permissive), a source on `pull_from` but **not**
+  inject-listed records **no** `send-keys` while the trusted source does — proving
+  the gate, not a broken harness, is the only difference. The committed message
+  **body never appears** in any injected argv (paste-safe, content-free).
+
+- **Signed identity tamper / spoof / strict (Tier-2, `#[cfg(feature = "sign")]`).**
+  A present-but-invalid signature is **always rejected** (`pulled 0`, inbox empty,
+  source byte-unchanged) in both strict and non-strict modes; an intent claiming a
+  `from` it was not signed for (spoof) is rejected against the real registered key;
+  an unsigned intent is **dropped** under `WEAVE_STRICT_VERIFY=1` and **commits**
+  advisory when off; the private key file is `0600` and the secret is never printed.
 
 ## 4. Property-based tests (`tests/prop.rs`)
 
@@ -285,6 +361,20 @@ cargo test --all-targets
 
 # libSQL backend — a separate binary build
 cargo test --no-default-features --features libsql
+```
+
+The optional **`sign`** feature (Tier-2 signed identity) composes with both
+backends, so the gated `sign` tests add two more columns. The crypto-gated unit /
+integration / security tests compile **out** of the default and libSQL columns
+(integration / security counts grow only when `sign` is enabled), and a headline
+drift check confirms `ed25519-dalek` is absent from the **shippable** build graph
+(`cargo tree --edges normal`) of both the default and libSQL builds — the crypto
+crate appears only under `--features sign`:
+
+```bash
+# signed-identity feature, on each backend
+cargo test --features sign
+cargo test --no-default-features --features "libsql sign"
 ```
 
 The integration, security, and property suites are backend-agnostic *by
@@ -371,6 +461,11 @@ done:
    `--no-default-features --features libsql` as well as the default, and make
    sure clippy passes for the libSQL build (CI gates both). If you add a column,
    add the additive migration and a roundtrip test.
+   - **Behind an optional feature (e.g. `sign`) → gate the test too** with
+     `#[cfg(feature = "...")]` so the default build stays clean, and run the
+     feature column on **both** backends (`--features sign`,
+     `--no-default-features --features "libsql sign"`). For a new dependency, add a
+     drift check that it is absent from the default shippable graph.
 9. **Performance-sensitive path → consider a criterion bench** so regressions are
    visible.
 10. **Before pushing**, the full gate is: `cargo fmt --all --check`,
