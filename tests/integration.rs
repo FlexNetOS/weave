@@ -1272,3 +1272,1188 @@ fn mcp_peers_and_sessions_reflect_federation() {
     mcp.shutdown();
     let _ = std::fs::remove_file(&bad);
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 cross-store delivery (2a outbox + authorized send, 2b pull/commit/dedup)
+//
+// Two temp stores A (sender) and B (receiver). A `weave send --to-store <B>`
+// deposits an Intent into A's OWN outbox; B with `WEAVE_PULL_FROM=<A>` pulls and
+// commits it into B's inbox. Owner-only-writes, allowlist, idempotency, failure
+// isolation and the local-send regression are exercised black-box through the
+// compiled binary.
+// ---------------------------------------------------------------------------
+
+/// A cross-store `send --to-store` writes an Intent into the SENDER's outbox and
+/// creates NO inbox row in the sender; `weave outbox` lists the pending intent.
+/// With `WEAVE_PULL_FROM=<A>` the receiver pulls it into its own inbox with a
+/// receiver-assigned id/ts and the sender's `from` attribution. A second pull is
+/// idempotent (no duplicate). The original local store stays untouched as a row.
+#[test]
+fn tier2_cross_store_send_outbox_pull_and_idempotency() {
+    let a = TestDb::new(); // sender store
+    let b = TestDb::new(); // receiver store
+
+    // A enqueues a directed cross-store intent for "bob" living in store B.
+    let sent = run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "hi",
+            "--body",
+            "hello from another store",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    assert!(
+        sent.contains("queued intent"),
+        "cross-store send reports a queued intent, got: {sent}"
+    );
+
+    // The intent lives in A's OUTBOX, not A's inbox.
+    let a_outbox = run_ok(&a, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&a_outbox).expect("outbox --json parses");
+    assert_eq!(
+        ov["outbox"].as_array().map(|x| x.len()),
+        Some(1),
+        "exactly one pending intent in A's outbox: {a_outbox}"
+    );
+    assert_eq!(ov["outbox"][0]["to"], "bob");
+    assert_eq!(ov["outbox"][0]["from"], "alice");
+    assert_eq!(ov["outbox"][0]["body"], "hello from another store");
+
+    // A's own inbox (for bob) has NOTHING: the sender never wrote a local row.
+    let a_inbox = run_ok(&a, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let aiv: serde_json::Value = serde_json::from_str(&a_inbox).expect("inbox --json parses");
+    assert_eq!(
+        aiv["messages"].as_array().map(|x| x.len()),
+        Some(0),
+        "cross-store send must NOT create a local inbox row in the sender: {a_inbox}"
+    );
+
+    // B pulls from A (allow-listed via WEAVE_PULL_FROM). The message appears in
+    // B's inbox, attributed to A's `from`.
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(
+        pull.contains("pulled 1 message"),
+        "first pull commits exactly one message: {pull}"
+    );
+
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox --json parses");
+    assert_eq!(
+        biv["messages"].as_array().map(|x| x.len()),
+        Some(1),
+        "B's inbox has exactly one delivered message: {b_inbox}"
+    );
+    assert_eq!(biv["messages"][0]["sender"], "alice", "from-attribution");
+    assert_eq!(biv["messages"][0]["body"], "hello from another store");
+    // The receiver assigns its own id (>0) at commit time (anchored to B).
+    assert!(
+        biv["messages"][0]["id"].as_i64().unwrap_or(0) > 0,
+        "B assigns its own local id"
+    );
+
+    // IDEMPOTENCY: a second pull with no new intents delivers nothing new.
+    let pull2 = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(
+        pull2.contains("pulled 0 message"),
+        "re-pull with no new intents commits nothing: {pull2}"
+    );
+    let b_inbox2 = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv2: serde_json::Value = serde_json::from_str(&b_inbox2).expect("inbox --json parses");
+    assert_eq!(
+        biv2["messages"].as_array().map(|x| x.len()),
+        Some(1),
+        "re-pull must NOT duplicate the delivered message: {b_inbox2}"
+    );
+}
+
+/// Two intents with the SAME content but different outbox ids both deliver (the
+/// dedup key is the source outbox id, not the content). A newly-enqueued intent
+/// after a pull is delivered on the next pull (the high-water cursor only blocks
+/// already-committed ids, never future ones).
+#[test]
+fn tier2_dedup_keyed_on_intent_id_not_content() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    // Two identical-content intents (distinct outbox ids).
+    for _ in 0..2 {
+        run_ok(
+            &a,
+            &[
+                "send",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--body",
+                "same body",
+                "--to-store",
+                &b.path_str(),
+            ],
+        );
+    }
+
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(
+        pull.contains("pulled 2 message"),
+        "two same-content distinct-id intents both deliver: {pull}"
+    );
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(
+        v["messages"].as_array().map(|x| x.len()),
+        Some(2),
+        "both identical-content messages land in B's inbox: {inbox}"
+    );
+
+    // Enqueue a THIRD intent after the first pull; the next pull delivers only it.
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "later message",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    let pull2 = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(
+        pull2.contains("pulled 1 message"),
+        "only the new intent is delivered on the next pull: {pull2}"
+    );
+}
+
+/// Allowlist: a source NOT in the receiver's `pull_from` is never opened, so it
+/// cannot deliver. With no `WEAVE_PULL_FROM`, a pull commits nothing.
+#[test]
+fn tier2_unlisted_source_never_delivers() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "should not arrive",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // No WEAVE_PULL_FROM at all => A is not allow-listed => nothing delivered.
+    let pull = run_ok(&b, &["pull", "--me", "bob"]);
+    assert!(
+        pull.contains("pulled 0 message") && pull.contains("from 0 source"),
+        "with no pull_from configured, nothing is pulled: {pull}"
+    );
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(
+        v["messages"].as_array().map(|x| x.len()),
+        Some(0),
+        "an unlisted source never delivers into B's inbox: {inbox}"
+    );
+}
+
+/// An intent addressed to someone OTHER than the puller is never committed even
+/// when the source IS allow-listed (commit additionally requires `to == me`).
+#[test]
+fn tier2_misaddressed_intent_not_committed() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    // Addressed to carol, but bob pulls.
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "carol",
+            "--body",
+            "not for bob",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(
+        pull.contains("pulled 0 message"),
+        "an intent addressed to carol is not committed to bob: {pull}"
+    );
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"].as_array().map(|x| x.len()), Some(0));
+}
+
+/// Failure isolation: an unreadable/nonexistent/junk pull source is skipped and
+/// the good source still delivers; the pull exits 0.
+#[test]
+fn tier2_bad_source_is_skipped_good_source_delivers() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "delivered despite a bad sibling source",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // A junk (non-weave) file source.
+    let junk = std::env::temp_dir().join(format!("weave-junk-{}.db", std::process::id()));
+    std::fs::write(&junk, b"this is not a sqlite database at all").unwrap();
+    let missing = std::env::temp_dir().join(format!("weave-missing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
+
+    let list = format!("{},{},{}", missing.display(), junk.display(), a.path_str());
+    let (ok, out, _err) = run_env(&b, &["pull", "--me", "bob"], &[("WEAVE_PULL_FROM", &list)]);
+    assert!(ok, "pull exits 0 even with bad sources: {out}");
+    assert!(
+        out.contains("pulled 1 message"),
+        "the good source still delivers: {out}"
+    );
+    assert!(
+        out.contains("skipped"),
+        "bad sources reported as skipped: {out}"
+    );
+
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"].as_array().map(|x| x.len()), Some(1));
+
+    let _ = std::fs::remove_file(&junk);
+}
+
+/// Local regression: a purely-local `weave send` (no `--to-store`) is unchanged —
+/// a direct inbox row, and NOTHING in the outbox.
+#[test]
+fn tier2_local_send_unchanged_no_outbox() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "b", "--body", "local hi"],
+    );
+    assert!(
+        out.contains("sent #") && !out.contains("queued intent"),
+        "a local send is a direct send, not an intent: {out}"
+    );
+    // Inbox has the row.
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"][0]["body"], "local hi");
+    // Outbox is empty (no cross-store intent was created).
+    let outbox = run_ok(&db, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&outbox).expect("outbox parses");
+    assert_eq!(
+        ov["outbox"].as_array().map(|x| x.len()),
+        Some(0),
+        "a local send creates NO outbox intent: {outbox}"
+    );
+}
+
+/// Cross-store broadcast is rejected at the routing seam (Tier-2 is directed-only).
+#[test]
+fn tier2_cross_store_broadcast_rejected() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let (ok, _out, err) = run(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "all",
+            "--body",
+            "broadcast attempt",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    assert!(
+        !ok,
+        "cross-store broadcast must be rejected (non-zero exit)"
+    );
+    assert!(
+        err.contains("broadcast"),
+        "rejection mentions broadcast: {err}"
+    );
+    // Nothing queued.
+    let outbox = run_ok(&a, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&outbox).expect("outbox parses");
+    assert_eq!(ov["outbox"].as_array().map(|x| x.len()), Some(0));
+}
+
+/// Tier-2 phase 2c, DEFAULT-ON consent nudge: when B pulls an allow-listed
+/// cross-store message, B ALSO fires the paste-safe CONTENT-FREE nudge into B's
+/// OWN registered pane — by default, with no `inject_pulled` set. The fake tmux
+/// records a `send-keys` of the fixed ping (never the body). The toggle-off case
+/// (`WEAVE_INJECT_PULLED=false`) is pure queue-only: the message still delivers
+/// but NO keystroke is recorded.
+#[test]
+fn tier2_pulled_message_nudges_own_pane_by_default() {
+    let a = TestDb::new(); // sender store
+    let b = TestDb::new(); // receiver store
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    // A enqueues a directed cross-store intent for "bob" in store B.
+    let sent = run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "secret payload",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    assert!(sent.contains("queued intent"), "intent queued: {sent}");
+
+    // B registers its OWN session "bob" as an injectable tmux pane %3.
+    let reg = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[("TMUX_PANE", "%3")],
+        &["register", "--name", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    // B pulls from A (allow-listed). DEFAULT-ON consent ⇒ a nudge is fired into
+    // B's own pane %3 via the fake tmux. No WEAVE_INJECT_PULLED set ⇒ default true.
+    let pull = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull");
+    assert!(
+        pull.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull.stdout).contains("pulled 1 message"),
+        "pull commits the one message: {}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+
+    let logged = read_log_with_retries(&log);
+    // The consent nudge fired into B's own pane %3 ...
+    assert!(
+        logged.contains("send-keys") && logged.contains("-t %3"),
+        "default-on consent nudge should send-keys to B's own pane %3:\n{logged}"
+    );
+    // ... and it is the CONTENT-FREE ping, NOT the message body.
+    assert!(
+        logged.contains("check your inbox"),
+        "the nudge is the content-free ping:\n{logged}"
+    );
+    assert!(
+        !logged.contains("secret payload"),
+        "the message body must NEVER appear in the keystrokes:\n{logged}"
+    );
+
+    // The message was still delivered into B's inbox (delivery is independent of
+    // the nudge).
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox parses");
+    assert_eq!(biv["messages"].as_array().map(|x| x.len()), Some(1));
+}
+
+/// Tier-2 phase 2c, the single OFF-SWITCH: `WEAVE_INJECT_PULLED=false` ⇒ a pulled
+/// message is committed (delivered to the inbox) but NO nudge is fired (pure
+/// queue-only). The fake tmux records no `send-keys`.
+#[test]
+fn tier2_inject_pulled_false_is_queue_only() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "queue only please",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    let reg = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[("TMUX_PANE", "%4")],
+        &["register", "--name", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(reg.status.success(), "register failed");
+
+    // Pull with the consent master toggle OFF.
+    let pull = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[
+            ("WEAVE_PULL_FROM", &a.path_str()),
+            ("WEAVE_INJECT_PULLED", "false"),
+        ],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull");
+    assert!(
+        pull.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull.stdout).contains("pulled 1 message"),
+        "the message is still delivered: {}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+
+    // Give any (erroneous) async inject a moment; then assert the log has NO
+    // send-keys. A `has-session`/other probe may appear, but never a send-keys.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("send-keys"),
+        "inject_pulled=false must be pure queue-only (no keystroke):\n{logged}"
+    );
+
+    // Delivery still happened.
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox parses");
+    assert_eq!(biv["messages"].as_array().map(|x| x.len()), Some(1));
+}
+
+/// Tier-2 phase 2c, ALLOWLIST NARROWING: with `allow_inject_from` set to a subset
+/// of `pull_from`, a pulled message from a source that IS on `pull_from` but NOT in
+/// `allow_inject_from` is delivered to the inbox yet NEVER triggers a keystroke;
+/// a source that IS in the subset does inject. Proves the per-source inject gate is
+/// honored caller-side, independent of (and after) the master toggle.
+#[test]
+fn tier2_allow_inject_from_narrows_to_subset() {
+    let trusted = TestDb::new(); // on pull_from AND allow_inject_from -> injects
+    let untrusted = TestDb::new(); // on pull_from but NOT allow_inject_from -> no nudge
+    let b = TestDb::new(); // receiver
+
+    // Each source enqueues a distinct directed intent for "bob" in store B.
+    run_ok(
+        &untrusted,
+        &[
+            "send",
+            "--from",
+            "mallory",
+            "--to",
+            "bob",
+            "--body",
+            "untrusted body",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    run_ok(
+        &trusted,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "trusted body",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // ---- Case 1: pull ONLY the untrusted source (on pull_from, NOT allow set) ----
+    let log_u = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log_u);
+    let fake_u = make_fake_tmux(&log_u);
+    let reg = weave_with_fake_path(
+        &b,
+        &fake_u,
+        &[("TMUX_PANE", "%5")],
+        &["register", "--name", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    let pull_u = weave_with_fake_path(
+        &b,
+        &fake_u,
+        &[
+            ("WEAVE_PULL_FROM", &untrusted.path_str()),
+            // allow_inject_from narrows to ONLY the trusted store, so untrusted
+            // delivers but is never inject-eligible.
+            ("WEAVE_ALLOW_INJECT_FROM", &trusted.path_str()),
+        ],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull (untrusted)");
+    assert!(
+        pull_u.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&pull_u.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull_u.stdout).contains("pulled 1 message"),
+        "untrusted source still DELIVERS: {}",
+        String::from_utf8_lossy(&pull_u.stdout)
+    );
+    // Give any (erroneous) inject a moment, then assert NO keystroke for untrusted.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let logged_u = std::fs::read_to_string(&log_u).unwrap_or_default();
+    assert!(
+        !logged_u.contains("send-keys"),
+        "a source NOT in allow_inject_from must never inject:\n{logged_u}"
+    );
+
+    // ---- Case 2: pull the trusted source (on pull_from AND allow set) ----
+    let log_t = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log_t);
+    let fake_t = make_fake_tmux(&log_t);
+    let pull_t = weave_with_fake_path(
+        &b,
+        &fake_t,
+        &[
+            ("WEAVE_PULL_FROM", &trusted.path_str()),
+            ("WEAVE_ALLOW_INJECT_FROM", &trusted.path_str()),
+        ],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull (trusted)");
+    assert!(
+        pull_t.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&pull_t.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull_t.stdout).contains("pulled 1 message"),
+        "trusted source delivers: {}",
+        String::from_utf8_lossy(&pull_t.stdout)
+    );
+    let logged_t = read_log_with_retries(&log_t);
+    assert!(
+        logged_t.contains("send-keys") && logged_t.contains("-t %5"),
+        "a source in allow_inject_from DOES inject into B's own pane %5:\n{logged_t}"
+    );
+    assert!(
+        logged_t.contains("check your inbox") && !logged_t.contains("trusted body"),
+        "the inject is the content-free ping, never the body:\n{logged_t}"
+    );
+
+    // Both messages landed in B's inbox regardless of the inject gate.
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox parses");
+    assert_eq!(
+        biv["messages"].as_array().map(|x| x.len()),
+        Some(2),
+        "both messages delivered (gate only suppresses the nudge): {b_inbox}"
+    );
+}
+
+/// Tier-2 phase 2c, NON-INJECTABLE FALL-OPEN: a receiver whose own pane is `mux=none`
+/// (no registered injectable pane) delivers a pulled allow-listed message with no
+/// error and no injection — graceful degradation to queue-only. With `inject_pulled`
+/// default-on, the nudge path must still fail open silently.
+#[test]
+fn tier2_non_injectable_receiver_falls_open_to_queue_only() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "no pane here",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // Register B's session "bob" with NO mux pane (no TMUX_PANE, fake mux on PATH
+    // does not matter — without a pane env weave records mux=none).
+    let reg = weave_with_fake_path(&b, &fake_dir, &[], &["register", "--name", "bob"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    // Pull with default-on consent. The receiver has no injectable pane, so the
+    // nudge must fall open to queue-only with no error.
+    let pull = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull");
+    assert!(
+        pull.status.success(),
+        "a non-injectable receiver must still pull cleanly (exit 0): {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull.stdout).contains("pulled 1 message"),
+        "the message is delivered even without an injectable pane: {}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+
+    // No keystroke was attempted (mux=none ⇒ not injectable ⇒ no send-keys).
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("send-keys"),
+        "a mux=none receiver must never produce a keystroke:\n{logged}"
+    );
+
+    // Delivery still happened.
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox parses");
+    assert_eq!(biv["messages"].as_array().map(|x| x.len()), Some(1));
+}
+
+/// Tier-2 phase 2c, MCP DRAIN parity: the MCP `weave_inbox` drain ALSO fires the
+/// default-on consent nudge for a pulled allow-listed message — identical behavior
+/// to the CLI `weave pull` drain. The fake tmux records the content-free ping into
+/// B's own pane; the body never appears in the keystrokes.
+#[test]
+fn tier2_mcp_inbox_drain_nudges_own_pane_by_default() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "mcp secret body",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // Register B's pane %6 via the CLI under the fake mux (the MCP server itself
+    // does not auto-register).
+    let reg = weave_with_fake_path(
+        &b,
+        &fake_dir,
+        &[("TMUX_PANE", "%6")],
+        &["register", "--name", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    // Spawn the MCP server with the fake mux on PATH + WEAVE_MUX_DIR and the pull
+    // source. A `weave_inbox` call triggers the same default-on nudge as the CLI.
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_dir.display(), orig_path);
+    let fake_dir_str = fake_dir.display().to_string();
+    let mut mcp = McpServer::spawn_env(
+        &b,
+        &[
+            ("PATH", new_path.as_str()),
+            ("WEAVE_MUX_DIR", fake_dir_str.as_str()),
+            ("WEAVE_PULL_FROM", &a.path_str()),
+        ],
+    );
+
+    let (err, text) = mcp.call_tool("weave_inbox", serde_json::json!({ "me": "bob" }));
+    assert!(!err, "weave_inbox drain must not error: {text}");
+    assert!(
+        text.contains("mcp secret body"),
+        "the pulled message is delivered in the same drain: {text}"
+    );
+    mcp.shutdown();
+
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("send-keys") && logged.contains("-t %6"),
+        "the MCP drain fires the default-on nudge into B's own pane %6:\n{logged}"
+    );
+    assert!(
+        logged.contains("check your inbox"),
+        "the MCP-drain nudge is the content-free ping:\n{logged}"
+    );
+    assert!(
+        !logged.contains("mcp secret body"),
+        "the body must NEVER reach the keystrokes on the MCP drain path:\n{logged}"
+    );
+}
+
+/// Tier-2 phase 2c, NON-FATAL inject failure: when the registered pane refers to a
+/// mux target whose live submission fails (the fake mux's `send-keys` exits non-zero),
+/// the pull/drain still succeeds and the message stays in the inbox. A failed nudge
+/// must never break delivery.
+#[test]
+fn tier2_inject_failure_is_non_fatal_to_delivery() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "delivered despite fail",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // A fake mux whose has-session/liveness probe succeeds (so the target is
+    // considered alive) but whose send-keys FAILS. We build it inline: exit 0 for
+    // everything EXCEPT send-keys, which exits 1.
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let dir = common::unique_db().with_extension("muxbin");
+    std::fs::create_dir_all(&dir).expect("create fake-mux dir");
+    let script = dir.join("tmux");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a in \"$@\"; do\n  if [ \"$a\" = send-keys ]; then exit 1; fi\ndone\nexit 0\n",
+        log.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+
+    let reg = weave_with_fake_path(
+        &b,
+        &dir,
+        &[("TMUX_PANE", "%8")],
+        &["register", "--name", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    let pull = weave_with_fake_path(
+        &b,
+        &dir,
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+        &["pull", "--me", "bob"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn pull");
+    // The inject failed, but the drain must still exit 0 and report delivery.
+    assert!(
+        pull.status.success(),
+        "a failed inject must NOT break the pull (exit 0): {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pull.stdout).contains("pulled 1 message"),
+        "the message is committed even though the nudge failed: {}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+    // Confirm the inject WAS attempted (the failing send-keys is recorded), proving
+    // we exercised the failure path rather than skipping it.
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("send-keys"),
+        "the inject was attempted (and failed): {logged}"
+    );
+
+    // The message survives in B's inbox.
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).expect("inbox parses");
+    assert_eq!(
+        biv["messages"].as_array().map(|x| x.len()),
+        Some(1),
+        "delivery is independent of the nudge outcome: {b_inbox}"
+    );
+}
+
+/// MCP `weave_send` cross-store routing: with `to_store` the tool returns a
+/// success (`isError:false`) "Queued intent" result and the intent shows up via
+/// `weave_outbox`. A broadcast cross-store send returns `isError`.
+#[test]
+fn mcp_weave_send_cross_store_routes_to_outbox() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let mut mcp = McpServer::spawn(&a);
+
+    // Cross-store send -> queued intent, not an error.
+    let (err, text) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "via mcp cross-store",
+            "to_store": b.path_str(),
+        }),
+    );
+    assert!(!err, "cross-store weave_send is not an error: {text}");
+    assert!(
+        text.contains("Queued intent"),
+        "cross-store send reports a queued intent: {text}"
+    );
+
+    // weave_outbox lists the pending intent.
+    let (oerr, otext) = mcp.call_tool("weave_outbox", serde_json::json!({}));
+    assert!(!oerr, "weave_outbox is not an error: {otext}");
+    assert!(
+        otext.contains("bob") && otext.contains("via mcp cross-store"),
+        "weave_outbox lists the queued intent: {otext}"
+    );
+
+    // Cross-store broadcast is rejected (isError).
+    let (berr, btext) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({
+            "from": "alice",
+            "to": "all",
+            "body": "no fan-out",
+            "to_store": b.path_str(),
+        }),
+    );
+    assert!(
+        berr,
+        "cross-store broadcast via weave_send must be an error: {btext}"
+    );
+    assert!(
+        btext.contains("broadcast"),
+        "error names broadcast: {btext}"
+    );
+
+    mcp.shutdown();
+}
+
+/// MCP `weave_send` cross-store failure path: a bad recipient identity (oversized)
+/// with `to_store` returns `isError` and persists nothing in the outbox.
+#[test]
+fn mcp_weave_send_cross_store_bad_recipient_is_error() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let oversized = "n".repeat(5_000);
+    let mut mcp = McpServer::spawn(&a);
+
+    let (err, text) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({
+            "from": "alice",
+            "to": oversized,
+            "body": "hi",
+            "to_store": b.path_str(),
+        }),
+    );
+    assert!(
+        err,
+        "an oversized cross-store recipient must be an isError result, not a panic: {text}"
+    );
+
+    // The bad intent was never persisted.
+    let (_oerr, otext) = mcp.call_tool("weave_outbox", serde_json::json!({}));
+    assert!(
+        otext.contains("Outbox empty"),
+        "a rejected cross-store send persists nothing: {otext}"
+    );
+
+    mcp.shutdown();
+}
+
+/// MCP inbox drain pulls cross-store intents: with `WEAVE_PULL_FROM` set, calling
+/// `weave_inbox` on the receiver opportunistically pulls + commits the intent and
+/// returns it in the same read (the pull-on-drain wiring).
+#[test]
+fn mcp_weave_inbox_pulls_cross_store_on_drain() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+
+    // A queues an intent for bob in B.
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "delivered via mcp drain",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // B's MCP server with A as a pull source; reading bob's inbox drains the pull.
+    let mut mcp = McpServer::spawn_env(&b, &[("WEAVE_PULL_FROM", &a.path_str())]);
+    let (err, text) = mcp.call_tool("weave_inbox", serde_json::json!({"me": "bob"}));
+    assert!(!err, "weave_inbox is not an error: {text}");
+    assert!(
+        text.contains("delivered via mcp drain"),
+        "the cross-store intent is pulled and shown on the inbox drain: {text}"
+    );
+    mcp.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 phase 2d — signed sender identity (only built with `--features sign`).
+//
+// These drive the REAL `--features sign` binary end-to-end through key files on
+// disk: each actor gets its own isolated `XDG_CONFIG_HOME` (so the private key
+// lands in a per-actor temp config dir, never the harness's), `weave key gen`
+// writes the keypair, the public key is registered on the receiver, and a signed
+// cross-store send is pulled and verified before commit.
+// ---------------------------------------------------------------------------
+
+/// A unique, isolated `XDG_CONFIG_HOME` dir for one signing actor. The private
+/// key file (`<dir>/weave/ed25519.key`) is created under it; nothing the real
+/// user owns is touched.
+#[cfg(feature = "sign")]
+fn unique_config_home() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!("weave-sign-cfg-{pid}-{n}-{nanos}"));
+    std::fs::create_dir_all(&d).expect("create temp config home");
+    d
+}
+
+/// Parse the `public key:  <hex>` line emitted by `weave key gen`.
+#[cfg(feature = "sign")]
+fn pubkey_from_gen(out: &str) -> String {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("public key:"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| panic!("`weave key gen` did not print a public key:\n{out}"))
+}
+
+/// Full signed cross-store flow: A `key gen`, register A's pubkey on B, A sends a
+/// SIGNED intent `--to-store B`, B pulls → the message is committed and (because
+/// the signature verified against A's registered key) attributed to A. Run with
+/// `strict_verify` ON to prove the committed message was genuinely verified, not
+/// merely advisory-accepted.
+#[cfg(feature = "sign")]
+#[test]
+fn signed_cross_store_send_is_verified_then_committed() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let a_cfg = unique_config_home();
+    let b_cfg = unique_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // A generates its signing keypair (private key 0600 under A's config dir).
+    let gen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let alice_pub = pubkey_from_gen(&gen);
+
+    // B registers alice's PUBLIC key so it can verify her signatures.
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &alice_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+
+    // A sends a SIGNED cross-store intent for bob (signed with A's key file).
+    run_ok_env(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "signed cross-store hello",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+
+    // B pulls in STRICT mode: only a cryptographically-verified intent commits.
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &a.path_str()),
+            ("WEAVE_STRICT_VERIFY", "1"),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        pull.contains("pulled 1 message"),
+        "a signature verified against the registered key commits even under strict: {pull}"
+    );
+
+    // The verified message is in B's inbox, attributed to alice.
+    let inbox = run_ok_env(
+        &b,
+        &["inbox", "--me", "bob", "--json", "--peek"],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"][0]["body"], "signed cross-store hello");
+    assert_eq!(
+        v["messages"][0]["sender"], "alice",
+        "the verified intent is attributed to the signed sender"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// `weave key gen` keeps the secret off stdout: only the PUBLIC key and the key
+/// FILE PATH are printed, never the private key bytes.
+#[cfg(feature = "sign")]
+#[test]
+fn key_gen_never_prints_the_private_key() {
+    let a = TestDb::new();
+    let a_cfg = unique_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+
+    let gen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+
+    // Read the secret hex actually written to disk, and assert it is NOT in stdout.
+    let key_file = a_cfg.join("weave").join("ed25519.key");
+    let secret = std::fs::read_to_string(&key_file).expect("key file written");
+    let secret = secret.trim();
+    assert!(!secret.is_empty(), "key file holds the secret");
+    assert!(
+        !gen.contains(secret),
+        "the private key must never appear in `weave key gen` stdout"
+    );
+    // The public key, which IS printed, must differ from the secret bytes.
+    let pubkey = pubkey_from_gen(&gen);
+    assert_ne!(pubkey, secret, "public key is not the secret");
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+}

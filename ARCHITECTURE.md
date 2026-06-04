@@ -20,8 +20,9 @@ one concern and depends only on the layers beneath it.
 
 ```
 src/
-├── model.rs         core types + helpers (no I/O)
+├── model.rs         core types + helpers (no I/O); incl. the Tier-2 Intent
 ├── config.rs        config file + env overlay
+├── sign.rs          OPTIONAL Ed25519 sign/verify + keyfile (cfg(feature="sign"))
 ├── store.rs         Store trait + bundled SQLite backend
 ├── store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
 ├── inject.rs        native multi-mux injector (pure command tables + runner)
@@ -40,12 +41,22 @@ main ──▶ mcp ──▶ store ──▶ model
 ```
 
 `config` is the lowest layer above `model`: `store`'s liveness (`is_alive` →
-`this_host`) and federation (`federated_*` → `peer_db_paths`) read it downward.
-The direction never reverses.
+`this_host`), federation (`federated_*` → `peer_db_paths`), and Tier-2 delivery
+(`pull_from_store` → `pull_from_paths`) read it downward. The direction never
+reverses. The optional `sign` module sits just above `config` (it reads the config
+dir for the keyfile); `store` depends down on it for verify-on-commit. The Tier-2
+consent nudge is fired **caller-side** in `main`/`mcp`, so there is **no
+`store → inject` edge** (§10).
 
 ### `model.rs` — core types, no I/O
 
 - `Message { id, ts, sender, recipient, subject: Option, body }`
+- `Intent { id, ts, to, to_host, from, subject: Option, body, sig }` — a Tier-2
+  cross-store delivery intent: a directed message the sender deposits in its **own**
+  outbox for a recipient that lives in another store (§10). `id`/`ts` are the
+  sender's local values (the receiver dedups on the source `id` and re-stamps `ts`
+  on commit); `sig` is the optional Ed25519 signature (empty unless `--features
+  sign`).
 - `Peer { name, mux, target, cwd: Option, last_seen, pid: Option<i64>, host }` —
   a session that has registered itself plus where (if anywhere) it can be
   injected. `pid`/`host` are captured at registration so liveness can be checked
@@ -64,10 +75,14 @@ The direction never reverses.
 ### `config.rs` — configuration
 
 `Config { session, backend, db, nudge_template, libsql_url, libsql_auth_token,
-peer_dbs }`, all `Option`. `Config::load()` reads `~/.config/weave/config.toml`
+retention_secs, peer_dbs, pull_from, inject_pulled, allow_inject_from,
+strict_verify }`, all `Option`. `Config::load()` reads `~/.config/weave/config.toml`
 (`$XDG_CONFIG_HOME` honored) if present, then overlays environment variables:
 `WEAVE_SESSION`, `WEAVE_BACKEND`, `WEAVE_DB`, `WEAVE_LIBSQL_URL`,
-`WEAVE_LIBSQL_AUTH_TOKEN`, `WEAVE_PEER_DBS` (env wins over file). Helpers:
+`WEAVE_LIBSQL_AUTH_TOKEN`, `WEAVE_RETENTION_SECS`, `WEAVE_PEER_DBS`,
+`WEAVE_PULL_FROM`, `WEAVE_INJECT_PULLED`, `WEAVE_ALLOW_INJECT_FROM`,
+`WEAVE_STRICT_VERIFY` (env wins over file; the list vars *union* onto the file
+list). Helpers:
 
 - `backend()` → defaults to `"sqlite"`.
 - `db_path()` → config/`WEAVE_DB` override, else
@@ -84,6 +99,19 @@ peer_dbs }`, all `Option`. `Config::load()` reads `~/.config/weave/config.toml`
   of extra read-only store paths for federation (§9), unioned from `peer_dbs` and
   `WEAVE_PEER_DBS`; the local `db_path()` is dropped (no self-federation).
   Default (unset) ⇒ empty ⇒ identical-to-today behavior.
+- `pull_from_paths()` → the Tier-2 **delivery** sources (§10), validated/deduped
+  with the same discipline and cap (`MAX_PULL_FROM` = 16) as `peer_db_paths`, but
+  keyed off the **distinct** `pull_from` list. Default (unset) ⇒ empty ⇒ no
+  cross-store delivery.
+- `inject_pulled()` → the Tier-2 consent toggle, **defaulting to `true`** (the one
+  place the original default-off is intentionally flipped). `false` ⇒ pure
+  queue-only delivery.
+- `allow_inject_from_paths()` / `inject_allowed_from(&Path)` → the optional finer
+  gate narrowing which pull sources may fire the consent nudge; unset ⇒ "same as
+  the pull set".
+- `strict_verify()` → the Tier-2 signed-identity strictness, **defaulting to
+  `false`** (advisory fallback); only consulted on the pull/commit path of a
+  `--features sign` build.
 
 ### `store.rs` — persistence
 
@@ -92,7 +120,12 @@ Owns the `Store` trait (§2), the bundled `SqliteStore`, the SQL schema, the
 liveness layer on top of it: `is_alive(peer)` and `pid_alive(pid)` (§6). It also
 owns the read-only federation aggregator — `open_readonly`, the
 `federated_peers` / `federated_sessions` / `federation_status` free functions, and
-the pure `merge_peer_views` / `merge_session_views` dedup/tie-break (§9).
+the pure `merge_peer_views` / `merge_session_views` dedup/tie-break (§9). For
+Tier-2 (§10) it owns the `outbox` / `pull_cursor` / `keys` tables, their additive
+trait methods, and the `pull_from_store` / `commit_pulled` free functions that
+read each allowed source read-only and commit addressed intents into the local
+inbox (owner-only-writes; the consent nudge is fired caller-side, so this layer
+takes no `inject` dependency).
 
 ### `inject.rs` — native injector
 
@@ -151,6 +184,16 @@ pub trait Store: Send {
     fn get_peer(&self, name:&str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
     fn backend(&self) -> &'static str;
+    // Tier-2 cross-store delivery (§10), all additive:
+    fn enqueue_intent(&self, to:&str, to_host:&str, from:&str, subject:Option<&str>, body:&str, sig:&str) -> Result<i64>;
+    fn list_outbox(&self, for_recipient:&str, since_id:i64, limit:i64) -> Result<Vec<Intent>>;
+    fn outbox_all(&self, limit:i64) -> Result<Vec<Intent>>;
+    fn pull_cursor_get(&self, source:&str) -> Result<i64>;
+    fn pull_cursor_set(&self, source:&str, last_id:i64) -> Result<()>;
+    // Tier-2 signed identity (§10), additive (the keys table is always present):
+    fn register_key(&self, identity:&str, pubkey:&str) -> Result<()>;
+    fn get_key(&self, identity:&str) -> Result<Option<String>>;
+    fn list_keys(&self) -> Result<Vec<(String,String)>>;
 }
 ```
 
@@ -338,14 +381,19 @@ next hook drain; a non-injectable session gets only the hook drain.
 
 ## 6. Data model
 
-Three tables, created idempotently:
+Tables created idempotently (`CREATE TABLE IF NOT EXISTS`):
 
 ```sql
-messages (id INTEGER PK AUTOINCREMENT, ts INTEGER, sender TEXT, recipient TEXT,
-          subject TEXT NULL, body TEXT)
-reads    (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id, reader))
-peers    (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
-          last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '')
+messages    (id INTEGER PK AUTOINCREMENT, ts INTEGER, sender TEXT, recipient TEXT,
+             subject TEXT NULL, body TEXT)
+reads       (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id, reader))
+peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
+             last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '')
+-- Tier-2 cross-store delivery (§10):
+outbox      (id INTEGER PK AUTOINCREMENT, ts INTEGER, to_peer TEXT, to_host TEXT NOT NULL DEFAULT '',
+             from_peer TEXT, subject TEXT NULL, body TEXT, sig TEXT NOT NULL DEFAULT '')
+pull_cursor (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)
+keys        (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
@@ -358,6 +406,15 @@ peers    (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
   added by an **additive, idempotent migration** (guarded, mirroring the `socket`
   precedent) in **both** backends, so a pre-existing DB upgrades in place and an
   old row reads `pid:NULL` / `host:""`.
+- **`outbox`** — Tier-2 pending intents the owner queued for recipients in *other*
+  stores (§10). Append-only; `id` is the monotonic dedup key the receiver tracks.
+  `sig` is empty unless `--features sign` signed the intent.
+- **`pull_cursor`** — the receiver's per-source high-water mark on the source's
+  `outbox.id`, the idempotency key for pull/commit.
+- **`keys`** — registered `(identity, public key)` pairs for signed-identity
+  verification (always present plain data; the SIGN/VERIFY crypto is `sign`-gated).
+- The three Tier-2 tables are whole **new** tables created on every open in **both**
+  backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER.
 
 ### Presence: `is_alive` vs `is_online`
 
@@ -430,12 +487,22 @@ injected and stored text is handled**, not on network attackers.
 - **Cross-store access is read-only (Tier-1).** Federation (§9) opens foreign
   stores with `SQLITE_OPEN_READ_ONLY` and never writes them, so aggregating
   another project's peers/sessions cannot mutate that project's store and stays
-  inside the single-local-trust-domain assumption. **Cross-store *write* / inject
-  (Tier-2) is deliberately deferred**: the moment store A could mutate store B,
-  "identity is advisory" stops being acceptable, so Tier-2 is gated on an approved
-  trust model (the recommended design is a broker-mediated request-pull where only
-  a store's owner ever writes it — preserving every invariant without a new
-  dependency, daemon, shell, or crypto). No Tier-2 code exists today.
+  inside the single-local-trust-domain assumption.
+- **Owner-only-writes (Tier-2).** Cross-store delivery (§10) never lets store A
+  write store B. A sender deposits a directed *intent* into its **own** outbox; the
+  recipient pulls each allowed source **read-only** (`open_readonly`,
+  `SQLITE_OPEN_READ_ONLY`, no schema/migrate/harden) and commits the intents
+  addressed to it into its **own** inbox. Every write the pull driver performs
+  (`Store::send`, `pull_cursor_set`) targets the *local* store — the source is
+  never written, migrated, or created. This is a first-class structural invariant
+  (the storage engine rejects any write to the read-only handle), proven by a
+  byte-unchanged-source test on both backends. It is what keeps "identity is
+  advisory" acceptable across stores: store A cannot mutate store B, so the only
+  thing cross-store carries is data B chooses to pull and commit itself.
+- **Signed sender identity is optional (Tier-2, `sign` feature).** By default
+  cross-store `from` is advisory, exactly like a same-store send. A `--features
+  sign` build (Ed25519, §10) makes a signed `from` unforgeable and **always**
+  rejects a tampered or spoofed signature; the default build links no crypto.
 
 ---
 
@@ -510,6 +577,94 @@ projects' mailboxes without those projects sharing one DB.
   is **skipped** — a note goes to stderr (MCP keeps stdout clean) and the local
   listing still returns with exit 0. One bad path never breaks the command.
 
-**Tier-2 (cross-store write / send / inject) is not implemented** — it is design
-only, deferred behind the trust-model gate described in §7. Federation today is
-read-only aggregation; to *message* across stores, share one `WEAVE_DB`.
+**Tier-1 is read-only aggregation.** It can never deliver a message into your
+inbox; `pull_from` (a strictly higher trust grant) does that — see §10. A path may
+appear in both lists; adding a store to `peer_dbs` to *view* it never silently
+upgrades it into a *delivery* source.
+
+---
+
+## 10. Cross-store delivery (Tier-2)
+
+Tier-2 lets sessions in **different stores** message each other without sharing one
+`WEAVE_DB`, using a broker-mediated **request-pull** model (Option C) in which the
+DB files are the only shared state and **only a store's owner ever writes it**
+(§7 owner-only-writes).
+
+### The flow
+
+1. **Send (owner of A).** `weave send --to-store <B-store> --to <name>` (or
+   `weave_send` with `to_store`) writes an `Intent` into **A's own** `outbox`. B's
+   store is never opened on the send path. A cross-store broadcast is refused
+   (directed delivery only). `weave outbox` / `weave_outbox` inspect A's pending
+   intents read-only.
+2. **Pull/commit (owner of B).** B lists A among its delivery sources
+   (`WEAVE_PULL_FROM` / `pull_from = [...]`, distinct from `peer_dbs`). On each
+   drain (the `prompt`/`stop` hook, `weave watch`, the MCP `weave_inbox` drain) or
+   an explicit `weave pull`, B opens each allowed source **read-only**, reads the
+   intents addressed to it since its per-source cursor, and commits each into its
+   **own** inbox via the normal local `Store::send` (so B assigns the id and
+   timestamp). It then advances `pull_cursor` for that source.
+
+### Idempotency + the at-least-once contract
+
+The dedup key is the **source's `outbox.id`** (`AUTOINCREMENT`, append-only ⇒
+monotonic), recorded per source in `pull_cursor(source, last_id)`; a pull reads
+only `id > last_id`. A normal re-drain therefore **never duplicates**. The cursor
+is advanced **after each commit** (not one batch transaction — friendlier to the
+async libsql path). The only re-delivery window is a crash *between* committing a
+message and advancing the cursor, which on the next drain re-delivers **at most one
+intent** — a **bounded, single-intent at-least-once** guarantee, not whole-batch
+replay. A misaddressed or malformed intent is skipped and the cursor still advances
+past it, so one poison row cannot wedge a source. Each drain is bounded to
+`MAX_PULL_PER_DRAIN` intents per source (DoS guard).
+
+### Consent nudge on a pulled message — DEFAULT ON
+
+When B commits a message from an **allow-listed** source, B also fires the existing
+content-free, paste-safe `Nudge::Nudge` (a fixed "check your inbox" ping) into
+**B's own** registered pane, by default (`inject_pulled` defaults to `true`). The
+body is never in the keystroke; only B's own pane is ever touched (never a foreign
+pane); A has no injection path at all. Gating, in order: (1) `inject_pulled` off ⇒
+queue-only; (2) the committing source must pass `inject_allowed_from`
+(`allow_inject_from` narrows the inject set to a subset of the pull set; unset ⇒
+"same as the pull set"); (3) B must have its own registered, injectable, live pane,
+else it falls open to queue-only. **Residual risk:** with the default on, any source
+on B's pull/allow set can type a capped nudge into B's live pane — accepting
+delivery from a source also grants it a live-pane ping. `WEAVE_INJECT_PULLED=false`
+disables it; `WEAVE_ALLOW_INJECT_FROM` narrows it.
+
+The nudge is fired **caller-side** (`main::nudge_pulled`, `mcp::nudge_pulled`),
+exactly where the live-send nudge already lives — in modules that already depend on
+both `store` and `inject`. The pull driver (`pull_from_store`, a `store`-layer free
+function) stays inject-free: it only **records** which source paths committed
+(`Pulled.committed_sources`) so the caller can gate per source. No new
+`store → inject` edge is introduced; the layering DAG is unchanged.
+
+### Signed sender identity — optional `sign` feature
+
+By default the cross-store `from` is advisory. Building with `--features sign`
+(Ed25519 via `ed25519-dalek`, mirroring the `libsql` optional-dependency pattern —
+the **default build links no crypto**) adds verifiable identity:
+
+- A new low, pure `sign` module (depends only on `config` + std) owns the canonical
+  encoding, sign/verify, hex codec, and the keypair file. The private key lives at
+  `~/.config/weave/ed25519.key` (mode `0600`), is never logged or printed, and
+  refuses to clobber an existing key.
+- The canonical signature covers `(from, to, body)` — **not** `created`/`ts`, which
+  is advisory and re-stamped by the receiver on commit, so binding it would be a
+  fragile coupling with no integrity gain. Length-prefixed with a
+  domain-separation prefix so no field boundary is ambiguous.
+- A new `keys(identity, pubkey)` table (always present, plain data, both backends)
+  stores peers' public keys. `weave key gen|show|add|list` (subcommand present only
+  under `--features sign`) manages them.
+- **Sign on enqueue** (A signs its outbound intent if it has a key);
+  **verify on commit** (B, before its local write): a present-but-invalid signature
+  (tamper/spoof) is **always rejected**; a valid one makes `from` unforgeable; an
+  unsigned intent — or one with no registered key to check against — falls back to
+  the advisory model and commits, **unless** `strict_verify` (`WEAVE_STRICT_VERIFY`)
+  is set, which drops it. Verification reads only B's own `keys` table; the source
+  is still opened read-only (owner-only-writes intact).
+
+`sign` is a low module (`model ← config ← sign`); `store` depends down on it for
+verify-on-commit; `main`/`mcp` depend down on both. No upward edge.

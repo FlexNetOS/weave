@@ -1,5 +1,45 @@
 # Changelog
 
+## [Unreleased] — cross-store delivery (Tier-2)
+
+### Added
+- **store:** Tier-2 cross-store delivery tables + driver — `outbox` (pending
+  directed intents the owner queues for recipients in other stores), `pull_cursor`
+  (per-source idempotency high-water mark), and `keys` (registered public keys);
+  additive trait methods (`enqueue_intent` / `list_outbox` / `outbox_all` /
+  `pull_cursor_get` / `pull_cursor_set` and `register_key` / `get_key` /
+  `list_keys`) and the `pull_from_store` / `commit_pulled` free functions, all
+  mirrored across both backends. **Owner-only-writes:** a sender only writes its own
+  outbox; a receiver opens each source `SQLITE_OPEN_READ_ONLY` and commits intents
+  addressed to it into its own inbox. Delivery is idempotent (dedup on the source's
+  monotonic `outbox.id`); the only re-delivery window is a crash between commit and
+  cursor-advance, bounded to at most one intent.
+- **cli:** `weave send --to-store <store> [--to-host <host>]` queues a cross-store
+  intent; `weave outbox` inspects pending intents (`--json`); `weave pull` pulls +
+  commits from configured `pull_from` sources now (also driven by the hook/`watch`
+  drain).
+- **mcp:** `weave_send` cross-store routing via `to_store` / `to_host` (queues an
+  intent; broadcast refused); new `weave_outbox` tool; the `weave_inbox` drain pulls
+  cross-store messages when `pull_from` is configured.
+- **config:** `pull_from` / `WEAVE_PULL_FROM` (delivery sources, distinct from
+  `peer_dbs`, capped at 16); `inject_pulled` / `WEAVE_INJECT_PULLED` (consent nudge,
+  **default ON**); `allow_inject_from` / `WEAVE_ALLOW_INJECT_FROM` (narrow the
+  inject-eligible subset); `strict_verify` / `WEAVE_STRICT_VERIFY` (drop
+  unsigned/unverifiable intents under signed identity).
+- **inject:** a pulled cross-store message from an allow-listed source fires the
+  existing content-free, paste-safe nudge into the receiver's **own** pane by
+  default (fired caller-side; no `store → inject` edge). Residual risk: any source
+  on your pull/allow set can, by default, nudge your live pane — disable with
+  `WEAVE_INJECT_PULLED=false` or narrow with `allow_inject_from`.
+- **feat(sign):** OPTIONAL Ed25519 signed sender identity behind the `sign` Cargo
+  feature (new `sign` module + `ed25519-dalek` / `getrandom`, mirroring the `libsql`
+  optional-dep pattern). Adds `weave key gen|show|add|list` (only under
+  `--features sign`); signs cross-store intents over canonical `(from, to, body)` and
+  verifies on commit so a signed `from` is unforgeable and a tampered/spoofed
+  signature is always rejected. Private key at `~/.config/weave/ed25519.key` (0600),
+  never logged. **The default build links no crypto** (`ed25519-dalek` is absent from
+  the default and libSQL shippable dependency graphs).
+
 ## [Unreleased] — presence & live-connect
 
 ### Added
@@ -31,10 +71,11 @@
   mirrored across both backends); new additive `register_peer_full` trait method
   (`register_peer` preserved as a default forwarding to it).
 
-### Deferred (design only, not shipped)
-- **store:** cross-store *write* / send / inject (Tier-2) is gated on an approved
-  trust model (recommended: broker-mediated request-pull where only a store's owner
-  writes it). No Tier-2 code exists; federation is read-only aggregation only.
+### Note
+- **store:** cross-store *write* / send (Tier-2) — deferred at the time of this
+  pass behind the trust-model gate — has since **shipped** using exactly the
+  recommended broker-mediated request-pull, owner-only-writes design. See the
+  cross-store delivery (Tier-2) section above.
 
 ## [Unreleased] — gap-closing upgrade pass
 

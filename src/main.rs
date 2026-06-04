@@ -4,7 +4,9 @@
 //!   weave mcp            run the MCP stdio server (register with `claude mcp add`)
 //!   weave setup          wire weave into Claude Code (MCP + hooks)
 //!   weave uninstall      remove weave's Claude Code wiring
-//!   weave send           send a message (CLI)
+//!   weave send           send a message (CLI; --to-store deposits a cross-store intent)
+//!   weave outbox         list pending cross-store intents (Tier-2)
+//!   weave pull           pull cross-store intents from pull_from sources into your inbox
 //!   weave reply          reply to a message, addressed to the original sender
 //!   weave inbox          read your inbox (CLI)
 //!   weave thread         print a message thread by its root id
@@ -35,6 +37,8 @@ mod inject;
 mod mcp;
 mod model;
 mod setup;
+#[cfg(feature = "sign")]
+mod sign;
 mod store;
 #[cfg(feature = "libsql")]
 mod store_libsql;
@@ -128,6 +132,30 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
+        /// Cross-store (Tier-2): deposit the message as an intent in THIS store's
+        /// outbox for a recipient that lives in another store. The recipient pulls
+        /// and commits it on its next drain (next-drain latency). This NEVER writes
+        /// the recipient's store. When omitted, the message is a normal local send.
+        #[arg(long)]
+        to_store: Option<String>,
+        /// Optional host hint stored on a cross-store intent (advisory; only with
+        /// --to-store). Disambiguates the same recipient name across machines.
+        #[arg(long)]
+        to_host: Option<String>,
+    },
+    /// List pending cross-store intents in your outbox (Tier-2, read-only).
+    Outbox {
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull cross-store intents from configured `pull_from` sources and commit
+    /// them into your inbox now (an explicit one-shot of the hook/watch drain).
+    Pull {
+        #[arg(long)]
+        me: Option<String>,
     },
     /// Reply to a message; the reply is auto-addressed to the original sender and
     /// linked to the parent via in_reply_to (so it shows up in `weave thread`).
@@ -261,8 +289,50 @@ enum Cmd {
     },
     /// Print a roff man page for weave to stdout.
     Man,
+    /// Manage Ed25519 signing keys for signed cross-store identity (Tier-2, only
+    /// built with `--features sign`). Generate this session's keypair, print/register
+    /// its public key, register a peer's public key, or list registered keys.
+    #[cfg(feature = "sign")]
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
+}
+
+/// `weave key` subcommands (only compiled with `--features sign`, so the default
+/// build's `--help` stays free of a subcommand that would do nothing).
+#[cfg(feature = "sign")]
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Generate this session's Ed25519 keypair (private key stored 0600 under the
+    /// config dir) and register + print its public key for `identity`.
+    Gen {
+        /// identity to register the generated public key under (defaults to
+        /// config/$WEAVE_SESSION or basename of cwd)
+        #[arg(long)]
+        me: Option<String>,
+    },
+    /// Print this session's public key (and its on-disk private-key path), without
+    /// revealing the private key itself.
+    Show {
+        #[arg(long)]
+        me: Option<String>,
+    },
+    /// Register a PEER's public key so signed intents claiming to be from them can
+    /// be verified. `pubkey` is the 64-hex-char Ed25519 public key.
+    Add {
+        /// the peer's identity (sender name as it appears on their intents)
+        identity: String,
+        /// the peer's hex-encoded Ed25519 public key
+        pubkey: String,
+    },
+    /// List all registered (identity, public key) pairs.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -376,6 +446,109 @@ fn refresh_presence(store: &dyn Store, name: &str, explicit: bool) {
     }
     if let Err(e) = store.touch_peer(name) {
         eprintln!("[weave] presence refresh failed for '{name}': {e}");
+    }
+}
+
+/// Sign a cross-store intent's canonical `(from,to,body)` with this session's
+/// configured signing key, returning the hex signature for `outbox.sig`. Returns
+/// `""` when no key is configured or the `sign` feature is not built — in which case
+/// the intent is unsigned and the receiver falls back to the advisory model (or
+/// drops it under `strict_verify`). A signing-key load error is non-fatal: it logs
+/// to stderr and sends unsigned rather than blocking the send. The private key is
+/// never logged here.
+#[cfg(feature = "sign")]
+fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
+    match sign::load_signing_key() {
+        Ok(Some(key)) => sign::sign_intent(&key, from, to, body),
+        Ok(None) => String::new(),
+        Err(e) => {
+            eprintln!("[weave] could not load signing key (sending unsigned): {e}");
+            String::new()
+        }
+    }
+}
+
+/// Without the `sign` feature, intents are always unsigned (empty `sig`).
+#[cfg(not(feature = "sign"))]
+fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
+    String::new()
+}
+
+/// Best-effort Tier-2 pull: commit any cross-store intents addressed to `me` from
+/// the configured `pull_from` sources into the local inbox. Like the heartbeat, a
+/// failure here must NEVER break the inbox drain — errors are reported to stderr
+/// and swallowed. A no-op when `pull_from` is unconfigured (no Tier-2). Pulling
+/// under a guessed identity is fine: it only commits intents explicitly addressed
+/// to that name (no read-marking, so no inbox is consumed).
+fn try_pull(store: &dyn Store, cfg: &Config, me: &str) {
+    let allow = cfg.pull_from_paths();
+    if allow.is_empty() {
+        return;
+    }
+    match store::pull_from_store(store, me, &allow, cfg.strict_verify()) {
+        Ok(p) if p.committed > 0 => {
+            eprintln!(
+                "[weave] pulled {} cross-store message(s) for '{me}'",
+                p.committed
+            );
+            nudge_pulled(store, cfg, me, &p.committed_sources);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[weave] pull skipped (non-fatal): {e}"),
+    }
+}
+
+/// Tier-2 consent nudge (decision 5, DEFAULT ON): after a pull commits messages,
+/// fire the EXISTING paste-safe content-free [`inject::Nudge::Nudge`] into THIS
+/// session's OWN registered pane — never a foreign pane, never the body. This is
+/// done **caller-side** (here, in `main`/`mcp`, which already depend on both
+/// `store` and `inject`) so `store::pull_from_store` never gains a `store → inject`
+/// edge.
+///
+/// Gating (hard): does nothing unless `inject_pulled()` is on (the single
+/// off-switch ⇒ pure queue-only) AND at least one committed source passes
+/// `inject_allowed_from` (a non-allow-listed source delivers to the inbox but
+/// never injects). If this session's pane is not injectable (`mux=none`) or not
+/// alive, the inject silently falls back to queue-only (the committed messages are
+/// already safely in the inbox). Best-effort: any failure is logged to stderr and
+/// NEVER breaks the drain.
+fn nudge_pulled(
+    store: &dyn Store,
+    cfg: &Config,
+    me: &str,
+    committed_sources: &[std::path::PathBuf],
+) {
+    // Master toggle: false ⇒ pure queue-only, no keystroke at all.
+    if !cfg.inject_pulled() {
+        return;
+    }
+    // Per-source gate: a source must be inject-eligible. A non-allow-listed source
+    // delivered its message to the inbox but must never trigger a keystroke.
+    if !committed_sources
+        .iter()
+        .any(|src| cfg.inject_allowed_from(src))
+    {
+        return;
+    }
+    // Inject into THIS session's OWN pane only (owner-only: never a foreign pane).
+    let peer = match store.get_peer(me) {
+        Ok(Some(p)) => p,
+        Ok(None) => return, // no registered pane for me ⇒ queue-only.
+        Err(err) => {
+            eprintln!("[weave] pull-nudge skipped (non-fatal): {err}");
+            return;
+        }
+    };
+    let target = inject::Target::from_peer(&peer);
+    // Fail open to queue-only when the pane is not injectable or not alive.
+    if !target.injectable() || !inject::target_alive(&target) {
+        return;
+    }
+    // Reuse the EXACT paste-safe path; content-free Nudge::Nudge (the body already
+    // landed in the inbox on commit). Failure is non-fatal — the message is safe.
+    match inject::inject_mode(&target, "", inject::Nudge::Nudge) {
+        Ok(_) => {}
+        Err(err) => eprintln!("[weave] pull-nudge inject failed (non-fatal): {err}"),
     }
 }
 
@@ -513,7 +686,7 @@ fn print_man() -> Result<()> {
 /// pass too. Either way subsequent ticks only ever see strictly-newer ids.
 fn watch(
     store: &dyn Store,
-    _cfg: &Config,
+    cfg: &Config,
     me: &str,
     explicit: bool,
     interval: u64,
@@ -545,6 +718,9 @@ fn watch(
     }
 
     loop {
+        // Tier-2: pull cross-store intents each tick (best-effort) so a federated
+        // message surfaces in the same forward-paging walk below.
+        try_pull(store, cfg, me);
         // Page within the tick until a short page: a backlog larger than `page`
         // is fully drained this tick rather than trickled one page per interval.
         loop {
@@ -642,7 +818,17 @@ fn main() -> Result<()> {
             // Tier-1 federation: pass the validated read-only extra store paths so
             // the MCP peers/sessions/doctor tools aggregate them too.
             let extra_dbs = cfg.peer_db_paths();
-            mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs)?;
+            // Tier-2: cross-store delivery sources the MCP inbox drain will pull
+            // intents from (DISTINCT from extra_dbs, which is read-only
+            // visibility), bundled with the decision-5 consent state so the drain
+            // can fire the caller-side nudge into this session's OWN pane.
+            let pull = mcp::PullConsent {
+                from: cfg.pull_from_paths(),
+                inject_pulled: cfg.inject_pulled(),
+                allow_inject_from: cfg.allow_inject_from_paths(),
+                strict_verify: cfg.strict_verify(),
+            };
+            mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs, pull)?;
         }
 
         Cmd::Send {
@@ -650,12 +836,98 @@ fn main() -> Result<()> {
             to,
             subject,
             body,
+            to_store,
+            to_host,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
-            let mid = store.send(&from, &to, subject.as_deref(), &body)?;
-            println!("sent #{mid}: {from} -> {to}");
-            try_inject(store, &cfg, &from, &to, &body)?;
+            match to_store {
+                // Cross-store (Tier-2): the recipient lives in a FOREIGN store, so
+                // we deposit an intent into OUR OWN outbox rather than attempt any
+                // foreign write (owner-only-writes). A is the writer of A's outbox;
+                // authorization is the receiver's (its pull_from allowlist). No
+                // local inbox row, no inject — A cannot reach the recipient's pane.
+                Some(store_path) => {
+                    if model::is_broadcast(&to) {
+                        anyhow::bail!(
+                            "cross-store broadcast is not supported; send to a named recipient \
+                             (Tier-2 is directed-only)."
+                        );
+                    }
+                    let host = to_host.as_deref().unwrap_or("");
+                    // Signed identity (2d): if a local signing key is configured,
+                    // sign the canonical (from,to,body,created) so the receiver can
+                    // verify `from` is unforgeable. `created` is the enqueue time we
+                    // bind into the row; we sign the SAME value the store stamps so
+                    // verification matches. Without the `sign` feature this is "".
+                    let sig = sign_intent_if_keyed(&from, &to, &body);
+                    let id =
+                        store.enqueue_intent(&to, host, &from, subject.as_deref(), &body, &sig)?;
+                    println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
+                }
+                None => {
+                    let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+                    println!("sent #{mid}: {from} -> {to}");
+                    try_inject(store, &cfg, &from, &to, &body)?;
+                }
+            }
+        }
+
+        Cmd::Outbox { limit, json } => {
+            let intents = store.outbox_all(limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "outbox": intents }))?
+                );
+            } else if intents.is_empty() {
+                println!("outbox: empty (no pending cross-store intents)");
+            } else {
+                println!("outbox: {} pending intent(s)", intents.len());
+                for i in &intents {
+                    let subj = i
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    let host = if i.to_host.is_empty() {
+                        String::new()
+                    } else {
+                        format!("@{}", i.to_host)
+                    };
+                    println!(
+                        "#{} [{}] {} -> {}{}{}\n  {}",
+                        i.id,
+                        model::fmt_ts(i.ts),
+                        i.from,
+                        i.to,
+                        host,
+                        subj,
+                        i.body
+                    );
+                }
+            }
+        }
+
+        Cmd::Pull { me } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            let allow = cfg.pull_from_paths();
+            let pulled = store::pull_from_store(store, &me, &allow, cfg.strict_verify())?;
+            println!(
+                "pulled {} message(s) into '{me}' from {} source(s){}",
+                pulled.committed,
+                allow.len(),
+                if pulled.sources_skipped > 0 {
+                    format!(" ({} skipped)", pulled.sources_skipped)
+                } else {
+                    String::new()
+                }
+            );
+            // Tier-2 consent nudge (decision 5, default on) into our OWN pane.
+            if pulled.committed > 0 {
+                nudge_pulled(store, &cfg, &me, &pulled.committed_sources);
+            }
         }
 
         Cmd::Reply {
@@ -1028,7 +1300,77 @@ fn main() -> Result<()> {
             );
         }
 
+        #[cfg(feature = "sign")]
+        Cmd::Key { cmd } => handle_key(store, &cfg, cmd)?,
+
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
+    }
+    Ok(())
+}
+
+/// `weave key` handler (only built with `--features sign`). Generates/shows this
+/// session's keypair and registers/lists public keys in the LOCAL `keys` table. The
+/// private key is written 0600 under the config dir and is never printed or logged.
+#[cfg(feature = "sign")]
+fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
+    match cmd {
+        KeyCmd::Gen { me } => {
+            let me = resolve_me(me, None, cfg);
+            let pubkey = sign::generate_keypair()?;
+            store.register_key(&me, &pubkey)?;
+            println!("generated signing key for '{me}'");
+            println!(
+                "private key: {} (0600, keep secret)",
+                sign::key_path().display()
+            );
+            println!("public key:  {pubkey}");
+            println!("share the public key with peers so they can `weave key add {me} {pubkey}`");
+        }
+        KeyCmd::Show { me } => {
+            let me = resolve_me(me, None, cfg);
+            match sign::local_public_key()? {
+                Some(pk) => {
+                    println!("identity:   {me}");
+                    println!("public key: {pk}");
+                    println!(
+                        "private key file: {} (not shown)",
+                        sign::key_path().display()
+                    );
+                }
+                None => {
+                    println!(
+                        "no signing key configured for '{me}' — run `weave key gen` to create one"
+                    );
+                }
+            }
+        }
+        KeyCmd::Add { identity, pubkey } => {
+            // Validate the identity and the hex pubkey before it touches the store.
+            store::check_ident("identity", &identity)?;
+            sign::check_pubkey(&pubkey)?;
+            store.register_key(&identity, &pubkey)?;
+            println!("registered public key for '{identity}'");
+        }
+        KeyCmd::List { json } => {
+            let keys = store.list_keys()?;
+            if json {
+                let arr: Vec<_> = keys
+                    .iter()
+                    .map(|(i, p)| serde_json::json!({ "identity": i, "pubkey": p }))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "keys": arr }))?
+                );
+            } else if keys.is_empty() {
+                println!("no registered keys");
+            } else {
+                println!("{} registered key(s):", keys.len());
+                for (identity, pubkey) in keys {
+                    println!("  {identity}  {pubkey}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1104,6 +1446,10 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
         // UserPromptSubmit drain re-surfaces and marks them. Marking them read here
         // would silently consume them — concrete message loss.
         "prompt" | "stop" => {
+            // Tier-2: opportunistically pull cross-store intents into the local
+            // inbox BEFORE draining, so a freshly-pulled message is delivered in
+            // this same turn. Best-effort: a pull failure never sinks the drain.
+            try_pull(store, cfg, &me);
             let mut mark_read = event == "prompt";
             // Never mark messages read under a guessed identity: if we had to fall
             // back to basename(current_dir()) (no config session, no payload cwd),

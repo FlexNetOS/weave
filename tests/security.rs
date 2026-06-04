@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{run_env, run_ok, run_ok_env, McpServer, TestDb};
+use common::{run, run_env, run_ok, run_ok_env, McpServer, TestDb};
 use std::os::unix::fs::PermissionsExt;
 
 // ---------------------------------------------------------------------------
@@ -521,4 +521,812 @@ fn federation_junk_path_cannot_escalate_to_a_write() {
         !resolved.exists(),
         "a read-only federated open must never create the target file"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 cross-store delivery — owner-only-writes and authorization hardening.
+// ---------------------------------------------------------------------------
+
+/// THE HEADLINE owner-only-writes proof: the receiver pulls and commits a message
+/// while the SOURCE store's main DB file stays byte-identical (no write, no
+/// migration, no journal data write). The cursor and the committed inbox row are
+/// written ONLY to the receiver's own store. Extends the Tier-1 byte-unchanged
+/// assertion to hold during an ACTIVE cross-store pull+commit.
+#[test]
+fn pull_never_writes_the_source_store() {
+    let source = TestDb::new(); // A — the sender, owner of the outbox
+    let receiver = TestDb::new(); // B — the puller/committer
+
+    // A enqueues a directed cross-store intent for bob (who lives in B).
+    run_ok(
+        &source,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "owner-only-writes proof",
+            "--to-store",
+            &receiver.path_str(),
+        ],
+    );
+    // Let A's writer fully settle (its own outbox write is flushed/checkpointed).
+    let _ = run_ok(&source, &["outbox"]);
+
+    let base = source.path_str();
+    let wal_path = format!("{base}-wal");
+    let journal_path = format!("{base}-journal");
+
+    // Snapshot A's main DB bytes BEFORE B pulls.
+    let before = std::fs::read(&base).expect("read source main DB (before)");
+
+    // B actively pulls and commits from A (allow-listed). Run twice so the
+    // re-pull (idempotent) also exercises the source again.
+    let env = [("WEAVE_PULL_FROM", base.as_str())];
+    let p1 = run_ok_env(&receiver, &["pull", "--me", "bob"], &env);
+    assert!(p1.contains("pulled 1 message"), "first pull delivers: {p1}");
+    let p2 = run_ok_env(&receiver, &["pull", "--me", "bob"], &env);
+    assert!(
+        p2.contains("pulled 0 message"),
+        "re-pull is idempotent: {p2}"
+    );
+
+    // The source's main DB is byte-for-byte unchanged: the engine opened it
+    // READ_ONLY, so no row, no schema, no consumed-marker was ever written to A.
+    let after = std::fs::read(&base).expect("read source main DB (after)");
+    assert_eq!(
+        before, after,
+        "an active cross-store pull must leave the SOURCE store byte-identical \
+         (owner-only-writes): no write, no migration, no consumed-marker"
+    );
+    // No write was committed to A: WAL empty/absent, no rollback journal created.
+    let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len, 0,
+        "pulling must not commit a write to the source (WAL must be empty/absent)"
+    );
+    assert!(
+        std::fs::metadata(&journal_path).is_err(),
+        "pulling must not create a rollback journal on the source store"
+    );
+
+    // And the message DID arrive in B (the read-only pull still delivered).
+    let inbox = run_ok(&receiver, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"][0]["body"], "owner-only-writes proof");
+}
+
+/// A non-allow-listed source cannot deliver into the receiver: with no
+/// `pull_from`, the source is never even opened, so no inbox row appears.
+#[test]
+fn non_allow_listed_source_cannot_deliver() {
+    let source = TestDb::new();
+    let receiver = TestDb::new();
+    run_ok(
+        &source,
+        &[
+            "send",
+            "--from",
+            "mallory",
+            "--to",
+            "bob",
+            "--body",
+            "unsolicited",
+            "--to-store",
+            &receiver.path_str(),
+        ],
+    );
+    // Receiver pulls WITHOUT listing the source => nothing is delivered.
+    let pull = run_ok(&receiver, &["pull", "--me", "bob"]);
+    assert!(pull.contains("pulled 0 message"), "no delivery: {pull}");
+    let inbox = run_ok(&receiver, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(
+        v["messages"].as_array().map(|x| x.len()),
+        Some(0),
+        "a non-allow-listed source can never deliver into the receiver: {inbox}"
+    );
+}
+
+/// Input caps at enqueue: a cross-store intent body over `MAX_BODY` (65536) is
+/// rejected — the oversized intent is never written to the outbox.
+#[test]
+fn cross_store_oversized_body_is_rejected_at_enqueue() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let huge = "x".repeat(65_537);
+    let (ok, _out, err) = run(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            &huge,
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    assert!(!ok, "an oversized cross-store body must be rejected");
+    assert!(
+        err.to_lowercase().contains("body") || err.to_lowercase().contains("long"),
+        "rejection mentions the body cap: {err}"
+    );
+    // Nothing was enqueued.
+    let outbox = run_ok(&a, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&outbox).expect("outbox parses");
+    assert_eq!(
+        ov["outbox"].as_array().map(|x| x.len()),
+        Some(0),
+        "an over-cap intent is never persisted to the outbox: {outbox}"
+    );
+}
+
+/// A bad recipient/sender identity on a cross-store intent is rejected at enqueue
+/// (the `check_ident` cap), so a malformed intent never enters the outbox.
+#[test]
+fn cross_store_bad_identity_is_rejected_at_enqueue() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let oversized = "n".repeat(5_000);
+    let (ok, _out, err) = run(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            &oversized,
+            "--body",
+            "hi",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    assert!(!ok, "an oversized recipient identity must be rejected");
+    assert!(
+        err.to_lowercase().contains("recipient") || err.to_lowercase().contains("long"),
+        "rejection mentions the identity cap: {err}"
+    );
+    let outbox = run_ok(&a, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&outbox).expect("outbox parses");
+    assert_eq!(ov["outbox"].as_array().map(|x| x.len()), Some(0));
+}
+
+/// `MAX_PULL_FROM` (16) bounds the pull fan-out: a hostile 1000-entry
+/// `WEAVE_PULL_FROM` does not open 1000 stores and the pull still succeeds; the
+/// cap note is emitted on stderr (truncation happened).
+#[test]
+fn pull_from_list_is_capped() {
+    let b = TestDb::new();
+    let list = (0..1000)
+        .map(|i| format!("/tmp/weave-pullcap-{i}.db"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (ok, out, err) = run_env(&b, &["pull", "--me", "bob"], &[("WEAVE_PULL_FROM", &list)]);
+    assert!(ok, "an oversized pull_from list must not fail the command");
+    // The driver reports the capped source count (<= 16), never 1000.
+    assert!(
+        out.contains("from 16 source"),
+        "the pull fan-out is capped at MAX_PULL_FROM: {out}"
+    );
+    assert!(
+        err.contains("capping at"),
+        "the cap must be diagnosed on stderr (truncation happened): {err}"
+    );
+}
+
+/// Cross-store broadcast is refused (no cross-store fan-out): a `--to-store` send
+/// to a broadcast alias exits non-zero and persists nothing.
+#[test]
+fn cross_store_broadcast_is_refused() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    for alias in ["all", "*", "everyone", "broadcast"] {
+        let (ok, _out, err) = run(
+            &a,
+            &[
+                "send",
+                "--from",
+                "alice",
+                "--to",
+                alias,
+                "--body",
+                "fan out everywhere",
+                "--to-store",
+                &b.path_str(),
+            ],
+        );
+        assert!(!ok, "cross-store broadcast to {alias:?} must be refused");
+        assert!(
+            err.contains("broadcast"),
+            "rejection mentions broadcast for {alias:?}: {err}"
+        );
+    }
+    let outbox = run_ok(&a, &["outbox", "--json"]);
+    let ov: serde_json::Value = serde_json::from_str(&outbox).expect("outbox parses");
+    assert_eq!(
+        ov["outbox"].as_array().map(|x| x.len()),
+        Some(0),
+        "no broadcast intent is ever persisted: {outbox}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 phase 2c — authorized injection gate (the headline security property).
+// ---------------------------------------------------------------------------
+
+/// Create a temp dir with an executable fake `tmux` that appends its full argv to
+/// `log_path` and exits 0. Mirrors the integration suite's `make_fake_tmux`.
+fn make_fake_tmux(log_path: &std::path::Path) -> std::path::PathBuf {
+    let dir = TestDb::new().path_str();
+    let dir = std::path::PathBuf::from(format!("{dir}.muxbin"));
+    std::fs::create_dir_all(&dir).expect("create fake-mux dir");
+    let script = dir.join("tmux");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        log_path.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake tmux");
+    dir
+}
+
+/// Run `weave` with the fake-mux dir prepended to PATH and trusted via
+/// WEAVE_MUX_DIR, plus extra env. Returns (success, stdout, stderr).
+fn run_with_fake_mux(
+    db: &TestDb,
+    fake_dir: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (bool, String, String) {
+    let orig = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", fake_dir.display(), orig);
+    let fake_dir_str = fake_dir.display().to_string();
+    let mut env: Vec<(&str, &str)> = vec![
+        ("PATH", new_path.as_str()),
+        ("WEAVE_MUX_DIR", fake_dir_str.as_str()),
+    ];
+    env.extend_from_slice(extra_env);
+    run_env(db, args, &env)
+}
+
+/// Read the fake-mux log with a short backoff (the script writes asynchronously).
+fn read_mux_log(log: &std::path::Path) -> String {
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(log) {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// THE HEADLINE 2c GATE: a source that delivers a message but is NOT inject-eligible
+/// (excluded by `allow_inject_from`) can NEVER cause a keystroke in B's pane — even
+/// with `inject_pulled=true` (the default-on, most permissive posture). The message
+/// is delivered to the inbox; no `send-keys` is ever recorded. A separate trusted
+/// source on the allow list DOES inject, proving the gate is the only difference.
+#[test]
+fn non_inject_listed_source_never_keystrokes_even_with_inject_on() {
+    let hostile = TestDb::new(); // pull_from yes, allow_inject_from NO
+    let trusted = TestDb::new(); // pull_from yes, allow_inject_from YES
+    let b = TestDb::new();
+
+    // Both sources enqueue a directed intent for bob.
+    run_ok(
+        &hostile,
+        &[
+            "send",
+            "--from",
+            "mallory",
+            "--to",
+            "bob",
+            "--body",
+            "hostile body",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    run_ok(
+        &trusted,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "trusted body",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    // Register B's OWN injectable pane %2 under a fake mux.
+    let reg_log = TestDb::new().path_str();
+    let reg_log = std::path::PathBuf::from(format!("{reg_log}.tmuxlog"));
+    let fake_reg = make_fake_tmux(&reg_log);
+    let (reg_ok, _o, reg_err) = run_with_fake_mux(
+        &b,
+        &fake_reg,
+        &[("TMUX_PANE", "%2")],
+        &["register", "--name", "bob"],
+    );
+    assert!(reg_ok, "register failed: {reg_err}");
+
+    // Pull the HOSTILE source. inject_pulled is ON by default; allow_inject_from is
+    // set to ONLY the trusted store, so the hostile source delivers but is never
+    // inject-eligible. The most permissive master switch must NOT override the gate.
+    let log_h = TestDb::new().path_str();
+    let log_h = std::path::PathBuf::from(format!("{log_h}.tmuxlog"));
+    let fake_h = make_fake_tmux(&log_h);
+    let (ok_h, out_h, err_h) = run_with_fake_mux(
+        &b,
+        &fake_h,
+        &[
+            ("WEAVE_PULL_FROM", &hostile.path_str()),
+            ("WEAVE_ALLOW_INJECT_FROM", &trusted.path_str()),
+            ("WEAVE_INJECT_PULLED", "true"),
+        ],
+        &["pull", "--me", "bob"],
+    );
+    assert!(ok_h, "hostile pull must still succeed: {err_h}");
+    assert!(
+        out_h.contains("pulled 1 message"),
+        "hostile source DELIVERS: {out_h}"
+    );
+    // The hard gate: NO keystroke for a non-inject-listed source, even inject_pulled=true.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let logged_h = std::fs::read_to_string(&log_h).unwrap_or_default();
+    assert!(
+        !logged_h.contains("send-keys"),
+        "a non-allow-listed source must NEVER cause a keystroke, even with \
+         inject_pulled=true:\n{logged_h}"
+    );
+
+    // Sanity: the TRUSTED (inject-listed) source DOES inject — proving the gate is
+    // the only thing that suppressed the hostile keystroke (not a broken harness).
+    let log_t = TestDb::new().path_str();
+    let log_t = std::path::PathBuf::from(format!("{log_t}.tmuxlog"));
+    let fake_t = make_fake_tmux(&log_t);
+    let (ok_t, out_t, err_t) = run_with_fake_mux(
+        &b,
+        &fake_t,
+        &[
+            ("WEAVE_PULL_FROM", &trusted.path_str()),
+            ("WEAVE_ALLOW_INJECT_FROM", &trusted.path_str()),
+            ("WEAVE_INJECT_PULLED", "true"),
+        ],
+        &["pull", "--me", "bob"],
+    );
+    assert!(ok_t, "trusted pull must succeed: {err_t}");
+    assert!(
+        out_t.contains("pulled 1 message"),
+        "trusted source delivers: {out_t}"
+    );
+    let logged_t = read_mux_log(&log_t);
+    assert!(
+        logged_t.contains("send-keys") && logged_t.contains("-t %2"),
+        "the inject-listed source DOES nudge B's own pane %2 (gate is the only diff):\n{logged_t}"
+    );
+
+    // Both messages arrived in B's inbox regardless of the inject gate.
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(
+        v["messages"].as_array().map(|x| x.len()),
+        Some(2),
+        "both messages delivered; only the keystroke was gated: {inbox}"
+    );
+}
+
+/// The message BODY never reaches the injector keystrokes on the pulled-inject path,
+/// regardless of consent config. Even when injection fires (allow-listed, default-on),
+/// the fake-mux argv contains only the fixed content-free ping — never the body bytes.
+/// This is the paste-safe + no-body-leak proof for the cross-trust-boundary nudge.
+#[test]
+fn pulled_inject_never_carries_the_message_body() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let secret = "TOPSECRET-cross-store-payload-42";
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            secret,
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+
+    let reg_log = TestDb::new().path_str();
+    let reg_log = std::path::PathBuf::from(format!("{reg_log}.tmuxlog"));
+    let fake_reg = make_fake_tmux(&reg_log);
+    let (reg_ok, _o, reg_err) = run_with_fake_mux(
+        &b,
+        &fake_reg,
+        &[("TMUX_PANE", "%9")],
+        &["register", "--name", "bob"],
+    );
+    assert!(reg_ok, "register failed: {reg_err}");
+
+    let log = TestDb::new().path_str();
+    let log = std::path::PathBuf::from(format!("{log}.tmuxlog"));
+    let fake_dir = make_fake_tmux(&log);
+    // Default-on, allow-listed (unset allow_inject_from ⇒ same as pull set) ⇒ inject
+    // fires. The body must STILL be absent from every recorded argv.
+    let (ok, out, err) = run_with_fake_mux(
+        &b,
+        &fake_dir,
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+        &["pull", "--me", "bob"],
+    );
+    assert!(ok, "pull must succeed: {err}");
+    assert!(out.contains("pulled 1 message"), "delivered: {out}");
+
+    let logged = read_mux_log(&log);
+    // The inject fired (proving we exercised the keystroke path, not a no-op)...
+    assert!(
+        logged.contains("send-keys"),
+        "the default-on nudge must fire so this proves the no-body property on a live \
+         keystroke:\n{logged}"
+    );
+    // ...but the body NEVER appears in any keystroke argv.
+    assert!(
+        !logged.contains(secret),
+        "the message body must NEVER reach the injector argv:\n{logged}"
+    );
+    // The body DID land in the inbox (it travels via the store, not the keystroke).
+    let inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    assert_eq!(v["messages"][0]["body"], secret);
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 phase 2d — signed sender identity (only built with `--features sign`).
+//
+// Black-box hostile-input tests against the real `--features sign` binary,
+// driving real key files on disk. Each actor gets an isolated `XDG_CONFIG_HOME`
+// so its private key never lands in the harness's config. These pin the
+// load-bearing security properties: a present-but-invalid signature is ALWAYS
+// rejected (never committed) regardless of strict mode; a spoofed `from` is
+// rejected; strict_verify drops an unsigned intent; and the private key file is
+// 0600 and never leaks to stdout.
+// ---------------------------------------------------------------------------
+
+/// A unique, isolated `XDG_CONFIG_HOME` for one signing actor.
+#[cfg(feature = "sign")]
+fn sign_config_home() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!("weave-sec-sign-{pid}-{n}-{nanos}"));
+    std::fs::create_dir_all(&d).expect("create temp config home");
+    d
+}
+
+/// Parse the `public key:  <hex>` line emitted by `weave key gen`.
+#[cfg(feature = "sign")]
+fn sign_pubkey_from_gen(out: &str) -> String {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("public key:"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| panic!("`weave key gen` did not print a public key:\n{out}"))
+}
+
+/// Count messages in a receiver's inbox via `--json --peek`.
+#[cfg(feature = "sign")]
+fn sign_inbox_len(db: &TestDb, me: &str, cfg_home: &str) -> usize {
+    let inbox = run_ok_env(
+        db,
+        &["inbox", "--me", me, "--json", "--peek"],
+        &[("XDG_CONFIG_HOME", cfg_home)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    v["messages"].as_array().map(|a| a.len()).unwrap_or(0)
+}
+
+/// TAMPER / mismatched signature: A genuinely signs as "alice", but B has a
+/// DIFFERENT public key registered for "alice" (so the present signature does not
+/// verify). A present-but-invalid signature is a hard fail — REJECTED, never
+/// committed — in BOTH non-strict and strict modes, and A's store stays unchanged.
+#[cfg(feature = "sign")]
+#[test]
+fn signed_intent_failing_verification_is_always_rejected() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let decoy = TestDb::new(); // a throwaway store used only to mint a real, DIFFERENT key
+    let a_cfg = sign_config_home();
+    let decoy_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let decoy_cfg_s = decoy_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // A's real signing key (will actually sign the intent).
+    run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    // A genuinely-different key, registered on B under "alice" — so A's signature
+    // verifies against the WRONG public key (equivalent to a tampered/forged sig).
+    let decoy_gen = run_ok_env(
+        &decoy,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &decoy_cfg_s)],
+    );
+    let wrong_pub = sign_pubkey_from_gen(&decoy_gen);
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &wrong_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+
+    // A sends a SIGNED intent (signed by A's real key).
+    run_ok_env(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "should never commit",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let a_bytes_before = std::fs::read(&a.path).expect("read A");
+
+    // Non-strict: a present-but-invalid signature is STILL rejected.
+    let p_lax = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &a.path_str()),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_lax.contains("pulled 0 message"),
+        "a signature that fails verification must be rejected even in advisory mode: {p_lax}"
+    );
+    assert_eq!(
+        sign_inbox_len(&b, "bob", &b_cfg_s),
+        0,
+        "a rejected intent must leave B's inbox untouched"
+    );
+    // A's store is byte-unchanged (owner-only-writes: verify happens on B's side).
+    assert_eq!(
+        a_bytes_before,
+        std::fs::read(&a.path).expect("read A after"),
+        "verification must not write the source store"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&decoy_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// SPOOF: an intent claiming `from = carol` but signed by a different (attacker's)
+/// key is rejected, because B verifies against carol's REAL registered key.
+#[cfg(feature = "sign")]
+#[test]
+fn spoofed_from_signed_by_wrong_key_is_rejected() {
+    let attacker = TestDb::new();
+    let carol_store = TestDb::new();
+    let b = TestDb::new();
+    let atk_cfg = sign_config_home();
+    let carol_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let atk_cfg_s = atk_cfg.to_string_lossy().into_owned();
+    let carol_cfg_s = carol_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // The attacker has its OWN key file (it will sign the spoof).
+    run_ok_env(
+        &attacker,
+        &["key", "gen", "--me", "attacker"],
+        &[("XDG_CONFIG_HOME", &atk_cfg_s)],
+    );
+    // Carol's REAL key, registered on B — this is what B checks against.
+    let carol_gen = run_ok_env(
+        &carol_store,
+        &["key", "gen", "--me", "carol"],
+        &[("XDG_CONFIG_HOME", &carol_cfg_s)],
+    );
+    let carol_pub = sign_pubkey_from_gen(&carol_gen);
+    run_ok_env(
+        &b,
+        &["key", "add", "carol", &carol_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+
+    // The attacker enqueues an intent CLAIMING from=carol, signed by attacker's key.
+    run_ok_env(
+        &attacker,
+        &[
+            "send",
+            "--from",
+            "carol",
+            "--to",
+            "bob",
+            "--body",
+            "I am totally carol",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &atk_cfg_s)],
+    );
+
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &attacker.path_str()),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        pull.contains("pulled 0 message"),
+        "a spoofed `from` signed by the wrong key must be rejected: {pull}"
+    );
+    assert_eq!(
+        sign_inbox_len(&b, "bob", &b_cfg_s),
+        0,
+        "the spoofed intent must never reach B's inbox"
+    );
+
+    let _ = std::fs::remove_dir_all(&atk_cfg);
+    let _ = std::fs::remove_dir_all(&carol_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// strict_verify: an UNSIGNED intent from a pull source is DROPPED under
+/// `WEAVE_STRICT_VERIFY=1` but COMMITS in advisory mode when strict is off.
+#[cfg(feature = "sign")]
+#[test]
+fn strict_verify_drops_unsigned_but_advisory_commits() {
+    // Two distinct sender stores (NO key file ⇒ unsigned intents). Using a separate
+    // source per receiver keeps each outbox to exactly one intent — a shared source
+    // would deliver BOTH enqueued intents to whichever receiver pulls it (the
+    // `--to-store` host hint is advisory, not a delivery filter).
+    let a = TestDb::new();
+    let a2 = TestDb::new();
+    let a_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // --- strict receiver: unsigned is DROPPED ---
+    let b_strict = TestDb::new();
+    run_ok_env(
+        &a,
+        &[
+            "send",
+            "--from",
+            "dave",
+            "--to",
+            "bob",
+            "--body",
+            "unsigned hello",
+            "--to-store",
+            &b_strict.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let p_strict = run_ok_env(
+        &b_strict,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &a.path_str()),
+            ("WEAVE_STRICT_VERIFY", "1"),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_strict.contains("pulled 0 message"),
+        "strict_verify must DROP an unsigned intent: {p_strict}"
+    );
+    assert_eq!(
+        sign_inbox_len(&b_strict, "bob", &b_cfg_s),
+        0,
+        "a dropped unsigned intent must not reach the inbox under strict"
+    );
+
+    // --- advisory receiver: unsigned COMMITS (from a fresh single-intent source) ---
+    let b_lax = TestDb::new();
+    run_ok_env(
+        &a2,
+        &[
+            "send",
+            "--from",
+            "dave",
+            "--to",
+            "bob",
+            "--body",
+            "unsigned hello",
+            "--to-store",
+            &b_lax.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let p_lax = run_ok_env(
+        &b_lax,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &a2.path_str()),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_lax.contains("pulled 1 message"),
+        "with strict off, an unsigned intent commits under advisory: {p_lax}"
+    );
+    assert_eq!(
+        sign_inbox_len(&b_lax, "bob", &b_cfg_s),
+        1,
+        "advisory mode delivers the unsigned intent"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// The private signing-key file is created 0600 (owner-only) and its secret
+/// bytes never appear on stdout.
+#[cfg(feature = "sign")]
+#[test]
+fn private_key_file_is_0600_and_secret_never_printed() {
+    let a = TestDb::new();
+    let a_cfg = sign_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+
+    let gen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+
+    let key_file = a_cfg.join("weave").join("ed25519.key");
+    let meta = std::fs::metadata(&key_file)
+        .unwrap_or_else(|e| panic!("private key file {key_file:?} must exist: {e}"));
+    let mode = meta.permissions().mode();
+    assert_eq!(
+        mode & 0o177,
+        0,
+        "private key file must be 0600 (no group/other, no exec); mode was {:o}",
+        mode & 0o777
+    );
+
+    let secret = std::fs::read_to_string(&key_file).expect("read key");
+    assert!(
+        !gen.contains(secret.trim()),
+        "the private key secret must never appear on stdout"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
 }

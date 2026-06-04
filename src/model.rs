@@ -85,6 +85,43 @@ pub struct Message {
     pub in_reply_to: Option<i64>,
 }
 
+/// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
+/// in the sender's own `outbox` table describing a message addressed to a peer
+/// living in a *different* store. The sender never writes the recipient's store;
+/// the recipient's own process pulls the intent (read-only) and commits it into
+/// its own inbox via the normal `Store::send` path (owner-only-writes).
+///
+/// Pure data (no I/O), shared by both store backends and the `main`/`mcp`
+/// consumers — the `Message`/`Peer` precedent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Intent {
+    /// The sender's local, per-store monotonic intent id (`outbox.id`,
+    /// `AUTOINCREMENT`). The receiver dedups on `(source, this id)` via its own
+    /// per-source `pull_cursor` high-water mark.
+    pub id: i64,
+    /// The sender's created time (advisory display only; the receiver re-stamps
+    /// with its own `now()` when it commits, anchoring ordering locally).
+    pub ts: i64,
+    /// Recipient identity in the receiver's store.
+    pub to: String,
+    /// Optional host hint disambiguating the same name across machines
+    /// (advisory). Empty when unspecified.
+    #[serde(default)]
+    pub to_host: String,
+    /// Sender identity. Attributed to the source store on the receiver side
+    /// (origin attribution); `from` is advisory within a store until signed
+    /// identity (2d) makes it unforgeable.
+    pub from: String,
+    pub subject: Option<String>,
+    pub body: String,
+    /// Reserved signature over the canonical message bytes. Empty in 2a/2b;
+    /// populated only by the optional `sign` feature (2d). Reserving the field
+    /// now means 2d adds no further `outbox` migration. `#[serde(default)]` keeps
+    /// older JSON payloads (which omit the field) deserializable.
+    #[serde(default)]
+    pub sig: String,
+}
+
 /// A session that has registered itself, with where (if anywhere) it can be
 /// injected into.
 #[derive(Debug, Clone, Serialize, Deserialize)]

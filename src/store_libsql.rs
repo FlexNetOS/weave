@@ -36,10 +36,11 @@
 //! via `query`, not `execute` (libsql's `execute` rejects row-returning statements).
 
 use crate::config::Config;
-use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
+use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
-    check_body, check_ident, clamp_limit, merge_peer_views, merge_session_views, reply_subject,
-    store_label, Origin, PeerView, SessionInfo, SessionView, Store, MAX_SESSIONS,
+    canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
+    merge_peer_views, merge_session_views, reply_subject, store_label, Origin, PeerView, Pulled,
+    SessionInfo, SessionView, Store, MAX_PULL_PER_DRAIN, MAX_SESSIONS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -74,6 +75,24 @@ const SCHEMA: &[&str] = &[
         pid       INTEGER,
         host      TEXT NOT NULL DEFAULT ''
     )",
+    "CREATE TABLE IF NOT EXISTS outbox (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        INTEGER NOT NULL,
+        to_peer   TEXT NOT NULL,
+        to_host   TEXT NOT NULL DEFAULT '',
+        from_peer TEXT NOT NULL,
+        subject   TEXT,
+        body      TEXT NOT NULL,
+        sig       TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE TABLE IF NOT EXISTS pull_cursor (
+        source  TEXT PRIMARY KEY,
+        last_id INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS keys (
+        identity TEXT PRIMARY KEY,
+        pubkey   TEXT NOT NULL
+    )",
 ];
 
 pub struct LibsqlStore {
@@ -96,6 +115,22 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         subject: r.get::<Option<String>>(4)?,
         body: r.get::<String>(5)?,
         in_reply_to: r.get::<Option<i64>>(6)?,
+    })
+}
+
+/// Convert an `outbox` row into our owned `Intent`. Column order matches the
+/// explicit projections below: id, ts, to_peer, to_host, from_peer, subject,
+/// body, sig.
+fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
+    Ok(Intent {
+        id: r.get::<i64>(0)?,
+        ts: r.get::<i64>(1)?,
+        to: r.get::<String>(2)?,
+        to_host: r.get::<String>(3)?,
+        from: r.get::<String>(4)?,
+        subject: r.get::<Option<String>>(5)?,
+        body: r.get::<String>(6)?,
+        sig: r.get::<String>(7)?,
     })
 }
 
@@ -371,6 +406,54 @@ pub fn federated_sessions(
         }
     }
     Ok(merge_session_views(views))
+}
+
+/// Tier-2 cross-store delivery (receiver side) — libsql mirror of
+/// `store::pull_from_store`. For each `allow`-listed source, open it **read-only**
+/// via [`LibsqlStore::open_readonly`] (the SQLite core rejects any write), read the
+/// intents addressed to `me` since this store's per-source cursor, and commit each
+/// into the LOCAL store via the shared `commit_pulled` (which uses the normal
+/// `Store::send` + advances the cursor). EVERY write is to `local`; the source is
+/// never written, migrated, or created — the owner-only-writes guarantee is
+/// structural. Unreadable/locked/missing/no-`outbox` sources are skipped (stderr),
+/// never fatal; per-source commits are bounded by [`MAX_PULL_PER_DRAIN`].
+///
+/// `strict` (`Config::strict_verify`, 2d) is forwarded to `commit_pulled`: under it
+/// an unsigned/unverifiable intent is dropped rather than committed. Inert without
+/// the `sign` feature.
+pub fn pull_from_store(
+    local: &dyn Store,
+    me: &str,
+    allow: &[std::path::PathBuf],
+    strict: bool,
+) -> Result<Pulled> {
+    let mut out = Pulled::default();
+    for path in allow {
+        let source = canonical_source(path);
+        let foreign = match LibsqlStore::open_readonly(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                out.sources_skipped += 1;
+                continue;
+            }
+        };
+        let since = local.pull_cursor_get(&source)?;
+        let intents = match foreign.list_outbox(me, since, MAX_PULL_PER_DRAIN) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                out.sources_skipped += 1;
+                continue;
+            }
+        };
+        let n = commit_pulled(local, me, &source, strict, intents)?;
+        out.committed += n;
+        if n > 0 {
+            out.committed_sources.push(path.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Build a positional parameter vector for a libsql query. `Value` already has
@@ -871,6 +954,150 @@ impl Store for LibsqlStore {
             let mut out = Vec::new();
             while let Some(r) = it.next().await? {
                 out.push(row_to_peer(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn enqueue_intent(
+        &self,
+        to: &str,
+        to_host: &str,
+        from: &str,
+        subject: Option<&str>,
+        body: &str,
+        sig: &str,
+    ) -> Result<i64> {
+        check_ident("recipient", to)?;
+        check_ident("sender", from)?;
+        check_host(to_host)?;
+        check_body(body)?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params(vec![
+                        now().into(),
+                        to.into(),
+                        to_host.into(),
+                        from.into(),
+                        subject.map(|s| s.to_string()).into(),
+                        body.into(),
+                        sig.into(),
+                    ]),
+                )
+                .await?;
+            Ok(self.conn.last_insert_rowid())
+        })
+    }
+
+    fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                     WHERE to_peer = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+                    params(vec![for_recipient.into(), since_id.into(), limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_intent(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                     ORDER BY id ASC LIMIT ?1",
+                    params(vec![limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_intent(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn pull_cursor_get(&self, source: &str) -> Result<i64> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT last_id FROM pull_cursor WHERE source = ?1",
+                    params(vec![source.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(r.get::<i64>(0)?),
+                None => Ok(0),
+            }
+        })
+    }
+
+    fn pull_cursor_set(&self, source: &str, last_id: i64) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO pull_cursor (source, last_id) VALUES (?1, ?2) \
+                     ON CONFLICT(source) DO UPDATE SET last_id = ?2",
+                    params(vec![source.into(), last_id.into()]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn register_key(&self, identity: &str, pubkey: &str) -> Result<()> {
+        check_ident("identity", identity)?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO keys (identity, pubkey) VALUES (?1, ?2) \
+                     ON CONFLICT(identity) DO UPDATE SET pubkey = ?2",
+                    params(vec![identity.into(), pubkey.into()]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn get_key(&self, identity: &str) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT pubkey FROM keys WHERE identity = ?1",
+                    params(vec![identity.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(r.get::<String>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_keys(&self) -> Result<Vec<(String, String)>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query("SELECT identity, pubkey FROM keys ORDER BY identity", ())
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push((r.get::<String>(0)?, r.get::<String>(1)?));
             }
             Ok(out)
         })
@@ -1539,5 +1766,134 @@ mod tests {
         // federation_status counts the ok store and the skipped bad path.
         let (ok, skipped) = federation_status(&extra);
         assert_eq!((ok, skipped), (1, 1));
+    }
+
+    // ---- Tier-2: outbox / pull cursor / pull driver (libsql mirror) ----
+
+    /// `enqueue_intent` round-trips every column (incl. reserved empty `sig`), and
+    /// `list_outbox` filters by recipient + `id>since`, oldest-first. (libsql.)
+    #[test]
+    fn enqueue_and_list_outbox_roundtrip_libsql() {
+        let s = mem();
+        let i1 = s
+            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "")
+            .unwrap();
+        s.enqueue_intent("carol", "", "alice", None, "for carol", "")
+            .unwrap();
+        let i3 = s
+            .enqueue_intent("bob", "", "alice", None, "body3", "")
+            .unwrap();
+
+        let all = s.outbox_all(50).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].to, "bob");
+        assert_eq!(all[0].to_host, "boxB");
+        assert_eq!(all[0].subject.as_deref(), Some("hi"));
+        assert_eq!(all[0].sig, "");
+
+        let for_bob = s.list_outbox("bob", 0, 50).unwrap();
+        assert_eq!(
+            for_bob.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![i1, i3]
+        );
+        let after = s.list_outbox("bob", i1, 50).unwrap();
+        assert_eq!(after.iter().map(|m| m.id).collect::<Vec<_>>(), vec![i3]);
+    }
+
+    /// The pull cursor defaults to 0 and round-trips through set/get. (libsql.)
+    #[test]
+    fn pull_cursor_default_and_roundtrip_libsql() {
+        let s = mem();
+        assert_eq!(s.pull_cursor_get("/src.db").unwrap(), 0);
+        s.pull_cursor_set("/src.db", 42).unwrap();
+        assert_eq!(s.pull_cursor_get("/src.db").unwrap(), 42);
+        s.pull_cursor_set("/src.db", 99).unwrap();
+        assert_eq!(s.pull_cursor_get("/src.db").unwrap(), 99);
+        assert_eq!(s.pull_cursor_get("/other.db").unwrap(), 0);
+    }
+
+    /// The 2d `keys` table round-trips a registered pubkey through get/list and
+    /// upserts on conflict (libsql mirror). Plain data; present regardless of the
+    /// `sign` feature.
+    #[test]
+    fn keys_register_get_list_roundtrip_libsql() {
+        let s = mem();
+        assert!(s.get_key("alice").unwrap().is_none());
+        s.register_key("alice", "aa11").unwrap();
+        s.register_key("bob", "bb22").unwrap();
+        assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
+        s.register_key("alice", "cc33").unwrap();
+        assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("cc33"));
+        let keys = s.list_keys().unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                ("alice".to_string(), "cc33".to_string()),
+                ("bob".to_string(), "bb22".to_string()),
+            ]
+        );
+        assert!(s.register_key("", "00").is_err());
+    }
+
+    /// End-to-end pull on libsql: A enqueues for B; B pulls read-only and commits
+    /// into its own inbox; a re-pull is idempotent; A's main DB file is
+    /// byte-unchanged (the owner-only-writes structural proof on libsql).
+    #[test]
+    fn pull_from_store_commits_once_and_leaves_source_unchanged_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-pull-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+
+        {
+            let cfg = Config {
+                db: Some(a_path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let a = LibsqlStore::open(&cfg).unwrap();
+            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "")
+                .unwrap();
+        }
+        // Snapshot A's main DB file BEFORE B pulls (WAL legitimately appears on a
+        // read-only open; the invariant is asserted on the main data file + empty WAL).
+        let before = std::fs::read(&a_path).unwrap();
+
+        let b = {
+            let cfg = Config {
+                db: Some(b_path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            LibsqlStore::open(&cfg).unwrap()
+        };
+        let allow = vec![a_path.clone()];
+        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(pulled.committed, 1);
+
+        let (rows, _) = b.inbox("bob", false, false, 50).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender, "alice");
+        assert_eq!(rows[0].body, "hello bob");
+
+        let again = pull_from_store(&b, "bob", &allow, false).unwrap();
+        assert_eq!(again.committed, 0, "re-drain must not double-deliver");
+        let (rows2, _) = b.inbox("bob", false, false, 50).unwrap();
+        assert_eq!(rows2.len(), 1);
+
+        // OWNER-ONLY-WRITES: A's main DB is byte-identical; its WAL is empty/absent.
+        let after = std::fs::read(&a_path).unwrap();
+        assert_eq!(
+            before, after,
+            "pulling must leave the source main DB byte-unchanged (libsql)"
+        );
+        let wal_len = std::fs::metadata(format!("{}-wal", a_path.display()))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal_len, 0, "no write committed to the source (WAL empty)");
     }
 }

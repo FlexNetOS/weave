@@ -301,22 +301,32 @@ multi-store federation** (`WEAVE_PEER_DBS` / `peer_dbs`, foreign stores opened
 `SQLITE_OPEN_READ_ONLY`, origin-tagged + deduped, both backends). That is the
 read-only half of cross-store work and ships clean.
 
-**Next gated item — Tier-2 cross-store *write* / send / inject.** This lets store
-A get a message (and optionally a live nudge) to a peer that lives in store B. It
-is **design-only and not implemented**, because it is the first feature to cross
-the local trust boundary — "identity is advisory" stops being acceptable once a
-write can originate outside a store's owner. It is gated on an approved trust
-model; the recommended design is **broker-mediated request-pull** (Option C): no
-direct foreign-store writes at all — A deposits an intent in its own store, and
-B's own process pulls it read-only (reusing Tier-1's `open_readonly`) and commits
-it locally via the normal `Store::send`. That keeps every invariant intact
-("only a store's owner writes it"), adds **no new dependency, daemon, shell, or
-crypto**, and accepts next-drain (not instant) cross-store delivery, consistent
-with weave's degrade-to-next-turn contract. A schema change (an owner-written
-`outbox`/intent table) means a **mandatory dual-backend mirror**. Optional
-unforgeable intra-store identity (signed `from`) would layer behind a feature flag
-later (the `libsql` precedent) and is not required for boundary safety. **No
-Tier-2 `src/` code is authorized until the trust model is approved.**
+**DELIVERED — Tier-2 cross-store *write* / send / inject.** The gated item has
+landed, built exactly on the recommended **broker-mediated request-pull** (Option
+C) with **owner-only-writes**: A deposits an intent in its **own** `outbox`; B's
+own process pulls each allowed source read-only (reusing Tier-1's `open_readonly`)
+and commits it locally via the normal `Store::send`. Every invariant stays intact
+— no daemon, no shell, no new **default** dependency — and delivery is next-drain
+(not instant), consistent with weave's degrade-to-next-turn contract. What shipped:
+
+- **Schema (dual-backend mirror):** owner-written `outbox` + per-source
+  `pull_cursor` (monotonic-id dedup ⇒ idempotent re-drain, bounded one-intent
+  at-least-once across a crash) + a `keys` table.
+- **CLI/MCP:** `weave send --to-store/--to-host`, `weave outbox`, `weave pull`;
+  `weave_send` cross-store routing + `weave_outbox`.
+- **Config:** `pull_from` (delivery sources, distinct from `peer_dbs`),
+  `inject_pulled` (consent nudge, default ON), `allow_inject_from`, `strict_verify`.
+- **Consent inject:** a pulled message from an allow-listed source fires the
+  content-free paste-safe nudge into the receiver's **own** pane by default
+  (caller-side; no `store → inject` edge).
+- **Optional signed identity (`sign` feature):** unforgeable cross-store `from` via
+  Ed25519, behind a feature flag exactly per the `libsql` precedent — **the default
+  build links no crypto**.
+
+**v1 limitation.** Pull sources are **local-file** stores (the receiver opens each
+source path read-only). Pulling from a **remote Turso/libSQL** endpoint is deferred
+— the model and tables are backend-mirrored, but the read-only pull path is
+exercised against local files; remote-pull wiring is future work.
 
 ---
 
@@ -330,7 +340,7 @@ Tier-2 `src/` code is authorized until the trust model is approved.**
 | 4 | Streamable-HTTP MCP | v0.2 `weave-mcp` lib split, §3 for retry-safety | feature-gated | M–L |
 | 5 | Reservation leases | store + presence (have/v0.2) | none (new table) | S–M |
 | 6 | iTerm2 backend | `inject.rs` seams (have) | none | M |
-| 7 | Cross-store write/inject (Tier-2) | Tier-1 federation (have), approved trust model | none (new table, dual-backend) | M–L |
+| 7 | Cross-store write/inject (Tier-2) — **DELIVERED** | Tier-1 federation (have) | none default (new tables, dual-backend; crypto behind `sign`) | M–L |
 
 Recommended order: **1 → 3 → 2 → 5 → 6 → 4.** The stop-wake (1) is the flagship
 differentiator and unlocks the *blocking* flavour of asks; the delivery-semantics
