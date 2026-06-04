@@ -1305,7 +1305,7 @@ fn private_key_file_is_0600_and_secret_never_printed() {
     let a_cfg = sign_config_home();
     let a_cfg_s = a_cfg.to_string_lossy().into_owned();
 
-    let gen = run_ok_env(
+    let keygen = run_ok_env(
         &a,
         &["key", "gen", "--me", "alice"],
         &[("XDG_CONFIG_HOME", &a_cfg_s)],
@@ -1324,7 +1324,7 @@ fn private_key_file_is_0600_and_secret_never_printed() {
 
     let secret = std::fs::read_to_string(&key_file).expect("read key");
     assert!(
-        !gen.contains(secret.trim()),
+        !keygen.contains(secret.trim()),
         "the private key secret must never appear on stdout"
     );
 
