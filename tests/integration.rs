@@ -315,6 +315,13 @@ fn injector_send_drives_fake_tmux() {
         logged.contains("-t %1") && logged.contains(" x"),
         "fake tmux log should target pane %1 and type the body 'x':\n{logged}"
     );
+    // The liveness probe must have been served by the FAKE tmux (not a real
+    // /usr/bin/tmux): the fake records every argv, so a `has-session` line proves
+    // WEAVE_MUX_DIR took precedence over the system dir on this runner.
+    assert!(
+        logged.contains("has-session"),
+        "fake tmux log should record the has-session liveness probe:\n{logged}"
+    );
 }
 
 #[test]
@@ -365,6 +372,13 @@ fn injector_explicit_inject_drives_fake_tmux() {
     assert!(
         logged.contains(" hi"),
         "fake tmux log should type the injected text 'hi':\n{logged}"
+    );
+    // The liveness probe must have been served by the FAKE tmux (not a real
+    // /usr/bin/tmux): a recorded `has-session` line proves WEAVE_MUX_DIR took
+    // precedence over the system dir on this runner.
+    assert!(
+        logged.contains("has-session"),
+        "fake tmux log should record the has-session liveness probe:\n{logged}"
     );
 }
 

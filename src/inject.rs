@@ -544,17 +544,27 @@ fn json_has_id(out: &str, want: i64) -> Option<bool> {
 /// execute inside weave's process (which may hold a libSQL auth token) on a
 /// remote-triggered send. We only run a mux found by ABSOLUTE path in one of these
 /// system/user-tool dirs.
+///
+/// Precedence: `WEAVE_MUX_DIR` entries come **first**, ahead of the hardcoded
+/// system dirs (`/usr/bin`, …) and the `$HOME/...` tool dirs. `resolve_trusted`
+/// returns the first dir that contains the binary, so an explicit opt-in dir wins
+/// over an ambient same-named system binary. This is intentional: a user who sets
+/// `WEAVE_MUX_DIR` is vouching for that dir and means "use *this* mux", and it is
+/// also how tests point weave at a fake mux on a runner that already ships a real
+/// `/usr/bin/tmux` (otherwise the system binary would shadow the fake).
 fn trusted_dirs() -> Vec<std::path::PathBuf> {
-    let mut v: Vec<std::path::PathBuf> =
-        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
+    let mut v: Vec<std::path::PathBuf> = Vec::new();
     // Explicit opt-in for a mux installed in a nonstandard dir (the user vouches
-    // for it by setting this); also how tests point at a fake mux.
+    // for it by setting this); also how tests point at a fake mux. Listed first so
+    // it takes precedence over an ambient same-named system binary below.
     if let Some(extra) = std::env::var_os("WEAVE_MUX_DIR") {
         v.extend(std::env::split_paths(&extra));
     }
+    v.extend(
+        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(std::path::PathBuf::from),
+    );
     if let Some(home) = std::env::var_os("HOME") {
         let h = std::path::PathBuf::from(home);
         v.push(h.join(".cargo/bin"));
@@ -1252,6 +1262,39 @@ mod tests {
         assert!(target_alive(&t(Mux::Screen, "1234.pts-0.host")));
         // None / un-injectable → no probe → true (inject() itself no-ops on these).
         assert!(target_alive(&Target::none()));
+    }
+
+    /// `WEAVE_MUX_DIR` must take precedence over the hardcoded system dirs so an
+    /// explicit opt-in dir wins over an ambient same-named system binary (e.g. a
+    /// runner-provided `/usr/bin/tmux` must not shadow a fake mux the test points
+    /// at). We assert the *ordering* of `trusted_dirs()` directly — no on-disk
+    /// binary, no process-global resolution that could race other parallel tests.
+    #[test]
+    fn weave_mux_dir_precedes_system_dirs() {
+        // Keep the env mutation local to this test body and restore the prior
+        // value afterward so we don't leak state to other tests.
+        let prev = std::env::var_os("WEAVE_MUX_DIR");
+        std::env::set_var("WEAVE_MUX_DIR", "/tmp/weave-fake-mux");
+        let dirs = trusted_dirs();
+        match prev {
+            Some(v) => std::env::set_var("WEAVE_MUX_DIR", v),
+            None => std::env::remove_var("WEAVE_MUX_DIR"),
+        }
+
+        let opt_in = std::path::Path::new("/tmp/weave-fake-mux");
+        let usr_bin = std::path::Path::new("/usr/bin");
+        let opt_in_idx = dirs
+            .iter()
+            .position(|d| d == opt_in)
+            .expect("WEAVE_MUX_DIR entry present in trusted_dirs()");
+        let usr_bin_idx = dirs
+            .iter()
+            .position(|d| d == usr_bin)
+            .expect("/usr/bin present in trusted_dirs()");
+        assert!(
+            opt_in_idx < usr_bin_idx,
+            "WEAVE_MUX_DIR ({opt_in_idx}) must precede /usr/bin ({usr_bin_idx}) in {dirs:?}"
+        );
     }
 
     #[test]
