@@ -2364,12 +2364,12 @@ fn signed_cross_store_send_is_verified_then_committed() {
     let b_cfg_s = b_cfg.to_string_lossy().into_owned();
 
     // A generates its signing keypair (private key 0600 under A's config dir).
-    let gen = run_ok_env(
+    let keygen = run_ok_env(
         &a,
         &["key", "gen", "--me", "alice"],
         &[("XDG_CONFIG_HOME", &a_cfg_s)],
     );
-    let alice_pub = pubkey_from_gen(&gen);
+    let alice_pub = pubkey_from_gen(&keygen);
 
     // B registers alice's PUBLIC key so it can verify her signatures.
     run_ok_env(
@@ -2436,7 +2436,7 @@ fn key_gen_never_prints_the_private_key() {
     let a_cfg = unique_config_home();
     let a_cfg_s = a_cfg.to_string_lossy().into_owned();
 
-    let gen = run_ok_env(
+    let keygen = run_ok_env(
         &a,
         &["key", "gen", "--me", "alice"],
         &[("XDG_CONFIG_HOME", &a_cfg_s)],
@@ -2448,11 +2448,11 @@ fn key_gen_never_prints_the_private_key() {
     let secret = secret.trim();
     assert!(!secret.is_empty(), "key file holds the secret");
     assert!(
-        !gen.contains(secret),
+        !keygen.contains(secret),
         "the private key must never appear in `weave key gen` stdout"
     );
     // The public key, which IS printed, must differ from the secret bytes.
-    let pubkey = pubkey_from_gen(&gen);
+    let pubkey = pubkey_from_gen(&keygen);
     assert_ne!(pubkey, secret, "public key is not the secret");
 
     let _ = std::fs::remove_dir_all(&a_cfg);
