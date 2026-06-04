@@ -1,94 +1,34 @@
-```markdown
 # weave Development Patterns
 
-> Auto-generated skill from repository analysis
+Repo-specific conventions for the **weave** codebase — a single dependency-light **Rust** binary (agent-to-agent session mesh + native multi-mux terminal injector). The authoritative source of truth is `CLAUDE.md` and the `.claude/skills/weave-*` harness skills; this file mirrors the essentials for the Codex/OpenAI-agents bundle.
 
-## Overview
-This skill teaches you the core development patterns and conventions used in the `weave` Rust codebase. You'll learn about file naming, import/export styles, commit message habits, and how to structure and run tests. This guide is designed to help contributors maintain consistency and quality in the project.
+> Note: an earlier auto-generated version of this file was inaccurate. The conventions below are verified against the actual codebase.
 
-## Coding Conventions
+## Coding conventions (actual)
 
-### File Naming
-- Use **camelCase** for file names.
-  - Example: `dataProcessor.rs`, `userSession.rs`
+- **File naming:** snake_case Rust modules — `model.rs`, `store.rs`, `store_libsql.rs`, `inject.rs`, `mcp.rs`, `config.rs`, `setup.rs`, `main.rs`. (Not camelCase.)
+- **Imports:** `crate::`/`super::` paths and std; the crate is one binary with focused modules.
+- **Module layering (acyclic):** `model` (no I/O) ← `inject`/`store`/`config` ← `mcp`/`setup` ← `main`. Never add an upward dependency.
+- **Tests:** in-module `#[cfg(test)]` unit tests **plus** black-box suites in `tests/` (`integration.rs`, `security.rs`, `prop.rs`) and a criterion bench in `benches/`. There are no `*.test.*` files.
+- **Commits:** Conventional Commits — `feat(inject): …`, `fix(store): …`, `docs(...)`, `test(...)`. Scopes mirror modules. (Not freeform.)
 
-### Import Style
-- Use **relative imports** within the codebase.
-  - Example:
-    ```rust
-    use crate::utils::stringHelpers;
-    use super::config;
-    ```
+## Non-negotiable invariants
 
-### Export Style
-- Use **named exports** for modules and functions.
-  - Example:
-    ```rust
-    pub fn process_data() { ... }
-    pub struct UserSession { ... }
-    ```
+No shell (argv-only `Command::new(bin).args(...)`, never `sh -c`); parameterized SQL (`params!`, the only inline literals are the `BROADCAST`-derived aliases); paste-safe injection (`commands_for` is pure; close bracketed paste before Enter); input caps (`MAX_IDENT_LEN`, `MAX_BODY`=65536, `MAX_INJECT_CHARS`=240, `id_valid`); destructive ops `confirm`-gated; MCP writes only protocol frames to stdout, logs to stderr; dependency-light default build (foreign/heavy deps behind a feature flag, as `libsql` is).
 
-### Commit Messages
-- Freeform style, often prefixed with `weave`.
-- Average commit message length: ~150 characters.
-  - Example: `weave: refactor dataProcessor to improve error handling and add logging for debug mode`
+## The verification gate (dual backend)
 
-## Workflows
-
-### Adding a New Module
-**Trigger:** When you need to introduce a new feature or component.
-**Command:** `/add-module`
-
-1. Create a new file using camelCase naming (e.g., `featureHandler.rs`).
-2. Implement your module using relative imports for dependencies.
-3. Export public functions or structs with `pub`.
-4. Write associated tests in a corresponding `*.test.*` file.
-5. Commit changes with a descriptive message, prefixed with `weave` if appropriate.
-
-### Refactoring Existing Code
-**Trigger:** When improving or restructuring code for clarity or performance.
-**Command:** `/refactor-code`
-
-1. Identify the target files and functions.
-2. Use relative imports for any new dependencies.
-3. Maintain camelCase naming for new files.
-4. Update exports to remain named and public as needed.
-5. Update or add tests to cover refactored logic.
-6. Commit with a detailed message, e.g., `weave: refactor session management for async support`.
-
-### Writing and Running Tests
-**Trigger:** When adding new features or fixing bugs.
-**Command:** `/run-tests`
-
-1. Create or update test files following the `*.test.*` pattern (e.g., `userSession.test.rs`).
-2. Write tests using the project's preferred Rust testing approach.
-3. Run tests using the standard Rust test runner:
-    ```sh
-    cargo test
-    ```
-4. Ensure all tests pass before committing.
-
-## Testing Patterns
-
-- Test files use the `*.test.*` naming pattern (e.g., `module.test.rs`).
-- The specific testing framework is not detected, but Rust's built-in test framework is likely used.
-- Example test structure:
-    ```rust
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_feature() {
-            assert_eq!(feature_function(), expected_value);
-        }
-    }
-    ```
-
-## Commands
-| Command         | Purpose                                         |
-|-----------------|-------------------------------------------------|
-| /add-module     | Scaffold and implement a new module             |
-| /refactor-code  | Refactor existing code with proper conventions  |
-| /run-tests      | Run all tests in the codebase                   |
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test  --all-targets                              # default sqlite backend
+cargo clippy --no-default-features --features libsql -- -D warnings
+cargo build  --no-default-features --features libsql   # mutually-exclusive backend
+cargo test   --no-default-features --features libsql
 ```
+
+A store-touching change is done only when **both** backends are green.
+
+## Rust-native drift
+
+weave must stay one self-contained Rust build. ECC/auto-generated artifacts (this file included, `.codex/`, `.claude/*.json`, `handoff/**`, any `.omc` or ecc-pushed package) are acceptable only as inert sidecars — never feeding the build, never a foreign source of truth Rust mirrors by hand, never contradicting the code. See `.claude/skills/weave-drift-guard/SKILL.md` for the full guard.

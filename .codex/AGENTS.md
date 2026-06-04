@@ -5,7 +5,7 @@ This supplements the root `AGENTS.md` with a repo-local ECC baseline.
 ## Repo Skill
 
 - Repo-generated Codex skill: `.agents/skills/weave/SKILL.md`
-- Claude-facing companion skill: `.claude/skills/weave/SKILL.md`
+- Claude-facing harness: `.claude/skills/weave-orchestrator/SKILL.md` (entry point) + `weave-invariants`, `weave-test-discipline`, `weave-drift-guard`, with agents in `.claude/agents/weave-*.md`
 - Keep user-specific credentials and private MCPs in `~/.codex/config.toml`, not in this repo.
 
 ## MCP Baseline
