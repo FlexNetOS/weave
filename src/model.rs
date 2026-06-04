@@ -103,6 +103,23 @@ pub struct Peer {
     pub socket: String,
     pub cwd: Option<String>,
     pub last_seen: i64,
+    /// PID of the process that registered this peer, if known. Used (together
+    /// with [`Peer::host`]) for real process-liveness on the local host. `None`
+    /// ⇒ unknown ⇒ presence falls back to the recency (TTL) guess. Additive +
+    /// backward-compatible: pre-existing rows (and DBs created before the `pid`
+    /// column migration) read back as `None`. `#[serde(default)]` keeps older
+    /// JSON payloads (which omit the field) deserializable.
+    #[serde(default)]
+    pub pid: Option<i64>,
+    /// Host identifier of the machine that registered this peer (see
+    /// `config::this_host`). A PID is only meaningful on the host that owns it,
+    /// so liveness probing is gated on `host == this_host()`; a remote peer
+    /// fails *open* (TTL-only) since we cannot probe its PID. Additive +
+    /// backward-compatible: pre-existing rows (and DBs created before the `host`
+    /// column migration) read back as `""`. `#[serde(default)]` keeps older JSON
+    /// payloads (which omit the field) deserializable.
+    #[serde(default)]
+    pub host: String,
 }
 
 #[cfg(test)]

@@ -290,6 +290,36 @@ live" behind real-hardware confirmation.
 
 ---
 
+## 7. Cross-store write / inject (Tier-2) — gated on a trust model
+
+**Delivered already (Presence & Live-Connect package, landed ahead of this
+roadmap):** real process liveness (`peers.pid`/`host`, `is_alive` = TTL ∧
+local-PID-alive, fail-open for remote/unprobeable peers) so presence means
+*alive*; heartbeat-on-read; `weave attach` / `weave_attach` zero-restart adoption;
+`weave connect` / `weave_connect` capability verdict; and **Tier-1 read-only
+multi-store federation** (`WEAVE_PEER_DBS` / `peer_dbs`, foreign stores opened
+`SQLITE_OPEN_READ_ONLY`, origin-tagged + deduped, both backends). That is the
+read-only half of cross-store work and ships clean.
+
+**Next gated item — Tier-2 cross-store *write* / send / inject.** This lets store
+A get a message (and optionally a live nudge) to a peer that lives in store B. It
+is **design-only and not implemented**, because it is the first feature to cross
+the local trust boundary — "identity is advisory" stops being acceptable once a
+write can originate outside a store's owner. It is gated on an approved trust
+model; the recommended design is **broker-mediated request-pull** (Option C): no
+direct foreign-store writes at all — A deposits an intent in its own store, and
+B's own process pulls it read-only (reusing Tier-1's `open_readonly`) and commits
+it locally via the normal `Store::send`. That keeps every invariant intact
+("only a store's owner writes it"), adds **no new dependency, daemon, shell, or
+crypto**, and accepts next-drain (not instant) cross-store delivery, consistent
+with weave's degrade-to-next-turn contract. A schema change (an owner-written
+`outbox`/intent table) means a **mandatory dual-backend mirror**. Optional
+unforgeable intra-store identity (signed `from`) would layer behind a feature flag
+later (the `libsql` precedent) and is not required for boundary safety. **No
+Tier-2 `src/` code is authorized until the trust model is approved.**
+
+---
+
 ## Sequencing & dependencies
 
 | # | Item | Depends on | Default-build impact | Effort |
@@ -300,6 +330,7 @@ live" behind real-hardware confirmation.
 | 4 | Streamable-HTTP MCP | v0.2 `weave-mcp` lib split, §3 for retry-safety | feature-gated | M–L |
 | 5 | Reservation leases | store + presence (have/v0.2) | none (new table) | S–M |
 | 6 | iTerm2 backend | `inject.rs` seams (have) | none | M |
+| 7 | Cross-store write/inject (Tier-2) | Tier-1 federation (have), approved trust model | none (new table, dual-backend) | M–L |
 
 Recommended order: **1 → 3 → 2 → 5 → 6 → 4.** The stop-wake (1) is the flagship
 differentiator and unlocks the *blocking* flavour of asks; the delivery-semantics

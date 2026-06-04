@@ -8,6 +8,13 @@
 use crate::model::{now, Message, Peer};
 use anyhow::Result;
 
+// Re-export the libsql backend's federation aggregators under `store::` so the
+// `main`/`mcp` consumers can call `store::federated_peers` / `federated_sessions`
+// regardless of which (mutually-exclusive) backend is compiled in. The sqlite
+// backend defines these free functions inline below.
+#[cfg(feature = "libsql")]
+pub use crate::store_libsql::{federated_peers, federated_sessions, federation_status};
+
 #[cfg(feature = "sqlite")]
 use crate::model::{is_broadcast, BROADCAST_SQL};
 #[cfg(feature = "sqlite")]
@@ -49,6 +56,32 @@ pub trait Store: Send {
     /// Delete messages (and their read-markers) older than `older_than_secs`.
     /// Returns how many messages were removed. Retention / disk-bound guard.
     fn gc(&self, older_than_secs: i64) -> Result<i64>;
+    /// Register (upsert) a peer carrying every field, including the registering
+    /// process's `pid` and `host` for real process-liveness. This is the full
+    /// primitive each backend implements; the 6-arg [`Store::register_peer`]
+    /// forwards here with `pid=None, host=""` so legacy call sites that do not
+    /// know a PID/host keep working unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn register_peer_full(
+        &self,
+        name: &str,
+        mux: &str,
+        target: &str,
+        socket: &str,
+        cwd: Option<&str>,
+        pid: Option<i64>,
+        host: &str,
+    ) -> Result<()>;
+
+    /// Register (upsert) a peer without PID/host liveness info. Additive
+    /// backward-compatible wrapper over [`Store::register_peer_full`]: forwards
+    /// with `pid=None, host=""` (== liveness unknown ⇒ presence falls back to the
+    /// TTL recency guess). Keeps existing 5-arg call sites/tests compiling.
+    ///
+    /// `allow(dead_code)`: weave is a binary crate, so a `pub` trait method with
+    /// only test callers is otherwise flagged unused. This is intentional
+    /// backward-compat surface (exercised by the store unit tests), not dead code.
+    #[allow(dead_code)]
     fn register_peer(
         &self,
         name: &str,
@@ -56,7 +89,9 @@ pub trait Store: Send {
         target: &str,
         socket: &str,
         cwd: Option<&str>,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        self.register_peer_full(name, mux, target, socket, cwd, None, "")
+    }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
     /// Backend label for diagnostics.
@@ -103,9 +138,202 @@ pub trait Store: Send {
     fn set_in_reply_to(&self, message_id: i64, in_reply_to: i64) -> Result<()>;
 }
 
+/// Where a federated row came from. `Local` is this session's own store;
+/// `Foreign` carries a short display label (the configured store's basename or
+/// path) so a listing can tell local from federated entries. Backend-agnostic
+/// data (no I/O), shared by both store backends and the `main`/`mcp` consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Local,
+    Foreign(String),
+}
+
+impl Origin {
+    /// Short label for display/JSON: `"local"` or the foreign store's label.
+    pub fn label(&self) -> &str {
+        match self {
+            Origin::Local => "local",
+            Origin::Foreign(s) => s,
+        }
+    }
+
+    /// True for any non-local (federated) origin.
+    pub fn is_foreign(&self) -> bool {
+        matches!(self, Origin::Foreign(_))
+    }
+}
+
+/// A peer tagged with the store it was read from (Tier-1 federation). Keeps
+/// [`Peer`] itself unchanged while carrying provenance for display + dedup.
+#[derive(Debug, Clone)]
+pub struct PeerView {
+    pub peer: Peer,
+    pub origin: Origin,
+}
+
+/// A session row tagged with its origin store (Tier-1 federation).
+/// `(name, unread, last_activity)` mirrors [`SessionInfo`]; foreign rows are kept
+/// distinct (origin-tagged) rather than arithmetic-merged, because Tier 1 cannot
+/// deliver a cross-store inbox so summing unread across stores would mislead.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub name: String,
+    pub unread: i64,
+    pub last_activity: i64,
+    pub origin: Origin,
+}
+
+/// Derive a short, display-friendly label for a foreign store from its path: the
+/// file's basename (e.g. `messages.db`), falling back to the full path string when
+/// there is no usable file name. Pure; used to tag `Foreign` origins.
+pub fn store_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Merge + dedup federated peer views on the key `(name, host)`, applying the
+/// Tier-1 tie-break so the same logical session seen via two stores collapses to
+/// one entry. Pure (no I/O) so it is exhaustively unit-testable.
+///
+/// Tie-break on collision, in order:
+/// 1. **alive beats not-alive** — `is_alive(peer)` true wins;
+/// 2. else **most-recently-seen wins** — higher `last_seen`;
+/// 3. else **prefer the local store** over a foreign one (local is authoritative
+///    for a session that registered here);
+/// 4. else a stable order by the origin label, so the merge is reproducible.
+///
+/// The surviving entries are returned sorted by peer name (then origin label) for
+/// a deterministic listing.
+pub fn merge_peer_views(views: Vec<PeerView>) -> Vec<PeerView> {
+    // (name, host) -> chosen view. Iterate, keeping the winner per key.
+    let mut chosen: Vec<PeerView> = Vec::new();
+    for v in views {
+        match chosen
+            .iter_mut()
+            .find(|c| c.peer.name == v.peer.name && c.peer.host == v.peer.host)
+        {
+            Some(existing) => {
+                if peer_view_beats(&v, existing) {
+                    *existing = v;
+                }
+            }
+            None => chosen.push(v),
+        }
+    }
+    chosen.sort_by(|a, b| {
+        a.peer
+            .name
+            .cmp(&b.peer.name)
+            .then_with(|| a.origin.label().cmp(b.origin.label()))
+    });
+    chosen
+}
+
+/// True if `candidate` should replace `current` for the same `(name, host)` key,
+/// per the [`merge_peer_views`] tie-break.
+fn peer_view_beats(candidate: &PeerView, current: &PeerView) -> bool {
+    let (ca, cu) = (is_alive(&candidate.peer), is_alive(&current.peer));
+    if ca != cu {
+        return ca; // alive beats not-alive
+    }
+    if candidate.peer.last_seen != current.peer.last_seen {
+        return candidate.peer.last_seen > current.peer.last_seen; // newer wins
+    }
+    // Same aliveness + recency: prefer local over foreign.
+    let (c_local, u_local) = (
+        matches!(candidate.origin, Origin::Local),
+        matches!(current.origin, Origin::Local),
+    );
+    if c_local != u_local {
+        return c_local;
+    }
+    // Final deterministic tie-break by origin label (candidate replaces only if
+    // strictly "smaller", so the result is order-independent).
+    candidate.origin.label() < current.origin.label()
+}
+
+/// Merge federated session views keyed on `name` (sessions have no host). On
+/// collision keep `max(last_activity)` and **do not sum unread** across stores —
+/// a message in another store is not in this session's local inbox, so summing
+/// would imply a unified inbox Tier 1 cannot deliver. The local row's unread is
+/// authoritative; if only foreign rows exist for a name, the most-recent foreign
+/// unread is kept but origin-tagged so the UI can signal it is not local.
+/// Pure (no I/O); returned sorted by name then origin label.
+pub fn merge_session_views(views: Vec<SessionView>) -> Vec<SessionView> {
+    let mut chosen: Vec<SessionView> = Vec::new();
+    for v in views {
+        match chosen.iter_mut().find(|c| c.name == v.name) {
+            Some(existing) => {
+                // Activity is the max across stores.
+                existing.last_activity = existing.last_activity.max(v.last_activity);
+                // Unread: a local row is authoritative. Otherwise keep the entry
+                // we already had unless this one is local (which wins) — never sum.
+                let existing_local = matches!(existing.origin, Origin::Local);
+                let v_local = matches!(v.origin, Origin::Local);
+                if v_local && !existing_local {
+                    existing.unread = v.unread;
+                    existing.origin = v.origin;
+                }
+            }
+            None => chosen.push(v),
+        }
+    }
+    chosen.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.origin.label().cmp(b.origin.label()))
+    });
+    chosen
+}
+
 /// True if `last_seen` is within the online window relative to now.
 pub fn is_online(last_seen: i64) -> bool {
     now().saturating_sub(last_seen) <= ONLINE_TTL_SECS
+}
+
+/// True if a process with PID `pid` currently exists on THIS machine.
+///
+/// Crate-free and OS-conditional:
+/// - **Linux**: checks `/proc/<pid>` existence (no dependency).
+/// - **other targets**: degrades to "assume alive" so non-Linux callers fall
+///   back to the TTL recency guess (we add no `libc`/`nix` dependency just to
+///   probe a PID; `is_alive` only ever consults this on the local host).
+#[cfg(target_os = "linux")]
+pub fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// See the Linux variant. On non-Linux targets we have no dependency-free PID
+/// probe, so report "alive" and let presence rely on the TTL window.
+#[cfg(not(target_os = "linux"))]
+pub fn pid_alive(_pid: i64) -> bool {
+    true
+}
+
+/// Real liveness verdict for a peer: it must be within the TTL window AND, when
+/// its PID/host say we *can* probe, the process must actually exist.
+///
+/// Rules:
+/// - Always require `is_online(last_seen)` (the recency guard).
+/// - If `host == this_host()` AND a PID is known, additionally require
+///   [`pid_alive`] — a dead-but-recent local process reads offline.
+/// - **Fail OPEN otherwise** (`host != this_host()`, or PID unknown): we cannot
+///   probe a remote PID (Turso/shared-DB case) or an unknown one, so we fall
+///   back to the TTL recency guess. A remote/legacy peer must NOT read dead.
+pub fn is_alive(peer: &Peer) -> bool {
+    if !is_online(peer.last_seen) {
+        return false;
+    }
+    match peer.pid {
+        Some(pid) if peer.host == crate::config::this_host() => pid_alive(pid),
+        // PID unknown, or a peer on another host we cannot probe: fail open.
+        _ => true,
+    }
 }
 
 /// Hard upper bound on a query `LIMIT`. A negative limit means *unbounded* in
@@ -210,7 +438,9 @@ CREATE TABLE IF NOT EXISTS peers (
     target    TEXT NOT NULL,
     socket    TEXT NOT NULL DEFAULT '',
     cwd       TEXT,
-    last_seen INTEGER NOT NULL
+    last_seen INTEGER NOT NULL,
+    pid       INTEGER,
+    host      TEXT NOT NULL DEFAULT ''
 );
 ";
 
@@ -260,6 +490,8 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         socket: r.get(3)?,
         cwd: r.get(4)?,
         last_seen: r.get(5)?,
+        pid: r.get(6)?,
+        host: r.get(7)?,
     })
 }
 
@@ -289,6 +521,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     // row (== socket unknown), matching `Peer::socket`'s empty default.
     if !column_exists(conn, "peers", "socket")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN socket TEXT NOT NULL DEFAULT '';")?;
+    }
+    // peers.pid — present on fresh DBs via SCHEMA, added here for DBs created
+    // before process-liveness existed. Nullable; defaults to NULL for every
+    // existing row (== PID unknown ⇒ presence falls back to the TTL guess),
+    // matching `Peer::pid`'s `None` default.
+    if !column_exists(conn, "peers", "pid")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN pid INTEGER;")?;
+    }
+    // peers.host — present on fresh DBs via SCHEMA, added here for DBs created
+    // before process-liveness existed. Defaults to '' for every existing row
+    // (== host unknown ⇒ liveness fails open / TTL-only), matching `Peer::host`'s
+    // empty default.
+    if !column_exists(conn, "peers", "host")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(())
 }
@@ -330,10 +576,123 @@ impl SqliteStore {
         Ok(Self { conn })
     }
 
+    /// Open an EXISTING store **read-only** for Tier-1 federation. The connection
+    /// is opened with `SQLITE_OPEN_READ_ONLY` (no `CREATE`), so the SQLite engine
+    /// itself rejects any write — the read-only guarantee is structural, not a
+    /// convention. We deliberately DO NOT create the file, run `SCHEMA`, call
+    /// `migrate()`, or `harden_permissions`: a foreign store we do not own must be
+    /// read exactly as-is and never altered. A missing/locked/non-weave file
+    /// surfaces here (or on first SELECT) as an error so the caller can skip it.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        // READ_ONLY rejects writes; NO_MUTEX matches our single-threaded use; we
+        // intentionally omit CREATE so a missing file errors rather than being
+        // created.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     /// Unread messages for `me` (inherent helper; used by `sessions`).
     fn unread_count(&self, me: &str) -> Result<i64> {
         unread_count_conn(&self.conn, me)
     }
+}
+
+/// Diagnostic: of the configured `extra` read-only stores, how many open + list
+/// cleanly vs. are skipped this run (missing/locked/non-weave). Used by `doctor`
+/// to surface federation health without emitting the per-store stderr skip notes
+/// twice. Read-only + best-effort, like the aggregators.
+#[cfg(feature = "sqlite")]
+pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    for path in extra {
+        match SqliteStore::open_readonly(path).and_then(|s| s.list_peers()) {
+            Ok(_) => ok += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+    (ok, skipped)
+}
+
+/// Aggregate the local store's peers with those of each configured read-only
+/// extra store (Tier-1 federation), origin-tagged and deduped on `(name, host)`.
+///
+/// Each foreign store is opened **read-only** via [`SqliteStore::open_readonly`]
+/// (structurally incapable of writing it) and listed via the existing
+/// `list_peers` SELECT. **Failure isolation:** an unreadable / locked / missing /
+/// non-weave extra store is logged to **stderr** and skipped — it never breaks the
+/// local listing. With `extra` empty this is exactly `local.list_peers()`
+/// tagged `Local`, i.e. identical-to-today.
+#[cfg(feature = "sqlite")]
+pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Result<Vec<PeerView>> {
+    let mut views: Vec<PeerView> = local
+        .list_peers()?
+        .into_iter()
+        .map(|peer| PeerView {
+            peer,
+            origin: Origin::Local,
+        })
+        .collect();
+    for path in extra {
+        let label = store_label(path);
+        match SqliteStore::open_readonly(path).and_then(|s| s.list_peers()) {
+            Ok(peers) => {
+                for peer in peers {
+                    views.push(PeerView {
+                        peer,
+                        origin: Origin::Foreign(label.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+            }
+        }
+    }
+    Ok(merge_peer_views(views))
+}
+
+/// Aggregate the local store's sessions with those of each configured read-only
+/// extra store (Tier-1 federation), origin-tagged and merged by name (keeping
+/// `max(last_activity)`, never summing unread — see [`merge_session_views`]).
+/// Same read-only open + per-store failure isolation as [`federated_peers`].
+#[cfg(feature = "sqlite")]
+pub fn federated_sessions(
+    local: &dyn Store,
+    extra: &[std::path::PathBuf],
+) -> Result<Vec<SessionView>> {
+    let mut views: Vec<SessionView> = local
+        .sessions()?
+        .into_iter()
+        .map(|(name, unread, last_activity)| SessionView {
+            name,
+            unread,
+            last_activity,
+            origin: Origin::Local,
+        })
+        .collect();
+    for path in extra {
+        let label = store_label(path);
+        match SqliteStore::open_readonly(path).and_then(|s| s.sessions()) {
+            Ok(sessions) => {
+                for (name, unread, last_activity) in sessions {
+                    views.push(SessionView {
+                        name,
+                        unread,
+                        last_activity,
+                        origin: Origin::Foreign(label.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+            }
+        }
+    }
+    Ok(merge_session_views(views))
 }
 
 #[cfg(feature = "sqlite")]
@@ -549,27 +908,30 @@ impl Store for SqliteStore {
         Ok(n)
     }
 
-    fn register_peer(
+    fn register_peer_full(
         &self,
         name: &str,
         mux: &str,
         target: &str,
         socket: &str,
         cwd: Option<&str>,
+        pid: Option<i64>,
+        host: &str,
     ) -> Result<()> {
         check_ident("peer name", name)?;
         self.conn.execute(
-            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen) VALUES (?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6",
-            params![name, mux, target, socket, cwd, now()],
+            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8",
+            params![name, mux, target, socket, cwd, now(), pid, host],
         )?;
         Ok(())
     }
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, mux, target, socket, cwd, last_seen FROM peers WHERE name=?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers WHERE name=?1",
+        )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
             Some(p) => Ok(Some(p?)),
@@ -578,9 +940,9 @@ impl Store for SqliteStore {
     }
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, mux, target, socket, cwd, last_seen FROM peers ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers ORDER BY name",
+        )?;
         let rows = stmt
             .query_map([], row_to_peer)?
             .collect::<rusqlite::Result<_>>()?;
@@ -675,6 +1037,170 @@ impl Store for SqliteStore {
             params![now(), name],
         )?;
         Ok(())
+    }
+}
+
+/// Pure dedup/tie-break tests for the federation merge helpers. Backend-agnostic
+/// (the merge functions have no I/O), so this module runs under BOTH backends.
+#[cfg(test)]
+mod federation_tests {
+    use super::*;
+
+    fn peer(name: &str, host: &str, last_seen: i64, pid: Option<i64>) -> Peer {
+        Peer {
+            name: name.to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen,
+            pid,
+            host: host.to_string(),
+        }
+    }
+
+    /// The same `(name, host)` seen via local + foreign collapses to ONE entry,
+    /// and a fresh `last_seen` (both not pid-probed ⇒ both TTL-alive) makes the
+    /// newer row win.
+    #[test]
+    fn merge_collapses_same_name_host_newer_wins() {
+        let local = PeerView {
+            peer: peer("prompt_hub", "boxA", now() - 100, None),
+            origin: Origin::Local,
+        };
+        let foreign = PeerView {
+            peer: peer("prompt_hub", "boxA", now() - 5, None),
+            origin: Origin::Foreign("other.db".to_string()),
+        };
+        let merged = merge_peer_views(vec![local, foreign]);
+        assert_eq!(merged.len(), 1, "same (name,host) collapses to one");
+        assert_eq!(merged[0].peer.last_seen, now() - 5, "newer last_seen wins");
+    }
+
+    /// Different hosts are NOT collapsed: the same name on two machines is two
+    /// distinct logical sessions.
+    #[test]
+    fn merge_keeps_distinct_hosts() {
+        let a = PeerView {
+            peer: peer("x", "boxA", now(), None),
+            origin: Origin::Local,
+        };
+        let b = PeerView {
+            peer: peer("x", "boxB", now(), None),
+            origin: Origin::Foreign("o.db".to_string()),
+        };
+        let merged = merge_peer_views(vec![a, b]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    /// Alive beats not-alive regardless of recency: a stale-but-alive vs a
+    /// recent-but-offline collision keeps the alive one. We build aliveness via the
+    /// recency window (no pid ⇒ TTL-only): an online row beats an offline one even
+    /// when the offline row is "newer" only relative to itself.
+    #[test]
+    fn merge_prefers_alive_over_offline() {
+        // Online (recent) local row.
+        let online = PeerView {
+            peer: peer("p", "boxA", now(), None),
+            origin: Origin::Local,
+        };
+        // Offline (stale) foreign row, but with a *higher* last_seen would still be
+        // stale here; use a clearly stale value so is_alive == false.
+        let offline = PeerView {
+            peer: peer("p", "boxA", now() - ONLINE_TTL_SECS - 100, None),
+            origin: Origin::Foreign("o.db".to_string()),
+        };
+        let merged = merge_peer_views(vec![offline, online]);
+        assert_eq!(merged.len(), 1);
+        assert!(is_alive(&merged[0].peer), "the alive row survives");
+        assert_eq!(merged[0].origin, Origin::Local);
+    }
+
+    /// On equal aliveness AND equal recency, the LOCAL origin wins the tie.
+    #[test]
+    fn merge_local_wins_final_tie() {
+        let ts = now();
+        let local = PeerView {
+            peer: peer("p", "boxA", ts, None),
+            origin: Origin::Local,
+        };
+        let foreign = PeerView {
+            peer: peer("p", "boxA", ts, None),
+            origin: Origin::Foreign("o.db".to_string()),
+        };
+        // Order-independent: local must win whichever way they are fed in.
+        let m1 = merge_peer_views(vec![local.clone(), foreign.clone()]);
+        let m2 = merge_peer_views(vec![foreign, local]);
+        assert_eq!(m1[0].origin, Origin::Local);
+        assert_eq!(m2[0].origin, Origin::Local);
+    }
+
+    /// Result order is deterministic: sorted by peer name then origin label.
+    #[test]
+    fn merge_output_is_sorted_deterministically() {
+        let views = vec![
+            PeerView {
+                peer: peer("zeta", "h", now(), None),
+                origin: Origin::Local,
+            },
+            PeerView {
+                peer: peer("alpha", "h", now(), None),
+                origin: Origin::Foreign("o.db".to_string()),
+            },
+        ];
+        let merged = merge_peer_views(views);
+        let names: Vec<&str> = merged.iter().map(|v| v.peer.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    /// Federated sessions merge by name: keep `max(last_activity)` and DO NOT sum
+    /// unread (a local row's unread is authoritative; foreign unread is never
+    /// added to it).
+    #[test]
+    fn merge_sessions_max_activity_no_unread_sum() {
+        let local = SessionView {
+            name: "s".to_string(),
+            unread: 3,
+            last_activity: 100,
+            origin: Origin::Local,
+        };
+        let foreign = SessionView {
+            name: "s".to_string(),
+            unread: 99,
+            last_activity: 250,
+            origin: Origin::Foreign("o.db".to_string()),
+        };
+        let merged = merge_session_views(vec![foreign, local]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].last_activity, 250, "max activity kept");
+        assert_eq!(
+            merged[0].unread, 3,
+            "local unread authoritative, NOT summed"
+        );
+        assert_eq!(merged[0].origin, Origin::Local);
+    }
+
+    /// A session present ONLY in a foreign store is kept, origin-tagged foreign.
+    #[test]
+    fn merge_sessions_keeps_foreign_only() {
+        let foreign = SessionView {
+            name: "only-there".to_string(),
+            unread: 2,
+            last_activity: 10,
+            origin: Origin::Foreign("o.db".to_string()),
+        };
+        let merged = merge_session_views(vec![foreign]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].origin.is_foreign());
+    }
+
+    /// `store_label` derives the basename for a foreign store path.
+    #[test]
+    fn store_label_uses_basename() {
+        assert_eq!(
+            store_label(std::path::Path::new("/home/x/proj/messages.db")),
+            "messages.db"
+        );
     }
 }
 
@@ -985,5 +1511,261 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "db file should be owner-only");
         }
+    }
+
+    // ---- A2 (real liveness): pid/host round-trip, migration, is_alive matrix ----
+
+    /// `register_peer_full` round-trips the new `pid`/`host` columns through both
+    /// `get_peer` and `list_peers`, and an upsert overwrites them.
+    #[test]
+    fn register_peer_full_roundtrips_pid_and_host() {
+        let s = mem();
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), Some(4321), "boxA")
+            .unwrap();
+        let p = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(p.pid, Some(4321));
+        assert_eq!(p.host, "boxA");
+        // list_peers carries them too.
+        let lp = &s.list_peers().unwrap()[0];
+        assert_eq!(lp.pid, Some(4321));
+        assert_eq!(lp.host, "boxA");
+        // Upsert overwrites pid/host (and a None pid clears it).
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB")
+            .unwrap();
+        let p2 = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(p2.pid, None);
+        assert_eq!(p2.host, "boxB");
+        // The 5-arg compat wrapper forwards pid=None, host="".
+        s.register_peer("q", "none", "", "", None).unwrap();
+        let q = s.get_peer("q").unwrap().unwrap();
+        assert_eq!(q.pid, None);
+        assert_eq!(q.host, "");
+    }
+
+    /// A DB created by a pre-A2 weave (a `peers` table WITHOUT the `pid`/`host`
+    /// columns) opens and gains them in place: the migration adds them, existing
+    /// rows survive, and the legacy row reads back `pid:None`, `host:""`.
+    #[test]
+    fn legacy_db_without_pid_host_migrates_in_place() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-legacy-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // Build a pre-A2 peers table by hand: socket exists (pre-A2 precedent) but
+        // pid/host do NOT. Insert a legacy row directly.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                    name      TEXT PRIMARY KEY,
+                    mux       TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    socket    TEXT NOT NULL DEFAULT '',
+                    cwd       TEXT,
+                    last_seen INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1)",
+                params![now()],
+            )
+            .unwrap();
+        }
+
+        // Opening through SqliteStore runs migrate(): the columns are added.
+        let s = SqliteStore::open(&path).unwrap();
+        let p = s.get_peer("old").unwrap().unwrap();
+        // Existing row survived with its original data.
+        assert_eq!(p.mux, "tmux");
+        assert_eq!(p.target, "%1");
+        assert_eq!(p.cwd.as_deref(), Some("/legacy"));
+        // New columns defaulted: pid NULL (None), host ''.
+        assert_eq!(p.pid, None, "legacy row reads pid:None after migration");
+        assert_eq!(p.host, "", "legacy row reads host:'' after migration");
+        // Re-opening is idempotent (the guarded ALTER does not error twice).
+        let s2 = SqliteStore::open(&path).unwrap();
+        assert!(s2.get_peer("old").unwrap().is_some());
+        // And a fresh register_peer_full now works against the upgraded table.
+        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h")
+            .unwrap();
+        let n = s2.get_peer("new").unwrap().unwrap();
+        assert_eq!(n.pid, Some(7));
+        assert_eq!(n.host, "h");
+    }
+
+    /// `is_alive` matrix. A fresh peer with `last_seen = now()` is recency-online;
+    /// liveness then depends on pid/host:
+    ///   (a) local host + dead pid + recent  => false (probe sees the gap)
+    ///   (b) remote host (host != this_host) + recent => true (fail-open)
+    ///   (c) NULL pid + recent => true (TTL fallback)
+    ///   (d) local host + OUR OWN live pid + recent => true
+    /// Plus: stale last_seen => false regardless of pid (recency guard first).
+    #[test]
+    fn is_alive_matrix_local_dead_remote_open_and_null_pid() {
+        let base = Peer {
+            name: "x".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: now(),
+            pid: None,
+            host: String::new(),
+        };
+
+        // (c) NULL pid + recent => true (TTL fallback, no probe).
+        assert!(is_alive(&base), "null pid + recent must be alive (TTL)");
+
+        // (b) remote host + recent => true (fail-open: cannot probe a remote PID).
+        //   Use a pid that does NOT exist locally to prove the host gate (not the
+        //   pid) is what keeps it alive.
+        let remote = Peer {
+            host: format!("{}-not-this-host", crate::config::this_host()),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_ne!(remote.host, crate::config::this_host());
+        assert!(
+            is_alive(&remote),
+            "remote host must fail open to alive even with an absurd pid"
+        );
+
+        // (d) local host + our OWN live pid + recent => true.
+        let live_local = Peer {
+            host: crate::config::this_host(),
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert!(
+            is_alive(&live_local),
+            "local host + our own (live) pid must be alive"
+        );
+
+        // (a) local host + dead pid + recent => false (Linux probes /proc; on
+        //   non-Linux pid_alive degrades to true, so only assert dead-offline where
+        //   the probe is real).
+        let dead_local = Peer {
+            host: crate::config::this_host(),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        if cfg!(target_os = "linux") {
+            assert!(
+                !is_alive(&dead_local),
+                "local host + dead pid must read offline under A2"
+            );
+        }
+
+        // Recency guard wins regardless of a live pid: a stale last_seen is offline.
+        let stale = Peer {
+            host: crate::config::this_host(),
+            pid: Some(std::process::id() as i64),
+            last_seen: now() - ONLINE_TTL_SECS - 1,
+            ..base.clone()
+        };
+        assert!(
+            !is_alive(&stale),
+            "stale last_seen is offline even with a live pid"
+        );
+    }
+
+    /// `pid_alive`: our own process is alive; an absurd/unused pid (and pid<=0) is
+    /// not — on Linux, where `/proc` is the real probe. On non-Linux the helper
+    /// degrades to "assume alive", which is the documented contract we assert there.
+    #[test]
+    fn pid_alive_own_pid_live_absurd_pid_dead() {
+        let me = std::process::id() as i64;
+        assert!(pid_alive(me), "our own pid must be alive");
+        if cfg!(target_os = "linux") {
+            assert!(
+                !pid_alive(999_999_999),
+                "an unused pid is not alive (linux)"
+            );
+            assert!(!pid_alive(0), "pid 0 is rejected");
+            assert!(!pid_alive(-1), "a negative pid is rejected");
+        } else {
+            // Degraded contract: non-Linux assumes alive (TTL-only presence).
+            assert!(pid_alive(999_999_999), "non-linux degrades to assume-alive");
+        }
+    }
+
+    // ---- Tier-1 federation: read-only open is structurally write-incapable ----
+
+    /// `open_readonly` opens an EXISTING store and can READ it, but the SQLite
+    /// engine rejects any write (SQLITE_READONLY) — the structural proof of the
+    /// Tier-1 read-only invariant. It also must NOT create a missing file.
+    #[test]
+    fn open_readonly_reads_but_cannot_write() {
+        let dir = std::env::temp_dir().join(format!("weave-ro-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+
+        // Seed a store with a peer via the normal RW open, then drop it.
+        {
+            let rw = SqliteStore::open(&path).unwrap();
+            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
+                .unwrap();
+        }
+
+        // Read-only open can list the peer.
+        let ro = SqliteStore::open_readonly(&path).unwrap();
+        let peers = ro.list_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "seed");
+
+        // But ANY write is rejected by the engine, not by convention.
+        let wr = ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA");
+        assert!(wr.is_err(), "a write through a read-only handle must error");
+        let send = ro.send("a", "b", None, "x");
+        assert!(
+            send.is_err(),
+            "a send through a read-only handle must error"
+        );
+
+        // Opening a path that does not exist read-only must NOT create it.
+        let missing = dir.join("does-not-exist.db");
+        assert!(SqliteStore::open_readonly(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "read-only open must never create a missing store"
+        );
+    }
+
+    /// `federated_peers` unions the local peers with a foreign read-only store,
+    /// origin-tagging the foreign rows; an unreadable extra store is skipped (the
+    /// local listing still returns).
+    #[test]
+    fn federated_peers_unions_and_isolates_failures() {
+        let dir = std::env::temp_dir().join(format!("weave-fed-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_path = dir.join("local.db");
+        let foreign_path = dir.join("foreign.db");
+
+        let local = SqliteStore::open(&local_path).unwrap();
+        local
+            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA")
+            .unwrap();
+        {
+            let foreign = SqliteStore::open(&foreign_path).unwrap();
+            foreign
+                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA")
+                .unwrap();
+        }
+
+        // A bad path is skipped, not fatal.
+        let bad = dir.join("nope.db");
+        let extra = vec![foreign_path.clone(), bad];
+        let views = federated_peers(&local, &extra).unwrap();
+        let names: Vec<&str> = views.iter().map(|v| v.peer.name.as_str()).collect();
+        assert!(names.contains(&"me"));
+        assert!(names.contains(&"them"));
+        // The foreign row is origin-tagged; the local row is Local.
+        let them = views.iter().find(|v| v.peer.name == "them").unwrap();
+        assert!(them.origin.is_foreign());
+        let me = views.iter().find(|v| v.peer.name == "me").unwrap();
+        assert_eq!(me.origin, Origin::Local);
     }
 }

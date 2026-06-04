@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased] — presence & live-connect
+
+### Added
+- **presence:** real liveness — a peer reads online only when within the presence
+  TTL **and** (for a peer on this host with a known PID) its process is still
+  running; presence fails open for remote / unprobeable peers. `weave peers` /
+  `weave doctor` now report *alive*, not "wrote recently".
+- **presence:** heartbeat-on-read — `weave peers` and `weave watch` refresh
+  `last_seen` (explicit-identity only) so a session stays visible without traffic.
+- **cli:** `weave attach` — adopt a running session into the store without a
+  restart (re-capture the current pane and upsert the caller's own peer row).
+- **cli:** `weave connect --to <peer>` — report a capability verdict
+  (live / registered-but-not-alive / not-injectable); a non-injectable / not-alive
+  peer is queued (graceful), not an error.
+- **mcp:** `weave_attach` and `weave_connect` tools mirroring the CLI; only a
+  non-existent peer is an error (`isError:false` for a queued/degraded verdict).
+- **store:** read-only multi-store federation (Tier-1) — `weave peers` /
+  `weave sessions` aggregate peers/sessions across extra stores, origin-tagged and
+  deduped on `(name, host)`; foreign stores opened `SQLITE_OPEN_READ_ONLY` and
+  never written; an unreadable store is skipped, not fatal; default-off keeps
+  single-store output byte-identical.
+- **config:** `WEAVE_PEER_DBS` env + `peer_dbs` config key (federation store list,
+  capped at 16); `this_host()` stable per-machine host label.
+- **cli/mcp:** `weave doctor` reports `db_is_default` (a non-default `WEAVE_DB`
+  hint) and, when federation is configured, configured / ok / skipped store counts.
+
+### Changed
+- **store:** additive `peers.pid` + `peers.host` columns (idempotent migration,
+  mirrored across both backends); new additive `register_peer_full` trait method
+  (`register_peer` preserved as a default forwarding to it).
+
+### Deferred (design only, not shipped)
+- **store:** cross-store *write* / send / inject (Tier-2) is gated on an approved
+  trust model (recommended: broker-mediated request-pull where only a store's owner
+  writes it). No Tier-2 code exists; federation is read-only aggregation only.
+
 ## [Unreleased] — gap-closing upgrade pass
 
 ### Added

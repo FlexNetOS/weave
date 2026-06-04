@@ -50,7 +50,9 @@ messages into the agent's context on its next turn (auto-delivery without a mult
 
 ```bash
 weave register --name desktop        # register this session (captures pane from $TMUX_PANE/$ZELLIJ_SESSION_NAME)
-weave peers                          # list peers + whether each is injectable
+weave attach --name desktop          # adopt a *running* session into the store WITHOUT restarting (re-capture pane)
+weave peers                          # list peers + whether each is alive + injectable
+weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
 weave inject --to envctl --text "live nudge"   # test the injector directly
@@ -60,12 +62,30 @@ weave mcp --session desktop          # run the MCP stdio server
 Identity resolution: `--from/--me/--name` > `$WEAVE_SESSION` > basename of cwd.
 Send `--to all` (or `*`) to broadcast; read state is tracked per-reader.
 
+`weave attach` captures the current pane and upserts **your own** peer row, so a
+session that started outside a mux (or before `weave setup`) becomes injectable
+without a restart. `weave connect --to <peer>` reports a capability verdict —
+`live` (a nudge can be delivered now), `registered but not alive` (queued for the
+recipient's next turn), or `not injectable` — and is **not** an error when a peer
+can't be live-nudged: its messages still arrive via the store on its next drain.
+
+**Presence means *alive*, not "wrote recently".** A peer reads online only when
+it is within the presence TTL **and** (for a peer on this host with a known PID)
+its process is still running; presence fails open for remote / cross-machine
+peers that can't be probed locally.
+
 ## MCP tools
 
 `weave_send` · `weave_inbox` · `weave_history` · `weave_sessions` · `weave_clear` · `weave_peers`
+· `weave_attach` · `weave_connect`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
+
+`weave_attach` adopts the calling session into the store without a restart (re-captures the
+current pane and upserts the caller's own peer row only). `weave_connect` reports the same
+live / registered-but-not-alive / not-injectable verdict as the CLI; only a non-existent
+peer is an error, so a queued delivery is reported with `isError:false`.
 
 ## Native injector
 
@@ -84,6 +104,21 @@ behind a backend-agnostic `Store` trait. A **libSQL/Turso backend** is also impl
 (`--no-default-features --features libsql`) for cross-machine sync — async client driven from the
 sync API via an embedded tokio runtime; local-file or remote (`libsql_url` + auth token). The
 backends are mutually exclusive (each bundles SQLite); the default build uses sqlite.
+
+### Read-only federation across stores
+
+`weave peers` / `weave sessions` can aggregate peers and sessions from **other
+projects' stores** read-only. Point `WEAVE_PEER_DBS` at a comma- (or path-)
+separated list of extra DB files (or set `peer_dbs = [...]` under `[federation]`
+in `config.toml`); foreign rows are origin-tagged (` (via <store>)` in text, plus
+`origin`/`foreign` fields in `--json`) and deduped on `(name, host)`. Foreign
+stores are opened with `SQLITE_OPEN_READ_ONLY` and are **never written**; an
+unreadable store is skipped (note on stderr), not fatal. Default (unset) behavior
+is unchanged — the listings are byte-identical to a single-store run.
+
+For agents that want to *message* each other rather than just see each other,
+share a single `WEAVE_DB` (one mailbox). **Cross-store *write* / send (Tier-2) is
+planned but not yet shipped** — federation today is read-only aggregation only.
 
 ## Status
 

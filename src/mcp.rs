@@ -6,10 +6,11 @@
 
 use crate::inject::{self, Nudge, Target};
 use crate::model::{self, fmt_ts};
-use crate::store::{is_online, Store};
+use crate::store::{self, is_alive, Store};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 const SERVER_NAME: &str = "weave";
 const SERVER_VERSION: &str = "0.1.0";
@@ -36,6 +37,7 @@ pub fn run(
     store: &dyn Store,
     me_default: Option<String>,
     nudge_template: Option<&str>,
+    extra_dbs: Vec<PathBuf>,
 ) -> Result<()> {
     log(&format!(
         "starting; backend={} default_session={:?}",
@@ -66,7 +68,7 @@ pub fn run(
                 continue;
             }
         };
-        if let Some(resp) = handle(store, &me_default, nudge_template, &req) {
+        if let Some(resp) = handle(store, &me_default, nudge_template, &extra_dbs, &req) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
             // cleanly; any other io error is logged and we keep serving.
@@ -154,6 +156,7 @@ fn handle(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
+    extra_dbs: &[PathBuf],
     req: &Value,
 ) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -196,7 +199,7 @@ fn handle(
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(store, me_default, nudge_template, name, &args) {
+            match call_tool(store, me_default, nudge_template, extra_dbs, name, &args) {
                 Ok(text) => Some(reply(
                     &id,
                     json!({ "content": [{"type":"text","text": text}], "isError": false }),
@@ -219,6 +222,7 @@ fn call_tool(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
+    extra_dbs: &[PathBuf],
     name: &str,
     args: &Value,
 ) -> Result<String, String> {
@@ -226,14 +230,16 @@ fn call_tool(
         "weave_send" => tool_send(store, me_default, nudge_template, args),
         "weave_inbox" => tool_inbox(store, me_default, args),
         "weave_history" => tool_history(store, me_default, args),
-        "weave_sessions" => tool_sessions(store, me_default, args),
+        "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
-        "weave_peers" => tool_peers(store),
+        "weave_peers" => tool_peers(store, extra_dbs),
         "weave_reply" => tool_reply(store, me_default, nudge_template, args),
         "weave_thread" => tool_thread(store, args),
         "weave_receipts" => tool_receipts(store, args),
-        "weave_doctor" => tool_doctor(store),
+        "weave_doctor" => tool_doctor(store, extra_dbs),
         "weave_whoami" => tool_whoami(store, me_default),
+        "weave_attach" => tool_attach(store, me_default, args),
+        "weave_connect" => tool_connect(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -418,23 +424,37 @@ fn tool_history(store: &dyn Store, def: &Option<String>, args: &Value) -> Result
     Ok(out)
 }
 
-fn tool_sessions(store: &dyn Store, def: &Option<String>, _args: &Value) -> Result<String, String> {
+fn tool_sessions(
+    store: &dyn Store,
+    def: &Option<String>,
+    extra_dbs: &[PathBuf],
+    _args: &Value,
+) -> Result<String, String> {
     let me = def.clone().unwrap_or_default();
-    let info = store.sessions().map_err(e)?;
+    // Tier-1 federation: union local sessions with read-only extra stores,
+    // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
+    let info = store::federated_sessions(store, extra_dbs).map_err(e)?;
     let total = store.total_messages().map_err(e)?;
     if info.is_empty() {
         return Ok("No sessions seen yet — the store is empty.".into());
     }
     let mut out = format!("Known sessions ({}), {total} message(s) total:", info.len());
-    for (n, unread, last) in info {
-        let mine = if !me.is_empty() && n == me {
+    for v in info {
+        let mine = if !me.is_empty() && v.name == me {
             "  <- you"
         } else {
             ""
         };
+        let via = if v.origin.is_foreign() {
+            format!(" (via {})", v.origin.label())
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "\n  • {n}: {unread} unread (last activity {}){mine}",
-            fmt_ts(last)
+            "\n  • {}: {} unread (last activity {}){via}{mine}",
+            v.name,
+            v.unread,
+            fmt_ts(v.last_activity)
         ));
     }
     Ok(out)
@@ -465,25 +485,29 @@ fn tool_clear(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
     Ok(format!("Marked {n} message(s) read for '{me}'."))
 }
 
-fn tool_peers(store: &dyn Store) -> Result<String, String> {
-    let peers = store.list_peers().map_err(e)?;
-    if peers.is_empty() {
+fn tool_peers(store: &dyn Store, extra_dbs: &[PathBuf]) -> Result<String, String> {
+    // Tier-1 federation: union local peers with read-only extra stores,
+    // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
+    let views = store::federated_peers(store, extra_dbs).map_err(e)?;
+    if views.is_empty() {
         return Ok("No peers registered yet. Sessions register via `weave hook session`.".into());
     }
-    let mut out = format!("Registered peers ({}):", peers.len());
-    for p in peers {
-        let inj = if inject::Target::from_peer(&p).injectable() {
+    let mut out = format!("Registered peers ({}):", views.len());
+    for v in views {
+        let p = &v.peer;
+        let inj = if inject::Target::from_peer(p).injectable() {
             "injectable"
         } else {
             "no-inject"
         };
-        let presence = if is_online(p.last_seen) {
-            "online"
+        let presence = if is_alive(p) { "online" } else { "offline" };
+        let via = if v.origin.is_foreign() {
+            format!(" (via {})", v.origin.label())
         } else {
-            "offline"
+            String::new()
         };
         out.push_str(&format!(
-            "\n  • {} [{presence}] [{}] {} ({inj}) seen {}",
+            "\n  • {} [{presence}] [{}] {} ({inj}) seen {}{via}",
             p.name,
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
@@ -615,10 +639,13 @@ fn tool_receipts(store: &dyn Store, args: &Value) -> Result<String, String> {
 /// into the MCP server (it only receives the live `Store`). We surface every
 /// diagnostic reachable from the store + current process environment; for the
 /// db/config file locations, run the `weave doctor` CLI.
-fn tool_doctor(store: &dyn Store) -> Result<String, String> {
+fn tool_doctor(store: &dyn Store, extra_dbs: &[PathBuf]) -> Result<String, String> {
     let target = inject::detect_target();
-    let peers = store.list_peers().map_err(e)?;
-    let online = peers.iter().filter(|p| is_online(p.last_seen)).count();
+    // Tier-1 federation: report the union peer count (local + read-only extras).
+    let views = store::federated_peers(store, extra_dbs).map_err(e)?;
+    let total_peers = views.len();
+    let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    let (fed_ok, fed_skipped) = store::federation_status(extra_dbs);
     let total = store.total_messages().map_err(e)?;
     let claude = inject::have("claude");
     let tgt = if target.id.is_empty() {
@@ -640,14 +667,30 @@ fn tool_doctor(store: &dyn Store) -> Result<String, String> {
     ));
     out.push_str(&format!("\n  messages:       {total}"));
     out.push_str(&format!(
-        "\n  peers:          {} ({online} online)",
-        peers.len()
+        "\n  peers:          {total_peers} ({online} online)"
     ));
     out.push_str(&format!(
         "\n  claude on PATH: {}",
         if claude { "yes" } else { "no" }
     ));
+    if !extra_dbs.is_empty() {
+        out.push_str(&format!(
+            "\n  federation:     {} extra store(s) ({fed_ok} ok, {fed_skipped} skipped)",
+            extra_dbs.len()
+        ));
+    }
     out.push_str("\n  (db/config paths: run `weave doctor` on the CLI)");
+    // FR6: warn when the resolved store is NOT the well-known XDG default — the most
+    // common "why can't I see the other session's peers" cause is a mismatched
+    // WEAVE_DB. Compare against the same default `Config::db_path` derives from.
+    let db = crate::config::Config::load().db_path();
+    let db_default = crate::config::default_db_path();
+    if db != db_default {
+        out.push_str(&format!(
+            "\n  note: using non-default WEAVE_DB ({}) — peers on a different store won't be visible.",
+            db.display()
+        ));
+    }
     Ok(out)
 }
 
@@ -672,6 +715,92 @@ fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String
         tgt,
         target.injectable()
     ))
+}
+
+/// Zero-restart adoption: re-capture THIS process's pane env and upsert the
+/// caller's OWN peer row (idempotent `ON CONFLICT(name) DO UPDATE`). The row key
+/// is bound to the resolved caller identity (`me`/default session), never an
+/// arbitrary arg-supplied target, so attach can only ever (re)register the caller
+/// itself — it can never overwrite another session's row.
+///
+/// Note (env semantics): `detect_target()` reads the MCP server process's env,
+/// i.e. the agent's mux env captured when it spawned `weave mcp`. If an agent
+/// re-parents panes mid-session, the CLI `weave attach` (run inside the live pane)
+/// is the authoritative path.
+fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    // Resolve + validate the caller's own identity (this is the row key).
+    let me = ident(args, "me", def)?;
+    let t = inject::detect_target();
+    // A detected mux must carry a structurally valid pane id, or we refuse to
+    // persist a poisoned, un-injectable registration. A legitimate mux=none has an
+    // empty id and is allowed (store-only delivery).
+    if t.injectable() && !inject::id_valid(t.mux, &t.id) {
+        return Err(format!(
+            "refusing to attach: captured target {:?} is not a valid {} target.",
+            t.id,
+            t.mux.as_str()
+        ));
+    }
+    // Capture the MCP server process's PID + host so the adopted peer reflects
+    // real liveness (this is the agent's own process).
+    store
+        .register_peer_full(
+            &me,
+            t.mux.as_str(),
+            &t.id,
+            &t.socket,
+            None,
+            Some(std::process::id() as i64),
+            &crate::config::this_host(),
+        )
+        .map_err(e)?;
+    let tgt = if t.id.is_empty() { "-" } else { &t.id };
+    let inj = if t.injectable() {
+        "injectable"
+    } else {
+        "no-inject"
+    };
+    Ok(format!(
+        "Attached '{me}' to the store [{}] {tgt} ({inj}). It is now visible to other sessions.",
+        t.mux.as_str()
+    ))
+}
+
+/// Connect handshake: capability-probe `peer` before sending. Reports a structured
+/// verdict and degrades gracefully — a registered-but-not-alive or non-injectable
+/// peer is NOT an error (`isError=false`); its messages still arrive via the store
+/// on its next turn. Only a non-existent peer is an error.
+fn tool_connect(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the peer session name to connect to).")?;
+    let to = bound_ident("to", to_raw)?;
+    let Some(peer) = store.get_peer(&to).map_err(e)? else {
+        // The only hard failure: the peer is not registered in this store.
+        return Err(format!(
+            "No registered peer '{to}'. Ask them to run `weave attach` (or share one WEAVE_DB)."
+        ));
+    };
+    let target = Target::from_peer(&peer);
+    let msg = match inject::capability(&target) {
+        inject::Capability::Live => format!(
+            "Peer '{to}' is live [{}] {} — a live nudge can be delivered now.",
+            target.mux.as_str(),
+            target.id
+        ),
+        inject::Capability::RegisteredNotAlive => format!(
+            "Peer '{to}' is registered but not alive [{}] {} — delivery will be queued; \
+             recipient drains on next turn.",
+            target.mux.as_str(),
+            target.id
+        ),
+        inject::Capability::NotInjectable => format!(
+            "Peer '{to}' is not injectable (mux=none) — delivery will be queued; \
+             recipient drains on next turn."
+        ),
+    };
+    Ok(msg)
 }
 
 // ---- helpers ------------------------------------------------------------
@@ -767,6 +896,20 @@ fn tools() -> Value {
             "name": "weave_whoami",
             "description": "Echo the resolved identity (default session from WEAVE_SESSION), the active storage backend, and how this process would inject. Use to confirm who you are before sending.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_attach",
+            "description": "Adopt this session into the shared store WITHOUT restarting: re-capture the current pane env and upsert YOUR OWN peer row. Makes you visible/injectable to other sessions immediately. Only ever (re)registers the caller's own identity.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_connect",
+            "description": "Probe whether a peer can be reached by a live nudge right now, and report the verdict (live / registered-but-not-alive / not-injectable). A not-alive or non-injectable peer is NOT an error — its messages are still delivered via the store on its next turn; only a non-existent peer is an error.",
+            "inputSchema": {"type":"object","properties":{
+                "to":{"type":"string","description":"The peer session name to connect to."}
+            },"required":["to"]}
         }
     ])
 }

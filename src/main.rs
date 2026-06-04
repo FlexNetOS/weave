@@ -13,6 +13,8 @@
 //!   weave peers          list registered peers (with presence)
 //!   weave sessions       list known sessions
 //!   weave register       register this session as an injectable peer
+//!   weave attach         adopt this running session into the store (no restart)
+//!   weave connect        probe whether a peer can be live-nudged right now
 //!   weave inject         manually inject text into a peer's pane (test)
 //!   weave config init    scaffold a commented ~/.config/weave/config.toml
 //!   weave completions    print a shell completion script (bash|zsh|fish)
@@ -42,7 +44,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use std::io::Read;
 use std::path::PathBuf;
-use store::{is_online, Store};
+use store::{is_alive, Store};
 
 /// `--version` provenance: the package version plus the storage backend(s)
 /// compiled into THIS binary. Because the `sqlite` and `libsql` backends are
@@ -221,6 +223,22 @@ enum Cmd {
         #[arg(long)]
         cwd: Option<String>,
     },
+    /// Adopt this running session into the shared store WITHOUT restarting:
+    /// re-capture the current pane env and upsert your own peer row. The zero-
+    /// restart path to becoming visible/injectable to other sessions.
+    Attach {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// Probe whether a peer can be reached by a live nudge right now, and report
+    /// the verdict. A not-alive / non-injectable peer is NOT an error — its
+    /// messages are still delivered via the store on its next turn.
+    Connect {
+        #[arg(long)]
+        to: String,
+    },
     /// Manually inject text into a peer's pane (test the injector).
     Inject {
         #[arg(long)]
@@ -381,11 +399,21 @@ fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str)
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let target = inject::detect_target();
-    let peers = store.list_peers()?;
-    let online = peers.iter().filter(|p| is_online(p.last_seen)).count();
+    // Tier-1 federation: report the union peer count (local + read-only extra
+    // stores). `extra` empty ⇒ exactly the local peers, identical-to-today.
+    let extra = cfg.peer_db_paths();
+    let views = store::federated_peers(store, &extra)?;
+    let total_peers = views.len();
+    let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    let (fed_ok, fed_skipped) = store::federation_status(&extra);
     let total = store.total_messages()?;
     let claude = inject::have("claude");
     let db = cfg.db_path();
+    // FR6: warn when the resolved store is NOT the well-known XDG default. The most
+    // common "why can't I see the other session's peers" cause is each session
+    // pointing at a different WEAVE_DB, so surface it as a diagnostic hint.
+    let db_default = config::default_db_path();
+    let db_is_default = db == db_default;
     if json {
         println!(
             "{}",
@@ -393,14 +421,18 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "version": env!("CARGO_PKG_VERSION"),
                 "backend": store.backend(),
                 "db_path": db.to_string_lossy(),
+                "db_is_default": db_is_default,
                 "config_path": config::config_path().to_string_lossy(),
                 "current_mux": target.mux.as_str(),
                 "current_target": target.id,
                 "injectable_here": target.injectable(),
                 "total_messages": total,
-                "peers": peers.len(),
+                "peers": total_peers,
                 "peers_online": online,
                 "claude_on_path": claude,
+                "federation_stores": extra.len(),
+                "federation_stores_ok": fed_ok,
+                "federation_stores_skipped": fed_skipped,
             }))?
         );
     } else {
@@ -421,8 +453,22 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             target.injectable()
         );
         println!("  messages:       {total}");
-        println!("  peers:          {} ({online} online)", peers.len());
+        println!("  peers:          {total_peers} ({online} online)");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+        if !extra.is_empty() {
+            // Federation is configured: surface its health. This replaces the
+            // non-default-WEAVE_DB hint below for the federated case (the whole
+            // point of federation is to see across stores).
+            println!(
+                "  federation:     {} extra store(s) ({fed_ok} ok, {fed_skipped} skipped)",
+                extra.len()
+            );
+        } else if !db_is_default {
+            println!(
+                "  note: using non-default WEAVE_DB — peers on a different store won't be visible (default: {})",
+                db_default.display()
+            );
+        }
     }
     Ok(())
 }
@@ -469,7 +515,7 @@ fn watch(
     store: &dyn Store,
     _cfg: &Config,
     me: &str,
-    _explicit: bool,
+    explicit: bool,
     interval: u64,
     all: bool,
     limit: i64,
@@ -531,6 +577,11 @@ fn watch(
                 break;
             }
         }
+        // A1 heartbeat: a long-lived `weave watch` is an actively-attended session,
+        // so keep its presence warm each tick even when no messages arrive. Best-
+        // effort + explicit-identity-only via refresh_presence; a heartbeat failure
+        // must never abort the watch.
+        refresh_presence(store, me, explicit);
         std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
     }
 }
@@ -588,7 +639,10 @@ fn main() -> Result<()> {
             // its live-injection nudges honor the same `nudge_template` the CLI
             // uses. `None` ⇒ the server falls back to its built-in default text.
             let nudge_tpl = cfg.nudge_template().map(str::to_owned);
-            mcp::run(store, def, nudge_tpl.as_deref())?;
+            // Tier-1 federation: pass the validated read-only extra store paths so
+            // the MCP peers/sessions/doctor tools aggregate them too.
+            let extra_dbs = cfg.peer_db_paths();
+            mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs)?;
         }
 
         Cmd::Send {
@@ -741,39 +795,57 @@ fn main() -> Result<()> {
         }
 
         Cmd::Peers { json } => {
-            let peers = store.list_peers()?;
+            // A1 heartbeat-on-read: listing peers is a cheap, frequently-hit path,
+            // so use it to keep our own `last_seen` warm. Best-effort and explicit-
+            // identity-only (refresh_presence guards both): a heartbeat write failure
+            // must never abort the read.
+            let (me, explicit) = resolve_me_explicit(None, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            // Tier-1 federation: union the local peers with any configured
+            // read-only extra stores, origin-tagged. Default (no WEAVE_PEER_DBS /
+            // [federation] peer_dbs) ⇒ `extra` is empty ⇒ output is the local
+            // listing tagged `local`, byte-identical to single-store behavior.
+            let extra = cfg.peer_db_paths();
+            let views = store::federated_peers(store, &extra)?;
             if json {
-                let arr: Vec<_> = peers
+                let arr: Vec<_> = views
                     .iter()
-                    .map(|p| {
+                    .map(|v| {
+                        let p = &v.peer;
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
-                            "online": is_online(p.last_seen),
+                            "pid": p.pid, "host": p.host,
+                            "online": is_alive(p),
+                            "alive": is_alive(p),
                             "injectable": inject::Target::from_peer(p).injectable(),
+                            "origin": v.origin.label(),
+                            "foreign": v.origin.is_foreign(),
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
-                if peers.is_empty() {
+                if views.is_empty() {
                     println!("no peers registered");
                 }
-                for p in peers {
-                    let inj = if inject::Target::from_peer(&p).injectable() {
+                for v in &views {
+                    let p = &v.peer;
+                    let inj = if inject::Target::from_peer(p).injectable() {
                         "injectable"
                     } else {
                         "no-inject"
                     };
-                    let presence = if is_online(p.last_seen) {
-                        "online"
-                    } else {
-                        "offline"
-                    };
+                    let presence = if is_alive(p) { "online" } else { "offline" };
                     let tgt = if p.target.is_empty() { "-" } else { &p.target };
+                    let via = if v.origin.is_foreign() {
+                        format!(" (via {})", v.origin.label())
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{} [{presence}] [{}] {} ({inj}) seen {}",
+                        "{} [{presence}] [{}] {} ({inj}) seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -784,21 +856,38 @@ fn main() -> Result<()> {
         }
 
         Cmd::Sessions { json } => {
-            let info = store.sessions()?;
+            // Tier-1 federation: union local sessions with read-only extra stores,
+            // origin-tagged. Foreign sessions are kept distinct (no unread summing —
+            // Tier 1 has no cross-store inbox). Default ⇒ identical-to-today.
+            let extra = cfg.peer_db_paths();
+            let views = store::federated_sessions(store, &extra)?;
             if json {
-                let arr: Vec<_> = info
+                let arr: Vec<_> = views
                     .iter()
-                    .map(|(n, unread, last)| {
-                        serde_json::json!({"name": n, "unread": unread, "last_activity": last})
+                    .map(|v| {
+                        serde_json::json!({
+                            "name": v.name, "unread": v.unread, "last_activity": v.last_activity,
+                            "origin": v.origin.label(), "foreign": v.origin.is_foreign(),
+                        })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
-                if info.is_empty() {
+                if views.is_empty() {
                     println!("no sessions yet");
                 }
-                for (n, unread, last) in info {
-                    println!("{n}: {unread} unread (last {})", model::fmt_ts(last));
+                for v in &views {
+                    let via = if v.origin.is_foreign() {
+                        format!(" (via {})", v.origin.label())
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "{}: {} unread (last {}){via}",
+                        v.name,
+                        v.unread,
+                        model::fmt_ts(v.last_activity)
+                    );
                 }
             }
         }
@@ -820,14 +909,102 @@ fn main() -> Result<()> {
             });
             // Persist the captured kitty control socket (KITTY_LISTEN_ON; empty for
             // every other backend) so a remote sender can reach a `--listen-on`
-            // kitty via `kitten --to <socket>` without re-detecting it.
-            store.register_peer(&me, t.mux.as_str(), &t.id, &t.socket, cwd_val.as_deref())?;
+            // kitty via `kitten --to <socket>` without re-detecting it. Capture
+            // this process's PID + host so presence reflects real liveness.
+            store.register_peer_full(
+                &me,
+                t.mux.as_str(),
+                &t.id,
+                &t.socket,
+                cwd_val.as_deref(),
+                Some(std::process::id() as i64),
+                &config::this_host(),
+            )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
             } else {
                 t.id.clone()
             };
             println!("registered '{me}' [{}] {}", t.mux.as_str(), tgt);
+        }
+
+        Cmd::Attach { name, cwd } => {
+            // Bind the row key to OUR OWN resolved identity — attach upserts the
+            // caller's own peer row only, never an arg-supplied foreign target.
+            let me = resolve_me(name, cwd.as_deref(), &cfg);
+            // Validate identity up front (the store also enforces this, but failing
+            // here keeps the error close to the input).
+            store::check_ident("name", &me)?;
+            let t = inject::detect_target();
+            // If a mux was detected, the captured pane id must match that mux's
+            // expected shape; a structurally invalid injectable target is refused so
+            // we never persist a poisoned, un-injectable registration. A legitimate
+            // mux=none (no multiplexer) has an empty id and is allowed (store-only).
+            if t.injectable() && !inject::id_valid(t.mux, &t.id) {
+                anyhow::bail!(
+                    "refusing to attach: captured target {:?} is not a valid {} target",
+                    t.id,
+                    t.mux.as_str()
+                );
+            }
+            let cwd_val = cwd.or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+            // Idempotent upsert (ON CONFLICT(name) DO UPDATE) under our own identity.
+            // Capture this process's PID + host so the adopted peer reflects real
+            // liveness (the whole point of zero-restart attach).
+            store.register_peer_full(
+                &me,
+                t.mux.as_str(),
+                &t.id,
+                &t.socket,
+                cwd_val.as_deref(),
+                Some(std::process::id() as i64),
+                &config::this_host(),
+            )?;
+            let tgt = if t.id.is_empty() {
+                "-".to_string()
+            } else {
+                t.id.clone()
+            };
+            let inj = if t.injectable() {
+                "injectable"
+            } else {
+                "no-inject"
+            };
+            println!("attached '{me}' [{}] {tgt} ({inj})", t.mux.as_str());
+        }
+
+        Cmd::Connect { to } => {
+            let peer = store
+                .get_peer(&to)?
+                .ok_or_else(|| anyhow::anyhow!("no registered peer '{to}'"))?;
+            let t = inject::Target::from_peer(&peer);
+            match inject::capability(&t) {
+                inject::Capability::Live => {
+                    println!(
+                        "connect '{to}': live [{}] {} — a live nudge can be delivered now",
+                        t.mux.as_str(),
+                        t.id
+                    );
+                }
+                inject::Capability::RegisteredNotAlive => {
+                    println!(
+                        "connect '{to}': registered but not alive [{}] {} — \
+                         delivery will be queued; recipient drains on next turn",
+                        t.mux.as_str(),
+                        t.id
+                    );
+                }
+                inject::Capability::NotInjectable => {
+                    println!(
+                        "connect '{to}': not injectable (mux=none) — \
+                         delivery will be queued; recipient drains on next turn"
+                    );
+                }
+            }
         }
 
         Cmd::Inject { to, text, quiet } => {
@@ -889,8 +1066,17 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             let t = inject::detect_target();
             // Pass the captured kitty control socket through (empty for non-kitty);
             // see the Register arm. A poisoned/empty socket is harmless — only the
-            // kitty injector consults it.
-            store.register_peer(&me, t.mux.as_str(), &t.id, &t.socket, cwd)?;
+            // kitty injector consults it. Capture PID + host so presence reflects
+            // real process-liveness for this hook-registered session.
+            store.register_peer_full(
+                &me,
+                t.mux.as_str(),
+                &t.id,
+                &t.socket,
+                cwd,
+                Some(std::process::id() as i64),
+                &config::this_host(),
+            )?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must
             // never sink the session hook (which also drives presence/registration),

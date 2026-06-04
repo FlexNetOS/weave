@@ -38,10 +38,11 @@
 use crate::config::Config;
 use crate::model::{is_broadcast, now, Message, Peer, BROADCAST_SQL};
 use crate::store::{
-    check_body, check_ident, clamp_limit, reply_subject, SessionInfo, Store, MAX_SESSIONS,
+    check_body, check_ident, clamp_limit, merge_peer_views, merge_session_views, reply_subject,
+    store_label, Origin, PeerView, SessionInfo, SessionView, Store, MAX_SESSIONS,
 };
 use anyhow::{Context, Result};
-use libsql::{Builder, Connection, Database, Value};
+use libsql::{Builder, Connection, Database, OpenFlags, Value};
 use tokio::runtime::Runtime;
 
 /// Same schema as `SqliteStore`. Executed statement-by-statement because the
@@ -69,7 +70,9 @@ const SCHEMA: &[&str] = &[
         target    TEXT NOT NULL,
         socket    TEXT NOT NULL DEFAULT '',
         cwd       TEXT,
-        last_seen INTEGER NOT NULL
+        last_seen INTEGER NOT NULL,
+        pid       INTEGER,
+        host      TEXT NOT NULL DEFAULT ''
     )",
 ];
 
@@ -96,7 +99,7 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
     })
 }
 
-/// Column order: name, mux, target, socket, cwd, last_seen.
+/// Column order: name, mux, target, socket, cwd, last_seen, pid, host.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
     Ok(Peer {
         name: r.get::<String>(0)?,
@@ -105,6 +108,8 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         socket: r.get::<String>(3)?,
         cwd: r.get::<Option<String>>(4)?,
         last_seen: r.get::<i64>(5)?,
+        pid: r.get::<Option<i64>>(6)?,
+        host: r.get::<String>(7)?,
     })
 }
 
@@ -194,6 +199,38 @@ impl LibsqlStore {
                 .await
                 .context("adding socket column")?;
             }
+            // Migration: a DB created before process-liveness lacks `peers.pid`.
+            // Add it idempotently (mirrors SqliteStore::migrate). Nullable;
+            // defaults to NULL == PID unknown ⇒ presence falls back to the TTL
+            // guess.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='pid'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute("ALTER TABLE peers ADD COLUMN pid INTEGER", ())
+                    .await
+                    .context("adding pid column")?;
+            }
+            // Migration: a DB created before process-liveness lacks `peers.host`.
+            // Add it idempotently (mirrors SqliteStore::migrate) defaulting to ''
+            // for existing rows == host unknown ⇒ liveness fails open / TTL-only.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='host'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT ''",
+                    (),
+                )
+                .await
+                .context("adding host column")?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -210,6 +247,130 @@ impl LibsqlStore {
 
         Ok(Self { rt, conn, _db: db })
     }
+
+    /// Open an EXISTING local-file store **read-only** for Tier-1 federation.
+    ///
+    /// O-F3 RESOLVED: libsql 0.9 *does* expose a structural read-only open —
+    /// `Builder::new_local(path).flags(OpenFlags::SQLITE_OPEN_READ_ONLY)` opens the
+    /// underlying SQLite core with `SQLITE_OPEN_READONLY` (and WITHOUT
+    /// `SQLITE_OPEN_CREATE`), so the engine itself rejects any write and a missing
+    /// file errors rather than being created. The read-only guarantee is therefore
+    /// structural on the libsql backend too, exactly like the sqlite backend — it
+    /// is NOT gated off. We deliberately run NO `SCHEMA`, NO migration, and NO
+    /// permission hardening: a foreign store we do not own is read exactly as-is.
+    /// Remote (Turso) stores are out of scope for federation; this opens only a
+    /// local file path.
+    pub fn open_readonly(path: &std::path::Path) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for read-only libsql store")?;
+        let path = path.to_path_buf();
+        let (db, conn) = rt.block_on(async move {
+            let db = Builder::new_local(&path)
+                .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .build()
+                .await
+                .context("opening read-only libsql database")?;
+            let conn = db
+                .connect()
+                .context("connecting to read-only libsql database")?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .context("setting read-only libsql busy_timeout")?;
+            Ok::<_, anyhow::Error>((db, conn))
+        })?;
+        Ok(Self { rt, conn, _db: db })
+    }
+}
+
+/// Diagnostic mirror of `store::federation_status`: of the configured `extra`
+/// read-only stores, how many open + list cleanly vs. are skipped this run. Used
+/// by `doctor` to surface federation health. Read-only + best-effort.
+pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    for path in extra {
+        match LibsqlStore::open_readonly(path).and_then(|s| s.list_peers()) {
+            Ok(_) => ok += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+    (ok, skipped)
+}
+
+/// Aggregate the local store's peers with those of each configured read-only
+/// extra store (Tier-1 federation), origin-tagged and deduped on `(name, host)`.
+/// Mirrors `store::federated_peers`: each foreign store is opened **read-only**
+/// via [`LibsqlStore::open_readonly`] (structurally incapable of writing it) and
+/// listed via the existing `list_peers`. **Failure isolation:** an unreadable /
+/// locked / missing / non-weave extra store is logged to **stderr** and skipped —
+/// it never breaks the local listing. With `extra` empty this is exactly
+/// `local.list_peers()` tagged `Local`.
+pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Result<Vec<PeerView>> {
+    let mut views: Vec<PeerView> = local
+        .list_peers()?
+        .into_iter()
+        .map(|peer| PeerView {
+            peer,
+            origin: Origin::Local,
+        })
+        .collect();
+    for path in extra {
+        let label = store_label(path);
+        match LibsqlStore::open_readonly(path).and_then(|s| s.list_peers()) {
+            Ok(peers) => {
+                for peer in peers {
+                    views.push(PeerView {
+                        peer,
+                        origin: Origin::Foreign(label.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+            }
+        }
+    }
+    Ok(merge_peer_views(views))
+}
+
+/// Aggregate the local store's sessions with those of each configured read-only
+/// extra store (Tier-1 federation). Mirrors `store::federated_sessions`: merges
+/// by name keeping `max(last_activity)` and never summing unread, with the same
+/// read-only open + per-store failure isolation as [`federated_peers`].
+pub fn federated_sessions(
+    local: &dyn Store,
+    extra: &[std::path::PathBuf],
+) -> Result<Vec<SessionView>> {
+    let mut views: Vec<SessionView> = local
+        .sessions()?
+        .into_iter()
+        .map(|(name, unread, last_activity)| SessionView {
+            name,
+            unread,
+            last_activity,
+            origin: Origin::Local,
+        })
+        .collect();
+    for path in extra {
+        let label = store_label(path);
+        match LibsqlStore::open_readonly(path).and_then(|s| s.sessions()) {
+            Ok(sessions) => {
+                for (name, unread, last_activity) in sessions {
+                    views.push(SessionView {
+                        name,
+                        unread,
+                        last_activity,
+                        origin: Origin::Foreign(label.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+            }
+        }
+    }
+    Ok(merge_session_views(views))
 }
 
 /// Build a positional parameter vector for a libsql query. `Value` already has
@@ -649,20 +810,23 @@ impl Store for LibsqlStore {
         })
     }
 
-    fn register_peer(
+    fn register_peer_full(
         &self,
         name: &str,
         mux: &str,
         target: &str,
         socket: &str,
         cwd: Option<&str>,
+        pid: Option<i64>,
+        host: &str,
     ) -> Result<()> {
         check_ident("peer name", name)?;
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen) VALUES (?1,?2,?3,?4,?5,?6)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6",
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8",
                     params(vec![
                         name.into(),
                         mux.into(),
@@ -670,6 +834,8 @@ impl Store for LibsqlStore {
                         socket.into(),
                         cwd.map(|s| s.to_string()).into(),
                         now().into(),
+                        pid.into(),
+                        host.into(),
                     ]),
                 )
                 .await?;
@@ -682,7 +848,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -698,7 +864,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -770,7 +936,9 @@ impl LibsqlStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{clamp_limit, is_online, MAX_IDENT, MAX_LIMIT, ONLINE_TTL_SECS};
+    use crate::store::{
+        clamp_limit, is_alive, is_online, pid_alive, MAX_IDENT, MAX_LIMIT, ONLINE_TTL_SECS,
+    };
 
     /// A local-file libsql store backed by a unique temp DB. This exercises the
     /// REAL libsql backend (its own SQLite core, async-over-block_on bridge, and
@@ -1033,5 +1201,343 @@ mod tests {
             "control char in recipient rejected"
         );
         assert!(s.send("a", "b", None, "x").is_ok());
+    }
+
+    // ---- A2 (real liveness): mirror of the SqliteStore store-unit tests ----
+
+    /// `register_peer_full` round-trips the new `pid`/`host` columns through both
+    /// `get_peer` and `list_peers`, and an upsert overwrites them. (libSQL mirror.)
+    #[test]
+    fn register_peer_full_roundtrips_pid_and_host() {
+        let s = mem();
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), Some(4321), "boxA")
+            .unwrap();
+        let p = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(p.pid, Some(4321));
+        assert_eq!(p.host, "boxA");
+        let lp = &s.list_peers().unwrap()[0];
+        assert_eq!(lp.pid, Some(4321));
+        assert_eq!(lp.host, "boxA");
+        // Upsert overwrites pid/host (and a None pid clears it).
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB")
+            .unwrap();
+        let p2 = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(p2.pid, None);
+        assert_eq!(p2.host, "boxB");
+        // The 5-arg compat wrapper forwards pid=None, host="".
+        s.register_peer("q", "none", "", "", None).unwrap();
+        let q = s.get_peer("q").unwrap().unwrap();
+        assert_eq!(q.pid, None);
+        assert_eq!(q.host, "");
+    }
+
+    /// A libSQL DB created WITHOUT the `pid`/`host` columns opens and gains them in
+    /// place: the inline migration adds them, the legacy row survives, and reads
+    /// back `pid:None`/`host:""`. (libSQL mirror of the sqlite legacy-migration
+    /// test.) The pre-A2 table is built directly with libsql's own Builder so the
+    /// store's `open` exercises the real ADD COLUMN path.
+    #[test]
+    fn legacy_db_without_pid_host_migrates_in_place() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-legacy-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // Build a pre-A2 peers table (no pid/host) + a legacy row, via a raw libsql
+        // connection, then close it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE peers (
+                    name      TEXT PRIMARY KEY,
+                    mux       TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    socket    TEXT NOT NULL DEFAULT '',
+                    cwd       TEXT,
+                    last_seen INTEGER NOT NULL
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1)",
+                params(vec![now().into()]),
+            )
+            .await
+            .unwrap();
+        });
+        drop(rt);
+
+        // Opening through LibsqlStore runs the inline migration: the columns appear.
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let p = s.get_peer("old").unwrap().unwrap();
+        assert_eq!(p.mux, "tmux");
+        assert_eq!(p.target, "%1");
+        assert_eq!(p.cwd.as_deref(), Some("/legacy"));
+        assert_eq!(p.pid, None, "legacy row reads pid:None after migration");
+        assert_eq!(p.host, "", "legacy row reads host:'' after migration");
+        // Re-opening is idempotent and a fresh full register works on the upgrade.
+        let s2 = LibsqlStore::open(&cfg).unwrap();
+        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h")
+            .unwrap();
+        let nrow = s2.get_peer("new").unwrap().unwrap();
+        assert_eq!(nrow.pid, Some(7));
+        assert_eq!(nrow.host, "h");
+    }
+
+    /// `is_alive` matrix against the libSQL backend's actual rows: a remote-host
+    /// peer must read alive (fail-open) so the Turso/shared-DB case can't read every
+    /// peer dead; a local dead-pid peer reads offline on Linux; a NULL-pid peer
+    /// falls back to TTL. (Mirror of the sqlite is_alive matrix, driven through real
+    /// libSQL persistence + read-back.)
+    #[test]
+    fn is_alive_matrix_against_libsql_rows() {
+        let s = mem();
+
+        // (c) NULL pid + recent => alive (TTL fallback).
+        s.register_peer_full(
+            "nullpid",
+            "tmux",
+            "%1",
+            "",
+            None,
+            None,
+            &crate::config::this_host(),
+        )
+        .unwrap();
+        let nullpid = s.get_peer("nullpid").unwrap().unwrap();
+        assert!(is_alive(&nullpid), "null pid + recent must be alive (TTL)");
+
+        // (b) remote host (host != this_host) + recent + absurd pid => alive
+        //     (fail-open: cannot probe a remote PID — the Turso case).
+        let remote_host = format!("{}-remote", crate::config::this_host());
+        s.register_peer_full(
+            "remote",
+            "tmux",
+            "%2",
+            "",
+            None,
+            Some(999_999_999),
+            &remote_host,
+        )
+        .unwrap();
+        let remote = s.get_peer("remote").unwrap().unwrap();
+        assert_ne!(remote.host, crate::config::this_host());
+        assert!(
+            is_alive(&remote),
+            "remote-host peer must fail open to alive (Turso shared-DB case)"
+        );
+
+        // (d) local host + our OWN live pid => alive.
+        s.register_peer_full(
+            "live",
+            "tmux",
+            "%3",
+            "",
+            None,
+            Some(std::process::id() as i64),
+            &crate::config::this_host(),
+        )
+        .unwrap();
+        let live = s.get_peer("live").unwrap().unwrap();
+        assert!(
+            is_alive(&live),
+            "local host + our own live pid must be alive"
+        );
+
+        // (a) local host + dead pid => offline on Linux (probe is real).
+        s.register_peer_full(
+            "dead",
+            "tmux",
+            "%4",
+            "",
+            None,
+            Some(999_999_999),
+            &crate::config::this_host(),
+        )
+        .unwrap();
+        let dead = s.get_peer("dead").unwrap().unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(
+                !is_alive(&dead),
+                "local host + dead pid must read offline under A2 (libsql)"
+            );
+        }
+
+        // Recency guard: backdate the live-pid peer past the TTL => offline.
+        s.backdate_peer("live", ONLINE_TTL_SECS + 1).unwrap();
+        let stale = s.get_peer("live").unwrap().unwrap();
+        assert!(
+            !is_alive(&stale),
+            "stale last_seen is offline even with a live pid (libsql)"
+        );
+    }
+
+    /// `pid_alive` (shared pure helper) behaves the same when exercised from the
+    /// libSQL build: our own pid is alive; an absurd pid / pid<=0 is dead on Linux,
+    /// degraded-alive elsewhere. Mirrors the sqlite unit so both build feature sets
+    /// cover the probe contract.
+    #[test]
+    fn pid_alive_own_pid_live_absurd_pid_dead() {
+        let me = std::process::id() as i64;
+        assert!(pid_alive(me), "our own pid must be alive");
+        if cfg!(target_os = "linux") {
+            assert!(
+                !pid_alive(999_999_999),
+                "an unused pid is not alive (linux)"
+            );
+            assert!(!pid_alive(0), "pid 0 is rejected");
+            assert!(!pid_alive(-1), "a negative pid is rejected");
+        } else {
+            assert!(pid_alive(999_999_999), "non-linux degrades to assume-alive");
+        }
+    }
+
+    // ---- Tier-1 federation: libsql read-only open is structurally write-incapable ----
+
+    /// The structural read-only proof on the LIBSQL backend (mirror of the sqlite
+    /// `open_readonly_reads_but_cannot_write`): `open_readonly` can READ an existing
+    /// store but the libsql/SQLite core rejects every write, leaves the foreign file
+    /// byte-identical (sha-free content compare), and never creates a missing file.
+    #[test]
+    fn open_readonly_reads_but_cannot_write_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-ro-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+
+        // Seed a store with a peer via the normal RW open, then drop it.
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
+                .unwrap();
+        }
+
+        // Capture the exact main-DB-file bytes BEFORE any federated read. (A
+        // WAL-mode store legitimately materializes an empty `-shm` on a read-only
+        // open — documented SQLite behavior, not a data write — so the invariant
+        // is asserted on the main DATA file plus an empty/absent WAL.)
+        let before = std::fs::read(&path).expect("read foreign main DB bytes (before)");
+
+        // Read-only open can list the peer.
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        let peers = ro.list_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "seed");
+
+        // But ANY write is rejected by the engine, not by convention.
+        let wr = ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA");
+        assert!(
+            wr.is_err(),
+            "a write through a libsql read-only handle must error"
+        );
+        let send = ro.send("a", "b", None, "x");
+        assert!(
+            send.is_err(),
+            "a send through a libsql read-only handle must error"
+        );
+        // Reading the same handle again still succeeds (the failed writes were no-ops).
+        assert_eq!(ro.list_peers().unwrap().len(), 1);
+        drop(ro);
+
+        // The main DB file is byte-identical: no row touched, no migration. And no
+        // write was committed — the WAL is empty/absent.
+        let after = std::fs::read(&path).expect("read foreign main DB bytes (after)");
+        assert_eq!(
+            before, after,
+            "a federated read-only open must leave the foreign libsql main DB byte-unchanged"
+        );
+        let wal_len = std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wal_len, 0,
+            "a read-only libsql open must not commit a write (WAL empty/absent)"
+        );
+
+        // Opening a path that does not exist read-only must NOT create it.
+        let missing = dir.join("does-not-exist.db");
+        assert!(LibsqlStore::open_readonly(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "read-only libsql open must never create a missing store"
+        );
+    }
+
+    /// `federated_peers` (libsql) unions the local peers with a foreign read-only
+    /// store, origin-tagging foreign rows; an unreadable extra store is skipped (the
+    /// local listing still returns) — mirrors the sqlite federation aggregation test.
+    #[test]
+    fn federated_peers_unions_and_isolates_failures_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-fed-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_path = dir.join("local.db");
+        let foreign_path = dir.join("foreign.db");
+
+        let local = {
+            let cfg = Config {
+                db: Some(local_path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            LibsqlStore::open(&cfg).unwrap()
+        };
+        local
+            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA")
+            .unwrap();
+        {
+            let cfg = Config {
+                db: Some(foreign_path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let foreign = LibsqlStore::open(&cfg).unwrap();
+            foreign
+                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA")
+                .unwrap();
+        }
+
+        // A bad path is skipped, not fatal.
+        let bad = dir.join("nope.db");
+        let extra = vec![foreign_path.clone(), bad];
+        let views = federated_peers(&local, &extra).unwrap();
+        let names: Vec<&str> = views.iter().map(|v| v.peer.name.as_str()).collect();
+        assert!(names.contains(&"me"));
+        assert!(names.contains(&"them"));
+        let them = views.iter().find(|v| v.peer.name == "them").unwrap();
+        assert!(them.origin.is_foreign());
+        let me = views.iter().find(|v| v.peer.name == "me").unwrap();
+        assert_eq!(me.origin, Origin::Local);
+
+        // federation_status counts the ok store and the skipped bad path.
+        let (ok, skipped) = federation_status(&extra);
+        assert_eq!((ok, skipped), (1, 1));
     }
 }

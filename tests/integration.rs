@@ -13,10 +13,10 @@
 
 mod common;
 
-use common::{run, run_hook, run_ok, McpServer, TestDb};
+use common::{run, run_env, run_hook, run_ok, run_ok_env, McpServer, TestDb};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 // ---------------------------------------------------------------------------
 // 1. MCP stdio protocol
@@ -635,4 +635,640 @@ fn reply_thread_receipts_roundtrip() {
         rec.contains('a'),
         "receipts for #2 should list reader a: {rec}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Presence & Live-Connect (Phase 1): attach (B1), connect (C2), heartbeat (A1),
+// doctor non-default-DB hint (FR6).
+// ---------------------------------------------------------------------------
+
+/// B1 zero-restart adoption: a peer first registered with NO mux env (so it is
+/// `no-inject`) becomes `injectable` after `weave attach` is run inside a (fake)
+/// tmux — without restarting under the SessionStart hook. Proven via the
+/// `peers --json` `injectable` field flipping false -> true.
+#[test]
+fn attach_flips_no_inject_peer_to_injectable_under_fake_mux() {
+    let db = TestDb::new();
+
+    // 1. Register 'p' with no mux env present -> a non-injectable (mux=none) peer.
+    run_ok(&db, &["register", "--name", "p"]);
+    let before = run_ok(&db, &["peers", "--json"]);
+    let bv: serde_json::Value = serde_json::from_str(&before).expect("peers --json parses");
+    let p_before = bv
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "p")
+        .expect("peer p listed before attach");
+    assert_eq!(
+        p_before["injectable"],
+        serde_json::Value::Bool(false),
+        "peer 'p' starts no-inject (mux=none): {p_before}"
+    );
+
+    // 2. Run `weave attach --name p` inside a fake tmux pane %9. This re-captures
+    //    the live pane env and upserts ONLY p's own row.
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+    let attach = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%9")],
+        &["attach", "--name", "p"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn attach");
+    assert!(
+        attach.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let attach_out = String::from_utf8_lossy(&attach.stdout);
+    assert!(
+        attach_out.contains("attached 'p'")
+            && attach_out.contains("[tmux]")
+            && attach_out.contains("injectable"),
+        "attach should report p now injectable on tmux: {attach_out:?}"
+    );
+
+    // 3. peers --json now reports p injectable on tmux, target %9 — adopted with
+    //    zero restart.
+    let after = run_ok(&db, &["peers", "--json"]);
+    let av: serde_json::Value = serde_json::from_str(&after).expect("peers --json parses");
+    let p_after = av
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "p")
+        .expect("peer p listed after attach");
+    assert_eq!(
+        p_after["injectable"],
+        serde_json::Value::Bool(true),
+        "peer 'p' flipped to injectable after attach: {p_after}"
+    );
+    assert_eq!(p_after["mux"], "tmux", "mux re-captured: {p_after}");
+    assert_eq!(p_after["target"], "%9", "pane id re-captured: {p_after}");
+}
+
+/// C2 connect verdict strings under a fake mux:
+/// - an injectable, fake-tmux-alive peer reports "live";
+/// - a `mux=none` peer reports "not injectable" + the will-queue message;
+/// - a non-existent peer exits non-zero (CLI error).
+#[test]
+fn connect_cli_verdict_strings() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    // Injectable peer 'live1' on fake tmux pane %1; the fake `has-session` exits 0
+    // so target_alive is true -> Live.
+    let reg = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")],
+        &["register", "--name", "live1"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register live1");
+    assert!(reg.status.success(), "register live1 failed");
+
+    let conn = weave_with_fake_path(&db, &fake_dir, &[], &["connect", "--to", "live1"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn connect live1");
+    assert!(
+        conn.status.success(),
+        "connect to a live peer must not be an error: {}",
+        String::from_utf8_lossy(&conn.stderr)
+    );
+    let conn_out = String::from_utf8_lossy(&conn.stdout);
+    assert!(
+        conn_out.contains("connect 'live1': live"),
+        "connect to injectable+alive peer reports live: {conn_out:?}"
+    );
+
+    // Non-injectable peer 'queued' (registered with no mux) -> not injectable, will
+    // queue, and this is NOT an error (exit 0).
+    run_ok(&db, &["register", "--name", "queued"]);
+    let (ok, out, _err) = run(&db, &["connect", "--to", "queued"]);
+    assert!(
+        ok,
+        "connect to a non-injectable peer is graceful, not an error"
+    );
+    assert!(
+        out.contains("connect 'queued': not injectable (mux=none)")
+            && out.contains("delivery will be queued"),
+        "connect to mux=none peer reports queue fallback: {out:?}"
+    );
+
+    // Non-existent peer -> hard error (exit non-zero).
+    let (ok, _out, err) = run(&db, &["connect", "--to", "ghost"]);
+    assert!(!ok, "connect to a non-existent peer must be an error");
+    assert!(
+        err.contains("no registered peer 'ghost'"),
+        "clear not-found error: {err:?}"
+    );
+}
+
+/// A1 heartbeat-on-read: running `weave peers` with an EXPLICIT identity
+/// (`WEAVE_SESSION`) touches the caller's own `last_seen`. We assert the
+/// heartbeat never regresses `last_seen` (it is `>=` the value at registration).
+/// (last_seen has 1s granularity, so we assert non-regression rather than a
+/// strict increase to stay non-flaky.)
+///
+/// NOTE (A2): `register` runs in a short-lived subprocess, so the PID it persists
+/// is dead by the time we read back. With A2 real-liveness, a dead-PID peer on the
+/// local host reads `online:false` regardless of recency — so this test asserts
+/// the A1 heartbeat property (`last_seen` non-regression) only. The dead-PID
+/// offline behavior is asserted directly below.
+#[test]
+fn peers_read_heartbeats_explicit_identity() {
+    let db = TestDb::new();
+    // Register 'hb' as our own peer (sets last_seen = now).
+    run_ok(&db, &["register", "--name", "hb"]);
+
+    let read_last_seen = |db: &TestDb| -> i64 {
+        let j = run_ok(db, &["peers", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("peers --json parses");
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "hb")
+            .and_then(|x| x["last_seen"].as_i64())
+            .expect("hb last_seen present")
+    };
+
+    let t0 = read_last_seen(&db);
+
+    // Read `peers` with an explicit identity -> refresh_presence touches 'hb'.
+    let (ok, _o, _e) =
+        common::run_stdin_full(&db, &["peers"], "", None, &[("WEAVE_SESSION", "hb")]);
+    assert!(ok, "peers with explicit identity must succeed");
+
+    let t1 = read_last_seen(&db);
+    assert!(
+        t1 >= t0,
+        "heartbeat must never regress last_seen (was {t0}, now {t1})"
+    );
+}
+
+/// A2 real-liveness: a peer whose registering process has exited reads
+/// `online:false` (and `alive:false`) on the local host even though its
+/// `last_seen` is within the TTL window — recency alone is no longer enough. The
+/// `register` subprocess that wrote the row is dead by the time we read it back,
+/// so the persisted local PID fails the `/proc/<pid>` liveness probe.
+#[test]
+fn peers_dead_local_pid_reads_offline_despite_recency() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "gone"]);
+
+    let j = run_ok(&db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&j).expect("peers --json parses");
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "gone")
+        .expect("gone peer present");
+
+    // The row carries a (now-dead) pid and a non-empty host.
+    assert!(row["pid"].as_i64().is_some(), "pid was persisted");
+    assert!(
+        !row["host"].as_str().unwrap_or("").is_empty(),
+        "host was persisted"
+    );
+
+    // On Linux the dead PID is probed and the peer reads offline. On non-Linux the
+    // probe degrades to TTL-only, so we only assert the offline behavior where the
+    // probe is real.
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            row["online"].as_bool(),
+            Some(false),
+            "dead local PID must read offline under A2 liveness"
+        );
+        assert_eq!(row["alive"].as_bool(), Some(false), "alive mirrors online");
+    }
+}
+
+/// A2 `peers --json` shape: a peer registered by a STILL-LIVE process exposes
+/// `pid` (an integer), `host` (a non-empty string), and `alive:true`. We drive
+/// the registration through a long-lived `weave mcp` server (`weave_attach`
+/// captures the server's own pid/host) and read it back via the black-box CLI
+/// while the server is still running, so on Linux the persisted pid passes the
+/// `/proc` liveness probe and the peer reads `alive:true`. This proves the JSON
+/// types and that a genuinely-live session is not misreported offline.
+#[test]
+fn peers_json_live_session_reports_pid_host_and_alive_true() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // The live MCP server attaches itself (capturing its OWN live pid + host).
+    let (err, text) = mcp.call_tool("weave_attach", serde_json::json!({"me": "liveone"}));
+    assert!(!err, "attach must succeed: {text}");
+
+    // Read the peer back via the CLI while the server is still alive.
+    let j = run_ok(&db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&j).expect("peers --json parses");
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "liveone")
+        .expect("liveone peer present");
+
+    // Types: pid is an integer, host a non-empty string, alive a bool, and the
+    // legacy `online` field mirrors `alive`.
+    assert!(row["pid"].as_i64().is_some(), "pid is an integer: {row}");
+    assert!(
+        !row["host"].as_str().unwrap_or("").is_empty(),
+        "host is a non-empty string: {row}"
+    );
+    assert!(row["alive"].is_boolean(), "alive is a bool: {row}");
+    assert_eq!(
+        row["online"], row["alive"],
+        "online mirrors the resolved alive verdict"
+    );
+
+    // On Linux the live server's pid is probed and the peer reads alive:true.
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            row["alive"].as_bool(),
+            Some(true),
+            "a still-live session must read alive:true: {row}"
+        );
+    }
+
+    mcp.shutdown();
+}
+
+/// FR6: `doctor --json` carries `db_is_default`. Under our test (non-default)
+/// WEAVE_DB it is `false` and the text form prints the hint; under the default
+/// store path it is `true`.
+#[test]
+fn doctor_json_reports_db_is_default() {
+    // Non-default WEAVE_DB (every TestDb is a unique temp path) -> false + hint.
+    let db = TestDb::new();
+    let out = run_ok(&db, &["doctor", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["db_is_default"],
+        serde_json::Value::Bool(false),
+        "a temp WEAVE_DB is not the XDG default: {v}"
+    );
+    let txt = run_ok(&db, &["doctor"]);
+    assert!(
+        txt.contains("non-default WEAVE_DB"),
+        "text doctor prints the non-default hint: {txt:?}"
+    );
+
+    // Default store path: clear WEAVE_DB and point XDG_DATA_HOME at a temp dir so
+    // the resolved default path equals config::default_db_path() in this process.
+    let xdg = std::env::temp_dir().join(format!(
+        "weave-it-xdgdata-{}-{}",
+        std::process::id(),
+        common::unique_db().file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&xdg).ok();
+    let mut cmd = Command::new(common::weave_bin());
+    cmd.args(["doctor", "--json"]);
+    common::scrub_env(&mut cmd);
+    cmd.env_remove("WEAVE_DB");
+    cmd.env("XDG_DATA_HOME", &xdg);
+    let default_out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn doctor (default db)");
+    assert!(
+        default_out.status.success(),
+        "doctor (default db) failed: {}",
+        String::from_utf8_lossy(&default_out.stderr)
+    );
+    let dv: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&default_out.stdout))
+        .expect("doctor --json parses");
+    assert_eq!(
+        dv["db_is_default"],
+        serde_json::Value::Bool(true),
+        "resolved default WEAVE_DB should report db_is_default=true: {dv}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP: weave_attach / weave_connect (incl. failure paths).
+// ---------------------------------------------------------------------------
+
+/// `weave_attach` upserts the caller's own peer, which `weave_peers` then lists.
+/// Failure path: an empty `me` (no server default) and an oversized `me` both
+/// return `isError`, never a panic or a silent persist.
+#[test]
+fn mcp_attach_upserts_and_rejects_bad_identity() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // Success: explicit identity 'agentA' is upserted (the MCP server has no mux
+    // env, so it lands as a no-inject peer — but it IS now visible).
+    let (err, text) = mcp.call_tool("weave_attach", serde_json::json!({"me": "agentA"}));
+    assert!(!err, "attach with a valid identity must succeed: {text}");
+    assert!(
+        text.contains("Attached 'agentA'"),
+        "attach reports success: {text:?}"
+    );
+
+    // weave_peers now lists agentA.
+    let (perr, ptext) = mcp.call_tool("weave_peers", serde_json::json!({}));
+    assert!(!perr, "weave_peers must succeed: {ptext}");
+    assert!(
+        ptext.contains("agentA"),
+        "attached peer is visible via weave_peers: {ptext:?}"
+    );
+
+    // Failure: empty identity with no server default -> isError, nothing persisted.
+    let (eerr, etext) = mcp.call_tool("weave_attach", serde_json::json!({"me": ""}));
+    assert!(
+        eerr,
+        "empty identity must be an isError, not a silent persist: {etext}"
+    );
+
+    // Failure: oversized identity -> isError (MAX_IDENT_LEN cap).
+    let huge = "x".repeat(100_000);
+    let (herr, htext) = mcp.call_tool("weave_attach", serde_json::json!({"me": huge}));
+    assert!(herr, "oversized identity must be an isError: {htext}");
+
+    mcp.shutdown();
+}
+
+/// `weave_connect` verdicts over MCP:
+/// - to an injectable peer (a `screen` peer, which has no liveness probe so the
+///   fail-open verdict is `Live` regardless of any installed mux) -> "live",
+///   `isError=false`;
+/// - to a `mux=none` peer -> "not injectable" + will-queue, `isError=false`
+///   (graceful, NOT an error);
+/// - to a non-existent peer -> `isError=true` (the only hard failure).
+#[test]
+fn mcp_connect_verdicts_and_failure_path() {
+    let db = TestDb::new();
+
+    // Seed an injectable screen peer via the CLI (STY -> screen mux, no probe).
+    let (ok, _o, _e) = common::run_stdin_full(
+        &db,
+        &["register", "--name", "screenpeer"],
+        "",
+        None,
+        &[("STY", "1234.pts-0.host")],
+    );
+    assert!(ok, "register screen peer failed");
+    // And a non-injectable peer.
+    run_ok(&db, &["register", "--name", "queued"]);
+
+    let mut mcp = McpServer::spawn(&db);
+
+    // Live verdict (screen is injectable; no probe -> fail-open Live), not an error.
+    let (lerr, ltext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "screenpeer"}));
+    assert!(!lerr, "connect to a live peer is not an error: {ltext}");
+    assert!(
+        ltext.contains("is live"),
+        "connect reports live verdict: {ltext:?}"
+    );
+
+    // mux=none peer: not injectable, will queue, isError=false (graceful).
+    let (qerr, qtext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "queued"}));
+    assert!(
+        !qerr,
+        "connect to a non-injectable peer must NOT be an error: {qtext}"
+    );
+    assert!(
+        qtext.contains("not injectable") && qtext.contains("delivery will be queued"),
+        "connect reports graceful queue fallback: {qtext:?}"
+    );
+
+    // Non-existent peer: the only hard failure -> isError.
+    let (nerr, ntext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "ghost"}));
+    assert!(
+        nerr,
+        "connect to a non-existent peer must be isError: {ntext}"
+    );
+    assert!(
+        ntext.contains("No registered peer 'ghost'"),
+        "clear not-found error: {ntext:?}"
+    );
+
+    mcp.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Tier-1 federation: read-only multi-store aggregation (WEAVE_PEER_DBS).
+// ---------------------------------------------------------------------------
+
+/// A peer registered in store B is visible in `weave peers` here when B is
+/// configured via `WEAVE_PEER_DBS`, and the foreign row is origin-tagged
+/// (`origin` = B's basename, `foreign` = true) in `--json`; the local row keeps
+/// `origin:"local"`/`foreign:false` — the additive keys, not a reshape.
+#[test]
+fn federation_peers_union_origin_tagged() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+
+    // A local peer in store A and a distinct peer in store B.
+    run_ok(&local, &["register", "--name", "here"]);
+    run_ok(&foreign, &["register", "--name", "there"]);
+
+    let foreign_path = foreign.path_str();
+    let out = run_ok_env(
+        &local,
+        &["peers", "--json"],
+        &[("WEAVE_PEER_DBS", &foreign_path)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("peers --json parses");
+    let arr = v.as_array().expect("peers --json is an array");
+
+    let here = arr
+        .iter()
+        .find(|p| p["name"] == "here")
+        .expect("local peer present");
+    assert_eq!(here["origin"], "local", "local row tagged local");
+    assert_eq!(here["foreign"], false, "local row is not foreign");
+
+    let there = arr
+        .iter()
+        .find(|p| p["name"] == "there")
+        .expect("foreign peer surfaced via federation");
+    assert_eq!(there["foreign"], true, "foreign row tagged foreign");
+    let label = there["origin"].as_str().unwrap_or("");
+    assert!(
+        label.ends_with(".db") && label != "local",
+        "foreign origin is the store basename, got {label:?}"
+    );
+    // The existing pre-Tier-1 keys are still present on every row.
+    for key in ["name", "mux", "target", "alive", "injectable"] {
+        assert!(there.get(key).is_some(), "row keeps key {key:?}: {there}");
+    }
+}
+
+/// A session living only in store B surfaces in `weave sessions` here when B is
+/// federated, origin-tagged foreign — and its unread is NOT summed into a local
+/// session of the same name (Tier-1 has no cross-store inbox).
+#[test]
+fn federation_sessions_union_origin_tagged() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+
+    // Store B gets an unread session for "bob".
+    run_ok(
+        &foreign,
+        &["send", "--from", "a", "--to", "bob", "--body", "hi-B"],
+    );
+    // Store A gets a different session "carol".
+    run_ok(
+        &local,
+        &["send", "--from", "x", "--to", "carol", "--body", "hi-A"],
+    );
+
+    let foreign_path = foreign.path_str();
+    let out = run_ok_env(
+        &local,
+        &["sessions", "--json"],
+        &[("WEAVE_PEER_DBS", &foreign_path)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("sessions --json parses");
+    let arr = v.as_array().expect("sessions --json is an array");
+
+    let carol = arr
+        .iter()
+        .find(|s| s["name"] == "carol")
+        .expect("local session present");
+    assert_eq!(carol["foreign"], false);
+
+    let bob = arr
+        .iter()
+        .find(|s| s["name"] == "bob")
+        .expect("foreign session surfaced via federation");
+    assert_eq!(bob["foreign"], true, "foreign session tagged foreign");
+    assert_eq!(
+        bob["unread"], 1,
+        "foreign session keeps its own unread, not summed"
+    );
+}
+
+/// Regression guard: with `WEAVE_PEER_DBS` UNSET the federated `peers --json` is
+/// the single-store shape — every row tagged `origin:"local"`/`foreign:false`,
+/// and no spurious foreign rows. The default path is identical-to-today plus the
+/// two additive keys.
+#[test]
+fn federation_default_empty_is_local_only_shape() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "solo"]);
+
+    let out = run_ok(&db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("peers --json parses");
+    let arr = v.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        1,
+        "only the local peer, no spurious foreign rows"
+    );
+    assert_eq!(arr[0]["name"], "solo");
+    assert_eq!(arr[0]["origin"], "local");
+    assert_eq!(arr[0]["foreign"], false);
+
+    // Plain-text default output carries NO `(via ...)` tag for a local-only listing.
+    let text = run_ok(&db, &["peers"]);
+    assert!(
+        !text.contains("(via "),
+        "local-only listing must not emit a federation via-tag: {text}"
+    );
+}
+
+/// Failure isolation: a nonexistent / non-weave junk path in `WEAVE_PEER_DBS` is
+/// skipped (stderr note), the local listing still succeeds, and the exit code is
+/// unaffected. stdout carries the local peer and no skip noise.
+#[test]
+fn federation_bad_store_is_skipped_not_fatal() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    // Two bad entries: a path that does not exist, and a real file that is not a
+    // weave store (junk bytes).
+    let junk = std::env::temp_dir().join(format!("weave-junk-{}.db", std::process::id()));
+    std::fs::write(&junk, b"this is not a sqlite database at all").unwrap();
+    let missing = std::env::temp_dir().join(format!("weave-missing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
+
+    let list = format!("{},{}", missing.display(), junk.display());
+    let (ok, out, err) = run_env(&local, &["peers"], &[("WEAVE_PEER_DBS", &list)]);
+    assert!(ok, "a bad federated store must not change the exit code");
+    assert!(out.contains("here"), "local peer still listed: {out}");
+    assert!(
+        !out.contains("skipping federated store"),
+        "skip notes must go to stderr, never stdout: {out}"
+    );
+    assert!(
+        err.contains("skipping federated store"),
+        "a bad store is diagnosed on stderr: {err}"
+    );
+
+    let _ = std::fs::remove_file(&junk);
+}
+
+/// MCP: `weave_peers`/`weave_sessions` reflect a federated peer/session from a
+/// configured extra store, origin-tagged. A bad extra store mixed in still
+/// yields a SUCCESSFUL tool result (`isError:false`) — federation degradation is
+/// not a tool error. Confirms the CLI and MCP agree on the same federated view.
+#[test]
+fn mcp_peers_and_sessions_reflect_federation() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+
+    run_ok(&foreign, &["register", "--name", "fedpeer"]);
+    run_ok(
+        &foreign,
+        &["send", "--from", "a", "--to", "fedsess", "--body", "hi"],
+    );
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    // Mix a real foreign store with a bad path: the tool must still succeed.
+    let bad = std::env::temp_dir().join(format!("weave-mcp-nope-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&bad);
+    let list = format!("{},{}", foreign.path_str(), bad.display());
+
+    let mut mcp = McpServer::spawn_env(&local, &[("WEAVE_PEER_DBS", &list)]);
+
+    let (perr, ptext) = mcp.call_tool("weave_peers", serde_json::json!({}));
+    assert!(
+        !perr,
+        "weave_peers with a bad extra store is not an error: {ptext}"
+    );
+    assert!(ptext.contains("localpeer"), "local peer present: {ptext}");
+    assert!(
+        ptext.contains("fedpeer"),
+        "federated peer surfaced in MCP weave_peers: {ptext}"
+    );
+    assert!(
+        ptext.contains("(via "),
+        "foreign peer is origin-tagged in MCP text: {ptext}"
+    );
+
+    let (serr, stext) = mcp.call_tool("weave_sessions", serde_json::json!({}));
+    assert!(
+        !serr,
+        "weave_sessions with a bad extra store is not an error: {stext}"
+    );
+    assert!(
+        stext.contains("fedsess"),
+        "federated session surfaced in MCP weave_sessions: {stext}"
+    );
+
+    // weave_doctor reports the federation store count (configured/ok/skipped).
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "weave_doctor is not an error: {dtext}");
+    assert!(
+        dtext.contains("extra store"),
+        "doctor reports the federation store count: {dtext}"
+    );
+
+    mcp.shutdown();
+    let _ = std::fs::remove_file(&bad);
 }
