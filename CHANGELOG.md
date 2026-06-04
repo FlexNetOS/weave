@@ -13,6 +13,14 @@
 - Mux subprocesses run with a 5s timeout — a wedged tmux/zellij can't hang weave.
 - `Config`'s `Debug` redacts the libSQL auth token.
 
+### Fixed
+- Injector: `WEAVE_MUX_DIR` now takes precedence over the hardcoded system dirs
+  (`/usr/bin`, …) when resolving a trusted mux binary. Fixes a CI-only failure
+  where a runner-provided `/usr/bin/tmux` shadowed the fake-mux test harness, so
+  the liveness probe ran the real tmux against a nonexistent pane and reported the
+  test pane dead. An explicit opt-in dir now wins over an ambient same-named system
+  binary; the production liveness probe is unchanged.
+
 ### Tests
 - 25 → 38 tests: lifecycle hooks (session/prompt/stop, guessed-identity peek, malformed
   payloads), `--json`/`doctor`/`gc`, unknown-backend error, injector cap + clamp + gc unit tests.
