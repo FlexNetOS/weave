@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |------|--------|--------|--------|
 | 2026-06-04 | Initial harness build | All agents/skills | - |
 | 2026-06-04 | Removed ECC auto-generated `weave` skill | `.claude/skills/weave/` | Misinformation drift: it falsely claimed camelCase filenames, relative imports, `*.test.*` files, freeform commits — none true of this repo |
+| 2026-06-04 | Confirmed 4-agent team (kept `weave-guardian` separate from `weave-verifier`) | Team composition | Phase 7 feedback: user opted to keep the dedicated guardian for invariant + Rust-native drift review rather than fold it into the verifier |
 
 ## What weave is
 
