@@ -348,6 +348,37 @@ so the asynchronous write never flakes and never hangs. Because the fake mux onl
 has to *exist* on `PATH` for `have()`/`peers` to call the target injectable, this
 harness also exercises the "injectable tmux peer" listing.
 
+### Hermetic session-tag (scan) testing
+
+The `weave scan` / `weave_scan` tags (repo · branch · worktree id) are tested
+**with no real `git` binary and no repo mutation**, mirroring the no-real-terminal
+discipline above. The git parsers in `src/git.rs` are pure functions over fixture
+strings: `parse_worktree_id_from_gitdir`, `parse_worktree_porcelain`,
+`repo_name_from_toplevel`, and `capture_worktree_tags` — the last driven over a
+**crafted temp `.git`** (a `.git` *file* holding `gitdir: …/.git/worktrees/<name>`
+→ canonical id; a `.git` *directory* → the `(main)` sentinel; no `.git` → empty
+tags), all of which run the worktree-id path without spawning `git` at all.
+
+- **Integration (`tests/integration.rs`, hermetic):** a crafted-temp-`.git`-file
+  cwd fixture drives the real `.git`-parse path end-to-end (`weave scan` /
+  `scan --json` shape, `--repo`/`--branch` filters, and the tags showing in
+  `peers --json`, the `sessions` display-join, and `doctor`'s `peers_tagged`) with
+  **no real repo**. The one real-git assertion (a `git init` yielding
+  `worktree=(main)` + a non-empty repo tag) is **gated** on a trusted-path `git`
+  (mirroring `inject::have("git")` / `inject::resolve_trusted`) and skips cleanly
+  when git is absent — it is not `#[ignore]`'d.
+- **Migration roundtrip (both backends):** a `legacy_db_without_git_tag_columns_…`
+  test opens a `peers` table lacking the three tag columns, runs the additive
+  guarded migration, and roundtrips a tagged peer through `get_peer` / `list_peers`
+  (positions 8/9/10) plus an idempotent re-open — mirrored sqlite + libSQL.
+- **Proptest:** `sanitize_tag` totality/idempotence (any input → control-free,
+  ≤128, UTF-8-boundary-safe, `sanitize(sanitize(x)) == sanitize(x)`).
+- **Security (`tests/security.rs`):** a hostile cwd-derived tag (control chars,
+  newlines, `$(rm -rf ~)`, backticks) is bounded + control-stripped + non-fatal to
+  registration and never re-emitted verbatim or injected; a `$(touch PWNED)` /
+  `;touch PWNED` worktree-id segment never creates the sentinel file (the tag never
+  reaches a shell — argv-only `git`).
+
 ## 6. Dual-backend testing (sqlite **and** libSQL)
 
 weave ships two mutually-exclusive storage backends — bundled `rusqlite`
@@ -500,8 +531,12 @@ When you add or change a feature, add the matching coverage before you call it
 done:
 
 1. **Pure logic → a unit test** in the owning module's `#[cfg(test)]` block.
-   Prefer making the core a pure function (like `commands_for`) so it can be
-   asserted argv-for-argv with no subprocess.
+   Prefer making the core a pure function (like `commands_for`, or the
+   `src/git.rs` tag parsers) so it can be asserted with no subprocess. When the
+   feature reads an **external binary or filesystem** (e.g. `git`), test the parse
+   path hermetically over fixtures / a crafted temp `.git` and gate any real-binary
+   assertion on a trusted-path probe (`inject::have` / `inject::resolve_trusted`)
+   so the suite passes with the binary absent (see §5).
 2. **New CLI subcommand / flag → an integration test** in `tests/integration.rs`
    using the `tests/common` helpers (`run_ok`, `run`, `run_hook`,
    `run_stdin_full`). If it has machine-readable output, assert the `--json`

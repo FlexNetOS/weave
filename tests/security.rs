@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{run, run_env, run_ok, run_ok_env, McpServer, TestDb};
+use common::{run, run_env, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
 use std::os::unix::fs::PermissionsExt;
 
 // ---------------------------------------------------------------------------
@@ -1329,4 +1329,136 @@ fn private_key_file_is_0600_and_secret_never_printed() {
     );
 
     let _ = std::fs::remove_dir_all(&a_cfg);
+}
+
+// ---------------------------------------------------------------------------
+// N. Session-tag hardening — a hostile cwd-derived git tag is BOUNDED + control-
+//    free + non-fatal + never injected, and never reaches a shell.
+// ---------------------------------------------------------------------------
+
+/// `sanitize_tag`'s cap (mirrors `store::MAX_*_LEN`). The stored tag must never
+/// exceed this many CHARS regardless of how large the cwd-derived value was.
+const TAG_CAP: usize = 128;
+
+/// Build a temp cwd whose `.git` FILE encodes a HOSTILE linked-worktree id: the
+/// `<name>` segment carries shell metacharacters, quotes, backticks, a `$(...)`
+/// substitution, control characters, and is wildly oversized. The `.git`-file
+/// parser splits the worktree id on `/`, so the id stays a single path segment;
+/// everything else is hostile-but-in-segment. Returns (dir, the raw hostile name).
+fn hostile_worktree_cwd() -> (std::path::PathBuf, String) {
+    // No `/` (that would split the worktree id) but every other nasty byte:
+    // control chars (handled by sanitize), shell metacharacters, oversized length.
+    let hostile = format!(
+        "evil;`id`$(rm -rf ~)\"'\t\x07{}",
+        "A".repeat(4096) // wildly over the 128-char cap
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "weave-sec-tag-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create hostile cwd");
+    std::fs::write(
+        dir.join(".git"),
+        format!("gitdir: /fixture/main/.git/worktrees/{hostile}/.git\n"),
+    )
+    .expect("write hostile .git file");
+    (dir, hostile)
+}
+
+/// A hostile cwd-derived worktree tag is TRUNCATED + control-stripped and stored
+/// BOUNDED — never rejected-fatal, and the stored value is control-free and within
+/// the cap. Registration with such a tag must succeed (graceful), and the hostile
+/// raw value must never appear verbatim in any output.
+#[test]
+fn hostile_cwd_worktree_tag_is_bounded_and_nonfatal() {
+    let db = TestDb::new();
+    let (dir, hostile) = hostile_worktree_cwd();
+
+    // Registration captures the hostile tag from cwd. It must SUCCEED (the tag is
+    // descriptive + sanitized, never an identity that hard-fails).
+    let (ok, _out, err) = run_in_cwd(&db, &["register", "--name", "victim"], &dir);
+    assert!(
+        ok,
+        "register with a hostile cwd tag must be non-fatal: stderr={err}"
+    );
+
+    // The stored worktree tag, read back via peers --json, is BOUNDED and control-
+    // free — never the raw hostile string.
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let pv: serde_json::Value = serde_json::from_str(&peers).expect("peers --json parses");
+    let row = pv
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "victim")
+        .expect("victim peer present");
+    let stored = row["worktree"].as_str().expect("worktree tag is a string");
+    assert!(
+        stored.chars().count() <= TAG_CAP,
+        "stored worktree tag must be capped at {TAG_CAP} chars, got {}",
+        stored.chars().count()
+    );
+    assert!(
+        !stored.chars().any(|c| c.is_control()),
+        "stored worktree tag must be control-free, got {stored:?}"
+    );
+    assert_ne!(
+        stored, hostile,
+        "the raw oversized hostile value must never be stored verbatim"
+    );
+
+    // The raw hostile string (oversized) must not appear in any surface output.
+    let scan = run_ok(&db, &["scan", "--json"]);
+    assert!(
+        !scan.contains(&hostile),
+        "the raw hostile tag must never be re-emitted by scan"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hostile tag never reaches a shell: registering / scanning with it spawns no
+/// extra child process and never errors. We assert the process-level safety by the
+/// absence of any shell-side effect — the hostile `$(rm -rf ~)` / backtick `id`
+/// substitution must be inert (stored as inert text, never executed). We prove this
+/// by confirming a sentinel file the substitution *would* create is absent and the
+/// commands complete successfully.
+#[test]
+fn hostile_cwd_tag_never_reaches_a_shell() {
+    let db = TestDb::new();
+    // Craft a cwd whose worktree-id segment, if it ever hit `sh -c`, would create a
+    // sentinel file in the cwd. Because weave NEVER shells out (argv-only git), the
+    // sentinel must NOT appear.
+    let dir = std::env::temp_dir().join(format!(
+        "weave-sec-noshell-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create cwd");
+    let sentinel = dir.join("PWNED");
+    // `$(touch PWNED)` would create ./PWNED only if the tag ever reached a shell.
+    let payload = format!(
+        "gitdir: /fixture/main/.git/worktrees/{}/.git\n",
+        "wt$(touch PWNED)`touch PWNED`;touch PWNED"
+    );
+    std::fs::write(dir.join(".git"), payload).expect("write .git");
+
+    let (ok, _o, err) = run_in_cwd(&db, &["register", "--name", "shellsafe"], &dir);
+    assert!(ok, "register must not error on a metacharacter tag: {err}");
+    let (ok2, _o2, err2) = run_in_cwd(&db, &["scan"], &dir);
+    assert!(ok2, "scan must not error on a metacharacter tag: {err2}");
+
+    assert!(
+        !sentinel.exists(),
+        "a shell substitution in the tag must NEVER execute (no PWNED sentinel)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

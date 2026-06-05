@@ -1184,6 +1184,9 @@ mod tests {
             last_seen: 0,
             pid: None,
             host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -1201,6 +1204,9 @@ mod tests {
             last_seen: 0,
             pid: None,
             host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");

@@ -33,6 +33,7 @@ compile_error!(
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
 mod config;
+mod git;
 mod inject;
 mod mcp;
 mod model;
@@ -228,6 +229,20 @@ enum Cmd {
     },
     /// List known sessions with unread counts.
     Sessions {
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scan, identify, and tag running sessions: refresh your own row's git tags,
+    /// then list every (federated) peer joined with liveness and its
+    /// repo/branch/worktree tags. Optional `--repo`/`--branch` narrow the set.
+    Scan {
+        /// only show peers whose repo tag equals this value
+        #[arg(long)]
+        repo: Option<String>,
+        /// only show peers whose branch tag equals this value
+        #[arg(long)]
+        branch: Option<String>,
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -579,6 +594,13 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let views = store::federated_peers(store, &extra)?;
     let total_peers = views.len();
     let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    // Session-scan observability: how many peers carry a git repo/worktree tag (a
+    // self-describing, scan-able session). A 0 here on a populated mesh hints the
+    // sessions predate the scan feature or run in non-git cwds.
+    let tagged = views
+        .iter()
+        .filter(|v| !v.peer.repo.is_empty() || !v.peer.worktree_id.is_empty())
+        .count();
     let (fed_ok, fed_skipped) = store::federation_status(&extra);
     // On the default sqlite build a remote source cannot be opened — surface how
     // many were skipped purely for lack of the libsql feature so the user is told.
@@ -626,6 +648,7 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "total_messages": total,
                 "peers": total_peers,
                 "peers_online": online,
+                "peers_tagged": tagged,
                 "claude_on_path": claude,
                 "federation_stores": extra.len(),
                 "federation_stores_ok": fed_ok,
@@ -655,7 +678,7 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             target.injectable()
         );
         println!("  messages:       {total}");
-        println!("  peers:          {total_peers} ({online} online)");
+        println!("  peers:          {total_peers} ({online} online, {tagged} tagged)");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
         if !extra.is_empty() {
             // Federation is configured: surface its health. This replaces the
@@ -684,6 +707,57 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Capture the git session tags (repo / branch / worktree id) for an optional cwd
+/// string, falling back to the process `current_dir()` when `cwd` is `None`. Pure
+/// glue around [`git::capture_worktree_tags`]; best-effort and total — a non-git
+/// cwd or any failure yields empty tags (the store sanitizes + bounds them on
+/// write). Returns `WorktreeTags::default()` (all empty) when no cwd can be
+/// resolved at all.
+fn git_tags_for(cwd: Option<&str>) -> git::WorktreeTags {
+    let path = match cwd {
+        Some(c) => std::path::PathBuf::from(c),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(_) => return git::WorktreeTags::default(),
+        },
+    };
+    git::capture_worktree_tags(&path)
+}
+
+/// Build a `name -> Peer` map of the LOCAL store's peers for a display-layer tag
+/// join (e.g. attaching repo/branch/worktree to `sessions`, which is message-derived
+/// and carries no peer/git data). Best-effort: a read failure yields an empty map
+/// (sessions simply render without tags), never an error. Only the local store is
+/// consulted — never foreign/federated rows — so the join stays owner/secret-free.
+fn local_peer_tag_map(store: &dyn Store) -> std::collections::HashMap<String, model::Peer> {
+    store
+        .list_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.name.clone(), p))
+        .collect()
+}
+
+/// Render a peer's git session tags for a human listing, e.g.
+/// ` {weave@feat/x #my-wt}`, omitting any empty field and the whole group when all
+/// three are empty (a non-git session prints nothing extra). Pure formatting.
+fn fmt_peer_tags(p: &model::Peer) -> String {
+    if p.repo.is_empty() && p.branch.is_empty() && p.worktree_id.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    match (p.repo.is_empty(), p.branch.is_empty()) {
+        (false, false) => parts.push(format!("{}@{}", p.repo, p.branch)),
+        (false, true) => parts.push(p.repo.clone()),
+        (true, false) => parts.push(format!("@{}", p.branch)),
+        (true, true) => {}
+    }
+    if !p.worktree_id.is_empty() {
+        parts.push(format!("#{}", p.worktree_id));
+    }
+    format!(" {{{}}}", parts.join(" "))
 }
 
 /// Upper bound on messages returned for a `thread` view.
@@ -1139,6 +1213,7 @@ fn main() -> Result<()> {
                             "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
                             "pid": p.pid, "host": p.host,
+                            "repo": p.repo, "branch": p.branch, "worktree": p.worktree_id,
                             "online": is_alive(p),
                             "alive": is_alive(p),
                             "injectable": inject::Target::from_peer(p).injectable(),
@@ -1166,8 +1241,9 @@ fn main() -> Result<()> {
                     } else {
                         String::new()
                     };
+                    let tags = fmt_peer_tags(p);
                     println!(
-                        "{} [{presence}] [{}] {} ({inj}) seen {}{via}",
+                        "{} [{presence}] [{}] {} ({inj}){tags} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -1183,12 +1259,23 @@ fn main() -> Result<()> {
             // Tier 1 has no cross-store inbox). Default ⇒ identical-to-today.
             let extra = cfg.peer_db_sources();
             let views = store::federated_sessions(store, &extra)?;
+            // Display-layer tag join (purely additive, no schema/trait/federation
+            // change): SessionView is message-derived and carries no git tags, so we
+            // look up the LOCAL peer by session name and attach repo/branch/worktree
+            // for display only. Only the local store's peers are consulted (never
+            // foreign rows), and a session without a registered peer shows `-`/empty.
+            let local_peers = local_peer_tag_map(store);
             if json {
                 let arr: Vec<_> = views
                     .iter()
                     .map(|v| {
+                        let (repo, branch, worktree) = local_peers
+                            .get(&v.name)
+                            .map(|p| (p.repo.clone(), p.branch.clone(), p.worktree_id.clone()))
+                            .unwrap_or_default();
                         serde_json::json!({
                             "name": v.name, "unread": v.unread, "last_activity": v.last_activity,
+                            "repo": repo, "branch": branch, "worktree": worktree,
                             "origin": v.origin.label(), "foreign": v.origin.is_foreign(),
                         })
                     })
@@ -1204,11 +1291,101 @@ fn main() -> Result<()> {
                     } else {
                         String::new()
                     };
+                    let tags = local_peers
+                        .get(&v.name)
+                        .map(fmt_peer_tags)
+                        .unwrap_or_default();
                     println!(
-                        "{}: {} unread (last {}){via}",
+                        "{}: {} unread (last {}){tags}{via}",
                         v.name,
                         v.unread,
                         model::fmt_ts(v.last_activity)
+                    );
+                }
+            }
+        }
+
+        Cmd::Scan { repo, branch, json } => {
+            // Owner-only-writes: refresh ONLY the caller's own row (re-capture this
+            // session's git tags + presence and upsert under our own identity),
+            // exactly like attach. We never re-register a foreign/federated row.
+            // Best-effort: a heartbeat/tag refresh failure must not sink the read.
+            let (me, explicit) = resolve_me_explicit(None, None, &cfg);
+            if explicit {
+                let t = inject::detect_target();
+                let cwd_val = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let tags = git_tags_for(cwd_val.as_deref());
+                if let Err(e) = store.register_peer_full(
+                    &me,
+                    t.mux.as_str(),
+                    &t.id,
+                    &t.socket,
+                    cwd_val.as_deref(),
+                    Some(std::process::id() as i64),
+                    &config::this_host(),
+                    &tags.repo,
+                    &tags.branch,
+                    &tags.worktree_id,
+                ) {
+                    eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
+                }
+            }
+            // Enumerate federated peers (local + read-only extra stores), read-only.
+            let extra = cfg.peer_db_sources();
+            let mut views = store::federated_peers(store, &extra)?;
+            // Apply the optional repo/branch filters (exact match on the tag).
+            if let Some(r) = repo.as_deref() {
+                views.retain(|v| v.peer.repo == r);
+            }
+            if let Some(b) = branch.as_deref() {
+                views.retain(|v| v.peer.branch == b);
+            }
+            if json {
+                let arr: Vec<_> = views
+                    .iter()
+                    .map(|v| {
+                        let p = &v.peer;
+                        serde_json::json!({
+                            "name": p.name,
+                            "repo": p.repo,
+                            "branch": p.branch,
+                            "worktree": p.worktree_id,
+                            "mux": p.mux,
+                            "pane": p.target,
+                            "host": p.host,
+                            "alive": is_alive(p),
+                            "origin": v.origin.label(),
+                            "foreign": v.origin.is_foreign(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                if views.is_empty() {
+                    println!("no peers match the scan");
+                }
+                for v in &views {
+                    let p = &v.peer;
+                    let alive = if is_alive(p) { "alive" } else { "offline" };
+                    let repo = if p.repo.is_empty() { "-" } else { &p.repo };
+                    let branch = if p.branch.is_empty() { "-" } else { &p.branch };
+                    let wt = if p.worktree_id.is_empty() {
+                        "-"
+                    } else {
+                        &p.worktree_id
+                    };
+                    let pane = if p.target.is_empty() { "-" } else { &p.target };
+                    let host = if p.host.is_empty() { "-" } else { &p.host };
+                    let via = if v.origin.is_foreign() {
+                        format!(" (via {})", v.origin.label())
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "{} [{alive}] repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{via}",
+                        p.name, p.mux
                     );
                 }
             }
@@ -1232,7 +1409,10 @@ fn main() -> Result<()> {
             // Persist the captured kitty control socket (KITTY_LISTEN_ON; empty for
             // every other backend) so a remote sender can reach a `--listen-on`
             // kitty via `kitten --to <socket>` without re-detecting it. Capture
-            // this process's PID + host so presence reflects real liveness.
+            // this process's PID + host so presence reflects real liveness. Tag the
+            // session with its repo/branch/worktree id (best-effort from cwd; a git
+            // failure never sinks registration — empty tags result).
+            let tags = git_tags_for(cwd_val.as_deref());
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -1241,6 +1421,9 @@ fn main() -> Result<()> {
                 cwd_val.as_deref(),
                 Some(std::process::id() as i64),
                 &config::this_host(),
+                &tags.repo,
+                &tags.branch,
+                &tags.worktree_id,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -1276,7 +1459,8 @@ fn main() -> Result<()> {
             });
             // Idempotent upsert (ON CONFLICT(name) DO UPDATE) under our own identity.
             // Capture this process's PID + host so the adopted peer reflects real
-            // liveness (the whole point of zero-restart attach).
+            // liveness (the whole point of zero-restart attach), plus the git tags.
+            let tags = git_tags_for(cwd_val.as_deref());
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -1285,6 +1469,9 @@ fn main() -> Result<()> {
                 cwd_val.as_deref(),
                 Some(std::process::id() as i64),
                 &config::this_host(),
+                &tags.repo,
+                &tags.branch,
+                &tags.worktree_id,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -1459,7 +1646,11 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             // Pass the captured kitty control socket through (empty for non-kitty);
             // see the Register arm. A poisoned/empty socket is harmless — only the
             // kitty injector consults it. Capture PID + host so presence reflects
-            // real process-liveness for this hook-registered session.
+            // real process-liveness for this hook-registered session, plus the git
+            // tags. The hot path stays cheap: tag capture is a single fs read
+            // primary + a timeout-bounded best-effort git fallback that never sinks
+            // the hook.
+            let tags = git_tags_for(cwd);
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -1468,6 +1659,9 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 cwd,
                 Some(std::process::id() as i64),
                 &config::this_host(),
+                &tags.repo,
+                &tags.branch,
+                &tags.worktree_id,
             )?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must

@@ -51,7 +51,9 @@ messages into the agent's context on its next turn (auto-delivery without a mult
 ```bash
 weave register --name desktop        # register this session (captures pane from $TMUX_PANE/$ZELLIJ_SESSION_NAME)
 weave attach --name desktop          # adopt a *running* session into the store WITHOUT restarting (re-capture pane)
-weave peers                          # list peers + whether each is alive + injectable
+weave peers                          # list peers + whether each is alive + injectable (now with repo/branch/worktree tags)
+weave scan                           # refresh your own git tags, then list every (federated) peer + liveness + tags
+weave scan --repo weave --branch feat/x --json   # filter by exact repo/branch tag; machine-readable output
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
@@ -74,6 +76,22 @@ without a restart. `weave connect --to <peer>` reports a capability verdict —
 recipient's next turn), or `not injectable` — and is **not** an error when a peer
 can't be live-nudged: its messages still arrive via the store on its next drain.
 
+`weave scan` is the "who's around, and where?" view. It first re-captures **your
+own** session's git tags and presence (owner-only — it never re-registers a
+foreign row), then lists every (federated) peer joined with liveness and its
+**repo / branch / worktree** tags. `--repo <name>` / `--branch <name>` narrow the
+set by exact tag match; `--json` emits an array of
+`{name, repo, branch, worktree, mux, pane, host, alive, origin, foreign}`. The
+same repo/branch/worktree tags now also appear in `weave peers`, `weave sessions`
+(via a local-only display join), and the `weave doctor` `peers_tagged` count.
+
+**Session tags** (repo, branch, worktree id) are captured **best-effort** from
+the session's cwd at registration and refreshed on `scan`: the worktree id comes
+from the cwd's `.git` (the `.git/worktrees/<name>` segment for a linked worktree,
+the `(main)` sentinel for a main worktree), and the branch/repo from a trusted
+`git` invoked as an external program (explicit argv, no shell). A non-git cwd or
+any git/fs failure simply yields empty tags — it never blocks registration.
+
 **Presence means *alive*, not "wrote recently".** A peer reads online only when
 it is within the presence TTL **and** (for a peer on this host with a known PID)
 its process is still running; presence fails open for remote / cross-machine
@@ -82,7 +100,7 @@ peers that can't be probed locally.
 ## MCP tools
 
 `weave_send` · `weave_outbox` · `weave_inbox` · `weave_history` · `weave_sessions` · `weave_clear`
-· `weave_peers` · `weave_reply` · `weave_thread` · `weave_receipts` · `weave_doctor` · `weave_whoami`
+· `weave_peers` · `weave_scan` · `weave_reply` · `weave_thread` · `weave_receipts` · `weave_doctor` · `weave_whoami`
 · `weave_attach` · `weave_connect`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
@@ -99,6 +117,12 @@ configured pulls and commits eligible intents in the same call.
 current pane and upserts the caller's own peer row only). `weave_connect` reports the same
 live / registered-but-not-alive / not-injectable verdict as the CLI; only a non-existent
 peer is an error, so a queued delivery is reported with `isError:false`.
+
+`weave_scan` mirrors `weave scan`: it refreshes the **caller's own** row tags
+(owner-only-writes — never a foreign row), then returns the federated peer listing
+with liveness and repo/branch/worktree tags as text. Optional `repo` / `branch`
+filters narrow the set by exact tag match and are bounded, so an oversized or
+hostile filter argument is non-fatal (`isError:false`, never a panic).
 
 ## Native injector
 

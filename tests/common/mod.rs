@@ -210,6 +210,15 @@ pub fn run_hook(db: &TestDb, event: &str, payload: &str) -> (bool, String, Strin
     run_stdin_full(db, &["hook", event], payload, None, &[])
 }
 
+/// Run a `weave <args...>` subcommand with the child's working directory pinned to
+/// `cwd` (no stdin), capturing output. This is the seam that exercises cwd-derived
+/// git session tagging: point `cwd` at a temp dir containing a crafted `.git` file
+/// so `weave register`/`scan` capture deterministic worktree tags without a real
+/// repo or `git` binary. Returns (success, stdout, stderr).
+pub fn run_in_cwd(db: &TestDb, args: &[&str], cwd: &std::path::Path) -> (bool, String, String) {
+    run_stdin_full(db, args, "", Some(cwd), &[])
+}
+
 /// A live `weave mcp` server you talk to over newline-delimited JSON-RPC.
 ///
 /// Reads happen on a background thread that pushes whole lines down a channel,

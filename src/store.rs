@@ -74,12 +74,16 @@ pub trait Store: Send {
         cwd: Option<&str>,
         pid: Option<i64>,
         host: &str,
+        repo: &str,
+        branch: &str,
+        worktree_id: &str,
     ) -> Result<()>;
 
-    /// Register (upsert) a peer without PID/host liveness info. Additive
-    /// backward-compatible wrapper over [`Store::register_peer_full`]: forwards
-    /// with `pid=None, host=""` (== liveness unknown ⇒ presence falls back to the
-    /// TTL recency guess). Keeps existing 5-arg call sites/tests compiling.
+    /// Register (upsert) a peer without PID/host liveness info or git tags.
+    /// Additive backward-compatible wrapper over [`Store::register_peer_full`]:
+    /// forwards with `pid=None, host=""` (== liveness unknown ⇒ presence falls
+    /// back to the TTL recency guess) and empty git tags. Keeps existing 5-arg
+    /// call sites/tests compiling.
     ///
     /// `allow(dead_code)`: weave is a binary crate, so a `pub` trait method with
     /// only test callers is otherwise flagged unused. This is intentional
@@ -93,7 +97,7 @@ pub trait Store: Send {
         socket: &str,
         cwd: Option<&str>,
     ) -> Result<()> {
-        self.register_peer_full(name, mux, target, socket, cwd, None, "")
+        self.register_peer_full(name, mux, target, socket, cwd, None, "", "", "", "")
     }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
@@ -469,6 +473,39 @@ pub fn check_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Hard upper bounds on the descriptive session tags (`repo`, `branch`,
+/// `worktree_id`), in chars. These are captured from the cwd / git at
+/// registration and echoed into other agents' listings, so an unbounded one is a
+/// token/RAM/UI hazard exactly like an identity. 128 chars matches
+/// [`MAX_IDENT`] / [`crate::config::MAX_HOST_LEN`] and is generous for any real
+/// repo name, git ref, or `.git/worktrees/<name>` component.
+pub const MAX_REPO_LEN: usize = 128;
+pub const MAX_BRANCH_LEN: usize = 128;
+pub const MAX_WORKTREE_LEN: usize = 128;
+
+/// Sanitize a descriptive tag (repo/branch/worktree_id) for storage. UNLIKE
+/// [`check_ident`] these are NOT injection targets and NOT identities, so the
+/// rule is **lossy-but-total**: strip control characters and truncate to `max`
+/// chars on a UTF-8 boundary, never hard-fail. This is the `config::this_host`
+/// idiom (`trim → drop control → take(max)`), applied at the single store seam so
+/// every capture path (CLI register/attach, hook session, MCP attach/scan) is
+/// bounded identically. `max` is the per-tag cap (`MAX_REPO_LEN` etc.). An
+/// all-control / empty input collapses to `""` (== "unknown tag"), which the
+/// display layer renders as `-`.
+pub fn sanitize_tag(value: &str, max: usize) -> String {
+    // Drop control chars FIRST, then trim: trimming before the control-strip lets a
+    // trailing control char (e.g. `"x \u{7f}"`) shield a space that re-surfaces once
+    // the control is removed, so a single pass yields `"x "` while a second yields
+    // `"x"` — breaking idempotency. Truncation to `max` can likewise re-expose a
+    // trailing space at the cap boundary, so trim the end again afterward. The
+    // result is total, control-free, ≤ `max` chars on a UTF-8 boundary, and a fixed
+    // point of `sanitize_tag` (`sanitize(sanitize(x)) == sanitize(x)`).
+    let cleaned: String = value.chars().filter(|c| !c.is_control()).collect();
+    let mut out: String = cleaned.trim().chars().take(max).collect();
+    out.truncate(out.trim_end().len());
+    out
+}
+
 /// Tier-2 DoS bound: the maximum number of intents [`pull_from_store`] commits
 /// from a single source in one drain. A flood in a source's outbox cannot make
 /// one receiver drain unbounded — the per-source high-water cursor means the rest
@@ -526,14 +563,17 @@ CREATE TABLE IF NOT EXISTS reads (
     PRIMARY KEY (message_id, reader)
 );
 CREATE TABLE IF NOT EXISTS peers (
-    name      TEXT PRIMARY KEY,
-    mux       TEXT NOT NULL,
-    target    TEXT NOT NULL,
-    socket    TEXT NOT NULL DEFAULT '',
-    cwd       TEXT,
-    last_seen INTEGER NOT NULL,
-    pid       INTEGER,
-    host      TEXT NOT NULL DEFAULT ''
+    name        TEXT PRIMARY KEY,
+    mux         TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    socket      TEXT NOT NULL DEFAULT '',
+    cwd         TEXT,
+    last_seen   INTEGER NOT NULL,
+    pid         INTEGER,
+    host        TEXT NOT NULL DEFAULT '',
+    repo        TEXT NOT NULL DEFAULT '',
+    branch      TEXT NOT NULL DEFAULT '',
+    worktree_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -603,6 +643,9 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         last_seen: r.get(5)?,
         pid: r.get(6)?,
         host: r.get(7)?,
+        repo: r.get(8)?,
+        branch: r.get(9)?,
+        worktree_id: r.get(10)?,
     })
 }
 
@@ -662,6 +705,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     // empty default.
     if !column_exists(conn, "peers", "host")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT '';")?;
+    }
+    // peers.repo / branch / worktree_id — present on fresh DBs via SCHEMA, added
+    // here for DBs created before session-scan tagging existed. Each defaults to
+    // '' for every existing row (== tag unknown), matching the empty `Peer`
+    // defaults. The DDL identifiers are constant (no user data), the same
+    // discipline as the socket/pid/host steps above.
+    if !column_exists(conn, "peers", "repo")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN repo TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !column_exists(conn, "peers", "branch")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN branch TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !column_exists(conn, "peers", "worktree_id")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN worktree_id TEXT NOT NULL DEFAULT '';")?;
     }
     // Tier-2 tables: present on fresh DBs via SCHEMA, created here for DBs made
     // before cross-store delivery existed. `CREATE TABLE IF NOT EXISTS` is itself
@@ -1371,20 +1428,28 @@ impl Store for SqliteStore {
         cwd: Option<&str>,
         pid: Option<i64>,
         host: &str,
+        repo: &str,
+        branch: &str,
+        worktree_id: &str,
     ) -> Result<()> {
         check_ident("peer name", name)?;
+        // Descriptive git tags are bounded + control-free at this single store
+        // seam (lossy-but-total), so every capture path is covered identically.
+        let repo = sanitize_tag(repo, MAX_REPO_LEN);
+        let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
+        let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
         self.conn.execute(
-            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8",
-            params![name, mux, target, socket, cwd, now(), pid, host],
+            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11",
+            params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id],
         )?;
         Ok(())
     }
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
@@ -1395,7 +1460,7 @@ impl Store for SqliteStore {
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers ORDER BY name",
         )?;
         let rows = stmt
             .query_map([], row_to_peer)?
@@ -1609,6 +1674,9 @@ mod federation_tests {
             last_seen,
             pid,
             host: host.to_string(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
         }
     }
 
@@ -2026,6 +2094,109 @@ mod tests {
         assert_eq!(peers[0].socket, "/run/b.sock");
     }
 
+    /// `sanitize_tag` is lossy-but-total: it strips control chars, truncates to
+    /// the cap on a UTF-8 char boundary, and never panics or hard-fails.
+    #[test]
+    fn sanitize_tag_strips_control_and_truncates_on_boundary() {
+        // Control chars (newline, NUL, ESC) are dropped; surrounding ws trimmed.
+        assert_eq!(
+            sanitize_tag("  feat/x\n\0\u{1b}  ", MAX_BRANCH_LEN),
+            "feat/x"
+        );
+        // Over-cap input truncates to exactly `max` CHARS (not bytes).
+        let long = "ä".repeat(MAX_REPO_LEN + 50); // each 'ä' is 2 bytes, 1 char
+        let out = sanitize_tag(&long, MAX_REPO_LEN);
+        assert_eq!(out.chars().count(), MAX_REPO_LEN);
+        assert!(out.is_char_boundary(out.len()));
+        // All-control / empty collapses to "".
+        assert_eq!(sanitize_tag("\n\t\0", MAX_WORKTREE_LEN), "");
+        assert_eq!(sanitize_tag("", MAX_REPO_LEN), "");
+        // Git-ref punctuation (/, ., -, _) is preserved verbatim (not control).
+        assert_eq!(
+            sanitize_tag("feature/foo-bar.v1_2", MAX_BRANCH_LEN),
+            "feature/foo-bar.v1_2"
+        );
+    }
+
+    proptest::proptest! {
+        // Keep proptest from persisting a regression file in the source tree (the
+        // e2e prop suite uses the same policy) and cap cases — this is pure + fast.
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// `sanitize_tag` totality property: for ANY input string it never panics,
+        /// the output is control-character-free, never exceeds the cap in CHARS,
+        /// always lands on a UTF-8 boundary, and is IDEMPOTENT
+        /// (`sanitize(sanitize(x)) == sanitize(x)`).
+        #[test]
+        fn prop_sanitize_tag_total_controlfree_capped_idempotent(s in ".*") {
+            let cap = MAX_REPO_LEN; // 128
+            let out = sanitize_tag(&s, cap);
+            // Control-free.
+            proptest::prop_assert!(
+                !out.chars().any(|c| c.is_control()),
+                "output must be control-free: {out:?}"
+            );
+            // Capped in chars (≤ 128) and on a valid boundary.
+            proptest::prop_assert!(out.chars().count() <= cap);
+            proptest::prop_assert!(out.is_char_boundary(out.len()));
+            // Idempotent.
+            proptest::prop_assert_eq!(sanitize_tag(&out, cap), out.clone());
+        }
+    }
+
+    /// The three git tags round-trip through `register_peer_full`, `get_peer`,
+    /// and `list_peers`; an upsert overwrites them and a hostile control-bearing
+    /// tag is stored sanitized (never rejected-fatal).
+    #[test]
+    fn git_tags_roundtrip_and_sanitize_through_upsert() {
+        let s = mem();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%1",
+            "",
+            Some("/w"),
+            None,
+            "h",
+            "weave",
+            "feat/x",
+            "wt-1",
+        )
+        .unwrap();
+        let p = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(
+            (p.repo.as_str(), p.branch.as_str(), p.worktree_id.as_str()),
+            ("weave", "feat/x", "wt-1")
+        );
+        let lp = &s.list_peers().unwrap()[0];
+        assert_eq!(lp.repo, "weave");
+        // Upsert overwrites, and a hostile newline-bearing branch is sanitized.
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%1",
+            "",
+            Some("/w"),
+            None,
+            "h",
+            "weave2",
+            "bad\nbranch",
+            "(main)",
+        )
+        .unwrap();
+        let p2 = s.get_peer("p").unwrap().unwrap();
+        assert_eq!(p2.repo, "weave2");
+        assert_eq!(
+            p2.branch, "badbranch",
+            "control char stripped, not rejected"
+        );
+        assert_eq!(p2.worktree_id, "(main)");
+    }
+
     #[test]
     fn inbox_since_pages_forward_without_dropping_backlog() {
         let s = mem();
@@ -2073,17 +2244,31 @@ mod tests {
     #[test]
     fn register_peer_full_roundtrips_pid_and_host() {
         let s = mem();
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), Some(4321), "boxA")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%3",
+            "",
+            Some("/w"),
+            Some(4321),
+            "boxA",
+            "weave",
+            "main",
+            "(main)",
+        )
+        .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p.pid, Some(4321));
+        assert_eq!(p.repo, "weave");
+        assert_eq!(p.branch, "main");
+        assert_eq!(p.worktree_id, "(main)");
         assert_eq!(p.host, "boxA");
         // list_peers carries them too.
         let lp = &s.list_peers().unwrap()[0];
         assert_eq!(lp.pid, Some(4321));
         assert_eq!(lp.host, "boxA");
         // Upsert overwrites pid/host (and a None pid clears it).
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB")
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB", "", "", "")
             .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p2.pid, None);
@@ -2142,11 +2327,115 @@ mod tests {
         let s2 = SqliteStore::open(&path).unwrap();
         assert!(s2.get_peer("old").unwrap().is_some());
         // And a fresh register_peer_full now works against the upgraded table.
-        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h")
+        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h", "", "", "")
             .unwrap();
         let n = s2.get_peer("new").unwrap().unwrap();
         assert_eq!(n.pid, Some(7));
         assert_eq!(n.host, "h");
+    }
+
+    /// A DB whose `peers` table predates the session-tag columns (no `repo`,
+    /// `branch`, `worktree_id`) opens NON-FATALLY: `migrate()` adds the three columns
+    /// in place, the legacy row survives reading back empty tags, and a peer
+    /// registered with tags roundtrips them through `get_peer`/`list_peers`.
+    #[test]
+    fn legacy_db_without_git_tag_columns_migrates_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-legacy-tags-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-tags.db");
+
+        // Build a peers table that has pid/host (post-A2) but NOT the three tag
+        // columns, and insert a legacy row directly.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                    name      TEXT PRIMARY KEY,
+                    mux       TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    socket    TEXT NOT NULL DEFAULT '',
+                    cwd       TEXT,
+                    last_seen INTEGER NOT NULL,
+                    pid       INTEGER,
+                    host      TEXT NOT NULL DEFAULT ''
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1, 42, 'h')",
+                params![now()],
+            )
+            .unwrap();
+            // Sanity: the tag columns really are absent before migration.
+            assert!(!column_exists(&conn, "peers", "repo").unwrap());
+            assert!(!column_exists(&conn, "peers", "branch").unwrap());
+            assert!(!column_exists(&conn, "peers", "worktree_id").unwrap());
+        }
+
+        // Opening through SqliteStore runs migrate(): the 3 columns are added.
+        let s = SqliteStore::open(&path).unwrap();
+        let old = s.get_peer("old").unwrap().unwrap();
+        // Legacy row survives; new tag columns default to "".
+        assert_eq!(old.pid, Some(42));
+        assert_eq!(old.host, "h");
+        assert_eq!(
+            (
+                old.repo.as_str(),
+                old.branch.as_str(),
+                old.worktree_id.as_str()
+            ),
+            ("", "", ""),
+            "legacy row reads empty tags after migration"
+        );
+
+        // A peer registered WITH tags roundtrips them at the projection positions
+        // (repo/branch/worktree_id appended after host) through get_peer AND
+        // list_peers.
+        s.register_peer_full(
+            "tagged",
+            "tmux",
+            "%2",
+            "",
+            Some("/w"),
+            Some(7),
+            "h2",
+            "weave",
+            "feat/x",
+            "wt-9",
+        )
+        .unwrap();
+        let g = s.get_peer("tagged").unwrap().unwrap();
+        assert_eq!(
+            (g.repo.as_str(), g.branch.as_str(), g.worktree_id.as_str()),
+            ("weave", "feat/x", "wt-9"),
+            "get_peer roundtrips the migrated tag columns"
+        );
+        let lp = s
+            .list_peers()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "tagged")
+            .unwrap();
+        assert_eq!(
+            (
+                lp.repo.as_str(),
+                lp.branch.as_str(),
+                lp.worktree_id.as_str()
+            ),
+            ("weave", "feat/x", "wt-9"),
+            "list_peers roundtrips the migrated tag columns"
+        );
+        // Re-opening is idempotent (the guarded ALTERs do not error twice).
+        assert!(SqliteStore::open(&path)
+            .unwrap()
+            .get_peer("old")
+            .unwrap()
+            .is_some());
     }
 
     /// `is_alive` matrix. A fresh peer with `last_seen = now()` is recency-online;
@@ -2167,6 +2456,9 @@ mod tests {
             last_seen: now(),
             pid: None,
             host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -2259,8 +2551,19 @@ mod tests {
         // Seed a store with a peer via the normal RW open, then drop it.
         {
             let rw = SqliteStore::open(&path).unwrap();
-            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
-                .unwrap();
+            rw.register_peer_full(
+                "seed",
+                "tmux",
+                "%1",
+                "",
+                Some("/w"),
+                Some(7),
+                "boxA",
+                "",
+                "",
+                "",
+            )
+            .unwrap();
         }
 
         // Read-only open can list the peer.
@@ -2270,7 +2573,8 @@ mod tests {
         assert_eq!(peers[0].name, "seed");
 
         // But ANY write is rejected by the engine, not by convention.
-        let wr = ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA");
+        let wr =
+            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", "");
         assert!(wr.is_err(), "a write through a read-only handle must error");
         let send = ro.send("a", "b", None, "x");
         assert!(
@@ -2299,12 +2603,12 @@ mod tests {
 
         let local = SqliteStore::open(&local_path).unwrap();
         local
-            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA")
+            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA", "", "", "")
             .unwrap();
         {
             let foreign = SqliteStore::open(&foreign_path).unwrap();
             foreign
-                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA")
+                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA", "", "", "")
                 .unwrap();
         }
 

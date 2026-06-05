@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{run, run_env, run_hook, run_ok, run_ok_env, McpServer, TestDb};
+use common::{run, run_env, run_hook, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -3012,4 +3012,345 @@ fn remote_live_pull_delivers_and_is_idempotent() {
     assert_eq!(n1, n2, "a second remote pull must not double-deliver");
     // The token must never appear in any output.
     assert!(!inbox1.contains(token.as_str()) || token.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// N. Session scan / identify / tag (repo · branch · worktree_id)
+//
+// All hermetic: a temp cwd carrying a crafted `.git` FILE (the linked-worktree
+// shape) makes the captured worktree_id deterministic with NO real repo and NO
+// `git` binary. branch/repo need real `git` and are intentionally left empty in
+// these fixtures (covered by the pure-parse units + the gated real-git asserts).
+// ---------------------------------------------------------------------------
+
+/// Make a temp dir whose `.git` is a FILE pointing at a linked worktree named
+/// `wt`, so cwd-derived tagging yields `worktree_id == wt` without a git binary.
+/// The dir is unique per call and cleaned up by the caller's `TempCwd` guard.
+fn linked_worktree_cwd(wt: &str) -> TempCwd {
+    let dir = std::env::temp_dir().join(format!(
+        "weave-scan-cwd-{}-{}-{}",
+        std::process::id(),
+        wt,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp cwd");
+    std::fs::write(
+        dir.join(".git"),
+        format!("gitdir: /fixture/main/.git/worktrees/{wt}/.git\n"),
+    )
+    .expect("write crafted .git file");
+    TempCwd { path: dir }
+}
+
+/// A temp cwd that removes itself on drop.
+struct TempCwd {
+    path: std::path::PathBuf,
+}
+impl Drop for TempCwd {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// `weave register` (from a crafted linked-worktree cwd) then `weave scan` shows
+/// the row, and `weave scan --json` carries the full additive shape.
+#[test]
+fn scan_lists_registered_peer_with_tags_and_json_shape() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("scan-wt");
+
+    // Register a peer from the crafted cwd so its worktree_id tag is captured.
+    let (ok, _o, err) = run_in_cwd(&db, &["register", "--name", "alpha"], &cwd.path);
+    assert!(ok, "register failed: {err}");
+
+    // Human `weave scan` shows the row with its worktree tag.
+    let human = run_ok(&db, &["scan"]);
+    assert!(
+        human.contains("alpha"),
+        "scan human lists the peer: {human}"
+    );
+    assert!(
+        human.contains("worktree=scan-wt"),
+        "scan human shows the captured worktree id: {human}"
+    );
+
+    // `weave scan --json` carries the documented additive shape.
+    let out = run_ok(&db, &["scan", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("scan --json parses");
+    let arr = v.as_array().expect("scan --json is an array");
+    let row = arr
+        .iter()
+        .find(|p| p["name"] == "alpha")
+        .expect("scanned peer present");
+    for key in [
+        "name", "repo", "branch", "worktree", "mux", "pane", "host", "alive", "origin", "foreign",
+    ] {
+        assert!(row.get(key).is_some(), "scan row has key {key:?}: {row}");
+    }
+    assert_eq!(row["worktree"], "scan-wt", "worktree tag roundtrips: {row}");
+    assert_eq!(row["foreign"], false, "self row is local/not foreign");
+}
+
+/// `--repo` / `--branch` filters narrow the scan set by exact tag match. We drive
+/// the tags deterministically by registering peers that carry explicit tags via a
+/// crafted cwd for worktree_id; repo/branch filters are exercised against the
+/// empty-tag default (a non-matching filter yields no rows; an empty match keeps
+/// rows out — proving the filter is applied, never ignored).
+#[test]
+fn scan_repo_and_branch_filters_narrow_the_set() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("filter-wt");
+    run_in_cwd(&db, &["register", "--name", "beta"], &cwd.path);
+
+    // No filter: the peer is present.
+    let all = run_ok(&db, &["scan", "--json"]);
+    let all_v: serde_json::Value = serde_json::from_str(&all).unwrap();
+    assert_eq!(all_v.as_array().unwrap().len(), 1, "one peer unfiltered");
+
+    // A repo filter that cannot match the (empty) repo tag drops the row.
+    let none = run_ok(&db, &["scan", "--repo", "no-such-repo", "--json"]);
+    let none_v: serde_json::Value = serde_json::from_str(&none).unwrap();
+    assert_eq!(
+        none_v.as_array().unwrap().len(),
+        0,
+        "a non-matching --repo filter narrows the set to empty: {none}"
+    );
+
+    // Likewise a non-matching branch filter.
+    let none_b = run_ok(&db, &["scan", "--branch", "no-such-branch", "--json"]);
+    let none_b_v: serde_json::Value = serde_json::from_str(&none_b).unwrap();
+    assert_eq!(
+        none_b_v.as_array().unwrap().len(),
+        0,
+        "a non-matching --branch filter narrows the set to empty: {none_b}"
+    );
+}
+
+/// Tags surface on `peers --json`, on the new `sessions` display-join, and on
+/// `doctor` — the three additional tag-display surfaces.
+#[test]
+fn tags_visible_in_peers_sessions_and_doctor() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("surf-wt");
+    run_in_cwd(&db, &["register", "--name", "gamma"], &cwd.path);
+    // A message so `gamma` shows up as a session (sessions are message-derived).
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "gamma",
+            "--to",
+            "gamma",
+            "--body",
+            "self ping",
+        ],
+    );
+
+    // peers --json carries the tag fields.
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let pv: serde_json::Value = serde_json::from_str(&peers).expect("peers --json parses");
+    let prow = pv
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "gamma")
+        .expect("peer present");
+    assert_eq!(prow["worktree"], "surf-wt", "peers --json has worktree tag");
+    assert!(prow.get("repo").is_some() && prow.get("branch").is_some());
+
+    // sessions --json carries the display-joined tags (leader refinement #1).
+    let sessions = run_ok(&db, &["sessions", "--json"]);
+    let sv: serde_json::Value = serde_json::from_str(&sessions).expect("sessions --json parses");
+    let srow = sv
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "gamma")
+        .expect("session present");
+    assert_eq!(
+        srow["worktree"], "surf-wt",
+        "sessions --json display-joins the local peer's worktree tag: {srow}"
+    );
+    assert!(
+        srow.get("repo").is_some() && srow.get("branch").is_some(),
+        "sessions --json carries repo/branch keys: {srow}"
+    );
+
+    // sessions (human) shows the tag suffix from the join.
+    let sessions_human = run_ok(&db, &["sessions"]);
+    assert!(
+        sessions_human.contains("surf-wt"),
+        "sessions human display-joins the tag: {sessions_human}"
+    );
+
+    // doctor surfaces a tagged-peers count.
+    let doctor = run_ok(&db, &["doctor", "--json"]);
+    let dv: serde_json::Value = serde_json::from_str(&doctor).expect("doctor --json parses");
+    assert!(
+        dv.get("peers_tagged").is_some(),
+        "doctor --json reports a peers_tagged count: {dv}"
+    );
+}
+
+/// A session with NO registered local peer shows empty/`-` tags in the join
+/// (graceful degradation — the refinement must not error or fabricate tags).
+#[test]
+fn sessions_without_peer_show_empty_tags() {
+    let db = TestDb::new();
+    // A message creates a session 'lonely' with no peer row registered.
+    run_ok(
+        &db,
+        &["send", "--from", "lonely", "--to", "lonely", "--body", "hi"],
+    );
+    let sessions = run_ok(&db, &["sessions", "--json"]);
+    let sv: serde_json::Value = serde_json::from_str(&sessions).expect("sessions --json parses");
+    let srow = sv
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "lonely")
+        .expect("session present");
+    assert_eq!(srow["repo"], "", "no-peer session has empty repo tag");
+    assert_eq!(srow["branch"], "", "no-peer session has empty branch tag");
+    assert_eq!(
+        srow["worktree"], "",
+        "no-peer session has empty worktree tag"
+    );
+}
+
+/// MCP: `weave_scan` is advertised in `tools/list`, runs without error and shows
+/// the joined tags, and tolerates an oversized/control-bearing `repo` filter arg
+/// gracefully (no panic, no crash) — and `tool_sessions` shows the joined tags.
+#[test]
+fn mcp_weave_scan_listed_runs_and_filters_safely() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("mcp-wt");
+    // Register a peer named after the server's cwd basename so the MCP server's
+    // own identity resolves to it and tool_sessions/scan can join tags.
+    let me = cwd.path.file_name().unwrap().to_string_lossy().into_owned();
+    run_in_cwd(&db, &["register", "--name", &me], &cwd.path);
+    // A message so `me` is a known session for tool_sessions.
+    run_ok(&db, &["send", "--from", &me, "--to", &me, "--body", "ping"]);
+
+    let mut srv = McpServer::spawn_full(&db, &["mcp"], &[], Some(&cwd.path));
+    let _ = srv.request("initialize", serde_json::json!({}));
+
+    // weave_scan appears in tools/list.
+    let tools = srv.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = tools["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "weave_scan"),
+        "weave_scan advertised in tools/list: {names:?}"
+    );
+
+    // call_tool weave_scan {} -> not an error, shows the captured worktree tag.
+    let (is_err, text) = srv.call_tool("weave_scan", serde_json::json!({}));
+    assert!(!is_err, "weave_scan returned isError: {text}");
+    assert!(
+        text.contains("mcp-wt"),
+        "weave_scan shows the joined worktree tag: {text}"
+    );
+
+    // An oversized + control-bearing repo filter arg is handled gracefully:
+    // never a panic, never a server crash. (It may be rejected as a bad filter or
+    // simply match nothing — either is fine; what matters is no crash/hang.)
+    let hostile = format!("{}\n\t;`$(rm -rf /)", "A".repeat(5000));
+    let (_is_err2, _t2) = srv.call_tool("weave_scan", serde_json::json!({ "repo": hostile }));
+    // The server must still be alive and responsive afterward.
+    let (is_err3, _t3) = srv.call_tool("weave_scan", serde_json::json!({}));
+    assert!(
+        !is_err3,
+        "server still serves weave_scan after a hostile filter arg"
+    );
+
+    // tool_sessions shows the display-joined tag too.
+    let (sess_err, sess_text) = srv.call_tool("weave_sessions", serde_json::json!({}));
+    assert!(!sess_err, "weave_sessions errored: {sess_text}");
+    assert!(
+        sess_text.contains("mcp-wt"),
+        "tool_sessions display-joins the worktree tag: {sess_text}"
+    );
+
+    srv.shutdown();
+}
+
+/// Real-`git` smoke (GATED): when a `git` binary is present, a genuine `git init`
+/// checkout yields a non-empty repo + branch tag through `weave register`/`scan`.
+/// Skipped entirely when no `git` is available so zero-git CI still passes.
+#[test]
+fn scan_real_git_repo_tags_when_git_present() {
+    // Mirror the binary's trusted-path resolution: only run if `git` is on PATH.
+    if which_git().is_none() {
+        eprintln!("skipping: no `git` binary available");
+        return;
+    }
+    let git = which_git().unwrap();
+    let db = TestDb::new();
+    let dir = std::env::temp_dir().join(format!(
+        "weave-scan-realgit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = TempCwd { path: dir.clone() };
+    // Initialize a real repo on a known branch with no network, no remote.
+    let run_git = |args: &[&str]| {
+        Command::new(&git)
+            .args(args)
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(run_git(&["init", "-q", "-b", "trunk"]) || run_git(&["init", "-q"]));
+
+    run_in_cwd(&db, &["register", "--name", "realrepo"], &guard.path);
+    let out = run_ok(&db, &["scan", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "realrepo")
+        .expect("real repo peer present");
+    // The main worktree's id is the "(main)" sentinel; repo basename is captured.
+    assert_eq!(row["worktree"], "(main)", "main worktree sentinel: {row}");
+    assert!(
+        row["repo"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "real git yields a non-empty repo tag: {row}"
+    );
+}
+
+/// Resolve a `git` binary the SAME way the binary's `inject::resolve_trusted` does
+/// — by absolute path inside the trusted system/user-tool dirs (NOT ambient PATH),
+/// so this gate matches whether `weave register` will actually capture branch/repo.
+fn which_git() -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> =
+        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = std::path::PathBuf::from(home);
+        dirs.push(h.join(".cargo/bin"));
+        dirs.push(h.join(".local/bin"));
+        dirs.push(h.join(".nix-profile/bin"));
+    }
+    dirs.into_iter()
+        .map(|d| d.join("git"))
+        .find(|p| p.is_file())
 }

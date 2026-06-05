@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased] — session scan / identify / tag (repo · branch · worktree)
+
+### Added
+- **cli:** a new **`weave scan`** subcommand — scan, identify, and tag running
+  sessions. It first refreshes **your own** peer row's git tags (owner-only-writes),
+  then lists every (federated) peer joined with liveness and its
+  repo/branch/worktree tags. Flags: `--repo` / `--branch` narrow the set by exact
+  tag match, and `--json` emits a machine-readable array of
+  `{name, repo, branch, worktree, mux, pane, host, alive, origin, foreign}`.
+- **mcp:** a new **`weave_scan`** tool mirroring the CLI — refreshes the caller's
+  own row tags (never a foreign row), then returns the federated peer listing with
+  liveness and tags as text; optional `repo` / `branch` filters (each bounded so a
+  hostile/oversized arg is non-fatal).
+- **store / model:** sessions are now **tagged at registration** with their
+  **repo** (basename of the git toplevel), **branch**, and a canonical
+  **worktree id**, captured best-effort from the session cwd. The tags are surfaced
+  by `weave scan`, `weave peers` (CLI `--json` + human, and `weave_peers`),
+  `weave sessions` (CLI `--json` + human, and `weave_sessions`, via a local-only
+  display join), and `weave doctor` (a `peers_tagged` count). Capture is total: a
+  git/fs failure (or a non-git cwd) yields empty tags and never sinks registration.
+- **store (both backends):** three additive `peers` columns — `repo`, `branch`,
+  `worktree_id` (`TEXT NOT NULL DEFAULT ''`) — added by a guarded, idempotent
+  in-place migration mirrored in **both** the sqlite and libSQL backends, so a
+  pre-existing DB upgrades with old rows reading empty tags.
+
 ## [Unreleased] — remote cross-store pull (Tier-2 v2)
 
 ### Added
