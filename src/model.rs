@@ -157,6 +157,27 @@ pub struct Peer {
     /// payloads (which omit the field) deserializable.
     #[serde(default)]
     pub host: String,
+    /// Repository name (basename of the git toplevel) of this session's cwd at
+    /// registration. A descriptive tag attributing the session to its physical
+    /// git checkout (never an injection target, never injected text). Empty when
+    /// the cwd is not a git repo or git acquisition failed. Additive +
+    /// backward-compatible: DBs created before the `repo` column migration read
+    /// back as `""`. `#[serde(default)]` keeps older JSON payloads (which omit
+    /// the field) deserializable.
+    #[serde(default)]
+    pub repo: String,
+    /// Current git branch (`rev-parse --abbrev-ref HEAD`) of this session's cwd
+    /// at registration. Descriptive tag; empty when detached/non-git/failure.
+    /// Additive + backward-compatible (see [`Peer::repo`]).
+    #[serde(default)]
+    pub branch: String,
+    /// Canonical, path-stable worktree id: the `<name>` segment of
+    /// `.git/worktrees/<name>` for a linked worktree, or the literal `"(main)"`
+    /// sentinel for a main (non-linked) worktree. Empty when the cwd is not a git
+    /// repo. Stable across path moves and restarts (unlike a checkout basename or
+    /// `git worktree list`'s path column). Additive + backward-compatible.
+    #[serde(default)]
+    pub worktree_id: String,
 }
 
 #[cfg(test)]

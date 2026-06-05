@@ -328,6 +328,7 @@ fn call_tool(
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
         "weave_peers" => tool_peers(store, extra_dbs),
+        "weave_scan" => tool_scan(store, me_default, extra_dbs, args),
         "weave_reply" => tool_reply(store, me_default, nudge_template, args),
         "weave_thread" => tool_thread(store, args),
         "weave_receipts" => tool_receipts(store, args),
@@ -664,6 +665,17 @@ fn tool_sessions(
     if info.is_empty() {
         return Ok("No sessions seen yet — the store is empty.".into());
     }
+    // Display-layer tag join (purely additive, no schema/trait/federation change):
+    // SessionView is message-derived and carries no git tags, so we look up the LOCAL
+    // peer by session name and attach its repo/branch/worktree for display only. Only
+    // the local store's peers are consulted (never foreign rows); a session without a
+    // registered peer simply renders no tags.
+    let local_peers: std::collections::HashMap<String, crate::model::Peer> = store
+        .list_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.name.clone(), p))
+        .collect();
     let mut out = format!("Known sessions ({}), {total} message(s) total:", info.len());
     for v in info {
         let mine = if !me.is_empty() && v.name == me {
@@ -676,8 +688,12 @@ fn tool_sessions(
         } else {
             String::new()
         };
+        let tags = local_peers
+            .get(&v.name)
+            .map(fmt_peer_tags)
+            .unwrap_or_default();
         out.push_str(&format!(
-            "\n  • {}: {} unread (last activity {}){via}{mine}",
+            "\n  • {}: {} unread (last activity {}){tags}{via}{mine}",
             v.name,
             v.unread,
             fmt_ts(v.last_activity)
@@ -732,12 +748,127 @@ fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, St
         } else {
             String::new()
         };
+        let tags = fmt_peer_tags(p);
         out.push_str(&format!(
-            "\n  • {} [{presence}] [{}] {} ({inj}) seen {}{via}",
+            "\n  • {} [{presence}] [{}] {} ({inj}){tags} seen {}{via}",
             p.name,
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
             fmt_ts(p.last_seen)
+        ));
+    }
+    Ok(out)
+}
+
+/// Render a peer's git session tags for an MCP listing, e.g. ` {weave@feat/x
+/// #my-wt}`, omitting empty fields and the whole group for a non-git session.
+/// Mirrors the CLI `fmt_peer_tags`. Pure formatting.
+fn fmt_peer_tags(p: &crate::model::Peer) -> String {
+    if p.repo.is_empty() && p.branch.is_empty() && p.worktree_id.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    match (p.repo.is_empty(), p.branch.is_empty()) {
+        (false, false) => parts.push(format!("{}@{}", p.repo, p.branch)),
+        (false, true) => parts.push(p.repo.clone()),
+        (true, false) => parts.push(format!("@{}", p.branch)),
+        (true, true) => {}
+    }
+    if !p.worktree_id.is_empty() {
+        parts.push(format!("#{}", p.worktree_id));
+    }
+    format!(" {{{}}}", parts.join(" "))
+}
+
+/// Capture the git session tags for the MCP server's cwd (best-effort, total).
+/// MCP has no payload `cwd`, so this uses the process `current_dir()`. A non-git
+/// cwd or any failure yields empty tags.
+fn git_tags_here() -> crate::git::WorktreeTags {
+    match std::env::current_dir() {
+        Ok(p) => crate::git::capture_worktree_tags(&p),
+        Err(_) => crate::git::WorktreeTags::default(),
+    }
+}
+
+/// `weave_scan`: refresh THIS session's own row tags, then list every (federated)
+/// peer joined with liveness and its repo/branch/worktree tags, with optional
+/// `repo`/`branch` exact-match filters. OWNER-ONLY-WRITES: the self-refresh only
+/// ever re-registers the caller's own row (under `me_default`), never a foreign
+/// one. All output is the returned tool-result TEXT; capture skip-notes go to
+/// stderr (MCP stdout carries only JSON-RPC frames). A missing/blank default
+/// identity simply skips the self-refresh (read-only scan) rather than erroring.
+fn tool_scan(
+    store: &dyn Store,
+    def: &Option<String>,
+    extra_dbs: &[StoreSource],
+    args: &Value,
+) -> Result<String, String> {
+    // Self-refresh (owner-only-writes), best-effort: a failure is noted to STDERR
+    // and never aborts the read.
+    if let Some(me) = def.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Ok(me) = bound_ident("me", me) {
+            let t = inject::detect_target();
+            let tags = git_tags_here();
+            if let Err(err) = store.register_peer_full(
+                &me,
+                t.mux.as_str(),
+                &t.id,
+                &t.socket,
+                None,
+                Some(std::process::id() as i64),
+                &crate::config::this_host(),
+                &tags.repo,
+                &tags.branch,
+                &tags.worktree_id,
+            ) {
+                eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
+            }
+        }
+    }
+
+    // Optional exact-match filters, each bounded so a hostile/oversized filter arg
+    // is rejected gracefully (never a panic) before it touches the listing.
+    let repo_filter = match args.get("repo").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => Some(bound_ident("repo", s)?),
+        _ => None,
+    };
+    let branch_filter = match args.get("branch").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => Some(bound_ident("branch", s)?),
+        _ => None,
+    };
+
+    let mut views = store::federated_peers(store, extra_dbs).map_err(e)?;
+    if let Some(r) = repo_filter.as_deref() {
+        views.retain(|v| v.peer.repo == r);
+    }
+    if let Some(b) = branch_filter.as_deref() {
+        views.retain(|v| v.peer.branch == b);
+    }
+    if views.is_empty() {
+        return Ok("No peers match the scan.".into());
+    }
+    let mut out = format!("Scan ({} peer(s)):", views.len());
+    for v in views {
+        let p = &v.peer;
+        let alive = if is_alive(p) { "alive" } else { "offline" };
+        let via = if v.origin.is_foreign() {
+            format!(" (via {})", v.origin.label())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "\n  • {} [{alive}] repo={} branch={} worktree={} mux={} pane={} host={}{via}",
+            p.name,
+            if p.repo.is_empty() { "-" } else { &p.repo },
+            if p.branch.is_empty() { "-" } else { &p.branch },
+            if p.worktree_id.is_empty() {
+                "-"
+            } else {
+                &p.worktree_id
+            },
+            p.mux,
+            if p.target.is_empty() { "-" } else { &p.target },
+            if p.host.is_empty() { "-" } else { &p.host },
         ));
     }
     Ok(out)
@@ -995,7 +1126,9 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
         ));
     }
     // Capture the MCP server process's PID + host so the adopted peer reflects
-    // real liveness (this is the agent's own process).
+    // real liveness (this is the agent's own process), plus the git session tags
+    // derived from the server's cwd (best-effort; a git failure ⇒ empty tags).
+    let tags = git_tags_here();
     store
         .register_peer_full(
             &me,
@@ -1005,6 +1138,9 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
             None,
             Some(std::process::id() as i64),
             &crate::config::this_host(),
+            &tags.repo,
+            &tags.branch,
+            &tags.worktree_id,
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -1124,6 +1260,14 @@ fn tools() -> Value {
             "name": "weave_peers",
             "description": "List registered peers and whether each is injectable (live push) or delivery-on-next-turn.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_scan",
+            "description": "Scan, identify, and tag running sessions: refresh YOUR OWN row's git tags (repo/branch/worktree), then list every (federated) peer with liveness and its repo/branch/worktree tags. Optional 'repo'/'branch' filters narrow the set by exact tag match. Only ever (re)registers the caller's own row (owner-only-writes); other/federated rows are read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "repo":{"type":"string","description":"Only show peers whose repo tag equals this value."},
+                "branch":{"type":"string","description":"Only show peers whose branch tag equals this value."}
+            },"required":[]}
         },
         {
             "name": "weave_reply",

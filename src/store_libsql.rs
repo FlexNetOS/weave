@@ -39,8 +39,9 @@ use crate::config::{Config, StoreSource};
 use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
-    merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, store_label, Origin,
-    PeerView, Pulled, SessionInfo, SessionView, Store, MAX_PULL_PER_DRAIN, MAX_SESSIONS,
+    merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
+    store_label, Origin, PeerView, Pulled, SessionInfo, SessionView, Store, MAX_BRANCH_LEN,
+    MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS, MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -66,14 +67,17 @@ const SCHEMA: &[&str] = &[
         PRIMARY KEY (message_id, reader)
     )",
     "CREATE TABLE IF NOT EXISTS peers (
-        name      TEXT PRIMARY KEY,
-        mux       TEXT NOT NULL,
-        target    TEXT NOT NULL,
-        socket    TEXT NOT NULL DEFAULT '',
-        cwd       TEXT,
-        last_seen INTEGER NOT NULL,
-        pid       INTEGER,
-        host      TEXT NOT NULL DEFAULT ''
+        name        TEXT PRIMARY KEY,
+        mux         TEXT NOT NULL,
+        target      TEXT NOT NULL,
+        socket      TEXT NOT NULL DEFAULT '',
+        cwd         TEXT,
+        last_seen   INTEGER NOT NULL,
+        pid         INTEGER,
+        host        TEXT NOT NULL DEFAULT '',
+        repo        TEXT NOT NULL DEFAULT '',
+        branch      TEXT NOT NULL DEFAULT '',
+        worktree_id TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +165,8 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
     })
 }
 
-/// Column order: name, mux, target, socket, cwd, last_seen, pid, host.
+/// Column order: name, mux, target, socket, cwd, last_seen, pid, host, repo,
+/// branch, worktree_id.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
     Ok(Peer {
         name: r.get::<String>(0)?,
@@ -172,6 +177,9 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         last_seen: r.get::<i64>(5)?,
         pid: r.get::<Option<i64>>(6)?,
         host: r.get::<String>(7)?,
+        repo: r.get::<String>(8)?,
+        branch: r.get::<String>(9)?,
+        worktree_id: r.get::<String>(10)?,
     })
 }
 
@@ -292,6 +300,21 @@ impl LibsqlStore {
                 )
                 .await
                 .context("adding host column")?;
+            }
+            // Migration: a DB created before session-scan tagging lacks the
+            // `peers.repo` / `branch` / `worktree_id` columns. Add each
+            // idempotently (mirrors SqliteStore::migrate) defaulting to '' for
+            // existing rows == tag unknown. The DDL identifiers are constant.
+            for col in ["repo", "branch", "worktree_id"] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('peers') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    let ddl =
+                        format!("ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''");
+                    conn.execute(&ddl, ())
+                        .await
+                        .with_context(|| format!("adding {col} column"))?;
+                }
             }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
@@ -1071,15 +1094,23 @@ impl Store for LibsqlStore {
         cwd: Option<&str>,
         pid: Option<i64>,
         host: &str,
+        repo: &str,
+        branch: &str,
+        worktree_id: &str,
     ) -> Result<()> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
+        // Bound + control-strip the descriptive git tags at the store seam
+        // (lossy-but-total), mirroring the sqlite backend.
+        let repo = sanitize_tag(repo, MAX_REPO_LEN);
+        let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
+        let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8",
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11",
                     params(vec![
                         name.into(),
                         mux.into(),
@@ -1089,6 +1120,9 @@ impl Store for LibsqlStore {
                         now().into(),
                         pid.into(),
                         host.into(),
+                        repo.into(),
+                        branch.into(),
+                        worktree_id.into(),
                     ]),
                 )
                 .await?;
@@ -1101,7 +1135,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -1118,7 +1152,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -1613,16 +1647,30 @@ mod tests {
     #[test]
     fn register_peer_full_roundtrips_pid_and_host() {
         let s = mem();
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), Some(4321), "boxA")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%3",
+            "",
+            Some("/w"),
+            Some(4321),
+            "boxA",
+            "weave",
+            "main",
+            "(main)",
+        )
+        .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p.pid, Some(4321));
+        assert_eq!(p.repo, "weave");
+        assert_eq!(p.branch, "main");
+        assert_eq!(p.worktree_id, "(main)");
         assert_eq!(p.host, "boxA");
         let lp = &s.list_peers().unwrap()[0];
         assert_eq!(lp.pid, Some(4321));
         assert_eq!(lp.host, "boxA");
         // Upsert overwrites pid/host (and a None pid clears it).
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB")
+        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB", "", "", "")
             .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p2.pid, None);
@@ -1696,11 +1744,126 @@ mod tests {
         assert_eq!(p.host, "", "legacy row reads host:'' after migration");
         // Re-opening is idempotent and a fresh full register works on the upgrade.
         let s2 = LibsqlStore::open(&cfg).unwrap();
-        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h")
+        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h", "", "", "")
             .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
         assert_eq!(nrow.pid, Some(7));
         assert_eq!(nrow.host, "h");
+    }
+
+    /// A libSQL DB whose `peers` table predates the session-tag columns (no `repo`,
+    /// `branch`, `worktree_id`) opens NON-FATALLY: the inline migration adds the
+    /// three columns, the legacy row survives reading empty tags, and a peer
+    /// registered with tags roundtrips through `get_peer`/`list_peers`. (libSQL
+    /// mirror of the sqlite `legacy_db_without_git_tag_columns_migrates_and_roundtrips`.)
+    #[test]
+    fn legacy_db_without_git_tag_columns_migrates_and_roundtrips() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-legacy-tags-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-tags.db");
+
+        // Build a peers table with pid/host but WITHOUT the three tag columns +
+        // a legacy row, via a raw libsql connection.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE peers (
+                    name      TEXT PRIMARY KEY,
+                    mux       TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    socket    TEXT NOT NULL DEFAULT '',
+                    cwd       TEXT,
+                    last_seen INTEGER NOT NULL,
+                    pid       INTEGER,
+                    host      TEXT NOT NULL DEFAULT ''
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1, 42, 'h')",
+                params(vec![now().into()]),
+            )
+            .await
+            .unwrap();
+        });
+        drop(rt);
+
+        // Opening runs the inline migration: the 3 tag columns are added.
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let old = s.get_peer("old").unwrap().unwrap();
+        assert_eq!(old.pid, Some(42));
+        assert_eq!(old.host, "h");
+        assert_eq!(
+            (
+                old.repo.as_str(),
+                old.branch.as_str(),
+                old.worktree_id.as_str()
+            ),
+            ("", "", ""),
+            "legacy libSQL row reads empty tags after migration"
+        );
+
+        // A peer registered with tags roundtrips at the projection positions.
+        s.register_peer_full(
+            "tagged",
+            "tmux",
+            "%2",
+            "",
+            Some("/w"),
+            Some(7),
+            "h2",
+            "weave",
+            "feat/x",
+            "wt-9",
+        )
+        .unwrap();
+        let g = s.get_peer("tagged").unwrap().unwrap();
+        assert_eq!(
+            (g.repo.as_str(), g.branch.as_str(), g.worktree_id.as_str()),
+            ("weave", "feat/x", "wt-9"),
+            "get_peer roundtrips the migrated libSQL tag columns"
+        );
+        let lp = s
+            .list_peers()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "tagged")
+            .unwrap();
+        assert_eq!(
+            (
+                lp.repo.as_str(),
+                lp.branch.as_str(),
+                lp.worktree_id.as_str()
+            ),
+            ("weave", "feat/x", "wt-9"),
+            "list_peers roundtrips the migrated libSQL tag columns"
+        );
+        // Re-opening is idempotent.
+        assert!(LibsqlStore::open(&cfg)
+            .unwrap()
+            .get_peer("old")
+            .unwrap()
+            .is_some());
     }
 
     /// `is_alive` matrix against the libSQL backend's actual rows: a remote-host
@@ -1721,6 +1884,9 @@ mod tests {
             None,
             None,
             &crate::config::this_host(),
+            "",
+            "",
+            "",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -1737,6 +1903,9 @@ mod tests {
             None,
             Some(999_999_999),
             &remote_host,
+            "",
+            "",
+            "",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -1755,6 +1924,9 @@ mod tests {
             None,
             Some(std::process::id() as i64),
             &crate::config::this_host(),
+            "",
+            "",
+            "",
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -1772,6 +1944,9 @@ mod tests {
             None,
             Some(999_999_999),
             &crate::config::this_host(),
+            "",
+            "",
+            "",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -1835,8 +2010,19 @@ mod tests {
                 ..Config::default()
             };
             let rw = LibsqlStore::open(&cfg).unwrap();
-            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
-                .unwrap();
+            rw.register_peer_full(
+                "seed",
+                "tmux",
+                "%1",
+                "",
+                Some("/w"),
+                Some(7),
+                "boxA",
+                "",
+                "",
+                "",
+            )
+            .unwrap();
         }
 
         // Capture the exact main-DB-file bytes BEFORE any federated read. (A
@@ -1852,7 +2038,8 @@ mod tests {
         assert_eq!(peers[0].name, "seed");
 
         // But ANY write is rejected by the engine, not by convention.
-        let wr = ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA");
+        let wr =
+            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", "");
         assert!(
             wr.is_err(),
             "a write through a libsql read-only handle must error"
@@ -1916,8 +2103,19 @@ mod tests {
                 ..Config::default()
             };
             let rw = LibsqlStore::open(&cfg).unwrap();
-            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
-                .unwrap();
+            rw.register_peer_full(
+                "seed",
+                "tmux",
+                "%1",
+                "",
+                Some("/w"),
+                Some(7),
+                "boxA",
+                "",
+                "",
+                "",
+            )
+            .unwrap();
             rw.send("seed", "seed", None, "hi").unwrap();
         }
         let before = std::fs::read(&path).expect("read foreign DB bytes (before)");
@@ -1952,7 +2150,7 @@ mod tests {
         assert_trapped("touch_peer", ro.touch_peer("seed"));
         assert_trapped(
             "register_peer_full",
-            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA"),
+            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", ""),
         );
         assert_trapped(
             "enqueue_intent",
@@ -2001,7 +2199,7 @@ mod tests {
             LibsqlStore::open(&cfg).unwrap()
         };
         local
-            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA")
+            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA", "", "", "")
             .unwrap();
         {
             let cfg = Config {
@@ -2011,7 +2209,7 @@ mod tests {
             };
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
-                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA")
+                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA", "", "", "")
                 .unwrap();
         }
 

@@ -265,6 +265,39 @@ the input line) and returns a `Target`. `Target::injectable()` is true only when
 the mux is not `None` and the id is non-empty. `Target::from_peer(&Peer)` rebuilds
 a target from a registered peer's stored `(mux, target)`.
 
+### Session tag acquisition (`src/git.rs`)
+
+Where `detect_target()` answers *how to reach* a session, `src/git.rs` answers
+*what the session is*: it derives the session's **repo name**, **branch**, and a
+canonical **worktree id** from its cwd at registration (and refreshes them on
+`weave scan`), so a `peers` row is self-describing across the mesh. It sits at the
+inject tier — pure parsers plus a no-shell argv `git` runner — and is **never** a
+build/link dependency: `git` is invoked as an **external trusted binary** (resolved
+via `inject::resolve_trusted`, an absolute path from a trusted dir, never ambient
+`$PATH`), so weave stays one dependency-light Rust binary.
+
+Acquisition is best-effort and total — a git/fs failure or a non-git cwd yields
+empty tags and **never sinks registration** (the hook hot path) — and writes are
+self-only (owner-only-writes: a session only ever tags its own row):
+
+- **`worktree_id`** comes from a pure `.git`-file parse *first* (zero subprocess):
+  a linked worktree's `<cwd>/.git` is a file holding
+  `gitdir: …/.git/worktrees/<name>/.git`, and `parse_worktree_id_from_gitdir`
+  recovers `<name>` as the canonical id. A main (non-linked) worktree has a `.git`
+  *directory* → the literal `"(main)"` sentinel. No `.git` at all → empty (and the
+  subprocess is skipped entirely).
+- **`branch`** is `git rev-parse --abbrev-ref HEAD`, with a
+  `git worktree list --porcelain` parse fallback (`parse_worktree_porcelain`,
+  matched to this worktree's path) when the former is blank/detached.
+- **`repo`** is the basename of `git rev-parse --show-toplevel`
+  (`repo_name_from_toplevel`).
+
+The argv `git` runner (`git_capture`) copies `inject::run_capture`'s discipline:
+`Command::new(<trusted git>).args([...]).current_dir(cwd)` with a wall-clock
+timeout + kill and `Stdio::null()` stderr/stdin — explicit argv, never `sh -c`,
+never a built command string, so cwd/repo/branch text never reaches a shell. The
+store seam (`sanitize_tag`, §7) bounds and control-strips every tag on write.
+
 ### Paste-safe submission
 
 Submitting the message (pressing "Enter") is the subtle part. Modern TUIs such
@@ -388,7 +421,9 @@ messages    (id INTEGER PK AUTOINCREMENT, ts INTEGER, sender TEXT, recipient TEX
              subject TEXT NULL, body TEXT)
 reads       (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id, reader))
 peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
-             last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '')
+             last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '',
+             repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+             worktree_id TEXT NOT NULL DEFAULT '')
 -- Tier-2 cross-store delivery (§10):
 outbox      (id INTEGER PK AUTOINCREMENT, ts INTEGER, to_peer TEXT, to_host TEXT NOT NULL DEFAULT '',
              from_peer TEXT, subject TEXT NULL, body TEXT, sig TEXT NOT NULL DEFAULT '')
@@ -402,10 +437,15 @@ keys        (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)
   broadcast deliverable exactly once per reader and keeps each session's "unread"
   independent.
 - **`peers`** — the injection registry: where each named session can be reached,
-  plus `last_seen`, `pid`, and `host` for presence. The `pid`/`host` columns are
-  added by an **additive, idempotent migration** (guarded, mirroring the `socket`
-  precedent) in **both** backends, so a pre-existing DB upgrades in place and an
-  old row reads `pid:NULL` / `host:""`.
+  plus `last_seen`, `pid`, and `host` for presence, and the descriptive session
+  tags `repo` / `branch` / `worktree_id`. The `pid`/`host` and the
+  `repo`/`branch`/`worktree_id` columns are each added by an **additive, idempotent
+  migration** (guarded, mirroring the `socket` precedent) in **both** backends, so
+  a pre-existing DB upgrades in place and an old row reads `pid:NULL` / `host:""` /
+  empty tags. The three tag columns are `TEXT NOT NULL DEFAULT ''` (nullable in
+  spirit — empty means "unknown/non-git"), appended after `host` at fixed positions
+  8/9/10 so the column order is identical across backends. They are **descriptive
+  tags only**, never injection targets.
 - **`outbox`** — Tier-2 pending intents the owner queued for recipients in *other*
   stores (§10). Append-only; `id` is the monotonic dedup key the receiver tracks.
   `sig` is empty unless `--features sign` signed the intent.
@@ -469,6 +509,13 @@ injected and stored text is handled**, not on network attackers.
   inlined SQL literals are the broadcast aliases, which are compile-time
   constants derived from `BROADCAST` — never user input — so `BROADCAST_SQL`
   cannot be an injection vector.
+- **Session tags are sanitized at the store seam.** The cwd-derived `repo` /
+  `branch` / `worktree_id` tags pass through `sanitize_tag` inside
+  `register_peer_full` in **both** backends (trim → drop control chars →
+  char-boundary-safe `take(MAX_*_LEN)`, each 128) before persistence, so a hostile
+  or oversized cwd-derived tag is bounded and control-free, is never re-emitted
+  verbatim, and is never an injection target (tags are descriptive only). Capture
+  is no-shell argv `git` (§3), so the tag text cannot reach a shell either.
 - **Injection is a contained side effect.** The worst case of a hostile body is
   the text appearing in another session's pane (a social/UX concern), not code
   execution. A failed or impossible injection degrades to next-turn hook

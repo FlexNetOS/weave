@@ -26,7 +26,7 @@
 
 mod common;
 
-use common::{run_ok, TestDb};
+use common::{run_in_cwd, run_ok, TestDb};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -318,5 +318,66 @@ proptest! {
             &bodies[0], &body,
             "delivered body must match the sent body byte-for-byte"
         );
+    }
+
+    /// PROPERTY 4: SESSION-TAG SANITIZE TOTALITY (end-to-end, black-box).
+    ///
+    /// For ANY worktree-id segment (arbitrary unicode, control chars, shell
+    /// metacharacters — but no `/`, which is the segment delimiter the `.git`-file
+    /// parser splits on), capturing it from a crafted cwd via `weave register` and
+    /// reading it back through `peers --json` ALWAYS yields a tag that is:
+    ///   * stored without error (registration never hard-fails on a tag),
+    ///   * control-character-free, and
+    ///   * within the 128-char cap.
+    /// This exercises the full cwd → `git::capture_worktree_tags` →
+    /// `store::sanitize_tag` → persistence → projection seam, proving the sanitize
+    /// is total no matter how hostile the cwd-derived value is.
+    #[test]
+    fn session_tag_capture_is_bounded_and_controlfree(seg in r"[^/]{0,300}") {
+        // The crafted `.git` file is one line; the parser trims and splits on `/`.
+        // A segment that trims to empty would yield no worktree_id (the cwd looks
+        // non-git) — that is a valid total outcome, asserted as "no tag captured".
+        let db = TestDb::new();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-prop-tag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".git"),
+            format!("gitdir: /fixture/main/.git/worktrees/{seg}/.git\n"),
+        )
+        .unwrap();
+
+        let (ok, _o, err) = run_in_cwd(&db, &["register", "--name", "proptag"], &dir);
+        prop_assert!(ok, "register must be total over any tag: stderr={}", err);
+
+        let out = run_ok(&db, &["peers", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let stored = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "proptag")
+            .and_then(|p| p["worktree"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        prop_assert!(
+            !stored.chars().any(|c| c.is_control()),
+            "stored worktree tag must be control-free: {:?}",
+            stored
+        );
+        prop_assert!(
+            stored.chars().count() <= 128,
+            "stored worktree tag must be ≤128 chars, got {}",
+            stored.chars().count()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
