@@ -2592,6 +2592,220 @@ fn mcp_peers_with_remote_source_degrades_cleanly() {
     mcp.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Tier-2 v2 follow-up — per-source pull tokens (WEAVE_PULL_TOKEN_<LABEL>),
+// hermetic (NO network). These assert RESOLUTION + token-tier OBSERVABILITY and
+// the headline secret-hygiene invariant (no token byte ever reaches stdout or
+// stderr), NOT live remote auth. A labelled remote (`MYDB=libsql://host/db`) +
+// a per-source `WEAVE_PULL_TOKEN_MYDB` resolves the per-source tier; without the
+// per-source env it falls through to the shared `WEAVE_PULL_TOKEN`; with neither
+// it is tier=none. The remote host is `.invalid` with a 200ms timeout so the
+// libsql build never actually waits on a network.
+// ---------------------------------------------------------------------------
+
+/// A labelled remote in `WEAVE_PEER_DBS` plus its per-source `WEAVE_PULL_TOKEN_<LABEL>`
+/// resolves the PER-SOURCE token tier in `doctor --json`. The secret token never
+/// appears in stdout or stderr on EITHER backend, and on the default sqlite build
+/// the remote is still loudly rejected (rebuild note on stderr, never stdout).
+#[test]
+fn federation_per_source_token_selected() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const PER_SOURCE: &str = "per-source-secret-token-AAA";
+    const SHARED: &str = "shared-secret-token-BBB";
+    let remote_url = "libsql://prod-host.invalid/db";
+    let entry = format!("MYDB={remote_url}");
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN_MYDB", PER_SOURCE),
+            ("WEAVE_PULL_TOKEN", SHARED),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    // Headline secret-hygiene: NEITHER token appears anywhere.
+    assert!(
+        !out.contains(PER_SOURCE),
+        "per-source token in stdout: {out}"
+    );
+    assert!(
+        !err.contains(PER_SOURCE),
+        "per-source token in stderr: {err}"
+    );
+    assert!(!out.contains(SHARED), "shared token in stdout: {out}");
+    assert!(!err.contains(SHARED), "shared token in stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(1),
+        "labelled remote with its env token resolves the per-source tier: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(0),
+        "no shared-tier remote in this config: {out}"
+    );
+
+    if !cfg!(feature = "libsql") {
+        // The remote is still rejected loudly on the default build (token-free).
+        assert_eq!(
+            v["federation_remote_unsupported"].as_u64(),
+            Some(1),
+            "default build reports the remote as unsupported: {out}"
+        );
+        assert!(
+            err.contains("--features libsql"),
+            "default build tells the user to rebuild for remote: {err}"
+        );
+    }
+}
+
+/// A labelled remote with NO `WEAVE_PULL_TOKEN_<LABEL>` set but with the shared
+/// `WEAVE_PULL_TOKEN` set falls through to the SHARED token tier. The shared token
+/// never appears in the output.
+#[test]
+fn federation_label_falls_through_to_shared() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const SHARED: &str = "shared-only-secret-CCC";
+    let remote_url = "libsql://stage-host.invalid/db";
+    let entry = format!("STAGE={remote_url}");
+
+    // Note: WEAVE_PULL_TOKEN_STAGE deliberately UNSET (not in extra_env).
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN", SHARED),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+    assert!(!out.contains(SHARED), "shared token in stdout: {out}");
+    assert!(!err.contains(SHARED), "shared token in stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(1),
+        "labelled remote with no per-source env falls through to shared: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source-tier remote in this config: {out}"
+    );
+}
+
+/// A labelled remote with NEITHER a per-source env token NOR a shared token is
+/// tier=none. The command still succeeds (no panic) and nothing is printed.
+#[test]
+fn federation_no_token_tier_none() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    let remote_url = "libsql://lonely-host.invalid/db";
+    let entry = format!("SOLO={remote_url}");
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[("WEAVE_PEER_DBS", &entry), ("WEAVE_PULL_TIMEOUT_MS", "200")],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_none"].as_u64(),
+        Some(1),
+        "labelled remote with no token resolves tier=none: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source token configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(0),
+        "no shared token configured: {out}"
+    );
+}
+
+/// A LOCAL path that contains `=` (`a=b.db`) must NOT be misparsed as a `LABEL=`
+/// split: it stays a verbatim local source (which fails to open as a weave store
+/// and is skipped), and is never treated as a labelled remote. The command still
+/// succeeds on a valid local source. Guards the degradation contract end-to-end.
+#[test]
+fn federation_local_path_with_equals_not_misparsed() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_ok(&foreign, &["register", "--name", "fedpeer"]);
+    run_ok(&local, &["register", "--name", "here"]);
+
+    // A real local foreign store + a junk `a=b.db` local entry (right side not a URL).
+    let list = format!("{},a=b.db", foreign.path_str());
+    let (ok, out, err) = run_env(&local, &["doctor", "--json"], &[("WEAVE_PEER_DBS", &list)]);
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    // `a=b.db` is a LOCAL entry, never a remote — so the remote count excludes it.
+    assert_eq!(
+        v["federation_remote_stores"].as_u64(),
+        Some(0),
+        "a local `a=b.db` must not be counted as a remote: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source remote tier from a local path: {out}"
+    );
+}
+
+/// MCP `weave_doctor` reports the per-source token tier consistently with the CLI,
+/// is a SUCCESSFUL tool result, and never leaks the token into the tool output.
+#[test]
+fn mcp_doctor_per_source_token_tier_is_token_free() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const PER_SOURCE: &str = "mcp-per-source-secret-DDD";
+    let remote_url = "libsql://mcp-prod.invalid/db";
+    let entry = format!("MCPDB={remote_url}");
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN_MCPDB", PER_SOURCE),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "doctor degradation is not a tool error: {dtext}");
+    assert!(
+        !dtext.contains(PER_SOURCE),
+        "per-source token leaked into MCP output: {dtext}"
+    );
+    assert!(
+        dtext.contains("remote tokens:"),
+        "MCP doctor surfaces the token-tier line: {dtext}"
+    );
+    assert!(
+        dtext.contains("1 per-source"),
+        "MCP doctor reports the per-source tier count: {dtext}"
+    );
+    mcp.shutdown();
+}
+
 /// Liveness regression (A2, no regression): a peer pulled from a foreign source
 /// carrying a remote `host` is TTL-judged, NEVER pid-probed. We seed a foreign
 /// store with a peer whose host is a different machine and a pid that is alive on

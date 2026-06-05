@@ -187,6 +187,38 @@ redacted in logs) or `pull_token = "..."` in `config.toml`.
 > + write-guard + commit-local). weave cannot mint or verify the token's scope; that
 > guarantee is the server's.
 
+##### Per-source tokens — distinct token per remote (`LABEL=url`)
+
+When you pull from more than one remote, each may need its **own** auth token.
+Prefix a remote entry with a short label, `LABEL=<remote-url>`, to select a
+distinct token from the env var `WEAVE_PULL_TOKEN_<LABEL>`:
+
+```bash
+export WEAVE_PULL_FROM="PROD=libsql://prod.turso.io,STAGE=libsql://stage.turso.io,libsql://shared.turso.io"
+export WEAVE_PULL_TOKEN_PROD="…"     # token for the PROD source
+export WEAVE_PULL_TOKEN_STAGE="…"    # token for the STAGE source
+export WEAVE_PULL_TOKEN="…"          # shared fallback (used by the unlabelled source)
+```
+
+- The **LABEL is not a secret** — it only names which env var holds the token, so
+  inlining it in the source list is safe. The **token is** secret, so it stays in
+  the env var: never inline a token. A label is uppercased (`prod=` and `PROD=`
+  both look up `WEAVE_PULL_TOKEN_PROD`), charset `[A-Za-z0-9_]`, max 64 chars.
+- **Token precedence per remote source:** per-source `WEAVE_PULL_TOKEN_<LABEL>` →
+  shared `WEAVE_PULL_TOKEN` / `pull_token` → none. A per-source token is sanitized
+  (same length cap + control-char reject as the shared token); if it fails that
+  check it **falls through** to the shared token rather than suppressing it.
+- A label only applies to a **remote URL**. An entry with no label, an invalid
+  label, or a non-remote right side (e.g. a local path that happens to contain `=`)
+  behaves exactly as before and uses the shared token — fully backward compatible.
+- `weave doctor` reports token-free aggregate counts of how the remote sources
+  resolved their token (per-source / shared / none) on a `remote tokens:` line; it
+  never prints any token bytes.
+
+> Per-source tokens only choose **which** token is sent to each source. They grant
+> no new network or write capability — remote sources stay read-only and
+> owner-only-writes is unchanged.
+
 #### Live nudge on a pulled message — DEFAULT ON (consent)
 
 When a pull commits a message from an allow-listed source, weave **also fires a

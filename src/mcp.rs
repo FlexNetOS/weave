@@ -907,6 +907,24 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
         let remote_count = extra_dbs.iter().filter(|s| s.is_remote()).count();
         if remote_count > 0 {
             out.push_str(&format!("\n  remote sources: {remote_count} configured"));
+            // Token-FREE per-source token-tier observability, consistent with the CLI
+            // `weave doctor`. NEVER prints any token byte — only aggregate counts.
+            let tiers = crate::config::Config::load().peer_db_remote_token_tiers();
+            let per_source = tiers
+                .iter()
+                .filter(|t| **t == crate::config::PullTokenTier::PerSourceLabel)
+                .count();
+            let shared = tiers
+                .iter()
+                .filter(|t| **t == crate::config::PullTokenTier::Shared)
+                .count();
+            let none = tiers
+                .iter()
+                .filter(|t| **t == crate::config::PullTokenTier::None)
+                .count();
+            out.push_str(&format!(
+                "\n  remote tokens:  {per_source} per-source, {shared} shared, {none} none"
+            ));
             if !cfg!(feature = "libsql") {
                 out.push_str(&format!(
                     "\n  note: {remote_count} remote source(s) skipped — rebuild weave with --features libsql to use them"

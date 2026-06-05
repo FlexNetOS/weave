@@ -451,6 +451,28 @@ test surface stays **hermetic — no network in the default suite**:
   offline and deterministic. Tune the per-call network bound with
   `WEAVE_PULL_TIMEOUT_MS` (default 5000ms; an unreachable remote is just a skip).
 
+#### Per-source pull tokens (`WEAVE_PULL_TOKEN_<LABEL>`) — resolution, not network
+
+Per-source token selection is tested as **resolution + hygiene**, hermetically; the
+cases assert which token tier wins and that no token ever leaks — never live auth:
+
+- **Unit (`config`):** `is_valid_label` (charset/bounds + a totality + uppercasing
+  proptest), `parse_labeled_source` (a `LABEL=remote-url` splits to `(Some(LABEL),
+  Remote)` uppercased; an invalid label, an empty label, or a non-remote right side
+  degrades to the verbatim entry — a proptest asserts the no-label result equals
+  `classify_source` of the verbatim entry), and `per_source_token` precedence
+  (label-env set+sane wins; set-but-over-cap/control-char **falls through** to the
+  shared token; unset → shared; neither → none). `resolve_store_sources` proves a
+  labelled and an unlabelled remote coexist (per-source vs. shared token) in one
+  resolve, and the redacting `Debug` still hides both tokens.
+- **Integration (scrubbed env, both backends):** with `WEAVE_PULL_TOKEN_<LABEL>` set
+  for labelled remotes and a shared `WEAVE_PULL_TOKEN`, `weave doctor --json`'s
+  token-free tier counts (`federation_remote_token_per_source` / `_shared` / `_none`)
+  resolve correctly and **none** of the per-source or shared token bytes appear in
+  stdout or stderr. These run on the default sqlite build (remote loud-rejected) and
+  the libsql build (unreachable host + short timeout, skipped) — resolution and the
+  secret-never-printed invariant are asserted, not a real connection.
+
 ## 7. Benchmarks (`benches/weave_bench.rs`, criterion)
 
 A `criterion` harness (`harness = false` in `Cargo.toml`) tracks the costs that

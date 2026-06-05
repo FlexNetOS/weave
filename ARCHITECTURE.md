@@ -656,10 +656,30 @@ A delivery / federation source need not be a local file. A `StoreSource` (define
   (`reject_remote_source`, scheme+host only via `remote_scheme_host`) and count it as
   unsupported (`weave doctor` surfaces `federation_remote_unsupported`). Remote
   sources require a `--features libsql` build.
+- **Per-source token resolution.** A source-list entry may carry an inline
+  `LABEL=<remote-url>` prefix that selects a distinct token from the env var
+  `WEAVE_PULL_TOKEN_<LABEL>`. Resolution is **entirely in `config`** — `StoreSource`
+  is unchanged (`Remote { url, token }`, no `label` field): a private
+  `parse_labeled_source` splits and validates the label (`is_valid_label`: non-empty,
+  ≤ `MAX_LABEL_LEN` = 64, charset `[A-Za-z0-9_]`, uppercased), and only treats the
+  prefix as a label when the right side classifies as a remote URL — otherwise the
+  whole entry is passed verbatim to `classify_source`. `per_source_token` then resolves
+  with precedence **per-source `WEAVE_PULL_TOKEN_<LABEL>` (exact `env::var`, no
+  `env::vars()` scan) → shared `WEAVE_PULL_TOKEN` / `pull_token` → none**; the
+  per-source value goes through the same `sanitize_token` gate and, if rejected,
+  **falls through** to the shared token. The label is a *resolution input only* — it
+  is consumed to build the env-var name and never travels on `StoreSource`, into a log,
+  or adjacent to a token. An unlabelled (or invalid-label) entry resolves identically
+  to before, so the change is backward compatible. The label is not a secret (it names
+  the env var); the token is, and must never be inlined.
 - **Token hygiene.** The token is capped at `MAX_TOKEN_LEN` (8192) with control chars
   rejected (`sanitize_token`), redacted to `<redacted>` by the manual `Debug` on
   `StoreSource::Remote` and on `Config`, and reaches **only** `Builder::new_remote` —
   never a log line, never an argv, never interpolated into SQL or a command string.
+  This applies equally to per-source and shared tokens. `weave doctor` re-derives the
+  resolved tier per remote source (`PullTokenTier` via `peer_db_remote_token_tiers`, a
+  token-free enum) and prints only aggregate counts (per-source / shared / none) on a
+  `remote tokens:` line — never a token byte and never a label↔token pairing.
 - **Network-failure handling.** libSQL exposes no client timeout knob for a remote
   connection, so each remote `block_on` is bounded by `tokio::time::timeout` (the
   `time` tokio sub-feature, gated behind the existing `libsql` feature — the default

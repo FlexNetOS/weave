@@ -109,6 +109,91 @@ fn sanitize_token(token: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Upper bound (chars) on an inline source LABEL (the `LABEL=` prefix that selects
+/// a per-source `WEAVE_PULL_TOKEN_<LABEL>` env var). A label is NOT a secret — it
+/// only names which env var holds the token — but it is bounded + charset-restricted
+/// so it canonicalizes to a legal env-var suffix and can never carry an unbounded or
+/// hostile value. Generous for any human-chosen label.
+pub const MAX_LABEL_LEN: usize = 64;
+
+/// Which token tier resolved for a remote source, for token-FREE `doctor`
+/// observability. NEVER carries the token bytes or the label↔token pairing; it is a
+/// pure classification of WHERE the source's token came from (or that none applied).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PullTokenTier {
+    /// A per-source `WEAVE_PULL_TOKEN_<LABEL>` was set, sane, and applied.
+    PerSourceLabel,
+    /// The shared `pull_token` / `WEAVE_PULL_TOKEN` applied (no valid per-source).
+    Shared,
+    /// No token applied (no per-source label-env and no shared token).
+    None,
+}
+
+/// Is `s` a valid inline source label: non-empty, ≤ [`MAX_LABEL_LEN`] chars, and
+/// every char in `[A-Za-z0-9_]` (so it canonicalizes to a legal env-var suffix
+/// after uppercasing). Pure; total on any input. A label is the LEFT side of an
+/// inline `LABEL=<remote-url>` entry; it is not a secret.
+fn is_valid_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_LABEL_LEN
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse a single (already-trimmed) source entry into an optional inline LABEL and
+/// the [`StoreSource`] it governs. A WRAPPER around [`classify_source`] that adds
+/// label recognition WITHOUT changing `classify_source`'s behavior or totality.
+///
+/// The entry is parsed as `LABEL=<rest>` iff ALL of:
+///   1. it contains an `=`, AND
+///   2. the substring before the first `=` is a [valid label](is_valid_label), AND
+///   3. the substring after the first `=` classifies as a [`StoreSource::Remote`].
+///
+/// On a match the label is UPPERCASED (so `prod=` and `PROD=` select the same env
+/// var) and returned alongside the `Remote` source built from `<rest>`. If ANY
+/// condition fails, the WHOLE original entry is passed verbatim to `classify_source`
+/// with no label — so bare paths/URLs, a local path containing `=` (its right side
+/// is not a remote URL), and a malformed label all degrade exactly as today. A label
+/// is ONLY ever recognized on a remote URL (there is no per-source token for a local
+/// file). Pure; total on any input.
+fn parse_labeled_source(entry: &str) -> (Option<String>, StoreSource) {
+    if let Some((label, rest)) = entry.split_once('=') {
+        if is_valid_label(label) {
+            let inner = classify_source(rest);
+            if inner.is_remote() {
+                return (Some(label.to_ascii_uppercase()), inner);
+            }
+        }
+    }
+    (None, classify_source(entry))
+}
+
+/// Resolve a remote source's auth token by precedence, returning the token (a
+/// SECRET) AND the token-free [`PullTokenTier`] for diagnostics:
+///   1. per-source `WEAVE_PULL_TOKEN_<LABEL>` (exact `env::var` lookup — NO
+///      `env::vars()` scan — when the entry carried a valid label AND the var is set
+///      AND [`sanitize_token`] accepts it) ⇒ [`PullTokenTier::PerSourceLabel`];
+///   2. else the shared (already-sanitized) token ⇒ [`PullTokenTier::Shared`];
+///   3. else `None` ⇒ [`PullTokenTier::None`].
+///
+/// `label` is already validated/uppercased. A per-source env var that is set but
+/// REJECTED by `sanitize_token` (over-cap / control chars) FALLS THROUGH to the
+/// shared token (it does not suppress it) — the loud stderr note already fired. The
+/// label is used ONLY to build the exact env-var name; it never travels with the
+/// token and is never logged alongside it.
+fn per_source_token(label: Option<&str>, shared: Option<&str>) -> (Option<String>, PullTokenTier) {
+    if let Some(l) = label {
+        if let Some(v) = nonempty(&format!("WEAVE_PULL_TOKEN_{l}")) {
+            if let Some(t) = sanitize_token(&v) {
+                return (Some(t), PullTokenTier::PerSourceLabel);
+            }
+        }
+    }
+    match shared {
+        Some(s) => (Some(s.to_string()), PullTokenTier::Shared),
+        None => (None, PullTokenTier::None),
+    }
+}
+
 /// Platform path-list separator accepted in `WEAVE_PEER_DBS` (in addition to the
 /// canonical comma): `;` on Windows, `:` elsewhere — matching `PATH` semantics.
 /// NOT the path *component* separator (`/`), which must never split a list entry.
@@ -128,6 +213,13 @@ const PEER_DBS_LIST_SEP: char = ':';
 /// split to fragments that are NOT recognized remote URLs. A remote URL fragment is
 /// passed through whole. Blank fragments are dropped; trimming/NUL-reject/cap happen
 /// later in [`resolve_store_sources`].
+///
+/// Tier-2 v2 follow-up (per-source tokens): an inline `LABEL=<remote-url>` fragment
+/// ALSO embeds the `:` inside its `scheme://` (after the `LABEL=` prefix), so it must
+/// be treated as opaque too — otherwise `MYDB=libsql://h/db` would be shredded into
+/// `MYDB=libsql` + `//h/db` and the label feature would silently never engage via the
+/// env path. We recognize it with the SAME canonical label rule the resolver uses:
+/// a valid label left of the first `=` and a remote-scheme URL on the right.
 fn split_source_list(v: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for comma_part in v.split(',') {
@@ -136,7 +228,7 @@ fn split_source_list(v: &str) -> Vec<String> {
             continue;
         }
         // A recognized remote URL is opaque: never split it on the path separator.
-        if REMOTE_SCHEMES.iter().any(|s| part.starts_with(s)) {
+        if is_opaque_remote_fragment(part) {
             out.push(part.to_string());
             continue;
         }
@@ -148,6 +240,21 @@ fn split_source_list(v: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A list fragment that must NEVER be split on the platform path separator because it
+/// embeds `:` inside a `scheme://`: either a bare remote URL (`libsql://h`) or an
+/// inline `LABEL=<remote-url>` (`MYDB=libsql://h`). Mirrors the canonical label rule
+/// in [`parse_labeled_source`] so the env split and the resolver agree on what a
+/// labelled remote is (no drift).
+fn is_opaque_remote_fragment(part: &str) -> bool {
+    if REMOTE_SCHEMES.iter().any(|s| part.starts_with(s)) {
+        return true;
+    }
+    if let Some((label, rest)) = part.split_once('=') {
+        return is_valid_label(label) && REMOTE_SCHEMES.iter().any(|s| rest.starts_with(s));
+    }
+    false
 }
 
 /// Hard ceiling on how many extra read-only stores Tier-1 federation will open
@@ -633,15 +740,36 @@ impl Config {
         cap: usize,
         list_label: &str,
     ) -> Vec<StoreSource> {
+        self.resolve_store_sources_with_tiers(raw, cap, list_label)
+            .into_iter()
+            .map(|(src, _tier)| src)
+            .collect()
+    }
+
+    /// Tier-aware sibling of [`resolve_store_sources`](Self::resolve_store_sources):
+    /// returns each resolved source paired with the token-free [`PullTokenTier`] that
+    /// resolved for it (`PullTokenTier::None` for every Local source — locals carry
+    /// no token). The per-source token precedence (label-env → shared → none) is
+    /// applied inside the `Remote` arm. The shared token is sanitized ONCE before the
+    /// loop. The label is consumed here ONLY to look up its env var and to classify
+    /// the tier; it NEVER travels on `StoreSource` and is never logged with the token.
+    ///
+    /// `resolve_store_sources` discards the tier; `doctor` keeps it for observability.
+    fn resolve_store_sources_with_tiers(
+        &self,
+        raw: Option<&[String]>,
+        cap: usize,
+        list_label: &str,
+    ) -> Vec<(StoreSource, PullTokenTier)> {
         let raw = match raw {
             Some(v) => v,
             None => return Vec::new(),
         };
         let local = self.db_path();
         let local_canon = std::fs::canonicalize(&local).unwrap_or_else(|_| local.clone());
-        let token = self.pull_token.as_deref().and_then(sanitize_token);
+        let shared_token = self.pull_token.as_deref().and_then(sanitize_token);
 
-        let mut out: Vec<StoreSource> = Vec::new();
+        let mut out: Vec<(StoreSource, PullTokenTier)> = Vec::new();
         let mut seen_local: Vec<PathBuf> = Vec::new();
         let mut seen_remote: Vec<String> = Vec::new();
         for entry in raw {
@@ -653,7 +781,8 @@ impl Config {
                 eprintln!("[weave] skipping invalid {list_label} entry (contains NUL byte)");
                 continue;
             }
-            match classify_source(trimmed) {
+            let (label, source) = parse_labeled_source(trimmed);
+            match source {
                 StoreSource::Local(path) => {
                     let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if key == local_canon {
@@ -663,7 +792,7 @@ impl Config {
                         continue;
                     }
                     seen_local.push(key);
-                    out.push(StoreSource::Local(path));
+                    out.push((StoreSource::Local(path), PullTokenTier::None));
                 }
                 StoreSource::Remote { url, .. } => {
                     let key = normalize_remote_url(&url);
@@ -671,10 +800,8 @@ impl Config {
                         continue;
                     }
                     seen_remote.push(key);
-                    out.push(StoreSource::Remote {
-                        url,
-                        token: token.clone(),
-                    });
+                    let (token, tier) = per_source_token(label.as_deref(), shared_token.as_deref());
+                    out.push((StoreSource::Remote { url, token }, tier));
                 }
             }
         }
@@ -686,6 +813,24 @@ impl Config {
             out.truncate(cap);
         }
         out
+    }
+
+    /// Token-FREE per-source token-tier observability for `doctor`: re-resolves the
+    /// Tier-1 federation sources (`peer_dbs`, the SAME set `doctor` reports its remote
+    /// count over) and returns the [`PullTokenTier`] of every REMOTE source. Locals
+    /// are omitted (they carry no token). NEVER returns or logs any token byte. Used
+    /// only by `doctor` to render aggregate tier counts that line up with the existing
+    /// `remote sources: N configured` count.
+    pub fn peer_db_remote_token_tiers(&self) -> Vec<PullTokenTier> {
+        self.resolve_store_sources_with_tiers(
+            self.peer_dbs.as_deref(),
+            MAX_PEER_DBS,
+            "WEAVE_PEER_DBS",
+        )
+        .into_iter()
+        .filter(|(src, _)| src.is_remote())
+        .map(|(_, tier)| tier)
+        .collect()
     }
 
     /// Tier-2 v2 inject-gate over a [`StoreSource`] (the [`StoreSource`] analogue of
@@ -807,7 +952,8 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Every setting below is OPTIONAL and shown commented-out with its default.
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
-# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN) take precedence over anything set here.
+# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>) take
+# precedence over anything set here.
 
 # Default identity for this machine/session. When unset, weave falls back to
 # the basename of the current directory (a *guess* that never marks mail read).
@@ -864,10 +1010,21 @@ pub const CONFIG_TEMPLATE: &str = "\
 # remote entry is skipped with a clear stderr note (local sources still work).
 # pull_from = [\"/path/to/other-project/messages.db\", \"libsql://shared-db.turso.io\"]
 
-# Auth token for REMOTE pull/federation sources (Tier-2 v2). Applied to every
-# libsql://, https:// or wss:// source above that needs one. Treat as a SECRET;
-# weave redacts it from debug output. Prefer the WEAVE_PULL_TOKEN env var over
-# storing it here. RECOMMENDED: use a SERVER-ENFORCED read-only Turso token
+# PER-SOURCE auth tokens: prefix a REMOTE entry with `LABEL=` to select a distinct
+# token via the env var WEAVE_PULL_TOKEN_<LABEL> (label uppercased; charset
+# [A-Za-z0-9_]). The LABEL is NOT a secret (it only names which env var holds the
+# token), so inlining it is safe. Token precedence per remote source:
+# WEAVE_PULL_TOKEN_<LABEL> -> shared pull_token / WEAVE_PULL_TOKEN -> none.
+# A label only applies to a REMOTE URL; `LABEL=/local/path` is treated as a literal
+# local path. Example (two remotes with separate tokens, plus an unlabelled one that
+# falls back to the shared pull_token):
+# pull_from = [\"PROD=libsql://prod-db.turso.io\", \"STAGE=libsql://stage-db.turso.io\", \"libsql://shared-db.turso.io\"]
+
+# SHARED auth token for REMOTE pull/federation sources (Tier-2 v2). Applied to every
+# libsql://, https:// or wss:// source above that does NOT resolve a per-source
+# WEAVE_PULL_TOKEN_<LABEL>. Treat as a SECRET; weave redacts it from debug output.
+# Prefer the WEAVE_PULL_TOKEN env var over storing it here. RECOMMENDED: use a
+# SERVER-ENFORCED read-only Turso token
 # (`turso db tokens create <db> --read-only`) so the source is read-only at the
 # server, not just by weave's client-side guards.
 # pull_token = \"...\"
@@ -1514,6 +1671,272 @@ mod tests {
         ));
     }
 
+    // ---------------------------------------------------------------------
+    // Per-source pull tokens (WEAVE_PULL_TOKEN_<LABEL>).
+    // ---------------------------------------------------------------------
+
+    /// Serializes the env-mutating per-source-token tests (they set/clear process
+    /// env vars, which is global state) so they cannot race each other.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `is_valid_label` accepts a non-empty `[A-Za-z0-9_]` string up to
+    /// `MAX_LABEL_LEN`, and rejects empty, over-length, and any other charset.
+    #[test]
+    fn is_valid_label_charset_and_bounds() {
+        for ok in ["A", "a", "A1_b", "PROD", "_", &"x".repeat(MAX_LABEL_LEN)] {
+            assert!(is_valid_label(ok), "{ok:?} should be a valid label");
+        }
+        for bad in [
+            "",
+            &"x".repeat(MAX_LABEL_LEN + 1),
+            "a-b",
+            "a b",
+            "a.b",
+            "a/b",
+            "café",
+        ] {
+            assert!(!is_valid_label(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// `parse_labeled_source` recognizes `LABEL=<remote-url>` (uppercasing the
+    /// label), but degrades to a verbatim `classify_source` call for a bare URL, a
+    /// local path, a local path containing `=`, an invalid label, and an over-length
+    /// label — never silently stripping a bad label to recover a URL.
+    #[test]
+    fn parse_labeled_source_label_only_on_remote_url() {
+        // Valid label + remote URL ⇒ label uppercased, Remote on <rest>.
+        let (label, src) = parse_labeled_source("PROD=libsql://prod.turso.io");
+        assert_eq!(label.as_deref(), Some("PROD"));
+        assert!(matches!(&src, StoreSource::Remote { url, token }
+            if url == "libsql://prod.turso.io" && token.is_none()));
+
+        // lowercase label is uppercased for the env lookup.
+        let (label, src) = parse_labeled_source("team_a=https://a.turso.io/db");
+        assert_eq!(label.as_deref(), Some("TEAM_A"));
+        assert!(matches!(&src, StoreSource::Remote { url, .. } if url == "https://a.turso.io/db"));
+
+        // Bare URL ⇒ no label.
+        let (label, src) = parse_labeled_source("libsql://shared.turso.io");
+        assert!(label.is_none());
+        assert!(src.is_remote());
+
+        // Local path (no `=`) ⇒ no label, Local.
+        let (label, src) = parse_labeled_source("/tmp/local.db");
+        assert!(label.is_none());
+        assert_eq!(src, StoreSource::Local(PathBuf::from("/tmp/local.db")));
+
+        // Local path containing `=` whose right side is NOT a remote URL ⇒ verbatim
+        // Local (the whole `a=b.db`), NOT a label split.
+        let (label, src) = parse_labeled_source("a=b.db");
+        assert!(label.is_none());
+        assert_eq!(src, StoreSource::Local(PathBuf::from("a=b.db")));
+
+        // Invalid label (space) ⇒ verbatim classify ⇒ Local (no scheme prefix).
+        let (label, src) = parse_labeled_source("BAD LABEL=libsql://h");
+        assert!(label.is_none());
+        assert_eq!(
+            src,
+            StoreSource::Local(PathBuf::from("BAD LABEL=libsql://h"))
+        );
+
+        // Empty label ⇒ verbatim classify ⇒ Local.
+        let (label, src) = parse_labeled_source("=libsql://h");
+        assert!(label.is_none());
+        assert_eq!(src, StoreSource::Local(PathBuf::from("=libsql://h")));
+
+        // Over-length label ⇒ verbatim classify ⇒ Local.
+        let over = format!("{}=libsql://h", "x".repeat(MAX_LABEL_LEN + 1));
+        let (label, src) = parse_labeled_source(&over);
+        assert!(label.is_none());
+        assert_eq!(src, StoreSource::Local(PathBuf::from(over)));
+    }
+
+    /// `per_source_token` precedence: a set+sane label-env wins; a set-but-rejected
+    /// label-env falls THROUGH to the shared token; an unset label-env uses the
+    /// shared token; with neither, `None`. Asserts the paired `PullTokenTier`.
+    #[test]
+    fn per_source_token_precedence() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let var = "WEAVE_PULL_TOKEN_PSTEST";
+        std::env::remove_var(var);
+
+        // Label-env set + sane ⇒ per-source token, tier PerSourceLabel.
+        std::env::set_var(var, "per-source-jwt");
+        let (tok, tier) = per_source_token(Some("PSTEST"), Some("shared-jwt"));
+        assert_eq!(tok.as_deref(), Some("per-source-jwt"));
+        assert_eq!(tier, PullTokenTier::PerSourceLabel);
+
+        // Label-env set but over-cap ⇒ falls through to shared.
+        std::env::set_var(var, "x".repeat(MAX_TOKEN_LEN + 1));
+        let (tok, tier) = per_source_token(Some("PSTEST"), Some("shared-jwt"));
+        assert_eq!(tok.as_deref(), Some("shared-jwt"));
+        assert_eq!(tier, PullTokenTier::Shared);
+
+        // Label-env set but control-char ⇒ falls through to shared.
+        std::env::set_var(var, "good\nbad");
+        let (tok, tier) = per_source_token(Some("PSTEST"), Some("shared-jwt"));
+        assert_eq!(tok.as_deref(), Some("shared-jwt"));
+        assert_eq!(tier, PullTokenTier::Shared);
+
+        // Label-env unset ⇒ shared.
+        std::env::remove_var(var);
+        let (tok, tier) = per_source_token(Some("PSTEST"), Some("shared-jwt"));
+        assert_eq!(tok.as_deref(), Some("shared-jwt"));
+        assert_eq!(tier, PullTokenTier::Shared);
+
+        // No label, shared present ⇒ shared.
+        let (tok, tier) = per_source_token(None, Some("shared-jwt"));
+        assert_eq!(tok.as_deref(), Some("shared-jwt"));
+        assert_eq!(tier, PullTokenTier::Shared);
+
+        // No label, no shared ⇒ none.
+        let (tok, tier) = per_source_token(None, None);
+        assert!(tok.is_none());
+        assert_eq!(tier, PullTokenTier::None);
+
+        // Label set-but-rejected with NO shared ⇒ none (fall-through to None).
+        std::env::set_var(var, "bad\nvalue");
+        let (tok, tier) = per_source_token(Some("PSTEST"), None);
+        assert!(tok.is_none());
+        assert_eq!(tier, PullTokenTier::None);
+        std::env::remove_var(var);
+    }
+
+    /// End-to-end through `resolve_store_sources`: a labelled remote picks up its
+    /// per-source `WEAVE_PULL_TOKEN_<LABEL>` while a SECOND unlabelled remote in the
+    /// same list carries the shared token — proving per-source and shared coexist in
+    /// one resolve. The redacted `Debug` of the result still leaks neither token.
+    #[test]
+    fn resolve_store_sources_per_source_and_shared_coexist() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let var = "WEAVE_PULL_TOKEN_PROD";
+        std::env::set_var(var, "prod-only-jwt");
+
+        let cfg = Config {
+            pull_token: Some("shared-jwt".to_string()),
+            pull_from: Some(vec![
+                "PROD=libsql://prod.turso.io".to_string(),
+                "libsql://shared.turso.io".to_string(),
+            ]),
+            ..Config::default()
+        };
+        let sources = cfg.pull_from_sources();
+        assert_eq!(sources.len(), 2);
+        match &sources[0] {
+            StoreSource::Remote { url, token } => {
+                assert_eq!(url, "libsql://prod.turso.io");
+                assert_eq!(token.as_deref(), Some("prod-only-jwt"));
+            }
+            other => panic!("expected labelled remote, got {other:?}"),
+        }
+        match &sources[1] {
+            StoreSource::Remote { url, token } => {
+                assert_eq!(url, "libsql://shared.turso.io");
+                assert_eq!(token.as_deref(), Some("shared-jwt"));
+            }
+            other => panic!("expected unlabelled remote, got {other:?}"),
+        }
+
+        // Tier observability (token-free) sees one per-source + one shared.
+        let cfg2 = Config {
+            peer_dbs: cfg.pull_from.clone(),
+            ..cfg.clone()
+        };
+        let tiers = cfg2.peer_db_remote_token_tiers();
+        assert_eq!(
+            tiers
+                .iter()
+                .filter(|t| **t == PullTokenTier::PerSourceLabel)
+                .count(),
+            1
+        );
+        assert_eq!(
+            tiers
+                .iter()
+                .filter(|t| **t == PullTokenTier::Shared)
+                .count(),
+            1
+        );
+
+        // Neither token appears in the redacting Debug.
+        let dbg = format!("{sources:?}");
+        assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
+        assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
+
+        std::env::remove_var(var);
+    }
+
+    /// A per-source `WEAVE_PULL_TOKEN_<LABEL>` over the cap / with control chars is
+    /// rejected and FALLS THROUGH to the shared token (parity with the shared-token
+    /// sanitize behavior), end-to-end through `resolve_store_sources`.
+    #[test]
+    fn resolve_per_source_token_capped_falls_through_to_shared() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let var = "WEAVE_PULL_TOKEN_STAGE";
+        std::env::set_var(var, "x".repeat(MAX_TOKEN_LEN + 1));
+
+        let cfg = Config {
+            pull_token: Some("shared-jwt".to_string()),
+            pull_from: Some(vec!["STAGE=libsql://stage.turso.io".to_string()]),
+            ..Config::default()
+        };
+        let sources = cfg.pull_from_sources();
+        assert!(
+            matches!(&sources[0], StoreSource::Remote { token, .. } if token.as_deref() == Some("shared-jwt")),
+            "over-cap per-source token must fall through to shared: {sources:?}"
+        );
+        std::env::remove_var(var);
+    }
+
+    /// `split_source_list` keeps an inline `LABEL=<remote-url>` fragment OPAQUE: the
+    /// `:` inside its `scheme://` must NOT shred it on the platform path separator
+    /// (regression guard for the env path — the resolver only ever sees a whole
+    /// labelled URL). Bare remote URLs stay opaque; locals still split on the sep.
+    #[test]
+    fn split_source_list_keeps_labelled_remote_opaque() {
+        // A labelled remote travels whole (not shredded into `MYDB=libsql` + `//h/db`).
+        assert_eq!(
+            split_source_list("MYDB=libsql://h.turso.io/db"),
+            vec!["MYDB=libsql://h.turso.io/db".to_string()]
+        );
+        // A bare remote URL is still opaque.
+        assert_eq!(
+            split_source_list("libsql://h.turso.io/db"),
+            vec!["libsql://h.turso.io/db".to_string()]
+        );
+        // A labelled remote alongside a local entry: only the local participates in
+        // any path-sep splitting; the labelled URL stays whole.
+        let got = split_source_list("PROD=https://a.turso.io/db,/tmp/x.db");
+        assert_eq!(
+            got,
+            vec![
+                "PROD=https://a.turso.io/db".to_string(),
+                "/tmp/x.db".to_string()
+            ]
+        );
+        // An invalid-label `=` fragment is NOT treated as opaque (right side is a URL
+        // but the label is invalid) — it falls to the normal split, which on unix
+        // splits the `:` in the scheme. This matches `parse_labeled_source` degrading
+        // it to a verbatim (non-remote) entry anyway, so the post-split entries simply
+        // fail to classify as a remote — never a silent labelled remote.
+        let bad = split_source_list("bad label=libsql://h");
+        assert!(
+            !bad.contains(&"bad label=libsql://h".to_string()),
+            "an invalid label must not be treated as an opaque remote: {bad:?}"
+        );
+    }
+
+    /// The template documents the inline `LABEL=` per-source token syntax + the
+    /// `WEAVE_PULL_TOKEN_<LABEL>` env var, and still parses as all-default TOML.
+    #[test]
+    fn template_documents_per_source_label_tokens() {
+        assert!(CONFIG_TEMPLATE.contains("WEAVE_PULL_TOKEN_<LABEL>"));
+        assert!(CONFIG_TEMPLATE.contains("PROD=libsql://"));
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert!(cfg.pull_token.is_none());
+    }
+
     // ---- proptest: classify_source totality + resolve ordering/dedup ----
 
     use proptest::prelude::*;
@@ -1538,6 +1961,34 @@ mod tests {
                 prop_assert_eq!(url, s);
                 prop_assert!(token.is_none());
             }
+        }
+
+        /// `parse_labeled_source` is TOTAL and upholds its contract on arbitrary
+        /// input: a returned label is non-empty, ≤`MAX_LABEL_LEN`, all `[A-Z0-9_]`,
+        /// and pairs with a `Remote` source; when no label is returned the result
+        /// equals `classify_source` on the verbatim entry (degradation contract).
+        #[test]
+        fn parse_labeled_source_is_total(s in ".*") {
+            let (label, src) = parse_labeled_source(&s);
+            match &label {
+                Some(l) => {
+                    prop_assert!(!l.is_empty());
+                    prop_assert!(l.len() <= MAX_LABEL_LEN);
+                    prop_assert!(l.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
+                    prop_assert!(src.is_remote());
+                }
+                None => {
+                    prop_assert_eq!(&src, &classify_source(&s));
+                }
+            }
+        }
+
+        /// `is_valid_label` is total, and its verdict is invariant under ASCII
+        /// uppercasing (case-folding a label never changes its validity).
+        #[test]
+        fn is_valid_label_is_total_and_case_invariant(s in ".*") {
+            let v = is_valid_label(&s);
+            prop_assert_eq!(v, is_valid_label(&s.to_ascii_uppercase()));
         }
 
         /// `resolve_store_sources` is IDEMPOTENT under dedup and stable in order:

@@ -587,6 +587,22 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     } else {
         remote_count
     };
+    // Token-FREE per-source token-tier observability: how each remote source's auth
+    // token resolved (per-source label-env / shared / none). NEVER prints any token
+    // byte or the label↔token pairing — only aggregate COUNTS.
+    let tiers = cfg.peer_db_remote_token_tiers();
+    let token_per_source = tiers
+        .iter()
+        .filter(|t| **t == config::PullTokenTier::PerSourceLabel)
+        .count();
+    let token_shared = tiers
+        .iter()
+        .filter(|t| **t == config::PullTokenTier::Shared)
+        .count();
+    let token_none = tiers
+        .iter()
+        .filter(|t| **t == config::PullTokenTier::None)
+        .count();
     let total = store.total_messages()?;
     let claude = inject::have("claude");
     let db = cfg.db_path();
@@ -616,6 +632,9 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "federation_stores_skipped": fed_skipped,
                 "federation_remote_stores": remote_count,
                 "federation_remote_unsupported": remote_unsupported,
+                "federation_remote_token_per_source": token_per_source,
+                "federation_remote_token_shared": token_shared,
+                "federation_remote_token_none": token_none,
             }))?
         );
     } else {
@@ -648,6 +667,9 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             );
             if remote_count > 0 {
                 println!("  remote sources: {remote_count} configured");
+                println!(
+                    "  remote tokens:  {token_per_source} per-source, {token_shared} shared, {token_none} none"
+                );
                 if remote_unsupported > 0 {
                     println!(
                         "  note: {remote_unsupported} remote source(s) skipped — rebuild weave with --features libsql to use them"

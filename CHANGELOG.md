@@ -12,6 +12,19 @@
   Turso auth token used to open remote sources. It is **secret**: redacted in `Debug`
   / logs (never printed), length-capped (`MAX_TOKEN_LEN` = 8192), and rejected if it
   contains control characters. Prefer the env var over the config file.
+- **config:** **per-source pull tokens.** A remote source entry may carry an inline
+  `LABEL=<remote-url>` prefix (e.g. `PROD=libsql://prod.turso.io`) that selects a
+  distinct token from the env var `WEAVE_PULL_TOKEN_<LABEL>`. The LABEL is uppercased,
+  charset `[A-Za-z0-9_]`, ≤ `MAX_LABEL_LEN` (64), and is **not** a secret (it only
+  names which env var holds the token), so inlining it is safe — unlike the token,
+  which must never be inlined. Per remote source the token resolves with precedence
+  **per-source `WEAVE_PULL_TOKEN_<LABEL>` → shared `WEAVE_PULL_TOKEN` / `pull_token` →
+  none**; a per-source token goes through the same sanitize gate (cap + control-char
+  reject) and, if rejected, **falls through** to the shared token. Fully backward
+  compatible: an entry with no label (or whose left-of-`=` is not a valid label, or
+  whose right side is not a remote URL) behaves exactly as before. `weave doctor`
+  gains token-free aggregate tier counts (per-source / shared / none) and a
+  `remote tokens:` line — no token bytes are ever printed.
 - **store (libsql):** remote sources are opened **read-only** and weave **never
   writes them** — owner-only-writes now holds **cross-machine**. The remote handle is
   SELECT-only on the foreign store, hard-traps every write method (`guard_writable`
