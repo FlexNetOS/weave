@@ -850,7 +850,17 @@ fn main() -> Result<()> {
         Cmd::Mcp { session } => {
             let def = session
                 .filter(|s| !s.is_empty())
-                .or_else(|| cfg.session.clone());
+                .or_else(|| cfg.session.clone())
+                // MCP stdio mode has no per-call `--from`/`--me` flag, so without this it
+                // left the server identity *unset* and every tool errored with
+                // "'from' is required". Fall back to the SAME basename(cwd) identity the
+                // CLI's resolve_me() uses (mesh peers are already named by cwd basename),
+                // so MCP tools work without a hand-passed `from`. Only the degenerate
+                // "unknown" cwd is left unset.
+                .or_else(|| {
+                    let me = resolve_me(None, None, &cfg);
+                    (!me.is_empty() && me != "unknown").then_some(me)
+                });
             // Plumb the configured nudge template (if any) into the MCP server so
             // its live-injection nudges honor the same `nudge_template` the CLI
             // uses. `None` ⇒ the server falls back to its built-in default text.

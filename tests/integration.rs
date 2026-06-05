@@ -119,6 +119,89 @@ fn mcp_unknown_method_returns_jsonrpc_error() {
     mcp.shutdown();
 }
 
+// MCP stdio has no per-call `--from`/`--me` flag. With neither `--session` nor
+// `cfg.session` set, the server identity must fall back to the SAME basename(cwd)
+// identity the CLI's resolve_me() uses, so tools resolve a caller instead of
+// erroring `'from' is required`. We exercise that by running the server in a temp
+// dir whose basename is a known valid session name and confirming weave_whoami
+// reports it (and that a `from`-requiring tool, weave_send, succeeds with no
+// explicit identity).
+#[test]
+fn mcp_stdio_identity_falls_back_to_basename_cwd() {
+    let db = TestDb::new();
+    // A unique temp dir whose *basename* is a valid identity. scrub_env clears
+    // WEAVE_SESSION and points config at an empty dir, so neither --session nor
+    // cfg.session is set; only basename(cwd) can supply the identity.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let me = format!("weave-peer-{pid}-{nanos}");
+    let dir = std::env::temp_dir().join(&me);
+
+    let mut mcp = McpServer::spawn_full(&db, &["mcp"], &[], Some(&dir));
+
+    // weave_whoami must report the basename-derived identity (NOT "(unset ...)").
+    let (is_err, who) = mcp.call_tool("weave_whoami", serde_json::json!({}));
+    assert!(!is_err, "weave_whoami should not be an error: {who}");
+    assert!(
+        who.contains(&format!("identity:   {me}")),
+        "whoami should report basename(cwd) identity {me:?}; got: {who:?}"
+    );
+
+    // And a `from`-requiring tool must succeed WITHOUT an explicit identity,
+    // i.e. it must NOT error `'from' is required`.
+    let (is_err, send_text) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({"to": "envctl", "body": "hi from fallback"}),
+    );
+    assert!(
+        !is_err,
+        "weave_send with no explicit `from` should succeed via basename fallback, \
+         not error: {send_text}"
+    );
+    assert!(
+        !send_text.contains("'from' is required"),
+        "weave_send must not report \"'from' is required\": {send_text:?}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Regression: an explicit `--session <name>` must still win over the basename(cwd)
+// fallback (the new `.or_else` is last). Run the server with --session set AND in a
+// differently-named cwd; whoami must report the explicit name, not the basename.
+#[test]
+fn mcp_stdio_explicit_session_beats_basename_fallback() {
+    let db = TestDb::new();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let cwd_name = format!("weave-cwd-{pid}-{nanos}");
+    let dir = std::env::temp_dir().join(&cwd_name);
+    let explicit = "explicit-session";
+
+    let mut mcp = McpServer::spawn_full(&db, &["mcp", "--session", explicit], &[], Some(&dir));
+
+    let (is_err, who) = mcp.call_tool("weave_whoami", serde_json::json!({}));
+    assert!(!is_err, "weave_whoami should not be an error: {who}");
+    assert!(
+        who.contains(&format!("identity:   {explicit}")),
+        "explicit --session must win over basename(cwd); got: {who:?}"
+    );
+    assert!(
+        !who.contains(&cwd_name),
+        "basename(cwd) {cwd_name:?} must NOT override an explicit --session: {who:?}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // 2. CLI roundtrip
 // ---------------------------------------------------------------------------
@@ -986,19 +1069,27 @@ fn mcp_attach_upserts_and_rejects_bad_identity() {
         "attached peer is visible via weave_peers: {ptext:?}"
     );
 
-    // Failure: empty identity with no server default -> isError, nothing persisted.
-    let (eerr, etext) = mcp.call_tool("weave_attach", serde_json::json!({"me": ""}));
-    assert!(
-        eerr,
-        "empty identity must be an isError, not a silent persist: {etext}"
-    );
-
-    // Failure: oversized identity -> isError (MAX_IDENT_LEN cap).
+    // Failure: oversized identity -> isError (MAX_IDENT_LEN cap), even with a
+    // server default present.
     let huge = "x".repeat(100_000);
     let (herr, htext) = mcp.call_tool("weave_attach", serde_json::json!({"me": huge}));
     assert!(herr, "oversized identity must be an isError: {htext}");
 
     mcp.shutdown();
+
+    // Failure: empty identity with NO server default -> isError, nothing persisted.
+    // The server now falls back to basename(cwd) for its default identity, so to
+    // exercise the genuine "no default" path we run it in a degenerate cwd ("/",
+    // whose file_name() is None -> resolve_me yields "unknown" -> identity stays
+    // unset). Then an empty `me` has nothing to fall back to and must error.
+    let db2 = TestDb::new();
+    let mut mcp2 = McpServer::spawn_full(&db2, &["mcp"], &[], Some(Path::new("/")));
+    let (eerr, etext) = mcp2.call_tool("weave_attach", serde_json::json!({"me": ""}));
+    assert!(
+        eerr,
+        "empty identity with no server default must be an isError, not a silent persist: {etext}"
+    );
+    mcp2.shutdown();
 }
 
 /// `weave_connect` verdicts over MCP:

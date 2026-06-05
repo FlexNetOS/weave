@@ -34,6 +34,12 @@
   per-source failure isolation), and the bounded single-intent at-least-once contract
   is preserved.
 
+### Fixed
+- **mcp:** MCP stdio mode now resolves its server identity from `basename(cwd)`
+  (via the same `resolve_me()` the CLI uses) when neither the `--session` flag nor
+  `cfg.session` is set, so tools no longer error `'from' is required`. Only the
+  degenerate "unknown" cwd is left unset.
+
 ### Note
 - **store (sqlite, default build):** the default backend does **not** support remote
   sources — it skips any remote `peer_dbs` / `pull_from` entry with a loud stderr note
