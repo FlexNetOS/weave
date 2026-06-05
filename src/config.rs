@@ -26,22 +26,37 @@ pub enum StoreSource {
     /// A local store file path (existing behavior).
     Local(PathBuf),
     /// A remote libSQL/Turso endpoint. `token` is a SECRET (redacted in Debug,
-    /// never logged/injected/argv'd).
-    Remote { url: String, token: Option<String> },
+    /// never logged/injected/argv'd). `timeout_ms` is the resolved, clamped
+    /// per-source remote-call timeout (NOT a secret): `Some(ms)` ⇒ the store bounds
+    /// every connect/SELECT on this source by that value; `None` ⇒ the store falls
+    /// back to its global/default bound (identical to pre-per-source behavior). The
+    /// value is resolved in `config` (see [`per_source_timeout`]) so the store needs
+    /// no per-source context.
+    Remote {
+        url: String,
+        token: Option<String>,
+        timeout_ms: Option<u64>,
+    },
 }
 
 // Manual Debug that REDACTS the remote auth token (mirrors the `Config` Debug
 // redaction) so a `{:?}` can never leak the secret via a log line, panic message,
 // or error context. The URL is shown (it is not itself a secret), but the token is
-// only ever rendered as `<redacted>`.
+// only ever rendered as `<redacted>`. `timeout_ms` is a plain integer (not a
+// secret) and is shown verbatim.
 impl std::fmt::Debug for StoreSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreSource::Local(p) => f.debug_tuple("Local").field(p).finish(),
-            StoreSource::Remote { url, token } => f
+            StoreSource::Remote {
+                url,
+                token,
+                timeout_ms,
+            } => f
                 .debug_struct("Remote")
                 .field("url", url)
                 .field("token", &token.as_ref().map(|_| "<redacted>"))
+                .field("timeout_ms", timeout_ms)
                 .finish(),
         }
     }
@@ -69,6 +84,7 @@ pub fn classify_source(entry: &str) -> StoreSource {
         StoreSource::Remote {
             url: entry.to_string(),
             token: None,
+            timeout_ms: None,
         }
     } else {
         StoreSource::Local(PathBuf::from(entry))
@@ -192,6 +208,91 @@ fn per_source_token(label: Option<&str>, shared: Option<&str>) -> (Option<String
         Some(s) => (Some(s.to_string()), PullTokenTier::Shared),
         None => (None, PullTokenTier::None),
     }
+}
+
+/// Default wall-clock bound (ms) for a single REMOTE network call (connect or a
+/// SELECT). SINGLE SOURCE OF TRUTH: the store-layer fallback imports this const, so
+/// the config-resolved path and the store-fallback path can never disagree on the
+/// default (drift guard — mirrors the `BROADCAST_SQL` byte-identity discipline). A
+/// remote-call timeout is NEVER disabled (an unbounded remote could hang a drain).
+pub const REMOTE_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+
+/// Lower clamp on a resolved remote-call timeout: below this a remote can essentially
+/// never succeed, so a foot-gun `WEAVE_PULL_TIMEOUT_MS=1` is raised to a value that
+/// can plausibly connect rather than turning every remote into an instant skip.
+pub const MIN_TIMEOUT_MS: u64 = 50;
+
+/// Upper clamp on a resolved remote-call timeout (10 minutes): a generous hard ceiling
+/// so a hostile/garbage huge value (`WEAVE_PULL_TIMEOUT_MS=99999999999`) cannot make a
+/// drain hang ~forever. Mirrors the `clamp_limit` input-cap discipline.
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// Which timeout tier resolved for a remote source, for token-FREE `doctor`
+/// observability. A pure classification of WHERE the source's effective remote-call
+/// timeout came from. Mirrors [`PullTokenTier`]; carries no secret.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PullTimeoutTier {
+    /// A per-source `WEAVE_PULL_TIMEOUT_MS_<LABEL>` was set, sane, and applied.
+    PerSourceLabel,
+    /// The global `WEAVE_PULL_TIMEOUT_MS` applied (no valid per-source value).
+    Global,
+    /// Neither was set/valid ⇒ the hardcoded [`REMOTE_TIMEOUT_MS_DEFAULT`] applies.
+    Default,
+}
+
+/// Token-FREE per-source diagnostics bundle for a resolved REMOTE source: which token
+/// tier and which timeout tier resolved. Carries NO secret (no token bytes, no
+/// label↔token pairing) — only the two classifications, for `doctor` aggregation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RemoteTiers {
+    pub token: PullTokenTier,
+    pub timeout: PullTimeoutTier,
+}
+
+/// Parse + clamp a remote-call timeout env value: parse as `u64`, require `> 0`, and
+/// clamp into `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`. Returns `None` on an empty /
+/// unparsable / `0` value so the caller FALLS THROUGH to the next precedence tier
+/// (never disabling the bound). Pure; total on any input. A `0`/garbage value never
+/// disables the timeout — an unbounded remote could hang a drain.
+fn parse_clamp_timeout(s: &str) -> Option<u64> {
+    let n: u64 = s.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(n.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS))
+}
+
+/// Resolve a remote source's effective remote-call timeout (ms) by precedence,
+/// returning the resolved value AND the token-free [`PullTimeoutTier`] for
+/// diagnostics. Mirrors [`per_source_token`] exactly:
+///   1. per-source `WEAVE_PULL_TIMEOUT_MS_<LABEL>` (exact `env::var` lookup, when the
+///      entry carried a valid label AND the var parses+clamps via
+///      [`parse_clamp_timeout`]) ⇒ [`PullTimeoutTier::PerSourceLabel`];
+///   2. else the global `WEAVE_PULL_TIMEOUT_MS` (same parse+clamp) ⇒
+///      [`PullTimeoutTier::Global`];
+///   3. else `None` ⇒ [`PullTimeoutTier::Default`] (the store applies
+///      [`REMOTE_TIMEOUT_MS_DEFAULT`]).
+///
+/// `label` is already validated/uppercased. A per-source value that is set but
+/// unparsable / `0` / out-of-range FALLS THROUGH to the global (then default),
+/// mirroring the token `sanitize_token` fall-through. The returned `Option<u64>` is
+/// `Some(clamped_ms)` for tiers 1–2 and `None` for the default tier (the store
+/// supplies the default), so a `StoreSource::Remote` carrying `None` behaves exactly
+/// as today. Pure (env-reading); total on any label.
+fn per_source_timeout(label: Option<&str>) -> (Option<u64>, PullTimeoutTier) {
+    if let Some(l) = label {
+        if let Some(v) = nonempty(&format!("WEAVE_PULL_TIMEOUT_MS_{l}")) {
+            if let Some(ms) = parse_clamp_timeout(&v) {
+                return (Some(ms), PullTimeoutTier::PerSourceLabel);
+            }
+        }
+    }
+    if let Some(v) = nonempty("WEAVE_PULL_TIMEOUT_MS") {
+        if let Some(ms) = parse_clamp_timeout(&v) {
+            return (Some(ms), PullTimeoutTier::Global);
+        }
+    }
+    (None, PullTimeoutTier::Default)
 }
 
 /// Platform path-list separator accepted in `WEAVE_PEER_DBS` (in addition to the
@@ -742,7 +843,7 @@ impl Config {
     ) -> Vec<StoreSource> {
         self.resolve_store_sources_with_tiers(raw, cap, list_label)
             .into_iter()
-            .map(|(src, _tier)| src)
+            .map(|(src, _tiers)| src)
             .collect()
     }
 
@@ -754,13 +855,15 @@ impl Config {
     /// loop. The label is consumed here ONLY to look up its env var and to classify
     /// the tier; it NEVER travels on `StoreSource` and is never logged with the token.
     ///
-    /// `resolve_store_sources` discards the tier; `doctor` keeps it for observability.
+    /// `resolve_store_sources` discards the tiers; `doctor` keeps them for
+    /// observability. Every Local source pairs with `RemoteTiers { token: None,
+    /// timeout: Default }` (locals carry neither a token nor a remote timeout).
     fn resolve_store_sources_with_tiers(
         &self,
         raw: Option<&[String]>,
         cap: usize,
         list_label: &str,
-    ) -> Vec<(StoreSource, PullTokenTier)> {
+    ) -> Vec<(StoreSource, RemoteTiers)> {
         let raw = match raw {
             Some(v) => v,
             None => return Vec::new(),
@@ -769,7 +872,7 @@ impl Config {
         let local_canon = std::fs::canonicalize(&local).unwrap_or_else(|_| local.clone());
         let shared_token = self.pull_token.as_deref().and_then(sanitize_token);
 
-        let mut out: Vec<(StoreSource, PullTokenTier)> = Vec::new();
+        let mut out: Vec<(StoreSource, RemoteTiers)> = Vec::new();
         let mut seen_local: Vec<PathBuf> = Vec::new();
         let mut seen_remote: Vec<String> = Vec::new();
         for entry in raw {
@@ -792,7 +895,13 @@ impl Config {
                         continue;
                     }
                     seen_local.push(key);
-                    out.push((StoreSource::Local(path), PullTokenTier::None));
+                    out.push((
+                        StoreSource::Local(path),
+                        RemoteTiers {
+                            token: PullTokenTier::None,
+                            timeout: PullTimeoutTier::Default,
+                        },
+                    ));
                 }
                 StoreSource::Remote { url, .. } => {
                     let key = normalize_remote_url(&url);
@@ -800,8 +909,20 @@ impl Config {
                         continue;
                     }
                     seen_remote.push(key);
-                    let (token, tier) = per_source_token(label.as_deref(), shared_token.as_deref());
-                    out.push((StoreSource::Remote { url, token }, tier));
+                    let (token, token_tier) =
+                        per_source_token(label.as_deref(), shared_token.as_deref());
+                    let (timeout_ms, timeout_tier) = per_source_timeout(label.as_deref());
+                    out.push((
+                        StoreSource::Remote {
+                            url,
+                            token,
+                            timeout_ms,
+                        },
+                        RemoteTiers {
+                            token: token_tier,
+                            timeout: timeout_tier,
+                        },
+                    ));
                 }
             }
         }
@@ -829,8 +950,52 @@ impl Config {
         )
         .into_iter()
         .filter(|(src, _)| src.is_remote())
-        .map(|(_, tier)| tier)
+        .map(|(_, tiers)| tiers.token)
         .collect()
+    }
+
+    /// Token-FREE per-source TIMEOUT observability for `doctor` over the `peer_dbs`
+    /// Tier-1 federation set (the SAME set [`peer_db_remote_token_tiers`] reports
+    /// over). Returns, for every REMOTE source, its EFFECTIVE timeout (ms) paired with
+    /// the [`PullTimeoutTier`] that resolved it. The effective ms is the resolved
+    /// per-source/global value, or [`REMOTE_TIMEOUT_MS_DEFAULT`] when the source
+    /// resolves to the default tier. Locals are omitted (no remote timeout). Carries
+    /// no secret — only a plain integer + a tier classification.
+    pub fn peer_db_remote_timeout_tiers(&self) -> Vec<(u64, PullTimeoutTier)> {
+        self.remote_timeout_tiers(self.peer_dbs.as_deref(), MAX_PEER_DBS, "WEAVE_PEER_DBS")
+    }
+
+    /// `pull_from` analogue of [`peer_db_remote_timeout_tiers`]. The two share the same
+    /// LABEL namespace + resolution, so a labelled remote selects its
+    /// `WEAVE_PULL_TIMEOUT_MS_<LABEL>` whether it appears in `peer_dbs` or `pull_from`.
+    /// `doctor` aggregates over the `peer_dbs` set (matching the token-tier surface);
+    /// this sibling exposes the same view over the delivery set for callers/tests that
+    /// need the `pull_from` perspective — exercised by config unit/integration tests.
+    #[allow(dead_code)]
+    pub fn pull_from_remote_timeout_tiers(&self) -> Vec<(u64, PullTimeoutTier)> {
+        self.remote_timeout_tiers(self.pull_from.as_deref(), MAX_PULL_FROM, "WEAVE_PULL_FROM")
+    }
+
+    /// Shared resolver behind the two `*_remote_timeout_tiers` doctor methods: maps
+    /// each REMOTE source to `(effective_ms, tier)`, substituting
+    /// [`REMOTE_TIMEOUT_MS_DEFAULT`] for the default tier so `doctor` can report a
+    /// concrete effective ms range without re-implementing the store fallback.
+    fn remote_timeout_tiers(
+        &self,
+        raw: Option<&[String]>,
+        cap: usize,
+        list_label: &str,
+    ) -> Vec<(u64, PullTimeoutTier)> {
+        self.resolve_store_sources_with_tiers(raw, cap, list_label)
+            .into_iter()
+            .filter_map(|(src, tiers)| match src {
+                StoreSource::Remote { timeout_ms, .. } => Some((
+                    timeout_ms.unwrap_or(REMOTE_TIMEOUT_MS_DEFAULT),
+                    tiers.timeout,
+                )),
+                StoreSource::Local(_) => None,
+            })
+            .collect()
     }
 
     /// Tier-2 v2 inject-gate over a [`StoreSource`] (the [`StoreSource`] analogue of
@@ -1028,6 +1193,20 @@ pub const CONFIG_TEMPLATE: &str = "\
 # (`turso db tokens create <db> --read-only`) so the source is read-only at the
 # server, not just by weave's client-side guards.
 # pull_token = \"...\"
+
+# REMOTE-CALL TIMEOUT (ms) for each remote pull/federation source's connect + read.
+# This is NOT a config-file key; it is supplied via env. A per-source override rides
+# the SAME LABEL namespace as the per-source token, so one `LABEL=` prefix selects
+# BOTH that source's token and its timeout — and it applies to remotes in EITHER
+# pull_from OR peer_dbs. Precedence per remote source:
+#   WEAVE_PULL_TIMEOUT_MS_<LABEL>  (per-source, label uppercased)
+#     -> WEAVE_PULL_TIMEOUT_MS      (global)
+#     -> 5000 (default).
+# The value is parsed as a positive integer and CLAMPED to [50, 600000] ms; a
+# 0/unparsable/out-of-range value FALLS THROUGH to the next tier (the bound is NEVER
+# disabled — an unbounded remote could hang a drain). `weave doctor` reports the
+# per-source / global / default tier counts and the effective ms range (never a
+# token). Example: WEAVE_PULL_TIMEOUT_MS_PROD=250 WEAVE_PULL_TIMEOUT_MS=1000
 
 # Consent for live injection on a PULLED cross-store message (DEFAULT: true).
 # When a pull commits a message from an allow-listed source, weave ALSO fires a
@@ -1398,9 +1577,14 @@ mod tests {
             "ws://localhost:9000",
         ] {
             match classify_source(url) {
-                StoreSource::Remote { url: got, token } => {
+                StoreSource::Remote {
+                    url: got,
+                    token,
+                    timeout_ms,
+                } => {
                     assert_eq!(got, url, "URL preserved verbatim (no canonicalization)");
                     assert!(token.is_none(), "classify never attaches a token");
+                    assert!(timeout_ms.is_none(), "classify never attaches a timeout");
                 }
                 StoreSource::Local(_) => panic!("{url:?} must classify Remote"),
             }
@@ -1456,7 +1640,7 @@ mod tests {
             StoreSource::Local(PathBuf::from("/tmp/local-a.db"))
         );
         match &sources[1] {
-            StoreSource::Remote { url, token } => {
+            StoreSource::Remote { url, token, .. } => {
                 assert_eq!(url, "libsql://h.turso.io");
                 assert_eq!(
                     token.as_deref(),
@@ -1467,7 +1651,7 @@ mod tests {
             other => panic!("expected libsql remote, got {other:?}"),
         }
         match &sources[2] {
-            StoreSource::Remote { url, token } => {
+            StoreSource::Remote { url, token, .. } => {
                 assert_eq!(url, "https://h2.turso.io");
                 assert_eq!(token.as_deref(), Some("secret-jwt"));
             }
@@ -1512,6 +1696,7 @@ mod tests {
         let remote = StoreSource::Remote {
             url: "libsql://db.turso.io".to_string(),
             token: Some(SECRET.to_string()),
+            timeout_ms: None,
         };
         let dbg = format!("{remote:?}");
         assert!(
@@ -1595,12 +1780,14 @@ mod tests {
         let trusted = StoreSource::Remote {
             url: "libsql://trusted.turso.io/".to_string(), // trailing slash → normalized match
             token: None,
+            timeout_ms: None,
         };
         assert!(cfg.inject_allowed_from_source(&trusted));
 
         let untrusted = StoreSource::Remote {
             url: "libsql://evil.turso.io".to_string(),
             token: None,
+            timeout_ms: None,
         };
         assert!(!cfg.inject_allowed_from_source(&untrusted));
 
@@ -1708,7 +1895,7 @@ mod tests {
         // Valid label + remote URL ⇒ label uppercased, Remote on <rest>.
         let (label, src) = parse_labeled_source("PROD=libsql://prod.turso.io");
         assert_eq!(label.as_deref(), Some("PROD"));
-        assert!(matches!(&src, StoreSource::Remote { url, token }
+        assert!(matches!(&src, StoreSource::Remote { url, token, .. }
             if url == "libsql://prod.turso.io" && token.is_none()));
 
         // lowercase label is uppercased for the env lookup.
@@ -1824,14 +2011,14 @@ mod tests {
         let sources = cfg.pull_from_sources();
         assert_eq!(sources.len(), 2);
         match &sources[0] {
-            StoreSource::Remote { url, token } => {
+            StoreSource::Remote { url, token, .. } => {
                 assert_eq!(url, "libsql://prod.turso.io");
                 assert_eq!(token.as_deref(), Some("prod-only-jwt"));
             }
             other => panic!("expected labelled remote, got {other:?}"),
         }
         match &sources[1] {
-            StoreSource::Remote { url, token } => {
+            StoreSource::Remote { url, token, .. } => {
                 assert_eq!(url, "libsql://shared.turso.io");
                 assert_eq!(token.as_deref(), Some("shared-jwt"));
             }
@@ -1937,6 +2124,198 @@ mod tests {
         assert!(cfg.pull_token.is_none());
     }
 
+    // ---------------------------------------------------------------------
+    // Per-source remote-call timeout (WEAVE_PULL_TIMEOUT_MS[_<LABEL>]).
+    // ---------------------------------------------------------------------
+
+    /// `parse_clamp_timeout`: a sane value passes through; `0`/non-numeric ⇒ `None`
+    /// (the caller falls through); below `MIN` clamps UP; above `MAX` clamps DOWN; the
+    /// exact bounds are accepted unchanged. NEVER disables the bound.
+    #[test]
+    fn parse_clamp_timeout_cases() {
+        assert_eq!(parse_clamp_timeout("200"), Some(200));
+        assert_eq!(
+            parse_clamp_timeout("0"),
+            None,
+            "0 falls through (never disable)"
+        );
+        assert_eq!(
+            parse_clamp_timeout("-5"),
+            None,
+            "u64 parse fails on negative"
+        );
+        assert_eq!(parse_clamp_timeout("abc"), None);
+        assert_eq!(parse_clamp_timeout(""), None);
+        assert_eq!(
+            parse_clamp_timeout("10"),
+            Some(MIN_TIMEOUT_MS),
+            "clamped UP to MIN"
+        );
+        assert_eq!(
+            parse_clamp_timeout("99999999"),
+            Some(MAX_TIMEOUT_MS),
+            "clamped DOWN to MAX"
+        );
+        assert_eq!(
+            parse_clamp_timeout(&MIN_TIMEOUT_MS.to_string()),
+            Some(MIN_TIMEOUT_MS)
+        );
+        assert_eq!(
+            parse_clamp_timeout(&MAX_TIMEOUT_MS.to_string()),
+            Some(MAX_TIMEOUT_MS)
+        );
+        // Surrounding whitespace is trimmed before parsing.
+        assert_eq!(parse_clamp_timeout("  250  "), Some(250));
+    }
+
+    /// `per_source_timeout` precedence (mirrors `per_source_token`): a sane label-env
+    /// wins (tier `PerSourceLabel`); a set-but-garbage label-env falls THROUGH to the
+    /// global (tier `Global`); per-source + global both set ⇒ per-source wins; neither
+    /// set ⇒ `(None, Default)`.
+    #[test]
+    fn per_source_timeout_precedence() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let label_var = "WEAVE_PULL_TIMEOUT_MS_TOTEST";
+        let global_var = "WEAVE_PULL_TIMEOUT_MS";
+        std::env::remove_var(label_var);
+        std::env::remove_var(global_var);
+
+        // Neither set ⇒ default tier, no resolved value (store applies its default).
+        let (ms, tier) = per_source_timeout(Some("TOTEST"));
+        assert!(ms.is_none());
+        assert_eq!(tier, PullTimeoutTier::Default);
+
+        // Label-env set + sane ⇒ per-source, clamped, tier PerSourceLabel.
+        std::env::set_var(label_var, "250");
+        let (ms, tier) = per_source_timeout(Some("TOTEST"));
+        assert_eq!(ms, Some(250));
+        assert_eq!(tier, PullTimeoutTier::PerSourceLabel);
+
+        // Per-source + global both set ⇒ per-source wins.
+        std::env::set_var(global_var, "1000");
+        let (ms, tier) = per_source_timeout(Some("TOTEST"));
+        assert_eq!(ms, Some(250));
+        assert_eq!(tier, PullTimeoutTier::PerSourceLabel);
+
+        // Per-source garbage ⇒ falls THROUGH to the global (tier Global).
+        std::env::set_var(label_var, "0");
+        let (ms, tier) = per_source_timeout(Some("TOTEST"));
+        assert_eq!(ms, Some(1000));
+        assert_eq!(tier, PullTimeoutTier::Global);
+
+        // No label, only global set ⇒ Global.
+        std::env::remove_var(label_var);
+        let (ms, tier) = per_source_timeout(None);
+        assert_eq!(ms, Some(1000));
+        assert_eq!(tier, PullTimeoutTier::Global);
+
+        // Global garbage + no label ⇒ default tier.
+        std::env::set_var(global_var, "notanumber");
+        let (ms, tier) = per_source_timeout(None);
+        assert!(ms.is_none());
+        assert_eq!(tier, PullTimeoutTier::Default);
+
+        std::env::remove_var(global_var);
+    }
+
+    /// End-to-end: `resolve_store_sources_with_tiers` carries the clamped per-source
+    /// timeout onto `StoreSource::Remote.timeout_ms` and reports the `PerSourceLabel`
+    /// timeout tier, while a second unlabelled remote (only the global set) reports the
+    /// `Global` tier. The `source_cursor_key`-relevant URL is untouched by the timeout.
+    #[test]
+    fn resolve_store_sources_carries_per_source_timeout_and_tier() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let label_var = "WEAVE_PULL_TIMEOUT_MS_PROD";
+        let global_var = "WEAVE_PULL_TIMEOUT_MS";
+        std::env::set_var(label_var, "250");
+        std::env::set_var(global_var, "1000");
+
+        let cfg = Config {
+            pull_from: Some(vec![
+                "PROD=libsql://prod.turso.io".to_string(),
+                "libsql://shared.turso.io".to_string(),
+            ]),
+            ..Config::default()
+        };
+        let resolved = cfg.resolve_store_sources_with_tiers(
+            cfg.pull_from.as_deref(),
+            MAX_PULL_FROM,
+            "WEAVE_PULL_FROM",
+        );
+        assert_eq!(resolved.len(), 2);
+
+        // Labelled remote: clamped per-source ms + PerSourceLabel tier.
+        match &resolved[0] {
+            (
+                StoreSource::Remote {
+                    url, timeout_ms, ..
+                },
+                tiers,
+            ) => {
+                assert_eq!(url, "libsql://prod.turso.io");
+                assert_eq!(*timeout_ms, Some(250));
+                assert_eq!(tiers.timeout, PullTimeoutTier::PerSourceLabel);
+            }
+            other => panic!("expected labelled remote, got {other:?}"),
+        }
+        // Unlabelled remote: falls back to the global ms + Global tier.
+        match &resolved[1] {
+            (
+                StoreSource::Remote {
+                    url, timeout_ms, ..
+                },
+                tiers,
+            ) => {
+                assert_eq!(url, "libsql://shared.turso.io");
+                assert_eq!(*timeout_ms, Some(1000));
+                assert_eq!(tiers.timeout, PullTimeoutTier::Global);
+            }
+            other => panic!("expected unlabelled remote, got {other:?}"),
+        }
+
+        // The doctor timeout-tier method reports effective ms within [MIN, MAX].
+        let tiers = cfg.pull_from_remote_timeout_tiers();
+        assert_eq!(tiers.len(), 2);
+        for (ms, _) in &tiers {
+            assert!(*ms >= MIN_TIMEOUT_MS && *ms <= MAX_TIMEOUT_MS);
+        }
+
+        std::env::remove_var(label_var);
+        std::env::remove_var(global_var);
+    }
+
+    /// A labelled remote with NO timeout env set resolves to the `Default` tier and the
+    /// doctor method substitutes `REMOTE_TIMEOUT_MS_DEFAULT` as the effective ms.
+    #[test]
+    fn resolve_store_sources_timeout_defaults_when_unset() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_NOENVDB");
+
+        let cfg = Config {
+            pull_from: Some(vec!["NOENVDB=libsql://h.turso.io".to_string()]),
+            ..Config::default()
+        };
+        let tiers = cfg.pull_from_remote_timeout_tiers();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].1, PullTimeoutTier::Default);
+        assert_eq!(
+            tiers[0].0, REMOTE_TIMEOUT_MS_DEFAULT,
+            "default tier reports REMOTE_TIMEOUT_MS_DEFAULT as effective ms"
+        );
+    }
+
+    /// The template documents `WEAVE_PULL_TIMEOUT_MS[_<LABEL>]`, the precedence, the
+    /// clamp bounds, and that the LABEL namespace covers BOTH pull_from and peer_dbs.
+    #[test]
+    fn template_documents_per_source_timeout() {
+        assert!(CONFIG_TEMPLATE.contains("WEAVE_PULL_TIMEOUT_MS_<LABEL>"));
+        assert!(CONFIG_TEMPLATE.contains("WEAVE_PULL_TIMEOUT_MS"));
+        assert!(CONFIG_TEMPLATE.contains("peer_dbs"));
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert!(cfg.pull_token.is_none());
+    }
+
     // ---- proptest: classify_source totality + resolve ordering/dedup ----
 
     use proptest::prelude::*;
@@ -1957,9 +2336,10 @@ mod tests {
             let got = classify_source(&s);
             let expect_remote = REMOTE_SCHEMES.iter().any(|p| s.starts_with(p));
             prop_assert_eq!(got.is_remote(), expect_remote);
-            if let StoreSource::Remote { url, token } = got {
+            if let StoreSource::Remote { url, token, timeout_ms } = got {
                 prop_assert_eq!(url, s);
                 prop_assert!(token.is_none());
+                prop_assert!(timeout_ms.is_none());
             }
         }
 
@@ -1989,6 +2369,25 @@ mod tests {
         fn is_valid_label_is_total_and_case_invariant(s in ".*") {
             let v = is_valid_label(&s);
             prop_assert_eq!(v, is_valid_label(&s.to_ascii_uppercase()));
+        }
+
+        /// `parse_clamp_timeout` is TOTAL on arbitrary input: it never panics, and any
+        /// `Some(n)` it returns lies within `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]` (the
+        /// bound is never disabled and never escapes the clamp).
+        #[test]
+        fn parse_clamp_timeout_is_total_and_bounded(s in ".*") {
+            if let Some(n) = parse_clamp_timeout(&s) {
+                prop_assert!(n >= MIN_TIMEOUT_MS);
+                prop_assert!(n <= MAX_TIMEOUT_MS);
+            }
+        }
+
+        /// `per_source_timeout` is TOTAL on arbitrary label strings: no panic. (Only
+        /// env presence varies the result; here we exercise label totality, not the
+        /// env, so the resolved value/tier is not asserted.)
+        #[test]
+        fn per_source_timeout_is_total_on_arbitrary_label(s in ".*") {
+            let _ = per_source_timeout(Some(&s));
         }
 
         /// `resolve_store_sources` is IDEMPOTENT under dedup and stable in order:

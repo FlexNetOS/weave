@@ -706,7 +706,7 @@ A delivery / federation source need not be a local file. A `StoreSource` (define
 - **Per-source token resolution.** A source-list entry may carry an inline
   `LABEL=<remote-url>` prefix that selects a distinct token from the env var
   `WEAVE_PULL_TOKEN_<LABEL>`. Resolution is **entirely in `config`** — `StoreSource`
-  is unchanged (`Remote { url, token }`, no `label` field): a private
+  carries no `label` field (`Remote { url, token, timeout_ms }`): a private
   `parse_labeled_source` splits and validates the label (`is_valid_label`: non-empty,
   ≤ `MAX_LABEL_LEN` = 64, charset `[A-Za-z0-9_]`, uppercased), and only treats the
   prefix as a label when the right side classifies as a remote URL — otherwise the
@@ -718,7 +718,10 @@ A delivery / federation source need not be a local file. A `StoreSource` (define
   is consumed to build the env-var name and never travels on `StoreSource`, into a log,
   or adjacent to a token. An unlabelled (or invalid-label) entry resolves identically
   to before, so the change is backward compatible. The label is not a secret (it names
-  the env var); the token is, and must never be inlined.
+  the env var); the token is, and must never be inlined. Because `peer_db_sources` and
+  `pull_from_sources` both call the SAME `resolve_store_sources`, the LABEL namespace
+  (and per-source token) covers remotes in **both** `peer_dbs` and `pull_from` — there
+  is one resolver, no second token scheme.
 - **Token hygiene.** The token is capped at `MAX_TOKEN_LEN` (8192) with control chars
   rejected (`sanitize_token`), redacted to `<redacted>` by the manual `Debug` on
   `StoreSource::Remote` and on `Config`, and reaches **only** `Builder::new_remote` —
@@ -734,6 +737,25 @@ A delivery / federation source need not be a local file. A `StoreSource` (define
   skip** (the existing failure-isolation path: note on stderr, continue), and because
   commits land local-only with a per-intent local cursor advance, the bounded
   single-intent at-least-once / one-intent-per-crash guarantee is preserved unchanged.
+- **Per-source remote-call timeout.** The timeout that bounds each remote call is
+  resolvable per source on the SAME LABEL namespace as the token, via
+  `WEAVE_PULL_TIMEOUT_MS_<LABEL>` (precedence **per-source → global
+  `WEAVE_PULL_TIMEOUT_MS` → `REMOTE_TIMEOUT_MS_DEFAULT` (5000 ms)**). It resolves in
+  `config` (`per_source_timeout`, mirroring `per_source_token`) — values parsed and
+  **clamped to `[MIN_TIMEOUT_MS=50, MAX_TIMEOUT_MS=600000]` ms**; a `0`/unparsable/
+  out-of-range value falls through to the next tier (the bound is never disabled). The
+  resolved value is carried to the store on the new `StoreSource::Remote.timeout_ms`
+  field (NOT a secret; shown verbatim in `Debug`) — it does **not** enter
+  `source_cursor_key` (two configs differing only in timeout share one cursor). The
+  libSQL backend threads it through `open_readonly_remote(url, token, timeout_ms)` and
+  stores it on `LibsqlStore.remote_timeout` so `remote_timeout_for(Option<u64>)` bounds
+  both the connect and the read SELECTs; `None` ⇒ the global/default fallback (identical
+  to before). `REMOTE_TIMEOUT_MS_DEFAULT` is **owned by `config`** as the single source
+  of truth and imported by the store, so the config-resolved and store-fallback paths
+  cannot drift. `weave doctor` / `weave_doctor` print a token-free `remote timeout:`
+  line (per-source / global / default tier counts via `PullTimeoutTier` +
+  `peer_db_remote_timeout_tiers`, plus the effective ms range) — never adjacent to a
+  token, never a token byte.
 
 ### Consent nudge on a pulled message — DEFAULT ON
 

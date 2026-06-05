@@ -1056,6 +1056,28 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             out.push_str(&format!(
                 "\n  remote tokens:  {per_source} per-source, {shared} shared, {none} none"
             ));
+            // Token-FREE per-source TIMEOUT-tier observability, parity with the CLI
+            // `weave doctor`. Only aggregate tier counts + an effective ms range; never
+            // a token byte. The result string is the JSON-RPC tool RESULT (stdout
+            // frame); all skip/timeout diagnostics stay on stderr.
+            let timeout_tiers = crate::config::Config::load().peer_db_remote_timeout_tiers();
+            let t_per_source = timeout_tiers
+                .iter()
+                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::PerSourceLabel)
+                .count();
+            let t_global = timeout_tiers
+                .iter()
+                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::Global)
+                .count();
+            let t_default = timeout_tiers
+                .iter()
+                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::Default)
+                .count();
+            let tmin = timeout_tiers.iter().map(|(ms, _)| *ms).min().unwrap_or(0);
+            let tmax = timeout_tiers.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
+            out.push_str(&format!(
+                "\n  remote timeout: {t_per_source} per-source, {t_global} global, {t_default} default (effective {tmin}-{tmax} ms)"
+            ));
             if !cfg!(feature = "libsql") {
                 out.push_str(&format!(
                     "\n  note: {remote_count} remote source(s) skipped — rebuild weave with --features libsql to use them"

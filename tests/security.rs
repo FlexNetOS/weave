@@ -523,6 +523,93 @@ fn federation_junk_path_cannot_escalate_to_a_write() {
     );
 }
 
+/// Secret-hygiene (Feature #2): `weave doctor` must NEVER print a configured pull
+/// token byte — in `--json`, in the human form, OR in the MCP `weave_doctor` tool
+/// result — even with a per-source token, a shared token, AND a per-source timeout
+/// all set. The new per-source-timeout observability prints only tier COUNTS + a
+/// plain ms range, never a token or a label↔token pairing. Holds on both backends.
+#[test]
+fn doctor_never_prints_pull_token() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const PER_SOURCE: &str = "doctor-redact-per-source-token-XYZ";
+    const SHARED: &str = "doctor-redact-shared-token-QRS";
+    let entry = "PROD=libsql://redact.invalid/db";
+
+    let env: &[(&str, &str)] = &[
+        ("WEAVE_PEER_DBS", entry),
+        ("WEAVE_PULL_TOKEN_PROD", PER_SOURCE),
+        ("WEAVE_PULL_TOKEN", SHARED),
+        ("WEAVE_PULL_TIMEOUT_MS_PROD", "250"),
+        ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+    ];
+
+    // (1) doctor --json — neither token in stdout/stderr.
+    let (ok_j, out_j, err_j) = run_env(&local, &["doctor", "--json"], env);
+    assert!(ok_j, "doctor --json must succeed; stderr:\n{err_j}");
+    assert!(
+        !out_j.contains(PER_SOURCE),
+        "per-source token in json stdout: {out_j}"
+    );
+    assert!(
+        !err_j.contains(PER_SOURCE),
+        "per-source token in json stderr: {err_j}"
+    );
+    assert!(
+        !out_j.contains(SHARED),
+        "shared token in json stdout: {out_j}"
+    );
+    assert!(
+        !err_j.contains(SHARED),
+        "shared token in json stderr: {err_j}"
+    );
+
+    // (2) doctor (human) — neither token in stdout/stderr.
+    let (ok_h, out_h, err_h) = run_env(&local, &["doctor"], env);
+    assert!(ok_h, "human doctor must succeed; stderr:\n{err_h}");
+    assert!(
+        !out_h.contains(PER_SOURCE),
+        "per-source token in human stdout: {out_h}"
+    );
+    assert!(
+        !err_h.contains(PER_SOURCE),
+        "per-source token in human stderr: {err_h}"
+    );
+    assert!(
+        !out_h.contains(SHARED),
+        "shared token in human stdout: {out_h}"
+    );
+    assert!(
+        !err_h.contains(SHARED),
+        "shared token in human stderr: {err_h}"
+    );
+    // Sanity: the new timeout observability line is actually present (so the
+    // redaction assertion above is exercising the new surface, not a no-op).
+    assert!(
+        out_h.contains("remote timeout:"),
+        "human doctor must surface the per-source timeout line: {out_h}"
+    );
+
+    // (3) MCP weave_doctor tool result — neither token in the result text.
+    let mut mcp = McpServer::spawn_env(&local, env);
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "MCP doctor is not a tool error: {dtext}");
+    assert!(
+        !dtext.contains(PER_SOURCE),
+        "per-source token in MCP doctor result: {dtext}"
+    );
+    assert!(
+        !dtext.contains(SHARED),
+        "shared token in MCP doctor result: {dtext}"
+    );
+    assert!(
+        dtext.contains("remote timeout:"),
+        "MCP doctor must surface the per-source timeout line: {dtext}"
+    );
+    mcp.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Tier-2 cross-store delivery — owner-only-writes and authorization hardening.
 // ---------------------------------------------------------------------------

@@ -625,6 +625,25 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         .iter()
         .filter(|t| **t == config::PullTokenTier::None)
         .count();
+    // Token-FREE per-source TIMEOUT-tier observability: where each remote source's
+    // effective remote-call timeout came from (per-source label / global / default)
+    // plus the effective ms range over the remotes. NEVER prints a token byte or the
+    // label↔timeout↔token pairing — only aggregate tier COUNTS + a plain ms range.
+    let timeout_tiers = cfg.peer_db_remote_timeout_tiers();
+    let timeout_per_source = timeout_tiers
+        .iter()
+        .filter(|(_, t)| *t == config::PullTimeoutTier::PerSourceLabel)
+        .count();
+    let timeout_global = timeout_tiers
+        .iter()
+        .filter(|(_, t)| *t == config::PullTimeoutTier::Global)
+        .count();
+    let timeout_default = timeout_tiers
+        .iter()
+        .filter(|(_, t)| *t == config::PullTimeoutTier::Default)
+        .count();
+    let timeout_ms_min = timeout_tiers.iter().map(|(ms, _)| *ms).min();
+    let timeout_ms_max = timeout_tiers.iter().map(|(ms, _)| *ms).max();
     let total = store.total_messages()?;
     let claude = inject::have("claude");
     let db = cfg.db_path();
@@ -634,32 +653,53 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let db_default = config::default_db_path();
     let db_is_default = db == db_default;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "backend": store.backend(),
-                "db_path": db.to_string_lossy(),
-                "db_is_default": db_is_default,
-                "config_path": config::config_path().to_string_lossy(),
-                "current_mux": target.mux.as_str(),
-                "current_target": target.id,
-                "injectable_here": target.injectable(),
-                "total_messages": total,
-                "peers": total_peers,
-                "peers_online": online,
-                "peers_tagged": tagged,
-                "claude_on_path": claude,
-                "federation_stores": extra.len(),
-                "federation_stores_ok": fed_ok,
-                "federation_stores_skipped": fed_skipped,
-                "federation_remote_stores": remote_count,
-                "federation_remote_unsupported": remote_unsupported,
-                "federation_remote_token_per_source": token_per_source,
-                "federation_remote_token_shared": token_shared,
-                "federation_remote_token_none": token_none,
-            }))?
-        );
+        let mut report = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "backend": store.backend(),
+            "db_path": db.to_string_lossy(),
+            "db_is_default": db_is_default,
+            "config_path": config::config_path().to_string_lossy(),
+            "current_mux": target.mux.as_str(),
+            "current_target": target.id,
+            "injectable_here": target.injectable(),
+            "total_messages": total,
+            "peers": total_peers,
+            "peers_online": online,
+            "peers_tagged": tagged,
+            "claude_on_path": claude,
+            "federation_stores": extra.len(),
+            "federation_stores_ok": fed_ok,
+            "federation_stores_skipped": fed_skipped,
+            "federation_remote_stores": remote_count,
+            "federation_remote_unsupported": remote_unsupported,
+            "federation_remote_token_per_source": token_per_source,
+            "federation_remote_token_shared": token_shared,
+            "federation_remote_token_none": token_none,
+        });
+        // Additive (token-free) per-source timeout observability — only when there is
+        // at least one remote source, so the surface is unchanged for local-only
+        // configs. min/max are the effective-ms bound over the remotes.
+        if remote_count > 0 {
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert(
+                    "federation_remote_timeout_per_source".into(),
+                    timeout_per_source.into(),
+                );
+                obj.insert(
+                    "federation_remote_timeout_global".into(),
+                    timeout_global.into(),
+                );
+                obj.insert(
+                    "federation_remote_timeout_default".into(),
+                    timeout_default.into(),
+                );
+                if let (Some(min), Some(max)) = (timeout_ms_min, timeout_ms_max) {
+                    obj.insert("federation_remote_timeout_ms_min".into(), min.into());
+                    obj.insert("federation_remote_timeout_ms_max".into(), max.into());
+                }
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let tgt = if target.id.is_empty() {
             "-"
@@ -692,6 +732,10 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 println!("  remote sources: {remote_count} configured");
                 println!(
                     "  remote tokens:  {token_per_source} per-source, {token_shared} shared, {token_none} none"
+                );
+                let (tmin, tmax) = (timeout_ms_min.unwrap_or(0), timeout_ms_max.unwrap_or(0));
+                println!(
+                    "  remote timeout: {timeout_per_source} per-source, {timeout_global} global, {timeout_default} default (effective {tmin}-{tmax} ms)"
                 );
                 if remote_unsupported > 0 {
                     println!(

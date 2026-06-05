@@ -504,6 +504,36 @@ cases assert which token tier wins and that no token ever leaks — never live a
   the libsql build (unreachable host + short timeout, skipped) — resolution and the
   secret-never-printed invariant are asserted, not a real connection.
 
+The same integration cases ALSO prove the per-source token covers `peer_dbs`
+(`WEAVE_PEER_DBS`) federation remotes (item-2 confirmation): a `WEAVE_PEER_DBS="LABEL=libsql://…"` remote with its
+own `WEAVE_PULL_TOKEN_<LABEL>` resolves the `PerSourceLabel` token tier in `weave
+doctor --json` (proving the LABEL namespace reaches `peer_dbs`, since
+`peer_db_sources` and `pull_from_sources` share one resolver), with neither token byte
+printed. No second peer_db token resolver exists or is tested.
+
+#### Per-source remote-call timeout (`WEAVE_PULL_TIMEOUT_MS[_<LABEL>]`)
+
+The per-source timeout is tested as **resolution + clamp + doctor observability**,
+hermetically — never a real network bound:
+
+- **Unit (`config`):** `parse_clamp_timeout` (`"200"`→`Some(200)`; `"0"`/`"abc"`/`""`/
+  negative → `None`; `"10"`→`Some(50)` clamp-UP; `"99999999"`→`Some(600000)` clamp-DOWN;
+  the exact bounds pass through) plus a **proptest** that it is total on arbitrary input
+  and any `Some(n)` is within `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`. `per_source_timeout`
+  precedence (per-source label-env wins; set-but-garbage falls through to the global;
+  global-only → `Global`; neither → `(None, Default)`), serialized via the env guard.
+  `resolve_store_sources_with_tiers` carries the clamped `timeout_ms` onto
+  `StoreSource::Remote` and returns the `PerSourceLabel` / `Global` timeout tier, and
+  the default-tier doctor method substitutes `REMOTE_TIMEOUT_MS_DEFAULT`.
+- **Integration (scrubbed env, both backends):** a labelled remote with
+  `WEAVE_PULL_TIMEOUT_MS_<LABEL>` + a global `WEAVE_PULL_TIMEOUT_MS` ⇒ `weave doctor
+  --json` reports `federation_remote_timeout_{per_source,global,default}` counts and a
+  `federation_remote_timeout_ms_{min,max}` range within `[50, 600000]`; the human
+  doctor and the MCP `weave_doctor` carry a `remote timeout:` line. The counts hold on
+  BOTH backends (resolution is backend-agnostic); the libsql-only skip note is gated by
+  `cfg!(feature="libsql")`. No token byte appears in any timeout output (the security
+  redaction test configures a token + a per-source timeout together).
+
 ## 7. Benchmarks (`benches/weave_bench.rs`, criterion)
 
 A `criterion` harness (`harness = false` in `Cargo.toml`) tracks the costs that

@@ -58,6 +58,20 @@
   `tokio::time::timeout`; a failed or timed-out remote is skipped (existing
   per-source failure isolation), and the bounded single-intent at-least-once contract
   is preserved.
+- **config:** **per-source remote-call timeout.** The remote connect/SELECT bound is
+  now resolvable per source via `WEAVE_PULL_TIMEOUT_MS_<LABEL>`, riding the SAME LABEL
+  namespace (and `LABEL=` prefix) as the per-source token, with precedence **per-source
+  `WEAVE_PULL_TIMEOUT_MS_<LABEL>` → global `WEAVE_PULL_TIMEOUT_MS` → default (5000 ms)**.
+  Values are parsed and **clamped to `[50, 600000]` ms**; a `0`/unparsable/out-of-range
+  value falls through to the next tier (the bound is never disabled). The resolved value
+  is carried to the libSQL backend on a new `StoreSource::Remote.timeout_ms` field and
+  bounds both the connect and the read SELECTs. `REMOTE_TIMEOUT_MS_DEFAULT` now lives in
+  `config` as the single source of truth (the store fallback imports it). `weave doctor`
+  and `weave_doctor` gain a token-free `remote timeout:` line (per-source / global /
+  default tier counts + effective ms range) and the JSON keys
+  `federation_remote_timeout_{per_source,global,default}` and
+  `federation_remote_timeout_ms_{min,max}`. The LABEL namespace + per-source token are
+  confirmed to cover **both** `pull_from` and `peer_dbs` remotes (one shared resolver).
 
 ### Fixed
 - **mcp:** MCP stdio mode now resolves its server identity from `basename(cwd)`

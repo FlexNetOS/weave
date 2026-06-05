@@ -2897,6 +2897,254 @@ fn mcp_doctor_per_source_token_tier_is_token_free() {
     mcp.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Feature #2 — per-source remote-call TIMEOUT (WEAVE_PULL_TIMEOUT_MS[_<LABEL>]),
+// surfaced in `weave doctor` (CLI + MCP). Hermetic (NO network): `.invalid`
+// hosts + a short global timeout so the libsql build never waits on a real
+// connect. These assert RESOLUTION + the doctor timeout-tier observability and
+// the secret-hygiene invariant (no token byte ever reaches stdout/stderr); the
+// resolution is backend-agnostic, so the COUNTS hold on BOTH builds.
+// ---------------------------------------------------------------------------
+
+/// `weave doctor --json` reports per-source timeout-tier counts: a labelled
+/// remote with `WEAVE_PULL_TIMEOUT_MS_<LABEL>` set resolves the per-source tier,
+/// while a sibling unlabelled remote with only the global `WEAVE_PULL_TIMEOUT_MS`
+/// resolves the global tier. The effective ms min/max stay within the clamp
+/// bounds `[50, 600000]`. A second human-form doctor surfaces the `remote
+/// timeout:` line. Counts hold on BOTH backends (resolution is backend-agnostic).
+#[test]
+fn doctor_reports_per_source_timeout() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    // PROD is labelled (per-source 250ms); the second entry is unlabelled and
+    // falls back to the global 1000ms. Both `.invalid` so libsql never connects.
+    let peer_dbs = "PROD=libsql://h.invalid,libsql://g.invalid";
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", peer_dbs),
+            ("WEAVE_PULL_TIMEOUT_MS_PROD", "250"),
+            ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_stores"].as_u64(),
+        Some(2),
+        "two remote sources configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_per_source"].as_u64(),
+        Some(1),
+        "the labelled PROD remote resolves the per-source timeout tier: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_global"].as_u64(),
+        Some(1),
+        "the unlabelled remote falls back to the global timeout tier: {out}"
+    );
+    let min = v["federation_remote_timeout_ms_min"]
+        .as_u64()
+        .expect("ms_min present when remotes configured");
+    let max = v["federation_remote_timeout_ms_max"]
+        .as_u64()
+        .expect("ms_max present when remotes configured");
+    assert!(
+        (50..=600_000).contains(&min) && (50..=600_000).contains(&max),
+        "effective ms within clamp bounds: min={min} max={max} ({out})"
+    );
+    assert_eq!(min, 250, "min effective ms is the per-source 250: {out}");
+    assert_eq!(max, 1000, "max effective ms is the global 1000: {out}");
+
+    // The human form surfaces the per-source timeout line (token-free).
+    let (ok2, out2, err2) = run_env(
+        &local,
+        &["doctor"],
+        &[
+            ("WEAVE_PEER_DBS", peer_dbs),
+            ("WEAVE_PULL_TIMEOUT_MS_PROD", "250"),
+            ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+        ],
+    );
+    assert!(ok2, "human doctor must succeed; stderr:\n{err2}");
+    assert!(
+        out2.contains("remote timeout:"),
+        "human doctor surfaces the per-source timeout line: {out2}"
+    );
+
+    if cfg!(feature = "libsql") {
+        // The libsql build actually attempts the (unreachable) remotes and
+        // diagnoses them as skipped federated stores on stderr (never fatal,
+        // never stdout). The short per-source/global timeouts bound the wait.
+        assert!(
+            err.contains("skipping federated store")
+                || err.contains("h.invalid")
+                || err.contains("g.invalid"),
+            "libsql build diagnoses the unreachable remotes on stderr: {err}"
+        );
+    }
+}
+
+/// A labelled remote with NO timeout env set resolves the DEFAULT tier, and the
+/// doctor reports `REMOTE_TIMEOUT_MS_DEFAULT` (5000) as the effective ms. Holds
+/// on both backends (resolution is backend-agnostic).
+#[test]
+fn doctor_timeout_falls_back_to_default() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    // Labelled remote, but NO WEAVE_PULL_TIMEOUT_MS[_LABEL] in the scrubbed env.
+    let entry = "NOENV=libsql://noenv.invalid/db";
+
+    let (ok, out, err) = run_env(&local, &["doctor", "--json"], &[("WEAVE_PEER_DBS", entry)]);
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_timeout_default"].as_u64(),
+        Some(1),
+        "the unconfigured remote resolves the default timeout tier: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_per_source"].as_u64(),
+        Some(0),
+        "no per-source timeout configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_global"].as_u64(),
+        Some(0),
+        "no global timeout configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_ms_min"].as_u64(),
+        Some(5000),
+        "default-tier effective ms is REMOTE_TIMEOUT_MS_DEFAULT: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_ms_max"].as_u64(),
+        Some(5000),
+        "default-tier effective ms is REMOTE_TIMEOUT_MS_DEFAULT: {out}"
+    );
+}
+
+/// MCP `weave_doctor` mirrors the per-source timeout line of the CLI: with a
+/// labelled remote + per-source timeout env, the tool RESULT contains `remote
+/// timeout:` and NONE of the configured token bytes leak. Successful tool result.
+#[test]
+fn mcp_doctor_reports_per_source_timeout_token_free() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const PER_SOURCE_TOKEN: &str = "mcp-timeout-secret-token-EEE";
+    let entry = "TODB=libsql://mcp-timeout.invalid/db";
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", entry),
+            ("WEAVE_PULL_TIMEOUT_MS_TODB", "250"),
+            ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+            ("WEAVE_PULL_TOKEN_TODB", PER_SOURCE_TOKEN),
+        ],
+    );
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "doctor degradation is not a tool error: {dtext}");
+    assert!(
+        dtext.contains("remote timeout:"),
+        "MCP doctor surfaces the per-source timeout line: {dtext}"
+    );
+    assert!(
+        dtext.contains("1 per-source"),
+        "MCP doctor reports the per-source timeout tier count: {dtext}"
+    );
+    assert!(
+        !dtext.contains(PER_SOURCE_TOKEN),
+        "no token byte leaks into the MCP doctor result: {dtext}"
+    );
+    mcp.shutdown();
+}
+
+/// Item-2 confirmation (headline): a per-source `WEAVE_PULL_TOKEN_<LABEL>` is
+/// selected for a `WEAVE_PEER_DBS` (peer_db) remote — proving the LABEL namespace
+/// covers peer_db, not just `pull_from`. Run `weave peers` AND `weave doctor
+/// --json`: both succeed; NEITHER the per-source NOR the shared token byte appears
+/// on stdout/stderr; doctor reports `federation_remote_token_per_source==1`. No
+/// live Turso auth is asserted (`.invalid` host, short timeout).
+#[test]
+fn federation_peer_db_per_source_token_selected() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const TOK_A: &str = "peerdb-per-source-token-AAA";
+    const SHARED: &str = "peerdb-shared-token-BBB";
+    let entry = "PROD=libsql://prod.invalid";
+
+    let env: &[(&str, &str)] = &[
+        ("WEAVE_PEER_DBS", entry),
+        ("WEAVE_PULL_TOKEN_PROD", TOK_A),
+        ("WEAVE_PULL_TOKEN", SHARED),
+        ("WEAVE_PULL_TIMEOUT_MS", "200"),
+    ];
+
+    // `weave peers` resolves + (on libsql) applies the per-source token; it must
+    // never surface a token byte regardless of backend.
+    let (ok_p, out_p, err_p) = run_env(&local, &["peers"], env);
+    assert!(ok_p, "peers must succeed; stderr:\n{err_p}");
+    assert!(
+        !out_p.contains(TOK_A),
+        "per-source token in peers stdout: {out_p}"
+    );
+    assert!(
+        !err_p.contains(TOK_A),
+        "per-source token in peers stderr: {err_p}"
+    );
+    assert!(
+        !out_p.contains(SHARED),
+        "shared token in peers stdout: {out_p}"
+    );
+    assert!(
+        !err_p.contains(SHARED),
+        "shared token in peers stderr: {err_p}"
+    );
+
+    // `weave doctor --json` proves the peer_db remote resolved its OWN token tier.
+    let (ok_d, out_d, err_d) = run_env(&local, &["doctor", "--json"], env);
+    assert!(ok_d, "doctor must succeed; stderr:\n{err_d}");
+    assert!(
+        !out_d.contains(TOK_A),
+        "per-source token in doctor stdout: {out_d}"
+    );
+    assert!(
+        !err_d.contains(TOK_A),
+        "per-source token in doctor stderr: {err_d}"
+    );
+    assert!(
+        !out_d.contains(SHARED),
+        "shared token in doctor stdout: {out_d}"
+    );
+    assert!(
+        !err_d.contains(SHARED),
+        "shared token in doctor stderr: {err_d}"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&out_d).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(1),
+        "the peer_db labelled remote resolves its OWN per-source token tier: {out_d}"
+    );
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(0),
+        "the per-source token wins; no shared-tier remote here: {out_d}"
+    );
+}
+
 /// Liveness regression (A2, no regression): a peer pulled from a foreign source
 /// carrying a remote `host` is TTL-judged, NEVER pid-probed. We seed a foreign
 /// store with a peer whose host is a different machine and a pid that is alive on

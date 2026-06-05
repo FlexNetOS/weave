@@ -243,6 +243,32 @@ export WEAVE_PULL_TOKEN="…"          # shared fallback (used by the unlabelled
 > no new network or write capability — remote sources stay read-only and
 > owner-only-writes is unchanged.
 
+The per-source LABEL namespace (and the `LABEL=` prefix) applies to remotes in
+**both** `pull_from` **and** `peer_dbs` — they share one resolver — so a labelled
+remote authenticates with its own `WEAVE_PULL_TOKEN_<LABEL>` whichever list it
+appears in.
+
+#### Per-source remote-call timeout
+
+Each remote source's connect + read timeout (ms) is also resolvable per source, on
+the **same** LABEL namespace as the token, via `WEAVE_PULL_TIMEOUT_MS_<LABEL>`:
+
+```bash
+export WEAVE_PULL_TIMEOUT_MS_PROD=250   # PROD's remote calls bounded at 250 ms
+export WEAVE_PULL_TIMEOUT_MS=1000       # global fallback for the rest
+```
+
+- **Timeout precedence per remote source:** per-source `WEAVE_PULL_TIMEOUT_MS_<LABEL>`
+  → global `WEAVE_PULL_TIMEOUT_MS` → default `5000` ms.
+- The value is parsed as a positive integer and **clamped to `[50, 600000]` ms**. A
+  `0` / unparsable / out-of-range value **falls through** to the next tier — the
+  bound is **never disabled** (an unbounded remote could hang a drain).
+- The timeout is **not a secret**; it bounds only reads (remotes stay read-only).
+- `weave doctor` reports a token-free `remote timeout:` line — per-source / global /
+  default tier counts plus the effective ms range over the configured remotes — and
+  the JSON keys `federation_remote_timeout_{per_source,global,default}` /
+  `federation_remote_timeout_ms_{min,max}`.
+
 #### Live nudge on a pulled message — DEFAULT ON (consent)
 
 When a pull commits a message from an allow-listed source, weave **also fires a
