@@ -56,6 +56,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: clippy (libsql)
-        run: cargo clippy --no-default-features --features libsql -- -D warnings
+        run: cargo clippy --no-default-features --features libsql --all-targets -- -D warnings
       - name: build (libsql)
         run: cargo build --no-default-features --features libsql
+      - name: test (libsql)
+        run: cargo test --no-default-features --features libsql
+
+  sign:
+    # The optional signed-identity path (ed25519, gated behind `sign`) is compiled
+    # out of the default binary, so it needs its own column or a regression there
+    # ships unnoticed. This is the sqlite backend WITH `sign`.
+    name: sign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (sign)
+        run: cargo clippy --all-targets --features sign -- -D warnings
+      - name: test (sign)
+        run: cargo test --features sign
+
+  libsql-sign:
+    # The libSQL × sign cross-product: the crypto path on the cross-machine backend.
+    # Mutually-exclusive backends mean this is a separate binary from the `sign` job.
+    name: libsql + sign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (libsql + sign)
+        run: cargo clippy --no-default-features --features "libsql sign" --all-targets -- -D warnings
+      - name: build (libsql + sign)
+        run: cargo build --no-default-features --features "libsql sign"
+      - name: test (libsql + sign)
+        run: cargo test --no-default-features --features "libsql sign"

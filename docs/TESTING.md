@@ -638,5 +638,16 @@ done:
 9. **Performance-sensitive path → consider a criterion bench** so regressions are
    visible.
 10. **Before pushing**, the full gate is: `cargo fmt --all --check`,
-    `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, and
-    the libSQL clippy/build/test column.
+    `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, the
+    libSQL clippy/build/**test** column, and — when the crypto path is touched —
+    the `sign` and `libsql sign` columns
+    (`cargo clippy --all-targets --features sign -- -D warnings` /
+    `cargo test --features sign`, and the same with
+    `--no-default-features --features "libsql sign"`).
+
+    CI mirrors this exactly. The GitHub Actions workflow (`.github/workflows/ci.yml`)
+    runs six jobs — `rustfmt`, `clippy`, `test` (default sqlite), `build (libsql
+    backend)` (now clippy **+ build + test** for the libSQL backend), `sign` (sqlite
+    + `sign`: clippy + test), and `libsql + sign` (clippy + build + test). The
+    optional crypto path is therefore gated in CI on **both** backends, not just
+    locally, so a `sign`-only regression cannot merge unnoticed.
