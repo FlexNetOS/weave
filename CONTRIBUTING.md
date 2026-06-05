@@ -27,20 +27,27 @@ cargo clippy -- -D warnings # lint; the tree is clippy-clean, keep it that way
 cargo fmt --all             # format (CI-style check: cargo fmt --all -- --check)
 ```
 
-If you touch the feature-gated libSQL backend, also build it:
+If you touch the feature-gated libSQL backend, also build, lint, and test it:
 
 ```bash
-cargo build --no-default-features --features libsql
-cargo clippy --no-default-features --features libsql -- -D warnings
+cargo build  --no-default-features --features libsql
+cargo clippy --no-default-features --features libsql --all-targets -- -D warnings
+cargo test   --no-default-features --features libsql
 ```
 
-If you touch the optional `sign` backend (signed cross-store identity), build and
+If you touch the optional `sign` backend (signed cross-store identity), lint and
 test that feature on **both** backends too — it composes with each:
 
 ```bash
-cargo test --features sign
-cargo test --no-default-features --features "libsql sign"
+cargo clippy --all-targets --features sign -- -D warnings
+cargo test   --features sign
+cargo clippy --no-default-features --features "libsql sign" --all-targets -- -D warnings
+cargo test   --no-default-features --features "libsql sign"
 ```
+
+CI runs all of these as separate jobs (`rustfmt`, `clippy`, `test`, `build (libsql
+backend)`, `sign`, `libsql + sign`), so the optional crypto path and the libSQL
+test suite are gated on every PR — not just locally.
 
 A change is ready when the default build is clean, clippy is warning-free, the
 formatter reports no diff, and all tests pass.

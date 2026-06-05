@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased] — CI: gate the optional crypto path + the libSQL test suite
+
+### Changed
+- **ci:** the GitHub Actions workflow (`.github/workflows/ci.yml`) gains two
+  columns — **`sign`** (sqlite + `sign`: `clippy --all-targets` + `cargo test
+  --features sign`) and **`libsql + sign`** (`clippy --all-targets` + `build` +
+  `cargo test --no-default-features --features "libsql sign"`) — so the optional
+  Ed25519 signed-identity path is gated in CI on **both** backends, not just
+  locally. The existing **`build (libsql backend)`** job now also runs
+  `cargo test --no-default-features --features libsql` (and `clippy --all-targets`),
+  closing a gap where the libSQL test suite was never exercised in CI. The four
+  required-check names (`rustfmt`, `clippy`, `test`, `build (libsql backend)`) are
+  unchanged; `sign` and `libsql + sign` are added as required checks once green.
+
 ## [Unreleased] — tighten signed identity (trust-set strict, rotation/revocation, fingerprints)
 
 > All behind the existing `sign` feature; the default and `libsql`-no-sign builds
