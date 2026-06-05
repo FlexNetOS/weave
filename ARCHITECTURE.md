@@ -429,6 +429,10 @@ Tables created idempotently (`CREATE TABLE IF NOT EXISTS`):
 messages    (id INTEGER PK AUTOINCREMENT, ts INTEGER, sender TEXT, recipient TEXT,
              subject TEXT NULL, body TEXT)
 reads       (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id, reader))
+asks        (id TEXT PRIMARY KEY, question_msg_id INTEGER NOT NULL, answer_msg_id INTEGER NULL,
+             asker TEXT NOT NULL, askee TEXT NOT NULL, subject TEXT NULL,
+             state TEXT NOT NULL, reply_to TEXT NULL, close_note TEXT NULL,
+             opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, closed_ts INTEGER NULL)
 peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
              last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '',
              repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
@@ -450,6 +454,26 @@ revocations   (id INTEGER PK AUTOINCREMENT, ts INTEGER NOT NULL, fp TEXT NOT NUL
 - **`reads`** — per-`(message, reader)` read state. This is what makes a
   broadcast deliverable exactly once per reader and keeps each session's "unread"
   independent.
+- **`asks`** — the **tracked ask/answer/ack** side-table (P1, the first step toward
+  weave⊇repowire capability parity). Like `reads` and `revocations`, it is a **mutable
+  side-table to the append-only `messages`**: one row per correlation-tracked request,
+  keyed by an opaque `correlation_id` (`ask_<rowid>_<nonce>`, minted server-side, charset
+  `[A-Za-z0-9_]`, validated by `model::ask_id_valid` before any bind). The actual
+  question/answer **text reuses `messages`** (threaded via `in_reply_to`) — `asks` holds
+  only the correlation + lifecycle (`asker`/`askee`/`subject`, the `state`, pointers
+  `question_msg_id`/`answer_msg_id`, an optional `reply_to` chain link, the `close_note`,
+  and `opened`/`updated`/`closed` timestamps) and points at the `messages` rows by id.
+  `state` is a **monotonic** lifecycle, `open → answered → acked` (never backward),
+  enforced by the pure `model::AskState::can_transition` *before* any UPDATE — an illegal
+  edge (double-ack, answering an acked thread) is a clean `bail!`, never a panic or a
+  silent regression. `ask(reply_to = X)` acks `X` and links the new question into `X`'s
+  conversation in the same transaction (so `weave thread` renders the chain). The live
+  nudge + the honest delivery verdict (`transport_delivered` / `queued_next_turn` /
+  `recipient_not_injectable`) are computed **caller-side** in `mcp`/`main` by reusing the
+  existing `inject::capability` + `inject_mode` return — there is **no `store → inject`
+  edge** and **no new dependency**. Always-present plain data; point-to-point only
+  (broadcast/cross-store ask are out of P1). Created on every open in **both** backends
+  via an additive, guarded, idempotent migration (the `reads`/`revocations` precedent).
 - **`peers`** — the injection registry: where each named session can be reached,
   plus `last_seen`, `pid`, and `host` for presence, and the descriptive session
   tags `repo` / `branch` / `worktree_id`. The `pid`/`host` and the
@@ -735,6 +759,7 @@ keep what worked and drop the operational weight.
 | Daemon required | no | **yes** (127.0.0.1:8377) | **no** (optional later) |
 | Paste-safe submission | n/a | partial (had cancel bug) | ✅ per-mux idiom |
 | MCP-native | ✅ | ✅ | ✅ |
+| Tracked ask/answer/ack | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure DB** |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
 | Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
 
@@ -755,6 +780,13 @@ keep what worked and drop the operational weight.
   relay and chat bridges are deliberate non-goals for now; the libSQL-compatible
   on-disk format leaves a clean path to Turso replicas if cross-machine ever
   becomes a real need.
+- **weave⊇repowire parity (P1).** repowire's headline advantage over a plain
+  mailbox was a **tracked** ask/answer/ack round-trip — but it required the
+  long-running daemon to mediate it. weave now closes that gap **daemon-free**: the
+  `asks` side-table (§6) layers a correlation-tracked `open → answered → acked`
+  lifecycle on the existing append-only `messages` + the caller-side injector, with
+  an honest delivery verdict and **no new dependency**. It is local-mesh
+  point-to-point in P1; broadcast and cross-store ask are future epics.
 
 ---
 

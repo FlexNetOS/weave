@@ -2504,3 +2504,166 @@ fn audit_revocations_limit_is_bounded_end_to_end() {
 
     let _ = std::fs::remove_dir_all(&cfg);
 }
+
+// ---------------------------------------------------------------------------
+// P1 tracked ask/answer/ack — security / hardening
+// ---------------------------------------------------------------------------
+
+/// An ask question body that LOOKS like a CLI flag is delivered byte-for-byte to
+/// the askee and is never parsed as a flag (no-shell: the body never reaches a
+/// command line). Mirrors the `send` verbatim-delivery proof for the ask path.
+#[test]
+fn ask_body_is_delivered_verbatim() {
+    let db = TestDb::new();
+    let payload = "--to=victim --body=pwned; rm -rf / `id`";
+    let opened = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "attacker",
+            "--to",
+            "bob",
+            &format!("--body={payload}"),
+        ],
+    );
+    assert!(
+        opened.contains("attacker -> bob"),
+        "ask route confirmed: {opened:?}"
+    );
+    // The askee receives the question body unchanged (no flag-parsing, no shell).
+    let got = only_body(&db, "bob");
+    assert_eq!(
+        got, payload,
+        "an ask body must arrive byte-for-byte, never parsed as a flag or run by a shell"
+    );
+}
+
+/// An ask body over `MAX_BODY` (65536) is rejected, not stored — the same cap the
+/// `send` path enforces, applied through `store.ask`.
+#[test]
+fn ask_oversized_body_is_rejected() {
+    let db = TestDb::new();
+    let big = "x".repeat(70_000); // > MAX_BODY (65536)
+    let (ok, _out, _err) = run(
+        &db,
+        &["ask", "--from", "a", "--to", "b", &format!("--body={big}")],
+    );
+    assert!(!ok, "an oversized ask body must be rejected, not stored");
+    // Nothing landed in b's inbox.
+    let (peek_ok, inbox, _e) = run(&db, &["inbox", "--me", "b", "--peek"]);
+    assert!(peek_ok);
+    assert!(
+        !inbox.contains("xxxxx"),
+        "the oversized ask must not have been persisted: {inbox:?}"
+    );
+}
+
+/// An oversized askee identity is rejected by the cap (`MAX_IDENT`), never bound.
+#[test]
+fn ask_oversized_identity_is_rejected() {
+    let db = TestDb::new();
+    let giant = "x".repeat(100_000);
+    let (ok, _out, err) = run(&db, &["ask", "--from", "a", "--to", &giant, "--body", "q"]);
+    assert!(!ok, "an oversized askee identity must be rejected");
+    assert!(
+        !err.contains("panicked"),
+        "clean rejection, not a panic: {err:?}"
+    );
+}
+
+/// A hostile correlation id (shell metacharacters / oversized) is rejected by
+/// `ask_id_valid` BEFORE any DB bind on every reference path
+/// (`answer`/`ack`/`ask-get`). The metachar string never reaches a `Command`
+/// (no-shell) nor a SQL bind, and the failure is a clean non-zero exit.
+#[test]
+fn ask_hostile_correlation_id_is_rejected_before_bind() {
+    let db = TestDb::new();
+    let hostiles = [
+        "ask; rm -rf /",
+        "ask`id`",
+        "ask$(whoami)",
+        "ask|cat /etc/passwd",
+        "ask 1 2 3",
+        "../../etc/passwd",
+        "'; DROP TABLE asks;--",
+    ];
+    for bad in hostiles {
+        let (ok, _o, err) = run(&db, &["ack", "--from", "a", "--id", bad]);
+        assert!(!ok, "hostile ack id {bad:?} must be rejected");
+        assert!(!err.contains("panicked"), "{bad:?} clean error: {err:?}");
+        let (ok, _o, _e) = run(&db, &["answer", "--from", "a", "--id", bad, "--body", "x"]);
+        assert!(!ok, "hostile answer id {bad:?} must be rejected");
+        let (ok, _o, _e) = run(&db, &["ask-get", "--id", bad]);
+        assert!(!ok, "hostile ask-get id {bad:?} must be rejected");
+    }
+    // An oversized (>64) id is likewise rejected before any bind.
+    let oversized = "a".repeat(200);
+    let (ok, _o, _e) = run(&db, &["ack", "--from", "a", "--id", &oversized]);
+    assert!(!ok, "oversized correlation id must be rejected");
+}
+
+/// `weave asks` cannot be coerced into an unbounded scan: an absurd `--limit`
+/// returns only what exists (clamped), with no panic.
+#[test]
+fn asks_list_is_bounded() {
+    let db = TestDb::new();
+    for i in 0..4 {
+        run_ok(
+            &db,
+            &[
+                "ask",
+                "--from",
+                "a",
+                "--to",
+                "b",
+                "--body",
+                &format!("q{i}"),
+            ],
+        );
+    }
+    let json = run_ok(
+        &db,
+        &[
+            "asks",
+            "--me",
+            "a",
+            "--role",
+            "any",
+            "--limit",
+            "100000000",
+            "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).expect("asks --json parses");
+    let n = v["asks"].as_array().unwrap().len();
+    assert_eq!(
+        n, 4,
+        "over-cap limit returns only what exists, bounded: {json}"
+    );
+}
+
+/// MCP discipline: an ask through the MCP server keeps stdout a pure JSON-RPC
+/// stream even when the question body contains secret-looking text — the body is
+/// not echoed to stdout outside the structured result frame, and the result frame
+/// itself carries only the verdict sentence, not the raw body. (`call_tool`
+/// asserts a single parseable frame with the matching id; a stray stdout write
+/// would break that.)
+#[test]
+fn mcp_ask_stdout_is_pure_jsonrpc_no_body_leak() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let secret = "TOPSECRET-PASSWORD-9f3a";
+    let (is_err, text) = mcp.call_tool(
+        "weave_ask",
+        serde_json::json!({"from": "a", "to": "b", "body": secret}),
+    );
+    assert!(!is_err, "ask is honest success: {text}");
+    // The structured result is the ask confirmation + verdict, NOT the raw body.
+    assert!(text.contains("Opened ask"), "result frame: {text:?}");
+    assert!(
+        !text.contains(secret),
+        "the question body must not ride the ask RESULT frame: {text:?}"
+    );
+    mcp.shutdown();
+}

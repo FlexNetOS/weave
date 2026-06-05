@@ -336,6 +336,11 @@ fn call_tool(
         "weave_whoami" => tool_whoami(store, me_default),
         "weave_attach" => tool_attach(store, me_default, args),
         "weave_connect" => tool_connect(store, args),
+        "weave_ask" => tool_ask(store, me_default, nudge_template, args),
+        "weave_answer" => tool_answer(store, me_default, nudge_template, args),
+        "weave_ack" => tool_ack(store, me_default, args),
+        "weave_asks" => tool_asks(store, me_default, args),
+        "weave_ask_get" => tool_ask_get(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1346,6 +1351,250 @@ fn tool_connect(store: &dyn Store, args: &Value) -> Result<String, String> {
     Ok(msg)
 }
 
+/// Fire the caller-side live nudge for an ask/answer and compute the HONEST
+/// delivery verdict, reusing the EXISTING injector return (no new spawn path, no
+/// `store → inject` edge). This is the exact seam `tool_send` uses, lifted into a
+/// helper so ask + answer surface the same normalized vocabulary:
+///   * `inject_mode` returned `Ok(true)` (a nudge was actually injected) ⇒
+///     `transport_delivered`;
+///   * a registered-but-not-alive / `Ok(false)` / `Err` peer ⇒ `queued_next_turn`
+///     (still succeeds; arrives on the recipient's next drain);
+///   * `mux=none` / no peer row ⇒ `recipient_not_injectable`.
+///
+/// Advisory only: a queued / not-injectable delivery is NEVER an error.
+fn ask_delivery_verdict(
+    store: &dyn Store,
+    nudge_template: Option<&str>,
+    from: &str,
+    to: &str,
+    body: &str,
+) -> &'static str {
+    let Ok(Some(peer)) = store.get_peer(to) else {
+        return "recipient_not_injectable";
+    };
+    let target = Target::from_peer(&peer);
+    match inject::capability(&target) {
+        inject::Capability::NotInjectable => "recipient_not_injectable",
+        // Injectable (live or registered): fire the same paste-safe nudge tool_send
+        // does and report whether it actually landed.
+        _ => {
+            let (nudge, mode) = build_nudge(nudge_template, from, body);
+            match inject::inject_mode(&target, &nudge, mode) {
+                Ok(true) => "transport_delivered",
+                // Ok(false) (quiet/no-op) or Err (inject failed): the message is
+                // safely in the store and arrives on the next drain.
+                _ => "queued_next_turn",
+            }
+        }
+    }
+}
+
+/// One-line human verdict sentence for an ask/answer result, from the normalized
+/// verdict string.
+fn verdict_sentence(verdict: &str, to: &str) -> String {
+    match verdict {
+        "transport_delivered" => format!("Live nudge delivered to '{to}' (transport_delivered)."),
+        "queued_next_turn" => {
+            format!("Queued for '{to}'; arrives on their next turn (queued_next_turn).")
+        }
+        _ => format!(
+            "'{to}' is not injectable; arrives on their next drain (recipient_not_injectable)."
+        ),
+    }
+}
+
+/// `weave_ask`: open a correlation-tracked request and return its id + the honest
+/// delivery verdict. Point-to-point only (broadcast ask is P2). The live nudge is
+/// fired caller-side here — no `store → inject` edge.
+fn tool_ask(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the peer session name to ask).")?;
+    let to = bound_ident("to", to_raw)?;
+    if model::is_broadcast(&to) {
+        return Err(
+            "tracked ask is point-to-point; use weave_send for broadcast (broadcast ask is P2)."
+                .to_string(),
+        );
+    }
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required (the question).")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let reply_to = args
+        .get("reply_to")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(rt) = reply_to {
+        if !model::ask_id_valid(rt) {
+            return Err("'reply_to' is not a valid correlation id.".to_string());
+        }
+    }
+    let (cid, _qid) = store
+        .ask(&from, &to, subject.as_deref(), body, reply_to)
+        .map_err(e)?;
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body);
+    Ok(format!(
+        "Opened ask {cid} from '{from}' to '{to}'. {}",
+        verdict_sentence(verdict, &to)
+    ))
+}
+
+/// `weave_answer`: reply along a tracked thread back to the asker. Accepts either
+/// `correlation_id` or an `in_reply_to` message id (resolved to its owning ask).
+fn tool_answer(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required (the answer).")?;
+    let cid = resolve_correlation_id(store, args)?;
+    let ask = store
+        .get_ask(&cid)
+        .map_err(e)?
+        .ok_or_else(|| format!("No tracked ask '{cid}'."))?;
+    let asker = ask.asker.clone();
+    store.answer(&from, &cid, body).map_err(e)?;
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, body);
+    Ok(format!(
+        "Answered ask {cid} back to '{asker}'. {}",
+        verdict_sentence(verdict, &asker)
+    ))
+}
+
+/// `weave_ack`: close a tracked thread (pure state transition). An optional
+/// closing `message` is stored as the ask's close_note; P1 does NOT nudge on ack.
+fn tool_ack(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let cid_raw = args
+        .get("correlation_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'correlation_id' is required.")?;
+    if !model::ask_id_valid(cid_raw) {
+        return Err("'correlation_id' is not a valid correlation id.".to_string());
+    }
+    let message = args
+        .get("message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    store.ack(&from, cid_raw, message).map_err(e)?;
+    let mut out = format!("Closed ask {cid_raw} (acked).");
+    if message.is_some() {
+        out.push_str(" Note recorded.");
+    }
+    Ok(out)
+}
+
+/// `weave_asks`: list tracked asks where `me` plays `role` (asker/askee/any).
+fn tool_asks(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let role = model::AskRole::parse(args.get("role").and_then(|v| v.as_str()).unwrap_or("any"));
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
+    let asks = store.list_asks(&me, role, limit).map_err(e)?;
+    if asks.is_empty() {
+        return Ok("No tracked asks.".to_string());
+    }
+    let mut out = format!("{} tracked ask(s):\n", asks.len());
+    for a in &asks {
+        let subj = a
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{} [{}] {} -> {}{} ({})\n",
+            a.id,
+            a.state.as_str(),
+            a.asker,
+            a.askee,
+            subj,
+            fmt_ts(a.opened_ts)
+        ));
+    }
+    Ok(out)
+}
+
+/// `weave_ask_get`: fetch one tracked ask by correlation id.
+fn tool_ask_get(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'id' is required (the correlation id).")?;
+    if !model::ask_id_valid(id) {
+        return Err("'id' is not a valid correlation id.".to_string());
+    }
+    let ask = store
+        .get_ask(id)
+        .map_err(e)?
+        .ok_or_else(|| format!("No tracked ask '{id}'."))?;
+    let answered = if ask.answer_msg_id.is_some() {
+        " (answered)"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} [{}] {} -> {}{}{}",
+        ask.id,
+        ask.state.as_str(),
+        ask.asker,
+        ask.askee,
+        ask.subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default(),
+        answered
+    ))
+}
+
+/// Resolve the correlation id `weave_answer` targets: prefer an explicit
+/// `correlation_id`, else map an `in_reply_to` message id to its owning ask via a
+/// `get_ask`-free lookup walking `list_asks` is too coarse, so we resolve through
+/// the store's question/answer message ids. A reference resolving to no ask is a
+/// clean error.
+fn resolve_correlation_id(store: &dyn Store, args: &Value) -> Result<String, String> {
+    if let Some(cid) = args
+        .get("correlation_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !model::ask_id_valid(cid) {
+            return Err("'correlation_id' is not a valid correlation id.".to_string());
+        }
+        return Ok(cid.to_string());
+    }
+    if let Some(mid) = args.get("in_reply_to").and_then(|v| v.as_i64()) {
+        // Map a message id to its owning ask (`WHERE question_msg_id=? OR
+        // answer_msg_id=?`). A reference resolving to no ask is a clean error.
+        let cid = store
+            .ask_for_message(mid)
+            .map_err(e)?
+            .ok_or_else(|| format!("message #{mid} does not belong to any tracked ask."))?;
+        return Ok(cid);
+    }
+    Err("provide either 'correlation_id' or 'in_reply_to'.".to_string())
+}
+
 // ---- helpers ------------------------------------------------------------
 
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -1470,6 +1719,52 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "to":{"type":"string","description":"The peer session name to connect to."}
             },"required":["to"]}
+        },
+        {
+            "name": "weave_ask",
+            "description": "Open a correlation-TRACKED request to a peer and return its correlation_id immediately (NON-blocking — not a synchronous RPC). The question is delivered like a normal message (live nudge if injectable, else next-turn) and the result reports the honest delivery verdict (transport_delivered / queued_next_turn / recipient_not_injectable). Point-to-point only (no broadcast). Optional reply_to chains a new ask off a prior one, closing the prior thread.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "to":{"type":"string","description":"The peer session name to ask."},
+                "body":{"type":"string","description":"The question."},
+                "subject":{"type":"string"},
+                "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."}
+            },"required":["to","body"]}
+        },
+        {
+            "name": "weave_answer",
+            "description": "Answer a tracked ask, replying back along the thread to whoever opened it and transitioning the ask open->answered. Reference the thread by correlation_id OR by an in_reply_to message id (resolved to its owning ask). Reports the honest delivery verdict to the asker. Errors on an unknown thread, an already-acked thread, or a responder who is not the askee.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (must be the askee)."},
+                "correlation_id":{"type":"string","description":"The ask's correlation_id."},
+                "in_reply_to":{"type":"integer","description":"Alternatively, a message id belonging to the ask."},
+                "body":{"type":"string","description":"The answer."}
+            },"required":["body"]}
+        },
+        {
+            "name": "weave_ack",
+            "description": "Close a tracked ask (transition -> acked). A pure state transition; an optional 'message' is recorded as the closing note (NOT delivered/nudged — send a weave_answer first if you need it delivered). Errors on an unknown thread, a double-ack, or an acker who is not the askee.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (must be the askee)."},
+                "correlation_id":{"type":"string","description":"The ask's correlation_id."},
+                "message":{"type":"string","description":"Optional closing note (stored, not delivered)."}
+            },"required":["correlation_id"]}
+        },
+        {
+            "name": "weave_asks",
+            "description": "List tracked asks where you are the asker, the askee, or either (role: asker|askee|any, default any). Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string"},
+                "role":{"type":"string","description":"asker | askee | any (default any)."},
+                "limit":{"type":"integer"}
+            },"required":[]}
+        },
+        {
+            "name": "weave_ask_get",
+            "description": "Fetch a single tracked ask by correlation_id (its state, parties, subject, and whether it has been answered). Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"The correlation_id."}
+            },"required":["id"]}
         }
     ])
 }

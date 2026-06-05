@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — tracked ask/answer/ack (weave⊇repowire parity, epic 1)
+
+> **First step toward repowire capability parity — daemon-free, pure DB.** A
+> correlation-tracked request/response on top of the existing messaging + injector,
+> distinct from fire-and-forget send/reply. **No new dependency**; no `store → inject`
+> edge (the live nudge + delivery verdict are computed caller-side, reusing the existing
+> injector return). Both backends gain only the additive `asks` table + the mirrored
+> store methods + tests; point-to-point local-mesh only (broadcast / cross-store ask are
+> future epics).
+
+### Added
+- **store:** additive `asks` side-table (both backends, guarded idempotent migration —
+  the `reads`/`revocations` precedent) holding the correlation_id + a monotonic
+  `open → answered → acked` lifecycle; the question/answer **text reuses `messages`**
+  (threaded via `in_reply_to`), so `asks` carries only correlation + state + pointers.
+  New `Store` methods `ask` / `answer` / `ack` / `get_ask` / `list_asks` /
+  `ask_for_message`, mirrored across `store.rs` (sqlite) and `store_libsql.rs` (libSQL,
+  with the `read_only` write-trap on the three mutating methods). Lifecycle transitions
+  are guarded by `model::AskState::can_transition` before any UPDATE — an illegal edge
+  (double-ack, answering an acked thread, unknown correlation_id) is a clean error,
+  never a panic.
+- **model:** `Ask` struct, `AskState` enum (`as_str`/`from_str`/`can_transition` — the
+  pure monotonic state machine), `AskRole`, the opaque correlation_id helpers
+  `new_ask_id` (no `rand`/date crate — a process-local counter + `now()`) and
+  `ask_id_valid` / `MAX_ASK_ID_LEN` (64). `#[serde(default)]` on nullable fields.
+- **mcp:** `weave_ask` / `weave_answer` / `weave_ack` / `weave_asks` / `weave_ask_get`
+  tools. `ask`/`answer` fire the caller-side nudge and attach an **honest delivery
+  verdict** (`transport_delivered` / `queued_next_turn` / `recipient_not_injectable`)
+  derived from the existing `inject::capability` + `inject_mode` return — a queued or
+  not-injectable ask is **not** an `isError` (degrade-to-store). `weave_answer` accepts
+  either a `correlation_id` or an `in_reply_to` message id; broadcast `to` is refused.
+- **cli:** `weave ask` / `answer` / `ack` / `asks` / `ask-get` mirroring the tools
+  (`--json` on the list/get arms; the caller-side nudge fires via the `try_inject` seam).
+
 ## [Unreleased] — observed-revocation audit log + `weave_doctor` verify-summary parity (`sign`)
 
 > **Observability + parity only — `sign`-gated.** R1 revocation is **unchanged**: it

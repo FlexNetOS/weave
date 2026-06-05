@@ -59,6 +59,13 @@ weave sessions --watch --interval 5 --repo weave  # re-render every 5s, narrowed
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
+
+# Tracked ask/answer/ack (correlation-tracked request/response — distinct from send/reply)
+weave ask --from desktop --to envctl --body "can you confirm the schema?" --subject "schema"
+weave answer --id ask_42_17 --body "confirmed, ship it" --from envctl   # or: --in-reply-to <msg_id>
+weave ack --id ask_42_17 --from envctl --message "thanks"               # close the thread (acked)
+weave asks --me envctl --role askee  # list tracked asks (role: asker|askee|any); --json
+weave ask-get --id ask_42_17         # inspect one ask (state + answer presence); --json
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
 
@@ -200,6 +207,7 @@ is pulled in.
 `weave_send` · `weave_outbox` · `weave_inbox` · `weave_history` · `weave_sessions` · `weave_clear`
 · `weave_peers` · `weave_scan` · `weave_reply` · `weave_thread` · `weave_receipts` · `weave_doctor` · `weave_whoami`
 · `weave_attach` · `weave_connect`
+· `weave_ask` · `weave_answer` · `weave_ack` · `weave_asks` · `weave_ask_get`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
@@ -221,6 +229,47 @@ peer is an error, so a queued delivery is reported with `isError:false`.
 with liveness and repo/branch/worktree tags as text. Optional `repo` / `branch`
 filters narrow the set by exact tag match and are bounded, so an oversized or
 hostile filter argument is non-fatal (`isError:false`, never a panic).
+
+## Tracked ask/answer/ack
+
+`weave_send`/`weave_reply` are **fire-and-forget**: they deliver a message and forget
+it. `weave_ask`/`weave_answer`/`weave_ack` add a **correlation-tracked request/response
+thread** on top of the same mailbox + injector — use them when you need to *track*
+whether a request was answered and close the loop.
+
+- **`weave ask` / `weave_ask`** `{ from?, to, body, subject?, reply_to? }` — opens a
+  tracked thread to a peer and **returns a `correlation_id` immediately** (non-blocking —
+  *not* a synchronous RPC, *not* a delivery receipt). The state starts `open`. Pass
+  `reply_to` (a prior correlation_id) to chain a follow-up: the prior thread is acked and
+  the new question links into the same conversation (`weave thread` renders the chain).
+  Point-to-point only — a broadcast `to` is rejected (use `weave_send` for broadcast).
+- **`weave answer` / `weave_answer`** `{ from?, correlation_id? | in_reply_to?, body }` —
+  replies along the correlation chain **back to the original asker** (state → `answered`).
+  Accepts either the `correlation_id` or an `in_reply_to` message id that resolves to the
+  owning ask.
+- **`weave ack` / `weave_ack`** `{ from?, correlation_id, message? }` — closes/acknowledges
+  the thread (state → `acked`). A pure state transition; an optional closing `message` is
+  recorded as a note (not delivered/nudged in this version).
+- **`weave asks` / `weave_asks`** `{ me?, role? }` (role `asker|askee|any`, default `any`)
+  and **`weave ask-get` / `weave_ask_get`** `{ id }` — list / inspect tracked asks
+  (read-only).
+
+The lifecycle is **monotonic** — `open → answered → acked`, never backward — so a
+double-ack, an answer to an already-acked thread, or an unknown correlation_id is a clean
+error, never a silent regression.
+
+The question and answer text reuse the ordinary `messages` table (threaded via
+`in_reply_to`); a small `asks` side-table holds the correlation_id + lifecycle state, so
+the live nudge, hook drain, `weave thread`, and receipts all work for ask/answer with no
+new machinery. It is **daemon-free** (a synchronous DB write + the existing caller-side
+nudge) and local-mesh only — cross-store ask is future work.
+
+**Honest delivery verdict.** Each `ask`/`answer` fires the same caller-side live nudge as
+`weave_send` and reports an honest verdict derived from the existing injector return —
+`transport_delivered` (a nudge actually reached the pane), `queued_next_turn` (registered
+but not live; delivered on the recipient's next drain), or `recipient_not_injectable` (no
+injectable pane). The verdict is **advisory, never an error**: a queued or not-injectable
+ask still succeeds and arrives on the next drain.
 
 ## Native injector
 
