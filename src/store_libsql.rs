@@ -38,11 +38,11 @@
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
-    canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
+    canonical_source, check_body, check_host, check_ident, clamp_field, clamp_limit, commit_pulled,
     merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
-    store_label, Origin, PeerView, Pulled, SessionInfo, SessionView, Store, VerifyPolicy,
-    MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS,
-    MAX_WORKTREE_LEN,
+    store_label, Origin, PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo,
+    SessionView, Store, VerifyPolicy, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
+    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -103,6 +103,14 @@ const SCHEMA: &[&str] = &[
         pubkey   TEXT NOT NULL,
         added_ts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (identity, pubkey)
+    )",
+    "CREATE TABLE IF NOT EXISTS revocations (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        INTEGER NOT NULL,
+        fp        TEXT NOT NULL,
+        identity  TEXT NOT NULL DEFAULT '',
+        source    TEXT NOT NULL DEFAULT '',
+        kind      TEXT NOT NULL DEFAULT 'enforced'
     )",
 ];
 
@@ -361,6 +369,25 @@ impl LibsqlStore {
             )
             .await
             .context("copying legacy keys into identity_keys")?;
+            // Migration (#11): the observed-revocation audit log. Created via SCHEMA
+            // above for a fresh DB; also created idempotently here for a DB that
+            // predates it (mirrors SqliteStore::migrate). Inert plain data in every
+            // build; only the sign-gated write/read code touches it. NEVER read by the
+            // verification decision, so it cannot drift from or weaken R1. Constant DDL
+            // — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS revocations (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts        INTEGER NOT NULL,
+                    fp        TEXT NOT NULL,
+                    identity  TEXT NOT NULL DEFAULT '',
+                    source    TEXT NOT NULL DEFAULT '',
+                    kind      TEXT NOT NULL DEFAULT 'enforced'
+                )",
+                (),
+            )
+            .await
+            .context("creating revocations table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1446,6 +1473,72 @@ impl Store for LibsqlStore {
                 out.push((r.get::<String>(0)?, r.get::<String>(1)?));
             }
             Ok(out)
+        })
+    }
+
+    fn record_revocation(&self, ev: &RevocationEvent) -> Result<()> {
+        // OWNER-ONLY-WRITES: trap on a read-only/foreign handle, like every other
+        // write — the audit append only ever writes the LOCAL owned store.
+        self.guard_writable()?;
+        // Defensive clamp at the write seam (mirrors SqliteStore::record_revocation).
+        let fp = clamp_field(&ev.fp);
+        let identity = clamp_field(&ev.identity);
+        let source = clamp_field(&ev.source);
+        let kind = ev.kind.as_str().to_string();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO revocations (ts, fp, identity, source, kind) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params(vec![
+                        ev.ts.into(),
+                        fp.into(),
+                        identity.into(),
+                        source.into(),
+                        kind.into(),
+                    ]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_revocations(&self, limit: i64) -> Result<Vec<RevocationEvent>> {
+        let lim = limit.clamp(0, MAX_REVOCATIONS_LIST);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, ts, fp, identity, source, kind FROM revocations \
+                     ORDER BY id DESC LIMIT ?1",
+                    params(vec![lim.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(RevocationEvent {
+                    id: r.get::<i64>(0)?,
+                    ts: r.get::<i64>(1)?,
+                    fp: r.get::<String>(2)?,
+                    identity: r.get::<String>(3)?,
+                    source: r.get::<String>(4)?,
+                    kind: RevocationKind::parse(&r.get::<String>(5)?),
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn count_revocations(&self) -> Result<i64> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query("SELECT COUNT(*) FROM revocations", ())
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(r.get::<i64>(0)?),
+                None => Ok(0),
+            }
         })
     }
 }
@@ -2705,5 +2798,231 @@ mod tests {
             .map(|m| m.len())
             .unwrap_or(0);
         assert_eq!(wal_len, 0, "no write committed to the source (WAL empty)");
+    }
+
+    // -----------------------------------------------------------------------
+    // #11 observed-revocation audit log — libSQL backend mirror of the sqlite
+    // store-unit tests. Plain data in every build (not sign-gated for the
+    // round-trip/clamp/limit/migration/owner-only cases).
+    // -----------------------------------------------------------------------
+
+    /// libSQL `record_revocation` + `list_revocations` round-trip most-recent-first;
+    /// `count_revocations` matches; oversized `fp`/`source`/`identity` are clamped at
+    /// the write seam; `limit` is bounded (negative ⇒ 0, over-cap ⇒ cap).
+    #[test]
+    fn revocations_roundtrip_clamp_and_bounds_libsql() {
+        use crate::store::{RevocationEvent, RevocationKind, MAX_REVOCATION_FIELD_LEN};
+        let s = mem();
+        assert_eq!(s.count_revocations().unwrap(), 0);
+        assert!(s.list_revocations(50).unwrap().is_empty());
+
+        s.record_revocation(&RevocationEvent {
+            id: 0,
+            ts: 100,
+            fp: "SHA256:aa".into(),
+            identity: "alice".into(),
+            source: "local:/a".into(),
+            kind: RevocationKind::Enforced,
+        })
+        .unwrap();
+        s.record_revocation(&RevocationEvent {
+            id: 0,
+            ts: 200,
+            fp: "SHA256:bb".into(),
+            identity: String::new(),
+            source: String::new(),
+            kind: RevocationKind::Declared,
+        })
+        .unwrap();
+        assert_eq!(s.count_revocations().unwrap(), 2);
+        let rows = s.list_revocations(50).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].fp, "SHA256:bb", "most-recent-first (id DESC)");
+        assert_eq!(rows[0].kind, RevocationKind::Declared);
+        assert_eq!(rows[1].fp, "SHA256:aa");
+        assert_eq!(rows[1].identity, "alice");
+        assert_eq!(rows[1].source, "local:/a");
+        assert_eq!(rows[1].kind, RevocationKind::Enforced);
+
+        // Clamp at the seam.
+        let huge = "x".repeat(MAX_REVOCATION_FIELD_LEN + 300);
+        s.record_revocation(&RevocationEvent {
+            id: 0,
+            ts: 300,
+            fp: huge.clone(),
+            identity: huge.clone(),
+            source: huge.clone(),
+            kind: RevocationKind::Enforced,
+        })
+        .unwrap();
+        let r = s.list_revocations(1).unwrap();
+        assert!(r[0].fp.len() <= MAX_REVOCATION_FIELD_LEN, "fp clamped");
+        assert!(
+            r[0].source.len() <= MAX_REVOCATION_FIELD_LEN,
+            "source clamped"
+        );
+        assert!(
+            r[0].identity.len() <= MAX_REVOCATION_FIELD_LEN,
+            "identity clamped"
+        );
+
+        // Bounds: small truncates, negative ⇒ 0, over-cap ⇒ available (3).
+        assert_eq!(s.list_revocations(1).unwrap().len(), 1);
+        assert_eq!(s.list_revocations(0).unwrap().len(), 0);
+        assert_eq!(
+            s.list_revocations(-5).unwrap().len(),
+            0,
+            "negative ⇒ 0 (bounded)"
+        );
+        assert_eq!(
+            s.list_revocations(1_000_000).unwrap().len(),
+            3,
+            "over-cap clamps"
+        );
+    }
+
+    /// OWNER-ONLY-WRITES on libsql: `record_revocation` traps on a `read_only`
+    /// (foreign/remote) handle — never a write, never a panic — and the foreign DB
+    /// file is byte-unchanged. Reads (`list`/`count`) still work on the same handle.
+    #[test]
+    fn record_revocation_traps_on_readonly_handle_libsql() {
+        use crate::store::{RevocationEvent, RevocationKind};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-revguard-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foreign.db");
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            // Seed one event so list/count have something to read on the RO handle.
+            rw.record_revocation(&RevocationEvent {
+                id: 0,
+                ts: 1,
+                fp: "SHA256:seed".into(),
+                identity: String::new(),
+                source: String::new(),
+                kind: RevocationKind::Declared,
+            })
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(ro.read_only, "open_readonly sets the guard flag");
+        let ev = RevocationEvent {
+            id: 0,
+            ts: 2,
+            fp: "SHA256:intruder".into(),
+            identity: String::new(),
+            source: String::new(),
+            kind: RevocationKind::Enforced,
+        };
+        let e = ro
+            .record_revocation(&ev)
+            .expect_err("record_revocation must trap on a read-only handle");
+        assert!(
+            e.to_string()
+                .contains("BUG: write attempted on a read-only foreign store"),
+            "wrong trap error: {e}"
+        );
+        // Reads still work on the RO handle.
+        assert_eq!(
+            ro.count_revocations().unwrap(),
+            1,
+            "the seeded event is readable"
+        );
+        drop(ro);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "trapped write left the foreign DB byte-unchanged"
+        );
+    }
+
+    /// Migration on libsql: a legacy DB that predates `revocations` gains the table
+    /// idempotently on open (mirror of the sqlite legacy-migration test); a
+    /// pre-existing peers row survives (no data loss) and re-opening is a no-op.
+    #[test]
+    fn legacy_db_gains_revocations_table_libsql() {
+        use crate::store::{RevocationEvent, RevocationKind};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-revlegacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // Build a pre-#11 DB: a peers table + one row, NO revocations table.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let db = Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "CREATE TABLE peers (
+                        name TEXT PRIMARY KEY, mux TEXT NOT NULL, target TEXT NOT NULL,
+                        socket TEXT NOT NULL DEFAULT '', cwd TEXT, last_seen INTEGER NOT NULL
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen)
+                     VALUES ('old', 'tmux', '%1', '', '/legacy', ?1)",
+                    params(vec![now().into()]),
+                )
+                .await
+                .unwrap();
+            });
+        }
+
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        // First open runs the inline migration: the table exists and is usable, and
+        // the pre-existing peer survives.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(s.count_revocations().unwrap(), 0, "table created, empty");
+            s.record_revocation(&RevocationEvent {
+                id: 0,
+                ts: 9,
+                fp: "SHA256:zz".into(),
+                identity: "id".into(),
+                source: "src".into(),
+                kind: RevocationKind::Declared,
+            })
+            .unwrap();
+            assert_eq!(s.count_revocations().unwrap(), 1);
+            assert!(
+                s.get_peer("old").unwrap().is_some(),
+                "legacy peer survived the migration (no data loss)"
+            );
+        }
+        // Re-open: idempotent — the recorded event persists, no duplicate-table error.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(s.count_revocations().unwrap(), 1, "re-open is a no-op");
+        }
     }
 }

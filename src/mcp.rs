@@ -1160,6 +1160,63 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             ));
         }
     }
+    // Signed-identity verify summary (parity with the CLI `weave doctor` human block).
+    // Counts + this session's OWN fingerprint only — NEVER a peer pubkey, a token, or
+    // the private key. Reads trust/revoked policy via `Config::load()` (the full Config
+    // is not plumbed into the MCP server; same pattern as the federation rollup above)
+    // and the multi-key registry / revocation log via `store`. The whole `out` string
+    // is the JSON-RPC tool RESULT (stdout frame); no diagnostic is emitted to stdout,
+    // so stdout discipline holds (any logging stays on stderr elsewhere).
+    #[cfg(feature = "sign")]
+    {
+        let cfg = crate::config::Config::load();
+        let trust = cfg.trust_set();
+        let revoked = cfg.revoked_set();
+        let mode = match cfg.strict_verify_override() {
+            Some(true) => "forced",
+            Some(false) => "disabled",
+            None => "default (trust-set aware)",
+        };
+        out.push_str(&format!(
+            "\n  signed id:      strict={mode}, trusted={}, revoked={}",
+            trust.len(),
+            revoked.len()
+        ));
+        if let Ok(pairs) = store.list_keys() {
+            use std::collections::BTreeSet;
+            let idents: BTreeSet<&str> = pairs.iter().map(|(i, _)| i.as_str()).collect();
+            let mut multi = std::collections::BTreeMap::<&str, usize>::new();
+            for (i, _) in &pairs {
+                *multi.entry(i.as_str()).or_insert(0) += 1;
+            }
+            let mid_rotation = multi.values().filter(|&&c| c > 1).count();
+            out.push_str(&format!(
+                "\n  key registry:   {} identities, {} keys ({mid_rotation} mid-rotation)",
+                idents.len(),
+                pairs.len()
+            ));
+            let hit = pairs
+                .iter()
+                .filter(|(_, pk)| {
+                    revoked
+                        .iter()
+                        .any(|e| crate::sign::fingerprint_matches(e, pk))
+                })
+                .count();
+            out.push_str(&format!(
+                "\n  revoked keys:   {hit} registered key(s) currently revoked"
+            ));
+        }
+        if let Ok(events) = store.count_revocations() {
+            out.push_str(&format!("\n  revocation log: {events} event(s) recorded"));
+        }
+        let local_fp = crate::sign::local_public_key()
+            .ok()
+            .flatten()
+            .and_then(|pk| crate::sign::fingerprint(&pk))
+            .unwrap_or_else(|| "none".to_string());
+        out.push_str(&format!("\n  my fingerprint: {local_fp}"));
+    }
     out.push_str("\n  (db/config paths: run `weave doctor` on the CLI)");
     // FR6: warn when the resolved store is NOT the well-known XDG default — the most
     // common "why can't I see the other session's peers" cause is a mismatched

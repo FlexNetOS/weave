@@ -440,7 +440,8 @@ weave key add envctl <hex-pubkey>   # APPEND a peer's public key (multi-key: old
 weave key remove envctl <key-or-fp> # prune a retired key (full hex pubkey OR a SHA256:<64-hex> fingerprint)
 weave key list                      # list ALL registered (identity, public key, fingerprint) keys, with [trusted]/[REVOKED] tags (--json)
 weave key rotate --me desktop       # archive the old key (0600), generate a new one, KEEP the old registered during overlap, print both fingerprints
-weave key revoke <fingerprint>      # print the value to add to WEAVE_REVOKED to retire a key (config-driven; no store table)
+weave key revoke <fingerprint>      # print the value to add to WEAVE_REVOKED to retire a key (config-driven; also logs a `declared` audit event)
+weave audit revocations             # list the observed-revocation audit log (declared + enforced events), secret-free (--json, --limit)
 ```
 
 The private key lives at `~/.config/weave/ed25519.key` (mode `0600`) and is never
@@ -509,6 +510,33 @@ pulled intent is verified. **Trusting a sender first requires `weave key add
 A **tampered or spoofed (present-but-invalid) signature is always rejected** in
 every configuration. The only intents that strict mode drops are *unsigned* or
 *unverifiable* ones; a *valid* signature from a non-revoked key always commits.
+
+#### Revocation audit log (`weave audit revocations`)
+
+The R1 revocation predicate above stays **absolute and config-driven** — the
+decision reads only `WEAVE_REVOKED` / `revoked`, never the store. Alongside it, a
+sign-gated **observed-revocation audit log** (the additive `revocations` table,
+present as inert plain data in every build) records *when revocation is exercised*,
+purely for operator visibility — it is **never read by the verifier** and so can
+never weaken or diverge from R1:
+
+- A **`declared`** event is recorded when an operator runs `weave key revoke <fp>`
+  (provenance: which fingerprint was marked revoked, and when).
+- An **`enforced`** event is recorded (best-effort) at the moment the absolute R1
+  predicate rejects a pulled signed intent because its signature verified only
+  against a revoked key. An audit-write failure is logged to stderr and swallowed —
+  it can never change the rejection decision.
+
+`weave audit revocations` lists the log most-recent-first (`--json`, `--limit`).
+The log is **secret-free**: it stores and prints fingerprints (`SHA256:<64-hex>`),
+public identities, source labels, and counts only — never a private key, peer
+pubkey, or token.
+
+Both `weave doctor` and the MCP `weave_doctor` tool emit a sign-gated
+**verify-summary** at parity: strict-verify mode, the trusted set / revoked set
+counts, the registered-key count, the number of registered keys currently revoked,
+the recorded revocation-event count, and this session's own fingerprint — counts
+and the local fingerprint only, never a peer key.
 
 ## Status
 

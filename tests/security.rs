@@ -2377,3 +2377,130 @@ fn signed_by_unregistered_key_rejected_even_with_multikey_set() {
     let _ = std::fs::remove_dir_all(&atk_cfg);
     let _ = std::fs::remove_dir_all(&b_cfg);
 }
+
+// ---------------------------------------------------------------------------
+// #11 observed-revocation audit log — security properties: the `audit` / `doctor`
+// surfaces are SECRET-FREE (fingerprints + public labels + counts only, never a
+// private key) and BOUNDED (a huge `--limit` cannot trigger an unbounded response;
+// captured identity/fp/source are clamped at the write seam).
+// ---------------------------------------------------------------------------
+
+/// SECRET-FREE: after generating a key and declaring its revocation, neither
+/// `weave audit revocations` (human + json) nor `weave doctor` (human + json) ever
+/// leaks the on-disk PRIVATE key. Output carries only the `SHA256:` fingerprint,
+/// public identities/labels and counts.
+#[cfg(feature = "sign")]
+#[test]
+fn audit_and_doctor_output_is_secret_free() {
+    let db = TestDb::new();
+    let cfg = sign_config_home();
+    let cfg_s = cfg.to_string_lossy().into_owned();
+
+    let keygen = run_ok_env(
+        &db,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &cfg_s)],
+    );
+    let pubkey = sign_pubkey_from_gen(&keygen);
+    let secret = std::fs::read_to_string(cfg.join("weave").join("ed25519.key")).expect("key file");
+    let secret = secret.trim().to_string();
+    assert!(!secret.is_empty(), "key file holds the secret");
+
+    // Register the key and declare it revoked (records a declared audit event).
+    run_ok_env(
+        &db,
+        &["key", "add", "alice", &pubkey],
+        &[("XDG_CONFIG_HOME", &cfg_s)],
+    );
+    let revoke = run_ok_env(
+        &db,
+        &["key", "revoke", &pubkey],
+        &[("XDG_CONFIG_HOME", &cfg_s)],
+    );
+    let full_fp = revoke
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("WEAVE_REVOKED="))
+        .map(|s| s.trim().to_string())
+        .expect("revoke echoes the full fp");
+
+    let surfaces = [
+        run_ok(&db, &["audit", "revocations"]),
+        run_ok(&db, &["audit", "revocations", "--json"]),
+        run_ok_env(
+            &db,
+            &["doctor"],
+            &[("WEAVE_REVOKED", &full_fp), ("XDG_CONFIG_HOME", &cfg_s)],
+        ),
+        run_ok_env(
+            &db,
+            &["doctor", "--json"],
+            &[("WEAVE_REVOKED", &full_fp), ("XDG_CONFIG_HOME", &cfg_s)],
+        ),
+    ];
+    for out in &surfaces {
+        assert!(
+            !out.contains(&secret),
+            "the private key must NEVER appear in audit/doctor output:\n{out}"
+        );
+    }
+    // The audit surfaces DO carry the public fingerprint (sanity that we tested a
+    // surface that actually contains revocation data).
+    assert!(
+        surfaces[1].contains("SHA256:"),
+        "audit json carries the public fingerprint: {}",
+        surfaces[1]
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+/// BOUNDED: a hostile/oversized `--limit` to `weave audit revocations` cannot
+/// produce an unbounded response — the CLI clamps to the read cap. With a handful of
+/// events present, an absurd limit returns them without error and never more than the
+/// cap. (The per-field write-seam clamp is unit-proven in the store; this asserts the
+/// CLI read bound end-to-end.)
+#[cfg(feature = "sign")]
+#[test]
+fn audit_revocations_limit_is_bounded_end_to_end() {
+    let db = TestDb::new();
+    let cfg = sign_config_home();
+    let cfg_s = cfg.to_string_lossy().into_owned();
+
+    // Declare a few revokes so the log has rows.
+    for seed in 0..3u8 {
+        let kdb = TestDb::new();
+        let kcfg = sign_config_home();
+        let kcfg_s = kcfg.to_string_lossy().into_owned();
+        let pk = sign_pubkey_from_gen(&run_ok_env(
+            &kdb,
+            &["key", "gen", "--me", &format!("u{seed}")],
+            &[("XDG_CONFIG_HOME", &kcfg_s)],
+        ));
+        run_ok_env(&db, &["key", "revoke", &pk], &[("XDG_CONFIG_HOME", &cfg_s)]);
+        let _ = std::fs::remove_dir_all(&kcfg);
+    }
+
+    // An absurdly large limit must NOT error and must return a bounded result.
+    let json = run_ok(
+        &db,
+        &["audit", "revocations", "--json", "--limit", "100000000"],
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).expect("audit --json parses");
+    let n = v["revocations"].as_array().unwrap().len();
+    assert_eq!(
+        n, 3,
+        "over-cap limit returns only what exists, bounded: {json}"
+    );
+    assert_eq!(v["count"], 3);
+
+    // A negative limit is also bounded (clamped, no unbounded scan, no panic).
+    // (`--limit=-1` form: clap reads a bare `-1` as a flag.)
+    let neg = run_ok(&db, &["audit", "revocations", "--json", "--limit=-1"]);
+    let nv: serde_json::Value = serde_json::from_str(&neg).expect("audit --json parses");
+    assert!(
+        nv["revocations"].as_array().unwrap().len() <= 3,
+        "negative limit stays bounded: {neg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
