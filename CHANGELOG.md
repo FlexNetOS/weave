@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] — unify the test `WEAVE_*` env guard (`crate::testenv`)
+
+> **Test-only.** No runtime/behavior change, no new dependency (std-only), nothing
+> enters the shippable binary (all `#[cfg(test)]`). Contributor-relevant hardening of
+> the multithreaded unit-test harness.
+
+### Tests
+- **testenv:** new `#[cfg(test)] mod testenv` (`src/testenv.rs`) provides ONE
+  canonical, process-wide env serialization guard — `lock_env()` (a poison-tolerant
+  `OnceLock<Mutex<()>>`) plus the RAII `EnvVarGuard` (sets/removes a `WEAVE_*` var and
+  restores the exact prior state on Drop, even on panic). It replaces `config.rs`'s
+  old private `static ENV_GUARD`: all 11 config sites and `inject.rs`'s previously
+  **unguarded** `weave_mux_dir_precedes_system_dirs` test now serialize on the one
+  lock, eliminating a rare multithreaded `WEAVE_*` data race. A stress test
+  (`env_guard_serializes_concurrent_weave_mux_dir`, 8 threads × 200 iters) proves the
+  serialization. Integration/security/prop tests are unchanged (separate process,
+  scrubbed env).
+
 ## [Unreleased] — `weave doctor` federation-health rollup (token/timeout parity)
 
 > **Observability-only.** No new dependency, no schema/migration, no `Store`-trait,
