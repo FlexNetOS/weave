@@ -312,6 +312,68 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// Open a correlation-tracked request to a peer (P1 ask/answer/ack). Returns a
+    /// correlation id immediately (non-blocking); the question is delivered like a
+    /// normal message and the honest delivery verdict is printed. Point-to-point.
+    Ask {
+        #[arg(long)]
+        to: String,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        /// prior correlation id this ask chains/closes
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Answer a tracked ask, replying back to whoever opened it (open -> answered).
+    /// Reference the thread by --id (correlation id) OR --in-reply-to (a message id).
+    Answer {
+        /// the ask's correlation id
+        #[arg(long)]
+        id: Option<String>,
+        /// alternatively, a message id belonging to the ask
+        #[arg(long = "in-reply-to")]
+        in_reply_to: Option<i64>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Close a tracked ask (-> acked). Pure state transition; an optional --message
+    /// is recorded as the closing note (not delivered).
+    Ack {
+        /// the ask's correlation id
+        #[arg(long)]
+        id: String,
+        #[arg(long, allow_hyphen_values = true)]
+        message: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// List tracked asks where you are the asker, askee, or either.
+    Asks {
+        #[arg(long)]
+        me: Option<String>,
+        /// asker | askee | any (default any)
+        #[arg(long, default_value = "any")]
+        role: String,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a single tracked ask by correlation id.
+    AskGet {
+        #[arg(long)]
+        id: String,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Configuration helpers.
     Config {
         #[command(subcommand)]
@@ -680,6 +742,37 @@ fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str)
         }
     }
     Ok(())
+}
+
+/// Fire the caller-side live nudge for an ask/answer and return the HONEST delivery
+/// verdict string, reusing the EXISTING injector return (no new spawn path, no
+/// `store → inject` edge — exactly the `try_inject` seam). A broadcast/queued/
+/// not-injectable recipient is never an error; the message is safely in the store.
+///   * `inject` returned `Ok(true)` ⇒ `transport_delivered`;
+///   * registered-but-not-alive / `Ok(false)` / `Err` ⇒ `queued_next_turn`;
+///   * `mux=none` / no peer row ⇒ `recipient_not_injectable`.
+fn ask_inject_verdict(
+    store: &dyn Store,
+    cfg: &Config,
+    from: &str,
+    to: &str,
+    body: &str,
+) -> &'static str {
+    let Ok(Some(peer)) = store.get_peer(to) else {
+        return "recipient_not_injectable";
+    };
+    let t = inject::Target::from_peer(&peer);
+    match inject::capability(&t) {
+        inject::Capability::NotInjectable => "recipient_not_injectable",
+        _ => match inject::inject(&t, &cfg.nudge(from, body)) {
+            Ok(true) => "transport_delivered",
+            Ok(false) => "queued_next_turn",
+            Err(err) => {
+                eprintln!("inject failed ({err}); will arrive on next turn");
+                "queued_next_turn"
+            }
+        },
+    }
 }
 
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
@@ -1657,6 +1750,128 @@ fn main() -> Result<()> {
                 .and_then(|t| t.into_iter().find(|m| m.id == mid))
             {
                 try_inject(store, &cfg, &from, &parent.recipient, &body)?;
+            }
+        }
+
+        Cmd::Ask {
+            to,
+            body,
+            subject,
+            reply_to,
+            from,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            if model::is_broadcast(&to) {
+                anyhow::bail!(
+                    "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
+                );
+            }
+            let (cid, _qid) =
+                store.ask(&from, &to, subject.as_deref(), &body, reply_to.as_deref())?;
+            // Honest delivery verdict via the caller-side nudge (no store->inject edge).
+            let verdict = ask_inject_verdict(store, &cfg, &from, &to, &body);
+            println!("opened ask {cid}: {from} -> {to} ({verdict})");
+        }
+
+        Cmd::Answer {
+            id,
+            in_reply_to,
+            body,
+            from,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            // Resolve the correlation id from --id or --in-reply-to (a message id).
+            let cid = match (id, in_reply_to) {
+                (Some(cid), _) => cid,
+                (None, Some(mid)) => store
+                    .ask_for_message(mid)?
+                    .ok_or_else(|| anyhow::anyhow!("message #{mid} belongs to no tracked ask"))?,
+                (None, None) => anyhow::bail!("provide either --id or --in-reply-to"),
+            };
+            let ask = store
+                .get_ask(&cid)?
+                .ok_or_else(|| anyhow::anyhow!("no tracked ask '{cid}'"))?;
+            let asker = ask.asker.clone();
+            store.answer(&from, &cid, &body)?;
+            let verdict = ask_inject_verdict(store, &cfg, &from, &asker, &body);
+            println!("answered ask {cid} -> {asker} ({verdict})");
+        }
+
+        Cmd::Ack { id, message, from } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            store.ack(&from, &id, message.as_deref())?;
+            println!("closed ask {id} (acked)");
+        }
+
+        Cmd::Asks {
+            me,
+            role,
+            limit,
+            json,
+        } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            let asks = store.list_asks(&me, model::AskRole::parse(&role), limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "asks": asks }))?
+                );
+            } else if asks.is_empty() {
+                println!("no tracked asks");
+            } else {
+                for a in &asks {
+                    let subj = a
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    println!(
+                        "{} [{}] {} -> {}{} ({})",
+                        a.id,
+                        a.state.as_str(),
+                        a.asker,
+                        a.askee,
+                        subj,
+                        model::fmt_ts(a.opened_ts)
+                    );
+                }
+            }
+        }
+
+        Cmd::AskGet { id, json } => {
+            let ask = store.get_ask(&id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "ask": ask }))?
+                );
+            } else {
+                match ask {
+                    None => println!("no tracked ask '{id}'"),
+                    Some(a) => {
+                        let answered = if a.answer_msg_id.is_some() {
+                            " (answered)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "{} [{}] {} -> {}{}{}",
+                            a.id,
+                            a.state.as_str(),
+                            a.asker,
+                            a.askee,
+                            a.subject
+                                .as_ref()
+                                .map(|s| format!(" | {s}"))
+                                .unwrap_or_default(),
+                            answered
+                        );
+                    }
+                }
             }
         }
 

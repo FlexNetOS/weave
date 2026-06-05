@@ -3,6 +3,34 @@
 > Roadmap feature #2 (closes the biggest functional gap vs repowire/agent-teams:
 > a synchronous-feeling ask/answer round-trip). SEP-1686-style async task pattern.
 
+> **Status: P1 implemented (weave⊇repowire parity, epic 1).** The core of this spec
+> shipped — see `CHANGELOG.md`, `ARCHITECTURE.md` §6 (`asks`), and the README "Tracked
+> ask/answer/ack" section. What landed vs what is deferred:
+>
+> - **Shipped:** the `asks` side-table (both backends, guarded additive migration),
+>   the question/answer text reusing `messages` (threaded via `in_reply_to`),
+>   point-to-point-only (broadcast `to` rejected), and the `weave_ask` / `weave_ack` /
+>   `weave_ask_get` / `weave_asks` MCP tools + CLI mirrors — exactly the storage and
+>   composition decisions below.
+> - **Shipped, but with a narrower lifecycle vocabulary than this spec proposed.** P1
+>   ships the brief's canonical **`open → answered → acked`** monotonic lifecycle (plus
+>   a dedicated **`weave_answer`** tool — the answer goes back along the correlation chain
+>   to the asker — distinct from `weave_ack`, which is a pure close). The richer
+>   **SEP-1686** state set below (`working | input_required | completed | failed |
+>   cancelled`) is **deferred** to a later epic. The schema is **forward-compatible**:
+>   `state` is stored as **TEXT** validated against a Rust `AskState` enum, so future
+>   variants can be added **without a migration**.
+> - **Shipped beyond this spec:** an opaque server-minted `correlation_id`
+>   (`ask_<rowid>_<nonce>`, no `rand`/date crate), `reply_to` thread chaining (a new ask
+>   acks the prior thread and links into its conversation), and an **honest delivery
+>   verdict** (`transport_delivered` / `queued_next_turn` / `recipient_not_injectable`)
+>   computed caller-side with **no `store → inject` edge** and **no new dependency**.
+> - **Deferred:** the SEP-1686 richer states, broadcast/fan-out-join asks, cross-store
+>   ask, and the stop-wake integration (Phasing §3 below). P1 is **local-mesh only**.
+>
+> The remainder of this document is the original forward-looking proposal, kept for the
+> deferred work; read it against the Status note above for what is live today.
+
 ## Shape
 A sender posts an **ask** (a request that needs a reply) to a peer and immediately
 gets a **task id**. The peer answers later via **weave_ack**, moving the task

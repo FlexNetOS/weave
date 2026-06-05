@@ -455,6 +455,33 @@ suite is hermetic in CI.
   pid in the generator), guarding the A2 classifier's totality and locking that a
   remote arm decision never depends on a probe.
 
+- **Property 5 — ask lifecycle monotonicity.** For all `(from, to)` `AskState`
+  pairs and every transition kind, `AskState::can_transition` permits **only** the
+  three legal edges (`Open→Answered`, `Open→Acked`, `Answered→Acked`) and **never**
+  a backward, self, or from-terminal edge — the pure "an ask never goes backwards"
+  invariant. Exercised purely (no store, no subprocess), so it pins the state
+  machine independently of the SQL that enforces it.
+
+### Tracked ask/answer/ack (P1)
+
+The ask/answer/ack lifecycle is tested **hermetically across both backends** and
+end-to-end. The pure monotonic state machine is locked by Property 5 above
+(`AskState::can_transition`). The store layer (`src/store.rs` /
+`src/store_libsql.rs` `#[cfg(test)]`, run under default sqlite **and**
+`--no-default-features --features libsql`) covers a full `ask → answer → ack`
+roundtrip: `ask` opens an `open` row + mints a valid `ask_id_valid` correlation_id
+and inserts the question into `messages`; `answer` addresses back to the asker, sets
+`answer_msg_id`, transitions `open → answered`; `ack` transitions `→ acked`, stamps
+`closed_ts`, and records the optional `close_note`; `reply_to` chaining acks the prior
+thread and links the new question into the same conversation. The **failure paths** are
+asserted as clean errors (never a panic): answering an acked thread, a double-ack, an
+unknown correlation_id, a wrong-owner write, a broadcast `askee`, and an oversized body /
+invalid correlation_id (rejected before any bind). The `McpServer` + `CARGO_BIN_EXE_weave`
+black-box layers assert the **honest delivery verdict** vocabulary
+(`transport_delivered` / `queued_next_turn` / `recipient_not_injectable`) appears and that
+a queued / not-injectable ask is **not** an `isError` (hermetic ⇒ no real mux), plus the
+`weave asks` / `weave ask-get` `--json` shapes.
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

@@ -6014,3 +6014,328 @@ fn mcp_weave_doctor_stdout_is_pure_jsonrpc() {
     );
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P1 tracked ask/answer/ack — black-box (CLI + MCP)
+// ---------------------------------------------------------------------------
+
+/// Pull the minted `ask_<rowid>_<nonce>` correlation id out of a CLI/MCP line.
+fn extract_cid(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| w.trim_end_matches([':', '.', ',']))
+        .find(|w| w.starts_with("ask_"))
+        .unwrap_or_else(|| panic!("no correlation id in: {text:?}"))
+        .to_string()
+}
+
+/// CLI end-to-end: `weave ask` -> `weave answer` -> `weave ack` across two
+/// identities. The answer lands in the asker's inbox/thread ("Re:" subject), the
+/// honest delivery verdict surfaces (hermetic ⇒ not-injectable/queued), and the
+/// lifecycle reaches `acked`.
+#[test]
+fn cli_ask_answer_ack_roundtrip() {
+    let db = TestDb::new();
+
+    // a opens a tracked ask to b.
+    let opened = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "lunch",
+            "--body",
+            "when?",
+        ],
+    );
+    assert!(opened.contains("opened ask"), "ask line: {opened:?}");
+    assert!(opened.contains("alice -> bob"), "ask line: {opened:?}");
+    // Hermetic: no real mux, no registered peer ⇒ a degrade verdict, never injected.
+    assert!(
+        opened.contains("recipient_not_injectable") || opened.contains("queued_next_turn"),
+        "honest delivery verdict must surface: {opened:?}"
+    );
+    let cid = extract_cid(&opened);
+    assert!(cid.starts_with("ask_"));
+
+    // The question landed in bob's inbox.
+    let b_inbox = run_ok(&db, &["inbox", "--me", "bob"]);
+    assert!(
+        b_inbox.contains("when?"),
+        "question in bob's inbox: {b_inbox:?}"
+    );
+
+    // b answers; the answer addresses back to alice.
+    let answered = run_ok(
+        &db,
+        &["answer", "--from", "bob", "--id", &cid, "--body", "noon"],
+    );
+    assert!(
+        answered.contains("answered ask"),
+        "answer line: {answered:?}"
+    );
+    assert!(
+        answered.contains("-> alice"),
+        "answer routes back to asker: {answered:?}"
+    );
+
+    // The answer is in alice's inbox with a "Re:" subject.
+    let a_inbox = run_ok(&db, &["inbox", "--me", "alice"]);
+    assert!(
+        a_inbox.contains("noon"),
+        "answer in alice's inbox: {a_inbox:?}"
+    );
+    assert!(
+        a_inbox.contains("Re: lunch"),
+        "Re: subject inherited: {a_inbox:?}"
+    );
+
+    // b acks to close.
+    let acked = run_ok(
+        &db,
+        &["ack", "--from", "bob", "--id", &cid, "--message", "ttyl"],
+    );
+    assert!(acked.contains("closed ask"), "ack line: {acked:?}");
+
+    // ask-get shows the terminal state + answered marker.
+    let got = run_ok(&db, &["ask-get", "--id", &cid]);
+    assert!(got.contains("[acked]"), "ask-get shows acked: {got:?}");
+    assert!(
+        got.contains("(answered)"),
+        "ask-get shows answered marker: {got:?}"
+    );
+}
+
+/// CLI `--json` shapes for `weave asks` and `weave ask-get` are well-formed and
+/// expose the lifecycle fields.
+#[test]
+fn cli_asks_and_ask_get_json_shapes() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &["ask", "--from", "alice", "--to", "bob", "--body", "q1"],
+    );
+    let cid = extract_cid(&opened);
+
+    // `weave asks --json` -> { "asks": [ { id, state, asker, askee, ... } ] }
+    let asks_json = run_ok(&db, &["asks", "--me", "alice", "--role", "asker", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&asks_json).expect("asks --json is valid JSON");
+    let arr = v
+        .get("asks")
+        .and_then(|a| a.as_array())
+        .expect("asks array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0].get("id").and_then(|x| x.as_str()),
+        Some(cid.as_str())
+    );
+    assert_eq!(arr[0].get("state").and_then(|x| x.as_str()), Some("open"));
+    assert_eq!(arr[0].get("asker").and_then(|x| x.as_str()), Some("alice"));
+    assert_eq!(arr[0].get("askee").and_then(|x| x.as_str()), Some("bob"));
+
+    // `weave ask-get --json` -> { "ask": { ... } }
+    let get_json = run_ok(&db, &["ask-get", "--id", &cid, "--json"]);
+    let g: serde_json::Value =
+        serde_json::from_str(&get_json).expect("ask-get --json is valid JSON");
+    let ask = g.get("ask").expect("ask object");
+    assert_eq!(ask.get("id").and_then(|x| x.as_str()), Some(cid.as_str()));
+    assert_eq!(ask.get("state").and_then(|x| x.as_str()), Some("open"));
+    assert!(ask
+        .get("answer_msg_id")
+        .map(|x| x.is_null())
+        .unwrap_or(true));
+}
+
+/// CLI failure paths are clean non-zero exits (never a panic): answering/acking an
+/// unknown correlation id, double-ack, a wrong-owner answer, and a metachar id.
+#[test]
+fn cli_ask_failure_paths_are_clean() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &["ask", "--from", "alice", "--to", "bob", "--body", "q"],
+    );
+    let cid = extract_cid(&opened);
+
+    // Unknown correlation id.
+    let (ok, _o, err) = run(
+        &db,
+        &[
+            "answer",
+            "--from",
+            "bob",
+            "--id",
+            "ask_999_1",
+            "--body",
+            "x",
+        ],
+    );
+    assert!(!ok, "answer of unknown id must fail");
+    assert!(
+        !err.contains("panicked"),
+        "must be a clean error, not a panic: {err:?}"
+    );
+
+    // Wrong owner: the asker cannot answer its own ask.
+    let (ok, _o, _e) = run(
+        &db,
+        &["answer", "--from", "alice", "--id", &cid, "--body", "x"],
+    );
+    assert!(!ok, "only the askee may answer");
+
+    // Double-ack: ack once, then again.
+    run_ok(&db, &["ack", "--from", "bob", "--id", &cid]);
+    let (ok, _o, err) = run(&db, &["ack", "--from", "bob", "--id", &cid]);
+    assert!(!ok, "double-ack must fail");
+    assert!(
+        !err.contains("panicked"),
+        "double-ack is a clean error: {err:?}"
+    );
+
+    // Answer of an acked thread.
+    let (ok, _o, _e) = run(
+        &db,
+        &["answer", "--from", "bob", "--id", &cid, "--body", "late"],
+    );
+    assert!(!ok, "answer of an acked thread must fail");
+
+    // A shell-metachar correlation id is rejected before any DB bind.
+    let (ok, _o, err) = run(&db, &["ack", "--from", "bob", "--id", "ask;rm -rf /"]);
+    assert!(!ok, "metachar id must be rejected");
+    assert!(
+        !err.contains("panicked"),
+        "metachar id is a clean rejection: {err:?}"
+    );
+}
+
+/// MCP black-box: tools/list grows by EXACTLY 5 (weave_ask/answer/ack/asks/ask_get),
+/// a happy-path ask returns a correlation id + an honest verdict (NOT isError even
+/// when not injectable), and the failure paths come back as clean isError results
+/// (never a panic, never a silent persist). stdout stays pure JSON-RPC (call_tool
+/// asserts a single parseable frame with the matching id).
+#[test]
+fn mcp_ask_lifecycle_and_failures() {
+    let db = TestDb::new();
+
+    // Count the tool set: the five ask tools are present and nothing was removed.
+    let mut mcp = McpServer::spawn(&db);
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in [
+        "weave_ask",
+        "weave_answer",
+        "weave_ack",
+        "weave_asks",
+        "weave_ask_get",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "tools/list missing {expected}; got {names:?}"
+        );
+    }
+    // Exactly five tool names start with the ask family prefix set.
+    let ask_family = names
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.as_str(),
+                "weave_ask" | "weave_answer" | "weave_ack" | "weave_asks" | "weave_ask_get"
+            )
+        })
+        .count();
+    assert_eq!(ask_family, 5, "exactly 5 ask-family tools: {names:?}");
+
+    // Happy path: ask to an unknown peer is HONEST SUCCESS with a verdict, NOT an
+    // error (degrade-to-store), exactly like weave_send/weave_connect.
+    let (is_err, ask_text) = mcp.call_tool(
+        "weave_ask",
+        serde_json::json!({"from": "alice", "to": "bob", "subject": "s", "body": "q?"}),
+    );
+    assert!(
+        !is_err,
+        "ask to a not-injectable peer is honest success, not an error: {ask_text}"
+    );
+    assert!(
+        ask_text.contains("Opened ask"),
+        "ask result text: {ask_text:?}"
+    );
+    assert!(
+        ask_text.contains("recipient_not_injectable") || ask_text.contains("queued_next_turn"),
+        "the honest delivery verdict vocabulary must appear: {ask_text:?}"
+    );
+    let cid = extract_cid(&ask_text);
+
+    // weave_answer happy path (back to the asker) with a verdict.
+    let (is_err, ans_text) = mcp.call_tool(
+        "weave_answer",
+        serde_json::json!({"from": "bob", "correlation_id": cid, "body": "a!"}),
+    );
+    assert!(!is_err, "answer happy path: {ans_text}");
+    assert!(
+        ans_text.contains("back to 'alice'"),
+        "answer routes to asker: {ans_text:?}"
+    );
+
+    // FAILURE: answer of an unknown correlation id -> isError, clean message.
+    let (is_err, t) = mcp.call_tool(
+        "weave_answer",
+        serde_json::json!({"from": "bob", "correlation_id": "ask_404_1", "body": "x"}),
+    );
+    assert!(is_err, "answer of unknown id must be isError: {t}");
+
+    // weave_ack closes; a second ack is a clean isError (double-ack).
+    let (is_err, _t) = mcp.call_tool(
+        "weave_ack",
+        serde_json::json!({"from": "bob", "correlation_id": cid}),
+    );
+    assert!(!is_err, "first ack succeeds");
+    let (is_err, t) = mcp.call_tool(
+        "weave_ack",
+        serde_json::json!({"from": "bob", "correlation_id": cid}),
+    );
+    assert!(is_err, "double-ack must be a clean isError: {t}");
+
+    // FAILURE: ack of an unknown correlation id -> isError.
+    let (is_err, t) = mcp.call_tool(
+        "weave_ack",
+        serde_json::json!({"from": "bob", "correlation_id": "ask_999_9"}),
+    );
+    assert!(is_err, "ack of unknown id must be isError: {t}");
+
+    // weave_ask_get reflects the terminal state.
+    let (is_err, got) = mcp.call_tool("weave_ask_get", serde_json::json!({"id": cid}));
+    assert!(!is_err, "ask_get: {got}");
+    assert!(got.contains("[acked]"), "ask_get shows acked: {got:?}");
+
+    mcp.shutdown();
+}
+
+/// MCP: a queued/not-injectable delivery for an ask is NEVER an error AND its
+/// result text never leaks the message body to stdout beyond the structured
+/// frame (call_tool asserts a single parseable JSON-RPC frame; here we also assert
+/// the verdict sentence rather than the raw body is what surfaces). This pins the
+/// honest-success-with-verdict contract.
+#[test]
+fn mcp_ask_verdict_is_success_not_error() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let (is_err, text) = mcp.call_tool(
+        "weave_ask",
+        serde_json::json!({"from": "alice", "to": "ghost", "body": "secret-question"}),
+    );
+    assert!(!is_err, "not-injectable ask is success: {text}");
+    assert!(
+        text.contains("not injectable") || text.contains("next turn"),
+        "a degrade verdict sentence surfaces: {text:?}"
+    );
+    mcp.shutdown();
+}

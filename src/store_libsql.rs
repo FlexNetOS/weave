@@ -36,7 +36,10 @@
 //! via `query`, not `execute` (libsql's `execute` rejects row-returning statements).
 
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
-use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
+use crate::model::{
+    ask_id_valid, is_broadcast, new_ask_id, now, Ask, AskRole, AskState, Intent, Message, Peer,
+    BROADCAST_SQL,
+};
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_field, clamp_limit, commit_pulled,
     merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
@@ -111,6 +114,20 @@ const SCHEMA: &[&str] = &[
         identity  TEXT NOT NULL DEFAULT '',
         source    TEXT NOT NULL DEFAULT '',
         kind      TEXT NOT NULL DEFAULT 'enforced'
+    )",
+    "CREATE TABLE IF NOT EXISTS asks (
+        id              TEXT PRIMARY KEY,
+        question_msg_id INTEGER NOT NULL,
+        answer_msg_id   INTEGER,
+        asker           TEXT NOT NULL,
+        askee           TEXT NOT NULL,
+        subject         TEXT,
+        state           TEXT NOT NULL,
+        reply_to        TEXT,
+        close_note      TEXT,
+        opened_ts       INTEGER NOT NULL,
+        updated_ts      INTEGER NOT NULL,
+        closed_ts       INTEGER
     )",
 ];
 
@@ -188,6 +205,29 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
         subject: r.get::<Option<String>>(5)?,
         body: r.get::<String>(6)?,
         sig: r.get::<String>(7)?,
+    })
+}
+
+/// Convert an `asks` row into our owned [`Ask`]. Column order matches the explicit
+/// projections below: id, question_msg_id, answer_msg_id, asker, askee, subject,
+/// state, reply_to, close_note, opened_ts, updated_ts, closed_ts. `state` is parsed
+/// through [`AskState::from_str`]; an unknown value is a clean error, never a panic.
+fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
+    let state_str = r.get::<String>(6)?;
+    let state = AskState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+    Ok(Ask {
+        id: r.get::<String>(0)?,
+        question_msg_id: r.get::<i64>(1)?,
+        answer_msg_id: r.get::<Option<i64>>(2)?,
+        asker: r.get::<String>(3)?,
+        askee: r.get::<String>(4)?,
+        subject: r.get::<Option<String>>(5)?,
+        state,
+        reply_to: r.get::<Option<String>>(7)?,
+        close_note: r.get::<Option<String>>(8)?,
+        opened_ts: r.get::<i64>(9)?,
+        updated_ts: r.get::<i64>(10)?,
+        closed_ts: r.get::<Option<i64>>(11)?,
     })
 }
 
@@ -388,6 +428,31 @@ impl LibsqlStore {
             )
             .await
             .context("creating revocations table")?;
+            // Migration (P1): the tracked ask/answer/ack side-table. Created via
+            // SCHEMA above for a fresh DB; also created idempotently here for a DB
+            // that predates it (mirrors SqliteStore::migrate). Inert plain data in
+            // every build; the question/answer TEXT lives in `messages`, this row
+            // holds only correlation + lifecycle. Constant DDL — no user data
+            // interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS asks (
+                    id              TEXT PRIMARY KEY,
+                    question_msg_id INTEGER NOT NULL,
+                    answer_msg_id   INTEGER,
+                    asker           TEXT NOT NULL,
+                    askee           TEXT NOT NULL,
+                    subject         TEXT,
+                    state           TEXT NOT NULL,
+                    reply_to        TEXT,
+                    close_note      TEXT,
+                    opened_ts       INTEGER NOT NULL,
+                    updated_ts      INTEGER NOT NULL,
+                    closed_ts       INTEGER
+                )",
+                (),
+            )
+            .await
+            .context("creating asks table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1541,6 +1606,342 @@ impl Store for LibsqlStore {
             }
         })
     }
+
+    fn ask(
+        &self,
+        asker: &str,
+        askee: &str,
+        subject: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+    ) -> Result<(String, i64)> {
+        self.guard_writable()?;
+        check_ident("asker", asker)?;
+        check_ident("askee", askee)?;
+        check_body(body)?;
+        if is_broadcast(askee) {
+            anyhow::bail!(
+                "tracked ask is point-to-point; a broadcast askee is not supported (P1)."
+            );
+        }
+        if let Some(rt) = reply_to {
+            if !ask_id_valid(rt) {
+                anyhow::bail!("invalid reply_to correlation id.");
+            }
+        }
+        let ts = now();
+        let subject_owned = subject.map(|s| s.to_string());
+        let reply_to_owned = reply_to.map(|s| s.to_string());
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+
+            // When chaining, load + close the prior thread and link the new question.
+            let (in_reply_to, subject_final): (Option<i64>, Option<String>) =
+                if let Some(rt) = &reply_to_owned {
+                    let mut rows = tx
+                        .query(
+                            "SELECT asker, askee, state, question_msg_id, answer_msg_id
+                             FROM asks WHERE id = ?1",
+                            params(vec![rt.clone().into()]),
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("reply_to ask '{rt}' not found."))?;
+                    let p_asker = row.get::<String>(0)?;
+                    let p_askee = row.get::<String>(1)?;
+                    let p_state = AskState::from_str(&row.get::<String>(2)?)
+                        .map_err(|m| anyhow::anyhow!(m))?;
+                    let p_qid = row.get::<i64>(3)?;
+                    let p_aid = row.get::<Option<i64>>(4)?;
+                    let same_pair = (p_asker == asker && p_askee == askee)
+                        || (p_asker == askee && p_askee == asker);
+                    if !same_pair {
+                        anyhow::bail!("reply_to ask '{rt}' is between different parties.");
+                    }
+                    let link = p_aid.unwrap_or(p_qid);
+                    if p_state != AskState::Acked {
+                        if !p_state.can_transition(AskState::Acked) {
+                            anyhow::bail!(
+                                "cannot chain from ask '{rt}' in state {}.",
+                                p_state.as_str()
+                            );
+                        }
+                        tx.execute(
+                            "UPDATE asks SET state = ?1, closed_ts = ?2, updated_ts = ?2 \
+                             WHERE id = ?3",
+                            params(vec![
+                                AskState::Acked.as_str().into(),
+                                ts.into(),
+                                rt.clone().into(),
+                            ]),
+                        )
+                        .await?;
+                    }
+                    // Inherit the prior subject's Re: discipline when none supplied.
+                    let subj = match &subject_owned {
+                        Some(s) => Some(s.clone()),
+                        None => {
+                            let mut sr = tx
+                                .query(
+                                    "SELECT subject FROM messages WHERE id = ?1",
+                                    params(vec![link.into()]),
+                                )
+                                .await?;
+                            let parent_subj = match sr.next().await? {
+                                Some(r) => r.get::<Option<String>>(0)?,
+                                None => None,
+                            };
+                            reply_subject(parent_subj.as_deref())
+                        }
+                    };
+                    (Some(link), subj)
+                } else {
+                    (None, subject_owned.clone())
+                };
+
+            tx.execute(
+                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params(vec![
+                    ts.into(),
+                    asker.into(),
+                    askee.into(),
+                    subject_final.clone().into(),
+                    body.into(),
+                    in_reply_to.into(),
+                ]),
+            )
+            .await?;
+            let question_msg_id = self.conn.last_insert_rowid();
+            let id = new_ask_id(question_msg_id);
+            tx.execute(
+                "INSERT INTO asks \
+                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
+                     reply_to, close_note, opened_ts, updated_ts, closed_ts) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL)",
+                params(vec![
+                    id.clone().into(),
+                    question_msg_id.into(),
+                    asker.into(),
+                    askee.into(),
+                    subject_final.into(),
+                    AskState::Open.as_str().into(),
+                    reply_to_owned.clone().into(),
+                    ts.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok((id, question_msg_id))
+        })
+    }
+
+    fn answer(&self, responder: &str, correlation_id: &str, body: &str) -> Result<i64> {
+        self.guard_writable()?;
+        check_ident("responder", responder)?;
+        check_body(body)?;
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        let ts = now();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let (asker, askee, state, question_msg_id) = {
+                let mut rows = tx
+                    .query(
+                        "SELECT asker, askee, state, question_msg_id FROM asks WHERE id = ?1",
+                        params(vec![correlation_id.into()]),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("ask '{correlation_id}' not found."))?;
+                (
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<i64>(3)?,
+                )
+            };
+            if responder != askee {
+                anyhow::bail!("only the askee '{askee}' can answer ask '{correlation_id}'.");
+            }
+            let state = AskState::from_str(&state).map_err(|m| anyhow::anyhow!(m))?;
+            if !state.can_transition(AskState::Answered) {
+                anyhow::bail!(
+                    "ask '{correlation_id}' is {} and cannot be answered.",
+                    state.as_str()
+                );
+            }
+            let parent_subject = {
+                let mut sr = tx
+                    .query(
+                        "SELECT subject FROM messages WHERE id = ?1",
+                        params(vec![question_msg_id.into()]),
+                    )
+                    .await?;
+                match sr.next().await? {
+                    Some(r) => r.get::<Option<String>>(0)?,
+                    None => None,
+                }
+            };
+            let subject = reply_subject(parent_subject.as_deref());
+            tx.execute(
+                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params(vec![
+                    ts.into(),
+                    responder.into(),
+                    asker.into(),
+                    subject.into(),
+                    body.into(),
+                    question_msg_id.into(),
+                ]),
+            )
+            .await?;
+            let answer_msg_id = self.conn.last_insert_rowid();
+            tx.execute(
+                "UPDATE asks SET answer_msg_id = ?1, state = ?2, updated_ts = ?3 WHERE id = ?4",
+                params(vec![
+                    answer_msg_id.into(),
+                    AskState::Answered.as_str().into(),
+                    ts.into(),
+                    correlation_id.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(answer_msg_id)
+        })
+    }
+
+    fn ack(&self, acker: &str, correlation_id: &str, message: Option<&str>) -> Result<()> {
+        self.guard_writable()?;
+        check_ident("acker", acker)?;
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        if let Some(m) = message {
+            check_body(m)?;
+        }
+        let ts = now();
+        let message_owned = message.map(|s| s.to_string());
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let (askee, state) = {
+                let mut rows = tx
+                    .query(
+                        "SELECT askee, state FROM asks WHERE id = ?1",
+                        params(vec![correlation_id.into()]),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("ask '{correlation_id}' not found."))?;
+                (row.get::<String>(0)?, row.get::<String>(1)?)
+            };
+            if acker != askee {
+                anyhow::bail!("only the askee '{askee}' can ack ask '{correlation_id}'.");
+            }
+            let state = AskState::from_str(&state).map_err(|m| anyhow::anyhow!(m))?;
+            if !state.can_transition(AskState::Acked) {
+                anyhow::bail!(
+                    "ask '{correlation_id}' is already {} (cannot ack).",
+                    state.as_str()
+                );
+            }
+            tx.execute(
+                "UPDATE asks SET state = ?1, close_note = ?2, closed_ts = ?3, updated_ts = ?3 \
+                 WHERE id = ?4",
+                params(vec![
+                    AskState::Acked.as_str().into(),
+                    message_owned.into(),
+                    ts.into(),
+                    correlation_id.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn get_ask(&self, correlation_id: &str) -> Result<Option<Ask>> {
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
+                            reply_to, close_note, opened_ts, updated_ts, closed_ts \
+                     FROM asks WHERE id = ?1",
+                    params(vec![correlation_id.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(row_to_ask(&r)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_asks(&self, me: &str, role: AskRole, limit: i64) -> Result<Vec<Ask>> {
+        check_ident("me", me)?;
+        let limit = clamp_limit(limit);
+        let where_clause = match role {
+            AskRole::Asker => "asker = ?1",
+            AskRole::Askee => "askee = ?1",
+            AskRole::Any => "(asker = ?1 OR askee = ?1)",
+        };
+        let sql = format!(
+            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
+                    reply_to, close_note, opened_ts, updated_ts, closed_ts \
+             FROM asks WHERE {where_clause} \
+             ORDER BY opened_ts DESC, rowid DESC LIMIT ?2"
+        );
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(&sql, params(vec![me.into(), limit.into()]))
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_ask(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn ask_for_message(&self, message_id: i64) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id FROM asks WHERE question_msg_id = ?1 OR answer_msg_id = ?1 LIMIT 1",
+                    params(vec![message_id.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(r.get::<String>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
 }
 
 /// Count unread messages for `me` against any connection (the live connection or
@@ -1624,6 +2025,228 @@ mod tests {
             ..Config::default()
         };
         LibsqlStore::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn ask_open_answer_ack_roundtrip() {
+        let s = mem();
+        let (cid, qid) = s.ask("a", "b", Some("help"), "what time?", None).unwrap();
+        assert!(crate::model::ask_id_valid(&cid));
+        let (b_in, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(b_in.iter().any(|m| m.id == qid && m.sender == "a"));
+        assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Open);
+
+        let aid = s.answer("b", &cid, "3pm").unwrap();
+        let (a_in, _) = s.inbox("a", true, false, 50).unwrap();
+        let ans = a_in.iter().find(|m| m.id == aid).expect("a got answer");
+        assert_eq!(ans.sender, "b");
+        assert_eq!(ans.recipient, "a");
+        assert_eq!(ans.in_reply_to, Some(qid));
+        let ask = s.get_ask(&cid).unwrap().unwrap();
+        assert_eq!(ask.state, AskState::Answered);
+        assert_eq!(ask.answer_msg_id, Some(aid));
+
+        s.ack("b", &cid, Some("done")).unwrap();
+        let ask = s.get_ask(&cid).unwrap().unwrap();
+        assert_eq!(ask.state, AskState::Acked);
+        assert!(ask.closed_ts.is_some());
+        assert_eq!(ask.close_note.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn ask_lifecycle_is_monotonic() {
+        let s = mem();
+        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        s.ack("b", &cid, None).unwrap();
+        assert!(s.ack("b", &cid, None).is_err());
+        assert!(s.answer("b", &cid, "late").is_err());
+        assert!(s.ack("b", "ask_999_1", None).is_err());
+        assert!(s.get_ask("ask_999_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn ask_owner_checks_and_caps() {
+        let s = mem();
+        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        assert!(s.answer("a", &cid, "self").is_err());
+        assert!(s.ack("a", &cid, None).is_err());
+        assert!(s.ask("a", "all", None, "q", None).is_err());
+        let big = "x".repeat(crate::store::MAX_BODY + 1);
+        assert!(s.ask("a", "b", None, &big, None).is_err());
+        assert!(s.answer("b", "ask;rm -rf", "x").is_err());
+        assert!(s.get_ask("bad id").is_err());
+    }
+
+    #[test]
+    fn ask_reply_to_chains_and_closes_prior() {
+        let s = mem();
+        let (c1, q1) = s.ask("a", "b", Some("topic"), "first?", None).unwrap();
+        s.answer("b", &c1, "first-ans").unwrap();
+        let (c2, q2) = s.ask("a", "b", None, "second?", Some(&c1)).unwrap();
+        assert_eq!(s.get_ask(&c1).unwrap().unwrap().state, AskState::Acked);
+        assert_eq!(
+            s.get_ask(&c2).unwrap().unwrap().reply_to.as_deref(),
+            Some(c1.as_str())
+        );
+        let thread = s.thread(q1, 50).unwrap();
+        assert!(thread.iter().any(|m| m.id == q2));
+        assert!(s.ask("a", "b", None, "x", Some("ask_404_1")).is_err());
+    }
+
+    #[test]
+    fn list_asks_role_filtering() {
+        let s = mem();
+        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
+        let (c2, _) = s.ask("b", "a", None, "q2", None).unwrap();
+        assert_eq!(s.list_asks("a", AskRole::Asker, 50).unwrap()[0].id, c1);
+        assert_eq!(s.list_asks("a", AskRole::Askee, 50).unwrap()[0].id, c2);
+        assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 2);
+    }
+
+    /// libsql parity: `list_asks` is bounded (clamped to MAX_LIMIT), and
+    /// `ask_for_message` resolves both the question and answer ends.
+    #[test]
+    fn list_asks_bounded_and_ask_for_message_libsql() {
+        let s = mem();
+        let (cid, qid) = s.ask("a", "b", None, "q", None).unwrap();
+        let aid = s.answer("b", &cid, "a").unwrap();
+        assert_eq!(
+            s.ask_for_message(qid).unwrap().as_deref(),
+            Some(cid.as_str())
+        );
+        assert_eq!(
+            s.ask_for_message(aid).unwrap().as_deref(),
+            Some(cid.as_str())
+        );
+        let mid = s.send("a", "b", None, "plain").unwrap();
+        assert_eq!(s.ask_for_message(mid).unwrap(), None);
+        let huge = s.list_asks("a", AskRole::Any, i64::MAX).unwrap();
+        assert!(
+            huge.len() <= MAX_LIMIT as usize,
+            "list_asks must clamp to MAX_LIMIT"
+        );
+    }
+
+    /// libsql write-trap parity: a `read_only` handle TRAPS every mutating ask op
+    /// (`ask`/`answer`/`ack`) at the `guard_writable` boundary (owner-only-writes),
+    /// while the read paths (`get_ask`/`list_asks`/`ask_for_message`) still work.
+    /// Mirrors `open_readonly_reads_but_cannot_write_libsql` for the ask surface.
+    #[test]
+    fn ask_writes_trap_on_readonly_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-ask-ro-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+
+        // Seed an ask via a normal RW open, then drop the handle.
+        let cid = {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            let (cid, _) = rw.ask("a", "b", None, "q", None).unwrap();
+            cid
+        };
+
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        // Reads work through the read-only handle.
+        assert_eq!(ro.get_ask(&cid).unwrap().unwrap().state, AskState::Open);
+        assert_eq!(ro.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
+        // All three mutating ops trap (never a silent foreign write, never a panic).
+        assert!(
+            ro.ask("a", "b", None, "intruder", None).is_err(),
+            "ask through a read-only handle must trap"
+        );
+        assert!(
+            ro.answer("b", &cid, "intruder").is_err(),
+            "answer through a read-only handle must trap"
+        );
+        assert!(
+            ro.ack("b", &cid, None).is_err(),
+            "ack through a read-only handle must trap"
+        );
+        // The failed writes were no-ops: the ask is still open.
+        assert_eq!(ro.get_ask(&cid).unwrap().unwrap().state, AskState::Open);
+    }
+
+    /// libsql parity: a legacy DB predating the `asks` table gains it idempotently
+    /// on open (mirror of the sqlite `legacy_db_gains_asks_table`), a full lifecycle
+    /// then works, and re-opening is a no-op that retains the acked ask.
+    #[test]
+    fn legacy_db_gains_asks_table_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-asks-legacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // A pre-P1 store: a messages table + a row, but NO asks table.
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let s = LibsqlStore::open(&cfg).unwrap();
+            s.send("a", "b", None, "pre-existing").unwrap();
+            // Drop the asks table to simulate a DB that predates the migration.
+            s.rt.block_on(async { s.conn.execute("DROP TABLE asks", ()).await })
+                .unwrap();
+            let exists =
+                s.rt.block_on(async {
+                    let mut rows = s
+                        .conn
+                        .query(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name='asks'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await
+                })
+                .unwrap()
+                .is_some();
+            assert!(!exists, "fixture must predate the asks table");
+        }
+        // Re-open runs the idempotent migration: the table is recreated, a full
+        // lifecycle works, and the pre-existing message survived.
+        let cid = {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let (cid, _) = s.ask("a", "b", Some("subj"), "q?", None).unwrap();
+            s.answer("b", &cid, "ans").unwrap();
+            s.ack("b", &cid, Some("closed")).unwrap();
+            assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);
+            let (rows, _) = s.inbox("b", true, false, 50).unwrap();
+            assert!(
+                rows.iter().any(|m| m.body == "pre-existing"),
+                "pre-existing message survived migration"
+            );
+            cid
+        };
+        // Re-open once more: idempotent, prior acked ask retained.
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);
+        }
     }
 
     #[test]
