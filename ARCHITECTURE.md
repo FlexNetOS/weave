@@ -109,9 +109,16 @@ list). Helpers:
 - `allow_inject_from_paths()` / `inject_allowed_from(&Path)` → the optional finer
   gate narrowing which pull sources may fire the consent nudge; unset ⇒ "same as
   the pull set".
-- `strict_verify()` → the Tier-2 signed-identity strictness, **defaulting to
-  `false`** (advisory fallback); only consulted on the pull/commit path of a
-  `--features sign` build.
+- `strict_verify_override()` → the **tri-state** Tier-2 signed-identity strictness
+  override (`Some(true)` = force strict everywhere, `Some(false)` = advisory
+  everywhere for the unsigned/unknown path, `None` = no override ⇒ the
+  trust-set-aware default decides per sender). `trust_set()` / `revoked_set()` →
+  the validated, deduped, capped (`MAX_TRUST` = 64) receiver-local fingerprint
+  lists; `trust_set_configured()` → whether the trust set is non-empty (which makes
+  strict the default for trusted senders). All four are only consulted on the
+  pull/commit path of a `--features sign` build; the collapsed-bool `strict_verify()`
+  is retained for back-compat. Default (everything unset) ⇒ advisory ⇒
+  identical-to-today.
 
 ### `store.rs` — persistence
 
@@ -781,28 +788,99 @@ function) stays inject-free: it only **records** which source paths committed
 
 ### Signed sender identity — optional `sign` feature
 
-By default the cross-store `from` is advisory. Building with `--features sign`
-(Ed25519 via `ed25519-dalek`, mirroring the `libsql` optional-dependency pattern —
-the **default build links no crypto**) adds verifiable identity:
+By default the cross-store `from` is advisory **unless a trust set is configured**.
+Building with `--features sign` (Ed25519 via `ed25519-dalek`, mirroring the `libsql`
+optional-dependency pattern — the **default build links no crypto**) adds verifiable
+identity:
 
 - A new low, pure `sign` module (depends only on `config` + std) owns the canonical
-  encoding, sign/verify, hex codec, and the keypair file. The private key lives at
-  `~/.config/weave/ed25519.key` (mode `0600`), is never logged or printed, and
-  refuses to clobber an existing key.
+  encoding, sign/verify, hex codec, the keypair file, **fingerprints**, and key
+  rotation. The private key lives at `~/.config/weave/ed25519.key` (mode `0600`), is
+  never logged or printed, and refuses to clobber an existing key.
 - The canonical signature covers `(from, to, body)` — **not** `created`/`ts`, which
   is advisory and re-stamped by the receiver on commit, so binding it would be a
   fragile coupling with no integrity gain. Length-prefixed with a
   domain-separation prefix so no field boundary is ambiguous.
 - A new `keys(identity, pubkey)` table (always present, plain data, both backends)
-  stores peers' public keys. `weave key gen|show|add|list` (subcommand present only
-  under `--features sign`) manages them.
-- **Sign on enqueue** (A signs its outbound intent if it has a key);
-  **verify on commit** (B, before its local write): a present-but-invalid signature
-  (tamper/spoof) is **always rejected**; a valid one makes `from` unforgeable; an
-  unsigned intent — or one with no registered key to check against — falls back to
-  the advisory model and commits, **unless** `strict_verify` (`WEAVE_STRICT_VERIFY`)
-  is set, which drops it. Verification reads only B's own `keys` table; the source
-  is still opened read-only (owner-only-writes intact).
+  stores peers' public keys. `weave key gen|show|fingerprint|add|list|rotate|revoke`
+  (subcommand present only under `--features sign`) manages them.
+
+#### Fingerprints
+
+A **fingerprint** is the SHA-256 of the **raw 32-byte public key**:
+`fingerprint_full(pubkey) = hex(SHA256(raw 32 pubkey bytes))` (64 lowercase hex, no
+label) is the canonical value trust/revocation match against; `fingerprint(pubkey) =
+"SHA256:" + first 16 hex chars` is the **display** form only. Trust and revocation
+match on the **full** digest (or a full pubkey hex), so a truncated `SHA256:<16-hex>`
+display string never matches — truncation can never cause a mis-trust. The helpers
+take the **public** key only and never hash the secret; they return `None` (never
+panic) on a malformed/oversized/non-32-byte input.
+
+`sha2` was **already in the `--features sign` dependency tree** (a transitive dep of
+`ed25519-dalek`), so declaring it directly under the `sign` feature
+(`sha2 = { version = "0.10", optional = true }`, pulled only by `sign`) adds **no new
+compiled crate to any graph** — the default and `libsql`-no-sign builds gain nothing.
+
+#### The verification decision table
+
+**Sign on enqueue** (A signs its outbound intent if it has a key); **verify on
+commit** in `store::verify_pulled_intent` (B, before its local write), under the
+threaded `VerifyPolicy` (tri-state strict override, trust set, revocation list).
+B looks up the sender's **registered** key once (a lookup error is a hard drop),
+then decides. `is_trusted` / `is_revoked` match the registered key's full digest
+against B's trust/revoked lists; `trust_configured` = trust set non-empty. The
+effective strictness for the unsigned / no-registered-key advisory path is:
+
+```text
+if strict_override == Some(true)            => STRICT   (user forced everywhere)
+else if strict_override == Some(false)      => ADVISORY (user disabled this path)
+else if trust_configured && is_trusted(key) => STRICT   (NEW trust-set default)
+else                                        => ADVISORY (current default)
+```
+
+Every cell below matches `verify_pulled_intent` exactly (COMMIT = local write,
+REJECT = dropped, cursor still advances). Two load-bearing rules hold in *every*
+row: a **present-but-invalid** signature is ALWAYS rejected, and **R1** — a valid
+signature against a **revoked** key is rejected unconditionally (the revocation
+check sits inside the valid-signature branch, evaluated BEFORE any disable toggle).
+
+| Sender | Signature | DECISION |
+|---|---|---|
+| trusted (registered key in trust set) | valid, key not revoked | **COMMIT** (unforgeable, attributed) |
+| trusted | present-but-invalid | **REJECT** (always — forgery/tamper) |
+| trusted | unsigned | **REJECT** (trusted ⇒ strict-by-default ⇒ must sign) |
+| untrusted (trust set configured, sender outside it) | valid | **COMMIT** (advisory — verified, just not pinned) |
+| untrusted | unsigned | **COMMIT** (advisory — unsigned operation preserved) |
+| any | present-but-invalid | **REJECT** (always) |
+| revoked (registered key in revoked list) | valid | **REJECT ALWAYS** (R1 — even with strict disabled) |
+| no trust set configured | unsigned | **COMMIT** (advisory — UNCHANGED from today) |
+| no trust set configured | present-but-invalid | **REJECT** (always) |
+| signed but no registered key for sender | present (unverifiable) | advisory path (no fp to trust) ⇒ STRICT only if forced |
+| global strict forced (`Some(true)`) | unsigned/unverifiable | **REJECT** (strict everywhere) |
+| global strict disabled (`Some(false)`) | unsigned/unverifiable | **COMMIT** (advisory everywhere — but R1 revoked-signed still rejected) |
+
+Only two cells changed from the prior model from COMMIT→REJECT: `trusted+unsigned`
+(new strict-by-default) and `revoked+valid-sig` (R1). Every no-trust-set row is
+byte-for-byte today's behavior; every present-but-invalid row is still REJECT.
+Verification reads only B's own `keys` table + B's receiver-local config; the source
+is opened read-only (owner-only-writes intact).
+
+#### Rotation & revocation (config-based, no schema)
+
+Trust and revocation are **receiver-local config**, not a store table — no schema,
+no dual-backend migration, no multi-key registry. `weave key rotate` archives the
+old private key (`fs::rename` to a `0600` `ed25519.key.<ts>.bak`, never read or
+printed), generates a new key, registers it (upsert), and prints **both**
+fingerprints plus config-based **overlap** guidance: trust BOTH full fingerprints in
+`WEAVE_TRUST` and keep the old pubkey registered (`weave key add`) during the window
+so in-flight messages signed by the old key still verify; once peers have the new
+key, `weave key revoke <old-full-fp>` retires it. `weave key revoke <fp>` validates
+the value and echoes the `WEAVE_REVOKED=` / `revoked = [...]` line to add (it does
+not rewrite a managed config); revocation is unconditional (R1). The emitted
+rotate/revoke values are the **full** `SHA256:<64-hex>` form so they are actually
+accepted by trust/revoke matching.
 
 `sign` is a low module (`model ← config ← sign`); `store` depends down on it for
-verify-on-commit; `main`/`mcp` depend down on both. No upward edge.
+verify-on-commit; `main`/`mcp` depend down on both. `VerifyPolicy` lives in `store`
+in every build (inert without `sign`) so both backends' free-fn signatures are
+identical. No upward edge.

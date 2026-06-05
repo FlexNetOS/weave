@@ -2550,6 +2550,612 @@ fn key_gen_never_prints_the_private_key() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier-2 phase 2d (Feature #3) — TIGHTEN signed identity: trust-set strict-by-
+// default, key rotation/overlap, revocation, and fingerprint listing. All
+// `--features sign`, hermetic (no network), per-actor isolated XDG_CONFIG_HOME,
+// fixed key files on disk. The decision-table semantics are unit-proven in
+// `src/store.rs::verify_decision_table_every_cell`; these prove the SAME table
+// holds end-to-end in the COMPILED binary through the CLI/MCP seams.
+// ---------------------------------------------------------------------------
+
+/// A distinct isolated config home for these Feature-#3 integration tests (separate
+/// from `unique_config_home` to keep names unambiguous and counters independent).
+#[cfg(feature = "sign")]
+fn sign_config_home_it() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!("weave-it-f3-{pid}-{n}-{nanos}"));
+    std::fs::create_dir_all(&d).expect("create temp config home");
+    d
+}
+
+/// The FULL-digest fingerprint (`SHA256:<64-hex>`) for `pubkey`, as the BINARY
+/// itself derives it: `weave key revoke <pubkey>` normalizes a bare pubkey to its
+/// `SHA256:<full-64-hex>` form on stdout. This is the ONLY value trust/revoke match
+/// against (R3) — weave displays a truncated `SHA256:<16-hex>` for humans but emits
+/// the full digest in every trust line. We derive it from the binary (never a
+/// hand-rolled hash) so the test trusts exactly what production computes.
+#[cfg(feature = "sign")]
+fn full_fp_of_registered(db: &TestDb, cfg_home: &str, pubkey: &str) -> String {
+    let out = run_ok_env(
+        db,
+        &["key", "revoke", pubkey],
+        &[("XDG_CONFIG_HOME", cfg_home)],
+    );
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("WEAVE_REVOKED="))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| panic!("`weave key revoke <pubkey>` did not echo a full fp:\n{out}"))
+}
+
+/// `weave key fingerprint` prints the local `SHA256:` display fingerprint and is
+/// secret-free; `--json` carries identity + pubkey + fingerprint and no secret.
+#[cfg(feature = "sign")]
+#[test]
+fn key_fingerprint_prints_secret_free_fp() {
+    let a = TestDb::new();
+    let a_cfg = sign_config_home_it();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+
+    let keygen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let pubkey = pubkey_from_gen(&keygen);
+    let secret =
+        std::fs::read_to_string(a_cfg.join("weave").join("ed25519.key")).expect("key file");
+    let secret = secret.trim();
+
+    let fp_txt = run_ok_env(
+        &a,
+        &["key", "fingerprint", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    assert!(
+        fp_txt.contains("SHA256:"),
+        "fingerprint prints a SHA256: form: {fp_txt}"
+    );
+    assert!(
+        !fp_txt.contains(secret),
+        "the private key must never appear in `key fingerprint`"
+    );
+
+    let fp_json = run_ok_env(
+        &a,
+        &["key", "fingerprint", "--me", "alice", "--json"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&fp_json).expect("fingerprint --json parses");
+    assert_eq!(v["identity"], "alice");
+    assert_eq!(v["pubkey"], pubkey);
+    assert!(
+        v["fingerprint"].as_str().unwrap().starts_with("SHA256:"),
+        "json fingerprint is SHA256-labeled: {fp_json}"
+    );
+    assert!(
+        !fp_json.contains(secret),
+        "the private key must never appear in `key fingerprint --json`"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+}
+
+/// `weave key list --json` surfaces each registered key's fingerprint plus the
+/// receiver-local trusted/revoked tags, and echoes the configured trust set —
+/// secret-free.
+#[cfg(feature = "sign")]
+#[test]
+fn key_list_json_shows_fingerprints_and_trust_tags() {
+    let alice_store = TestDb::new();
+    let b = TestDb::new();
+    let alice_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let alice_cfg_s = alice_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let agen = run_ok_env(
+        &alice_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &alice_cfg_s)],
+    );
+    let alice_pub = pubkey_from_gen(&agen);
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &alice_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let alice_full = full_fp_of_registered(&b, &b_cfg_s, &alice_pub);
+
+    let list = run_ok_env(
+        &b,
+        &["key", "list", "--json"],
+        &[("WEAVE_TRUST", &alice_full), ("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&list).expect("key list --json parses");
+    let key0 = &v["keys"][0];
+    assert_eq!(key0["identity"], "alice");
+    assert!(
+        key0["fingerprint"].as_str().unwrap().starts_with("SHA256:"),
+        "listed key carries a SHA256: fingerprint: {list}"
+    );
+    assert_eq!(key0["trusted"], true, "alice is tagged trusted: {list}");
+    assert_eq!(key0["revoked"], false, "alice not revoked: {list}");
+    assert_eq!(v["trust_set"][0], alice_full, "trust_set echoed: {list}");
+
+    let _ = std::fs::remove_dir_all(&alice_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// `weave key rotate` archives the OLD key (0600 .bak that exists and holds the old
+/// secret, with a NEW distinct on-disk key), prints BOTH fingerprints and a
+/// WEAVE_TRUST overlap line carrying both full fps, and never prints either secret.
+#[cfg(feature = "sign")]
+#[test]
+fn key_rotate_archives_old_prints_both_fps_secret_free() {
+    use std::os::unix::fs::PermissionsExt;
+    let a = TestDb::new();
+    let a_cfg = sign_config_home_it();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let key_file = a_cfg.join("weave").join("ed25519.key");
+
+    let gen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let old_pub = pubkey_from_gen(&gen);
+    let old_secret = std::fs::read_to_string(&key_file)
+        .expect("old key")
+        .trim()
+        .to_string();
+
+    let rot = run_ok_env(
+        &a,
+        &["key", "rotate", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    assert!(
+        rot.contains("old fingerprint:") && rot.contains("new fingerprint:"),
+        "rotate prints both old and new fingerprints: {rot}"
+    );
+    assert!(
+        rot.contains(&old_pub),
+        "rotate echoes the old pubkey: {rot}"
+    );
+    assert!(
+        !rot.contains(&old_secret),
+        "rotate must never print the OLD private key"
+    );
+
+    let new_secret = std::fs::read_to_string(&key_file)
+        .expect("new key")
+        .trim()
+        .to_string();
+    assert_ne!(old_secret, new_secret, "rotate writes a NEW distinct key");
+    assert!(
+        !rot.contains(&new_secret),
+        "rotate must never print the NEW private key"
+    );
+
+    // The .bak archive of the OLD key exists, is 0600, and holds the OLD secret.
+    let bak = std::fs::read_dir(a_cfg.join("weave"))
+        .expect("config dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("ed25519.key.") && n.contains(".bak"))
+                .unwrap_or(false)
+        })
+        .expect("rotate archives the old key to a .bak file");
+    let mode = std::fs::metadata(&bak).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o177,
+        0,
+        "archived old key is 0600; mode {:o}",
+        mode & 0o777
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bak).expect("read bak").trim(),
+        old_secret,
+        "the archive holds the OLD secret (recoverable for overlap)"
+    );
+
+    // The overlap guidance carries BOTH full fps in a WEAVE_TRUST line.
+    let trust_line = rot
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("WEAVE_TRUST="))
+        .unwrap_or("");
+    assert!(
+        trust_line.contains(',') && trust_line.contains("SHA256:"),
+        "rotate emits a WEAVE_TRUST line with BOTH full fps for overlap: {rot}"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+}
+
+/// DEFAULT-WHEN-TRUST-SET (the headline tightening): with `WEAVE_TRUST=<alice-fp>`
+/// and NO `WEAVE_STRICT_VERIFY`, an UNSIGNED intent claiming alice is REJECTED
+/// (pulled 0), while a SIGNED intent from alice COMMITS — strict-by-default for a
+/// trusted sender, end-to-end through the binary.
+#[cfg(feature = "sign")]
+#[test]
+fn trust_set_makes_unsigned_trusted_sender_rejected_signed_commits() {
+    let a = TestDb::new();
+    let unsigned_src = TestDb::new();
+    let b_signed = TestDb::new();
+    let b_unsigned = TestDb::new();
+    let a_cfg = sign_config_home_it();
+    let nokey_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let nokey_cfg_s = nokey_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let agen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let alice_pub = pubkey_from_gen(&agen);
+    run_ok_env(
+        &b_signed,
+        &["key", "add", "alice", &alice_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b_unsigned,
+        &["key", "add", "alice", &alice_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let alice_full = full_fp_of_registered(&b_signed, &b_cfg_s, &alice_pub);
+
+    // (1) UNSIGNED intent CLAIMING alice ⇒ trust set rejects (no strict flag set).
+    run_ok_env(
+        &unsigned_src,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "unsigned-claiming-alice",
+            "--to-store",
+            &b_unsigned.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &nokey_cfg_s)],
+    );
+    let pull_u = run_ok_env(
+        &b_unsigned,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &unsigned_src.path_str()),
+            ("WEAVE_TRUST", &alice_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        pull_u.contains("pulled 0 message"),
+        "a trusted sender's UNSIGNED message is rejected by the trust set alone (no strict flag): {pull_u}"
+    );
+
+    // (2) SIGNED intent from alice ⇒ commits under the same trust set.
+    run_ok_env(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "signed-from-alice",
+            "--to-store",
+            &b_signed.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let pull_s = run_ok_env(
+        &b_signed,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &a.path_str()),
+            ("WEAVE_TRUST", &alice_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        pull_s.contains("pulled 1 message"),
+        "a trusted sender's SIGNED message commits under the trust set: {pull_s}"
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&nokey_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// NO-TRUST-SET REGRESSION: with no `WEAVE_TRUST`, an UNSIGNED intent still COMMITS
+/// (advisory) — unsigned operation preserved for users who never opt in.
+#[cfg(feature = "sign")]
+#[test]
+fn no_trust_set_unsigned_still_commits() {
+    let src = TestDb::new();
+    let b = TestDb::new();
+    let src_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let src_cfg_s = src_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    run_ok_env(
+        &src,
+        &[
+            "send",
+            "--from",
+            "dave",
+            "--to",
+            "bob",
+            "--body",
+            "unsigned-no-trust",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &src_cfg_s)],
+    );
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &src.path_str()),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        pull.contains("pulled 1 message"),
+        "with NO trust set, an unsigned intent still commits (advisory preserved): {pull}"
+    );
+
+    let _ = std::fs::remove_dir_all(&src_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// ROTATION OVERLAP end-to-end (R6, config-based, no schema): a receiver trusting
+/// BOTH old+new fps commits a message signed by the OLD key while the OLD pubkey is
+/// registered; once the OLD fp is `WEAVE_REVOKED`, the OLD key's signed message is
+/// REJECTED while a NEW-key signed message (new pubkey registered) still commits.
+#[cfg(feature = "sign")]
+#[test]
+fn rotation_overlap_then_revoke_old_through_binary() {
+    let old_store = TestDb::new();
+    let new_store = TestDb::new();
+    let old_cfg = sign_config_home_it();
+    let new_cfg = sign_config_home_it();
+    let old_cfg_s = old_cfg.to_string_lossy().into_owned();
+    let new_cfg_s = new_cfg.to_string_lossy().into_owned();
+
+    let ogen = run_ok_env(
+        &old_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    );
+    let old_pub = pubkey_from_gen(&ogen);
+    let ngen = run_ok_env(
+        &new_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    );
+    let new_pub = pubkey_from_gen(&ngen);
+
+    let fp_helper = TestDb::new();
+    let fph_cfg = sign_config_home_it();
+    let fph_cfg_s = fph_cfg.to_string_lossy().into_owned();
+    let old_full = full_fp_of_registered(&fp_helper, &fph_cfg_s, &old_pub);
+    let new_full = full_fp_of_registered(&fp_helper, &fph_cfg_s, &new_pub);
+    let both_trust = format!("{old_full},{new_full}");
+
+    let b_cfg = sign_config_home_it();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // OVERLAP: B registers OLD pubkey, trusts BOTH ⇒ old-key signed commits.
+    let b_overlap = TestDb::new();
+    run_ok_env(
+        &b_overlap,
+        &["key", "add", "alice", &old_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &old_store,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "old-key-overlap",
+            "--to-store",
+            &b_overlap.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    );
+    let p_overlap = run_ok_env(
+        &b_overlap,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &old_store.path_str()),
+            ("WEAVE_TRUST", &both_trust),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_overlap.contains("pulled 1 message"),
+        "old key still verifies during overlap (old pubkey registered, both fps trusted): {p_overlap}"
+    );
+
+    // AFTER REVOKE: B registers OLD pubkey, revokes OLD fp ⇒ old-key signed REJECTED.
+    let b_revold = TestDb::new();
+    run_ok_env(
+        &b_revold,
+        &["key", "add", "alice", &old_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &old_store,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "old-key-after-revoke",
+            "--to-store",
+            &b_revold.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    );
+    let p_revold = run_ok_env(
+        &b_revold,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &old_store.path_str()),
+            ("WEAVE_TRUST", &new_full),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_revold.contains("pulled 0 message"),
+        "old key's signed message is REJECTED once its fp is revoked: {p_revold}"
+    );
+
+    // NEW key still commits after the old fp is revoked.
+    let b_new = TestDb::new();
+    run_ok_env(
+        &b_new,
+        &["key", "add", "alice", &new_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &new_store,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "new-key-after-revoke",
+            "--to-store",
+            &b_new.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    );
+    let p_new = run_ok_env(
+        &b_new,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &new_store.path_str()),
+            ("WEAVE_TRUST", &new_full),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_new.contains("pulled 1 message"),
+        "the new key still commits after the old fp is revoked: {p_new}"
+    );
+
+    let _ = std::fs::remove_dir_all(&old_cfg);
+    let _ = std::fs::remove_dir_all(&new_cfg);
+    let _ = std::fs::remove_dir_all(&fph_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// MCP drain path under a configured trust set DROPS a trusted-but-unsigned pulled
+/// intent (store-only, `isError:false`, never a panic) and leaks no secret.
+#[cfg(feature = "sign")]
+#[test]
+fn mcp_drain_under_trust_set_drops_unsigned_trusted_sender() {
+    let a = TestDb::new();
+    let unsigned_src = TestDb::new();
+    let b = TestDb::new();
+    let a_cfg = sign_config_home_it();
+    let nokey_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let nokey_cfg_s = nokey_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let agen = run_ok_env(
+        &a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+    let alice_pub = pubkey_from_gen(&agen);
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &alice_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let alice_full = full_fp_of_registered(&b, &b_cfg_s, &alice_pub);
+
+    run_ok_env(
+        &unsigned_src,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "unsigned-via-mcp-drain",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &nokey_cfg_s)],
+    );
+
+    let mut mcp = McpServer::spawn_env(
+        &b,
+        &[
+            ("WEAVE_PULL_FROM", &unsigned_src.path_str()),
+            ("WEAVE_TRUST", &alice_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    let (err, text) = mcp.call_tool("weave_inbox", serde_json::json!({"me": "bob"}));
+    assert!(
+        !err,
+        "weave_inbox under a trust set is not an error (store-only drop): {text}"
+    );
+    assert!(
+        !text.contains("unsigned-via-mcp-drain"),
+        "the trusted-but-unsigned intent must be DROPPED on the drain, not delivered: {text}"
+    );
+
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "weave_doctor is not an error: {dtext}");
+    assert!(
+        !dtext.contains("private key"),
+        "doctor never prints a private key: {dtext}"
+    );
+    mcp.shutdown();
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&nokey_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+// ---------------------------------------------------------------------------
 // Tier-2 v2 — remote (libsql/Turso) source handling, hermetic (NO network).
 //
 // On the DEFAULT sqlite build a remote URL is rejected LOUDLY at the store seam

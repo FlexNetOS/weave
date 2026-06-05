@@ -343,6 +343,59 @@ fn split_source_list(v: &str) -> Vec<String> {
     out
 }
 
+/// Split a `WEAVE_TRUST`/`WEAVE_REVOKED` env value into individual fingerprint/
+/// pubkey entries. Unlike [`split_source_list`], this splits ONLY on the comma (and
+/// whitespace/newlines) — NEVER on the platform `:` separator, because a fingerprint
+/// is literally `SHA256:<hex>` and splitting it on `:` would shred every entry. Blank
+/// fragments are dropped; trimming/cap/dedup happen later in [`resolve_fp_list`].
+fn split_fp_list(v: &str) -> Vec<String> {
+    v.split([',', '\n', '\r', '\t', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Resolve a validated, deduplicated TRUST/REVOKED list (free fn; no `&self` needed):
+/// trims blanks, rejects any entry containing a NUL/control char or longer than
+/// [`MAX_FP_ENTRY_LEN`], dedups preserving first-seen order, and caps the count at
+/// [`MAX_TRUST`] with a one-line stderr note. `list_label` names the list for that
+/// note. Default (`None`) ⇒ `[]`. Pure policy data — never a path, never opened.
+fn resolve_fp_list(raw: Option<&[String]>, list_label: &str) -> Vec<String> {
+    let raw = match raw {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > MAX_FP_ENTRY_LEN {
+            eprintln!("[weave] skipping over-long {list_label} entry (> {MAX_FP_ENTRY_LEN} chars)");
+            continue;
+        }
+        if trimmed.chars().any(|c| c == '\0' || c.is_control()) {
+            eprintln!("[weave] skipping invalid {list_label} entry (control character)");
+            continue;
+        }
+        let e = trimmed.to_string();
+        if out.contains(&e) {
+            continue;
+        }
+        out.push(e);
+    }
+    if out.len() > MAX_TRUST {
+        eprintln!(
+            "[weave] {} {list_label} entries configured; capping at {MAX_TRUST}",
+            out.len()
+        );
+        out.truncate(MAX_TRUST);
+    }
+    out
+}
+
 /// A list fragment that must NEVER be split on the platform path separator because it
 /// embeds `:` inside a `scheme://`: either a bare remote URL (`libsql://h`) or an
 /// inline `LABEL=<remote-url>` (`MYDB=libsql://h`). Mirrors the canonical label rule
@@ -371,6 +424,19 @@ pub const MAX_PEER_DBS: usize = 16;
 /// `WEAVE_PULL_FROM` could turn one drain into thousands of file opens. Entries
 /// beyond this cap are dropped with a stderr note. Mirrors [`MAX_PEER_DBS`].
 pub const MAX_PULL_FROM: usize = 16;
+
+/// Hard ceiling on how many entries a signed-identity TRUST or REVOKED list may
+/// hold (`WEAVE_TRUST` / `WEAVE_REVOKED` / `config.trust` / `config.revoked`).
+/// Each entry is a bounded fingerprint/pubkey string consulted only on the `sign`
+/// pull path; an unbounded list could bloat per-intent verification. Entries beyond
+/// this cap are dropped with a stderr note. Mirrors [`MAX_PULL_FROM`].
+pub const MAX_TRUST: usize = 64;
+
+/// Per-entry character cap for a TRUST/REVOKED list entry. Generous: a full
+/// `SHA256:<64-hex>` fingerprint is 71 chars and a bare 32-byte pubkey hex is 64;
+/// this bound (mirroring `sign::MAX_KEY_HEX_LEN`) rejects an unbounded/hostile entry
+/// at the config seam without coupling `config` to the feature-gated `sign` module.
+pub const MAX_FP_ENTRY_LEN: usize = 256;
 
 /// Default message-retention window: 30 days in seconds. A `session` hook GC pass
 /// (see `Config::retention`) deletes messages older than this. Mirrors the
@@ -441,6 +507,28 @@ pub struct Config {
     /// `sign` feature. Overlaid by `WEAVE_STRICT_VERIFY` (a truthy/falsy value).
     #[serde(default)]
     pub strict_verify: Option<bool>,
+    /// Tier-2 signed identity (2d, only meaningful in a `--features sign` build):
+    /// the receiver's TRUST SET — a list of trusted sender fingerprints
+    /// (`SHA256:<full-64-hex>`) or bare full pubkey hex strings. When NON-EMPTY a
+    /// trust set is "configured": a sender whose registered key's fingerprint is in
+    /// this list is verified STRICTLY (a bad/missing signature from them is REJECTED,
+    /// not warned). Senders OUTSIDE the trust set keep the advisory model (unsigned
+    /// operation unchanged). Empty/`None` ⇒ no trust set ⇒ behavior identical to
+    /// today. Each entry compares against the FULL SHA-256 digest (the truncated
+    /// display form is never trusted). Overlaid by `WEAVE_TRUST` (comma- or
+    /// path-separator list). Inert without the `sign` feature.
+    #[serde(default)]
+    pub trust: Option<Vec<String>>,
+    /// Tier-2 signed identity (2d, only meaningful in a `--features sign` build):
+    /// the REVOCATION LIST — fingerprints (`SHA256:<full-64-hex>`) or bare full
+    /// pubkey hex strings whose signatures are NO LONGER accepted. A signature that
+    /// verifies against a revoked key's fingerprint is REJECTED unconditionally
+    /// (even when `strict_verify = Some(false)`): the global-disable toggle governs
+    /// only the unsigned/unknown advisory path, never a revoked key's signed message
+    /// (R1). Empty/`None` ⇒ nothing revoked. Overlaid by `WEAVE_REVOKED` (comma- or
+    /// path-separator list). Inert without the `sign` feature.
+    #[serde(default)]
+    pub revoked: Option<Vec<String>>,
     /// Tier-2 v2 shared auth token applied to every REMOTE (`libsql://`/`https://`/
     /// `wss://`) `pull_from`/`peer_dbs` source that does not carry its own. Treat as
     /// a SECRET: it is redacted in [`Config`]'s Debug, never logged/injected/argv'd,
@@ -473,6 +561,8 @@ impl std::fmt::Debug for Config {
             .field("inject_pulled", &self.inject_pulled)
             .field("allow_inject_from", &self.allow_inject_from)
             .field("strict_verify", &self.strict_verify)
+            .field("trust", &self.trust)
+            .field("revoked", &self.revoked)
             .field(
                 "pull_token",
                 &self.pull_token.as_ref().map(|_| "<redacted>"),
@@ -631,6 +721,28 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_STRICT_VERIFY").and_then(|s| parse_bool(&s)) {
             cfg.strict_verify = Some(v);
         }
+        // Tier-2 signed-identity TRUST SET: WEAVE_TRUST is a list of trusted sender
+        // fingerprints (or full pubkey hex). Same split rules and env-unions-config
+        // posture as WEAVE_PULL_FROM above. Validation/cap/dedup happens in
+        // `trust_set`. Inert without the `sign` feature.
+        if let Some(v) = nonempty("WEAVE_TRUST") {
+            let env_entries = split_fp_list(&v);
+            if !env_entries.is_empty() {
+                let mut merged = cfg.trust.take().unwrap_or_default();
+                merged.extend(env_entries);
+                cfg.trust = Some(merged);
+            }
+        }
+        // Tier-2 signed-identity REVOCATION LIST: WEAVE_REVOKED is a list of revoked
+        // fingerprints (or full pubkey hex). Same discipline as WEAVE_TRUST.
+        if let Some(v) = nonempty("WEAVE_REVOKED") {
+            let env_entries = split_fp_list(&v);
+            if !env_entries.is_empty() {
+                let mut merged = cfg.revoked.take().unwrap_or_default();
+                merged.extend(env_entries);
+                cfg.revoked = Some(merged);
+            }
+        }
         // Tier-2 v2 shared remote auth token: WEAVE_PULL_TOKEN overrides the config
         // `pull_token`. A secret — never logged here (the value is not echoed). The
         // env var is the PREFERRED way to supply it (kept out of the config file).
@@ -711,8 +823,51 @@ impl Config {
     /// model. **Defaults to `false`** (advisory fallback, identical to 2a–2c). Only
     /// consulted on the pull/commit path of a `--features sign` build; a forged
     /// signature is rejected regardless of this flag.
+    ///
+    /// Superseded for the decision-table path by
+    /// [`strict_verify_override`](Self::strict_verify_override) (which preserves the
+    /// tri-state), but kept as the collapsed-bool accessor and exercised by config
+    /// unit tests, so `allow(dead_code)` marks the intentional retention.
+    #[allow(dead_code)]
     pub fn strict_verify(&self) -> bool {
         self.strict_verify.unwrap_or(false)
+    }
+
+    /// The TRI-STATE strict-verify override (2d): `Some(true)` ⇒ user forced strict
+    /// everywhere; `Some(false)` ⇒ user disabled strict (advisory everywhere for the
+    /// unsigned/unknown path — NOT a license to admit a revoked key's signed message,
+    /// R1); `None` ⇒ no override, so the trust-set-aware default decides per sender.
+    /// Preserves the forced-global semantics that `strict_verify()` collapses to a
+    /// bool. Only consulted on the pull path of a `--features sign` build.
+    pub fn strict_verify_override(&self) -> Option<bool> {
+        self.strict_verify
+    }
+
+    /// The validated, deduplicated TRUST SET (2d): trusted sender fingerprints
+    /// (`SHA256:<full-64-hex>`) or full pubkey hex strings. Trims blanks, rejects any
+    /// entry with a NUL/control char or longer than [`MAX_FP_ENTRY_LEN`], dedups
+    /// preserving first-seen order, and caps the count at [`MAX_TRUST`] with a stderr
+    /// note. Default (no env, no config) ⇒ `[]` ⇒ no trust set ⇒ identical-to-today.
+    pub fn trust_set(&self) -> Vec<String> {
+        resolve_fp_list(self.trust.as_deref(), "WEAVE_TRUST")
+    }
+
+    /// The validated, deduplicated REVOCATION LIST (2d), same discipline as
+    /// [`trust_set`](Self::trust_set). A fingerprint here causes a signature
+    /// verifying against it to be REJECTED unconditionally (R1).
+    pub fn revoked_set(&self) -> Vec<String> {
+        resolve_fp_list(self.revoked.as_deref(), "WEAVE_REVOKED")
+    }
+
+    /// Is a trust set CONFIGURED (i.e. the validated [`trust_set`](Self::trust_set)
+    /// is non-empty)? When configured, a trusted sender is verified strictly by
+    /// default; when not, every sender keeps the advisory model (unsigned operation
+    /// unchanged from today). Exercised by config unit tests and available to the
+    /// sign path; the per-intent decision uses `VerifyPolicy::trust_configured`, so
+    /// `allow(dead_code)` marks the intentional retention of this public accessor.
+    #[allow(dead_code)]
+    pub fn trust_set_configured(&self) -> bool {
+        !self.trust_set().is_empty()
     }
 
     /// The validated, deduplicated `allow_inject_from` subset (when set). Resolved
@@ -1232,7 +1387,28 @@ pub const CONFIG_TEMPLATE: &str = "\
 # the advisory allowlist model. A TAMPERED/FORGED signature is always rejected
 # regardless of this setting. Default false (advisory fallback — unsigned intents
 # still deliver). See `weave key`. Overridable via WEAVE_STRICT_VERIFY.
+# Tri-state: unset ⇒ the trust-set-aware default decides per sender (a TRUSTED
+# sender is verified strictly, others stay advisory); true ⇒ force strict for every
+# sender; false ⇒ disable strict for the unsigned/unknown path. A REVOKED key's
+# SIGNED message is ALWAYS rejected even with false (the toggle never re-admits it).
 # strict_verify = false
+
+# TRUST SET (only with --features sign): trusted sender fingerprints. A sender
+# whose registered public key's fingerprint is listed here is verified STRICTLY —
+# a missing or bad signature from them is REJECTED, not warned. Senders NOT in the
+# list keep the advisory model (unsigned operation unchanged). Empty (the default)
+# ⇒ no trust set ⇒ behavior identical to a no-trust-set build. An entry is a full
+# fingerprint `SHA256:<64-hex>` (from `weave key fingerprint`) OR a full pubkey hex;
+# the truncated display form is NEVER trusted. Trusting a sender first requires
+# registering their key: `weave key add <identity> <pubkey>`. Overridable via
+# WEAVE_TRUST (comma- or whitespace-separated). Capped at 64 entries.
+# trust = [\"SHA256:0123...\"]
+
+# REVOCATION LIST (only with --features sign): fingerprints whose signatures are no
+# longer accepted. A signature that verifies against a revoked key is REJECTED
+# UNCONDITIONALLY — even when strict_verify = false. Same entry forms as `trust`.
+# Empty (the default) ⇒ nothing revoked. Overridable via WEAVE_REVOKED. Capped at 64.
+# revoked = [\"SHA256:dead...\"]
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -1305,6 +1481,8 @@ mod tests {
         assert!(cfg.inject_pulled.is_none());
         assert!(cfg.allow_inject_from.is_none());
         assert!(cfg.strict_verify.is_none());
+        assert!(cfg.trust.is_none());
+        assert!(cfg.revoked.is_none());
         assert!(cfg.pull_token.is_none());
     }
 
@@ -1333,6 +1511,8 @@ mod tests {
             "inject_pulled",
             "allow_inject_from",
             "strict_verify",
+            "trust",
+            "revoked",
             "pull_token",
         ] {
             assert!(
@@ -1527,6 +1707,71 @@ mod tests {
             ..Config::default()
         };
         assert!(!off.strict_verify());
+    }
+
+    /// `strict_verify_override()` is the TRI-STATE the decision table consults:
+    /// `None` unset, `Some(true)` forced, `Some(false)` disabled.
+    #[test]
+    fn strict_verify_override_is_tri_state() {
+        assert_eq!(Config::default().strict_verify_override(), None);
+        assert_eq!(
+            Config {
+                strict_verify: Some(true),
+                ..Config::default()
+            }
+            .strict_verify_override(),
+            Some(true)
+        );
+        assert_eq!(
+            Config {
+                strict_verify: Some(false),
+                ..Config::default()
+            }
+            .strict_verify_override(),
+            Some(false)
+        );
+    }
+
+    /// `trust_set`/`revoked_set` default empty, trim blanks, drop control-char and
+    /// over-long entries, dedup preserving order, and cap at `MAX_TRUST`;
+    /// `trust_set_configured()` tracks non-emptiness.
+    #[test]
+    fn trust_and_revoked_sets_parse_cap_dedup() {
+        // Default ⇒ empty, no trust set configured.
+        assert!(Config::default().trust_set().is_empty());
+        assert!(Config::default().revoked_set().is_empty());
+        assert!(!Config::default().trust_set_configured());
+
+        let cfg = Config {
+            trust: Some(vec![
+                "  ".to_string(),
+                "SHA256:aaaa".to_string(),
+                "".to_string(),
+                "SHA256:bbbb".to_string(),
+                "SHA256:aaaa".to_string(),        // dup dropped
+                "bad\u{7}entry".to_string(),      // control char dropped
+                "x".repeat(MAX_FP_ENTRY_LEN + 1), // over-long dropped
+            ]),
+            revoked: Some(vec!["SHA256:dead".to_string()]),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.trust_set(),
+            vec!["SHA256:aaaa".to_string(), "SHA256:bbbb".to_string()],
+            "blanks/dups/control/over-long dropped, order preserved"
+        );
+        assert!(cfg.trust_set_configured());
+        assert_eq!(cfg.revoked_set(), vec!["SHA256:dead".to_string()]);
+
+        // Cap at MAX_TRUST.
+        let many: Vec<String> = (0..(MAX_TRUST + 10))
+            .map(|i| format!("SHA256:{i:04x}"))
+            .collect();
+        let capped = Config {
+            trust: Some(many),
+            ..Config::default()
+        };
+        assert_eq!(capped.trust_set().len(), MAX_TRUST, "capped at MAX_TRUST");
     }
 
     /// `inject_allowed_from` gate: unset `allow_inject_from` ⇒ every source is

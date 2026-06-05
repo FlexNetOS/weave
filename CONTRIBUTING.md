@@ -55,6 +55,15 @@ formatter reports no diff, and all tests pass.
   security invariant (see ARCHITECTURE §7), not a preference.
 - **Parameterize SQL.** Use bound `params!` for every variable value. The only
   inlined SQL literals are compile-time broadcast constants.
+- **Crypto conventions (`sign` feature).** A **fingerprint** is the SHA-256 of the
+  **raw public key**; trust and revocation match the **full** digest (the truncated
+  `SHA256:<16-hex>` form is display-only, never the basis of a trust decision).
+  **Never print a secret** — fingerprint/show/list/rotate/revoke/doctor emit only
+  public keys, fingerprints, and paths; rotate *moves* the old private key, it does
+  not read or print it. **Verification is RNG-free**, so its tests must seed keys
+  from **fixed bytes** (never `OsRng`) and stay deterministic across repeat runs.
+  **Trust and revocation are receiver-local config** (`WEAVE_TRUST` / `WEAVE_REVOKED`
+  / `trust` / `revoked`), **not a store table** — no schema or `Store`-trait change.
 - **Keep modules layered.** `model` has no I/O; `inject` and `store` depend only
   on `model`; `mcp`/`main` sit on top. Don't add upward dependencies.
 - **Doc comments** (`//!` module headers, `///` on public items) explain *why*,

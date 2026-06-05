@@ -50,11 +50,11 @@ pub struct PullConsent {
     /// Optional finer gate; `None` ⇒ "same as `from`" (every pull source is
     /// inject-eligible). When `Some`, only listed sources trigger the nudge.
     pub allow_inject_from: Option<Vec<StoreSource>>,
-    /// Tier-2 signed-identity strictness (2d, `Config::strict_verify`): when true an
-    /// unsigned/unverifiable pulled intent is dropped rather than committed under the
-    /// advisory model. Forwarded to `pull_from_store`; inert without the `sign`
-    /// feature. A forged signature is always rejected regardless.
-    pub strict_verify: bool,
+    /// Tier-2 signed-identity verification policy (2d): the trust set, revocation
+    /// list, and tri-state strict override. Forwarded to `pull_from_store`; inert
+    /// without the `sign` feature. A revoked key's signed message and a forged
+    /// signature are always rejected regardless.
+    pub policy: store::VerifyPolicy,
 }
 
 impl PullConsent {
@@ -496,7 +496,7 @@ fn tool_inbox(
     // failure must not fail the inbox read; diagnostics go to stderr (never
     // stdout, which carries only JSON-RPC frames).
     if !pull.from.is_empty() {
-        match store::pull_from_store(store, &me, &pull.from, pull.strict_verify) {
+        match store::pull_from_store(store, &me, &pull.from, &pull.policy) {
             Ok(p) if p.committed > 0 => {
                 log(&format!(
                     "pulled {} cross-store message(s) for '{me}'",
