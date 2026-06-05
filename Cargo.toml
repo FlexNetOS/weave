@@ -38,7 +38,7 @@ libsql = ["dep:libsql", "dep:tokio"]
 # (`sqlite sign` and `libsql sign`). `getrandom` is pulled only here, to seed key
 # GENERATION (verification needs no RNG); it is a tiny, std-backed crate already in
 # the dependency universe, so it adds no heavyweight tree.
-sign = ["dep:ed25519-dalek", "dep:getrandom"]
+sign = ["dep:ed25519-dalek", "dep:getrandom", "dep:sha2"]
 
 [profile.release]
 strip = true
@@ -64,6 +64,13 @@ getrandom = { version = "0.2", optional = true }
 libsql = { version = "0.9.30", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
+# SHA-256 for the public-key FINGERPRINT (`SHA256:` + hex of SHA256(raw 32-byte
+# pubkey)). OPTIONAL and pulled ONLY by the `sign` feature — and already a
+# transitive dep of `ed25519-dalek` in that tree, so declaring it adds NO new
+# compiled crate to any graph (`cargo tree` is byte-identical; only an existing
+# transitive edge becomes a declared direct one). The default + libsql-no-sign
+# builds never compile it. Fingerprints are derived from the PUBLIC key only.
+sha2 = { version = "0.10", optional = true }
 # `preserve_order` keeps the user's settings.json key order intact on rewrite, so
 # `weave setup`/`uninstall` only diff weave's own additions/removals.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }

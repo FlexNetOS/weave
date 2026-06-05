@@ -65,7 +65,16 @@ fastest layer and carry most of the injector and store coverage.
   (gated `#[cfg(feature = "sign")]`) covers the `keys` register/get/list roundtrip
   and `signed_pull_verifies_commits_and_rejects_forgery` (valid signature commits;
   a forged signature is **always** rejected; an unsigned intent commits advisory but
-  is dropped under `strict_verify`). Because the store-internals
+  is dropped under `strict_verify`). The tightened model adds
+  `verify_decision_table_every_cell` — a table-driven test exercising **every cell**
+  of `verify_pulled_intent` (trusted+good/bad/unsigned, untrusted+good/unsigned,
+  no-trust-set, global strict forced/disabled, and R1: a valid signature against a
+  **revoked** key rejected even with strict disabled) — and
+  `rotation_overlap_then_revoke_old` (both old+new keys trusted verify during
+  overlap; after revoking the old fingerprint the old key's signed message is
+  rejected while the new key's still commits). Both seed keys from **fixed bytes**
+  (`SigningKey::from_bytes`), and ed25519 verify is RNG-free, so they are bit-stable
+  across repeat runs. Because the store-internals
   tests touch backend internals (`s.conn.execute`, the concrete `SqliteStore`),
   that module is gated to the `sqlite` feature — see the dual-backend note below
   for how the *same* behaviors (including the mirrored `register_peer_full`,
@@ -99,24 +108,37 @@ fastest layer and carry most of the injector and store coverage.
 - **`src/config.rs`** — the `config.toml` scaffold parses as valid (all-default)
   TOML, documents every nudge placeholder, and mentions every real config field
   (including the federation `peer_dbs` and the Tier-2 `pull_from` / `inject_pulled`
-  / `allow_inject_from` / `strict_verify` keys) so a newly-added field can't be
-  left undocumented. `peer_db_paths()` is unit-tested for parse (comma / path-list
+  / `allow_inject_from` / `strict_verify` / `trust` / `revoked` keys) so a
+  newly-added field can't be left undocumented. `peer_db_paths()` is unit-tested for parse (comma / path-list
   separator), NUL-entry rejection, dropping the local `db_path()` (no
   self-federation), order-preserving dedup, and the `MAX_PEER_DBS` (16) cap; the
   default (no env, no key) resolves to an empty list (identical-to-today).
   `pull_from_paths()` mirrors that discipline against the **distinct** `pull_from`
   list (a `peer_dbs`-only store is **not** a delivery source) capped at
   `MAX_PULL_FROM` (16); `inject_pulled()` defaults **on** and honors the toggle;
-  `strict_verify()` defaults **off** and honors the toggle; `inject_allowed_from()`
-  gates to the configured subset (unset ⇒ every pull source eligible; explicit-empty
-  ⇒ none).
+  `strict_verify()` defaults **off** and honors the toggle, while the tri-state
+  `strict_verify_override()` distinguishes unset / `Some(true)` / `Some(false)`;
+  `inject_allowed_from()` gates to the configured subset (unset ⇒ every pull source
+  eligible; explicit-empty ⇒ none). `trust_set()` / `revoked_set()` parse the
+  comma/whitespace-split fingerprint lists (never on `:`, so `SHA256:` survives),
+  reject control chars and over-long entries (`MAX_FP_ENTRY_LEN`), dedup, and cap at
+  `MAX_TRUST` (64); `trust_set_configured()` is true only when the validated trust
+  set is non-empty.
 
 - **`src/sign.rs`** (gated `#[cfg(feature = "sign")]`) — the optional Ed25519
   module: sign↔verify round-trip + tamper detection, wrong-key rejection,
   malformed-input-is-`false`-not-error, canonical-encoding unambiguity/stability
   (length-prefixed, so `("ab","c")` ≠ `("a","bc")`), the hex codec, `check_pubkey`
   bounds, and a **proptest** property (any `(from, to, body)` verifies; any
-  single-field mutation fails). These compile out of the default/libsql builds.
+  single-field mutation fails). Plus the **fingerprint** layer:
+  `fingerprint`/`fingerprint_full` determinism and format (`SHA256:` + 16-hex
+  display, 64-hex full digest, lowercase), `None` (never panic) on
+  malformed/oversized/non-32-byte input, `fingerprint_matches` matches only the
+  **full** digest / full pubkey hex (a truncated display string never matches), and
+  a **proptest** `fingerprint_total_and_stable` (for any hex-ish input it returns
+  `Some`/`None` without panic and is stable across calls). All crypto tests seed
+  keys from **fixed bytes** (a `test_key(seed)` helper), never `OsRng`, so they are
+  deterministic across repeat runs. These compile out of the default/libsql builds.
 
 - **`src/setup.rs`** — `is_weave_command` matches only real installed
   `weave hook <event>` lines (and absolute-path forms) while rejecting
@@ -215,7 +237,14 @@ Coverage:
   on-disk key files: `weave key gen` (sender) → `weave key add` (register the
   sender's pubkey on the receiver) → signed `send --to-store` → `pull` commits with
   verified `sender` attribution even under `WEAVE_STRICT_VERIFY=1`; `weave key gen`
-  never prints the private key.
+  never prints the private key. The tightened-identity layer adds: `weave key
+  fingerprint` / `key list --json` print `SHA256:<16-hex>` fingerprints; `weave key
+  rotate` produces a new key and keeps the old one verifying during the trusted
+  overlap; **default-when-trust-set** — with `WEAVE_TRUST=<sender-full-fp>` and **no**
+  `WEAVE_STRICT_VERIFY`, an unsigned intent claiming that trusted sender is
+  **rejected** (`pulled 0`) while a signed one commits; and a **no-trust-set
+  regression** — with no `WEAVE_TRUST`, an unsigned intent still commits (advisory,
+  unchanged).
 
 ## 3. Security tests (`tests/security.rs`)
 
@@ -281,6 +310,12 @@ between semi-trusted agent sessions:
   `from` it was not signed for (spoof) is rejected against the real registered key;
   an unsigned intent is **dropped** under `WEAVE_STRICT_VERIFY=1` and **commits**
   advisory when off; the private key file is `0600` and the secret is never printed.
+  The tightened model adds: a forged/tampered signature under a configured trust set
+  is rejected (`pulled 0`); **R1** — a **revoked** fingerprint's signed message is
+  rejected even with `WEAVE_STRICT_VERIFY=false` (revocation is absolute for signed
+  messages); and the secret-never-printed assertion is extended across the new
+  `key fingerprint` / `rotate` / `revoke` / `doctor` commands (the on-disk key hex,
+  and every `.bak` archive from rotate, never substrings any command's stdout).
 
 ## 4. Property-based tests (`tests/prop.rs`)
 
@@ -580,7 +615,12 @@ done:
    malicious target ids. If a real spawn matters, extend the fake-mux harness.
 5. **A new invariant ("for any input, X holds") → a proptest property** in
    `tests/prop.rs`. Keep `cases` small (subprocess-heavy) and
-   `failure_persistence: None`.
+   `failure_persistence: None`. **Crypto/`sign` tests must be deterministic**: seed
+   every key from **fixed bytes** (`SigningKey::from_bytes(&[seed; 32])` / a
+   `test_key(seed)` helper), never `OsRng` — ed25519 verify is RNG-free, so a
+   correct test is bit-stable. Repeat-run any new crypto proptest (e.g.
+   `for i in $(seq 1 20); do cargo test --features sign <name> || break; done`) to
+   prove no flake before handoff.
 6. **A security or resource property → a `tests/security.rs` test**: verbatim
    delivery of hostile input, a confirm-gated destructive op, a length/identity
    cap, or a file-permission assertion.

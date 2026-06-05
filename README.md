@@ -290,8 +290,10 @@ from a source therefore also grants it a live-pane ping. To narrow or disable it
 ### Signed sender identity (optional `sign` feature)
 
 The **default build is crypto-free** — no `ed25519-dalek` in its dependency tree.
-Cross-store `from` attribution is advisory unless you opt into signed identity by
-building with the `sign` feature:
+Cross-store `from` attribution is advisory by default — **unless you configure a
+trust set** (see below), in which case a trusted sender is held to strict
+verification automatically. You opt into signed identity by building with the
+`sign` feature:
 
 ```bash
 cargo build --release --features sign         # composes with libsql too: --features "libsql sign"
@@ -301,18 +303,58 @@ A `--features sign` build adds the `weave key` subcommand and verifies signature
 on pull/commit using Ed25519 over the canonical `(from, to, body)`:
 
 ```bash
-weave key gen --me desktop          # generate a keypair; private key stored 0600, public key registered + printed
-weave key show --me desktop         # print this session's public key (never the private key)
+weave key gen --me desktop          # generate a keypair; private key stored 0600, public key + fingerprint registered + printed
+weave key show --me desktop         # print this session's public key + fingerprint (never the private key)
+weave key fingerprint --me desktop  # print just the SHA256:<16-hex> fingerprint peers add to WEAVE_TRUST (--json)
 weave key add envctl <hex-pubkey>   # register a peer's public key so their signed intents verify
-weave key list                      # list registered (identity, public key) pairs (--json)
+weave key list                      # list registered (identity, public key, fingerprint) triples (--json)
+weave key rotate --me desktop       # archive the old key (0600), generate a new one, print both fingerprints + overlap guidance
+weave key revoke <fingerprint>      # print the value to add to WEAVE_REVOKED to retire a key (config-driven; no store table)
 ```
 
 The private key lives at `~/.config/weave/ed25519.key` (mode `0600`) and is never
 logged or printed. A signed intent makes the cross-store `from` **unforgeable**; a
-**tampered or spoofed signature is always rejected** regardless of mode. An unsigned
-intent (or one with no registered key to check) falls back to the advisory model and
-still commits — unless you set `WEAVE_STRICT_VERIFY=1` (or `strict_verify = true`),
-which **drops** unsigned/unverifiable intents instead of committing them.
+**tampered or spoofed signature is always rejected** regardless of mode.
+
+#### Fingerprints
+
+A **fingerprint** is `SHA256:` followed by the first **16 hex chars** of the
+SHA-256 digest of the **raw 32-byte public key** — short, stable, secret-free, and
+derived only from the public key (never the private key). The 16-hex form is for
+**display**; trust and revocation always match against the **full** SHA-256 digest
+(`SHA256:<64-hex>`) or a full pubkey hex, so a truncated display string can never be
+the basis of a trust decision. `weave key rotate` / `weave key revoke` emit the full
+`SHA256:<64-hex>` form (the value `WEAVE_TRUST` / `WEAVE_REVOKED` actually match).
+
+#### Trust set, strict-by-default, and revocation
+
+Three receiver-local config keys (all inert without the `sign` feature) govern how a
+pulled intent is verified. **Trusting a sender first requires `weave key add
+<identity> <pubkey>`** so weave has the key to compute that sender's fingerprint.
+
+- **`WEAVE_STRICT_VERIFY` is tri-state** (env, or `strict_verify` in config):
+  - **unset** — the trust-set-aware default: a *trusted* sender is verified
+    strictly (unsigned/unverifiable intents from it are **dropped**); every other
+    sender keeps the advisory model and still commits unsigned.
+  - **`1` / `true`** — force strict **everywhere**: any unsigned/unverifiable
+    intent is dropped, trust set or not.
+  - **`0` / `false`** — advisory **everywhere**: unsigned/unverifiable intents
+    commit even from a trusted sender. This **never re-admits a revoked key's
+    signed message** — a signature that verifies against a revoked key is still
+    rejected unconditionally (see revocation below).
+- **`WEAVE_TRUST`** (env, or `trust = [...]` in config) — a comma- or
+  whitespace-separated list of **trusted fingerprints** (`SHA256:<64-hex>`) or full
+  pubkey hex strings. Configuring a non-empty trust set is what makes strict the
+  default for the senders in it (per the unset case above). Entries are validated,
+  deduped, and capped (64).
+- **`WEAVE_REVOKED`** (env, or `revoked = [...]` in config) — a list of **revoked
+  fingerprints** (same forms). A signature that verifies against a revoked key is
+  **rejected unconditionally**, even with `WEAVE_STRICT_VERIFY=0` / advisory mode —
+  revocation of a known-bad key is not defeatable by the global toggle.
+
+A **tampered or spoofed (present-but-invalid) signature is always rejected** in
+every configuration. The only intents that strict mode drops are *unsigned* or
+*unverifiable* ones; a *valid* signature from a non-revoked key always commits.
 
 ## Status
 

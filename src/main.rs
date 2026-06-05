@@ -329,11 +329,37 @@ enum KeyCmd {
         #[arg(long)]
         me: Option<String>,
     },
-    /// Print this session's public key (and its on-disk private-key path), without
-    /// revealing the private key itself.
+    /// Print this session's public key, its FINGERPRINT, and its on-disk
+    /// private-key path, without revealing the private key itself.
     Show {
         #[arg(long)]
         me: Option<String>,
+    },
+    /// Print this session's public-key FINGERPRINT (`SHA256:<16-hex>`) — the short,
+    /// stable, secret-free hash peers add to their `WEAVE_TRUST`. Add `--json` for a
+    /// machine-readable form (identity, pubkey, fingerprint).
+    Fingerprint {
+        #[arg(long)]
+        me: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rotate this session's signing key: ARCHIVE the existing private key (0600
+    /// backup), generate a NEW keypair, register + print BOTH fingerprints, and
+    /// explain the config-based overlap (trust BOTH in WEAVE_TRUST; keep the old
+    /// pubkey registered via `weave key add`) so in-flight signed messages from the
+    /// old key still verify during the window.
+    Rotate {
+        #[arg(long)]
+        me: Option<String>,
+    },
+    /// Mark a fingerprint REVOKED: print the value to add to WEAVE_REVOKED (or the
+    /// `revoked = [...]` config line). A signature verifying against a revoked key is
+    /// rejected unconditionally. `fp` is a `SHA256:<full-64-hex>` fingerprint or a
+    /// full pubkey hex (single positional argument; no shell involved).
+    Revoke {
+        /// the fingerprint (or full pubkey hex) to revoke
+        fp: String,
     },
     /// Register a PEER's public key so signed intents claiming to be from them can
     /// be verified. `pubkey` is the 64-hex-char Ed25519 public key.
@@ -495,12 +521,24 @@ fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
 /// and swallowed. A no-op when `pull_from` is unconfigured (no Tier-2). Pulling
 /// under a guessed identity is fine: it only commits intents explicitly addressed
 /// to that name (no read-marking, so no inbox is consumed).
+/// Build the signed-identity [`VerifyPolicy`](store::VerifyPolicy) from config: the
+/// tri-state strict override plus the validated trust/revocation sets. Inert without
+/// the `sign` feature (the fields are carried but never consulted), so a single
+/// builder serves every backend/feature cross-product.
+fn verify_policy(cfg: &Config) -> store::VerifyPolicy {
+    store::VerifyPolicy {
+        strict_override: cfg.strict_verify_override(),
+        trust: cfg.trust_set(),
+        revoked: cfg.revoked_set(),
+    }
+}
+
 fn try_pull(store: &dyn Store, cfg: &Config, me: &str) {
     let allow = cfg.pull_from_sources();
     if allow.is_empty() {
         return;
     }
-    match store::pull_from_store(store, me, &allow, cfg.strict_verify()) {
+    match store::pull_from_store(store, me, &allow, &verify_policy(cfg)) {
         Ok(p) if p.committed > 0 => {
             eprintln!(
                 "[weave] pulled {} cross-store message(s) for '{me}'",
@@ -676,6 +714,35 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "federation_remote_token_shared": token_shared,
             "federation_remote_token_none": token_none,
         });
+        // Signed-identity summary (counts + local fingerprint only, secret-free):
+        // surfaces the trust/revocation policy and this session's own fingerprint so
+        // a misconfigured trust set is diagnosable. Sign-gated; never any secret.
+        #[cfg(feature = "sign")]
+        if let Some(obj) = report.as_object_mut() {
+            let trust = cfg.trust_set();
+            let revoked = cfg.revoked_set();
+            let local_fp = sign::local_public_key()
+                .ok()
+                .flatten()
+                .and_then(|pk| sign::fingerprint(&pk));
+            obj.insert("sign_trust_set".into(), trust.len().into());
+            obj.insert("sign_revoked_set".into(), revoked.len().into());
+            obj.insert(
+                "sign_strict_verify".into(),
+                match cfg.strict_verify_override() {
+                    Some(true) => "forced".into(),
+                    Some(false) => "disabled".into(),
+                    None => "default".into(),
+                },
+            );
+            obj.insert(
+                "sign_local_fingerprint".into(),
+                match local_fp {
+                    Some(fp) => fp.into(),
+                    None => serde_json::Value::Null,
+                },
+            );
+        }
         // Additive (token-free) per-source timeout observability — only when there is
         // at least one remote source, so the surface is unchanged for local-only
         // configs. min/max are the effective-ms bound over the remotes.
@@ -720,6 +787,29 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         println!("  messages:       {total}");
         println!("  peers:          {total_peers} ({online} online, {tagged} tagged)");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+        // Signed-identity summary (secret-free): trust/revocation counts, the
+        // strict-verify mode, and this session's OWN fingerprint (never the secret).
+        #[cfg(feature = "sign")]
+        {
+            let trust = cfg.trust_set();
+            let revoked = cfg.revoked_set();
+            let mode = match cfg.strict_verify_override() {
+                Some(true) => "forced",
+                Some(false) => "disabled",
+                None => "default (trust-set aware)",
+            };
+            let local_fp = sign::local_public_key()
+                .ok()
+                .flatten()
+                .and_then(|pk| sign::fingerprint(&pk))
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "  signed id:      strict={mode}, trusted={}, revoked={}",
+                trust.len(),
+                revoked.len()
+            );
+            println!("  my fingerprint: {local_fp}");
+        }
         if !extra.is_empty() {
             // Federation is configured: surface its health. This replaces the
             // non-default-WEAVE_DB hint below for the federated case (the whole
@@ -994,7 +1084,7 @@ fn main() -> Result<()> {
                 from: cfg.pull_from_sources(),
                 inject_pulled: cfg.inject_pulled(),
                 allow_inject_from: cfg.allow_inject_from_sources(),
-                strict_verify: cfg.strict_verify(),
+                policy: verify_policy(&cfg),
             };
             mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs, pull)?;
         }
@@ -1081,7 +1171,7 @@ fn main() -> Result<()> {
             let (me, explicit) = resolve_me_explicit(me, None, &cfg);
             refresh_presence(store, &me, explicit);
             let allow = cfg.pull_from_sources();
-            let pulled = store::pull_from_store(store, &me, &allow, cfg.strict_verify())?;
+            let pulled = store::pull_from_store(store, &me, &allow, &verify_policy(&cfg))?;
             println!(
                 "pulled {} message(s) into '{me}' from {} source(s){}",
                 pulled.committed,
@@ -1599,20 +1689,24 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
             let me = resolve_me(me, None, cfg);
             let pubkey = sign::generate_keypair()?;
             store.register_key(&me, &pubkey)?;
+            let fp = sign::fingerprint(&pubkey).unwrap_or_else(|| "<unavailable>".to_string());
             println!("generated signing key for '{me}'");
             println!(
                 "private key: {} (0600, keep secret)",
                 sign::key_path().display()
             );
             println!("public key:  {pubkey}");
+            println!("fingerprint: {fp}");
             println!("share the public key with peers so they can `weave key add {me} {pubkey}`");
         }
         KeyCmd::Show { me } => {
             let me = resolve_me(me, None, cfg);
             match sign::local_public_key()? {
                 Some(pk) => {
+                    let fp = sign::fingerprint(&pk).unwrap_or_else(|| "<unavailable>".to_string());
                     println!("identity:   {me}");
                     println!("public key: {pk}");
+                    println!("fingerprint: {fp}");
                     println!(
                         "private key file: {} (not shown)",
                         sign::key_path().display()
@@ -1625,6 +1719,123 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
                 }
             }
         }
+        KeyCmd::Fingerprint { me, json } => {
+            let me = resolve_me(me, None, cfg);
+            match sign::local_public_key()? {
+                Some(pk) => {
+                    let fp = sign::fingerprint(&pk).unwrap_or_else(|| "<unavailable>".to_string());
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "identity": me,
+                                "pubkey": pk,
+                                "fingerprint": fp,
+                            }))?
+                        );
+                    } else {
+                        println!("{fp}");
+                    }
+                }
+                None => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "identity": me,
+                                "pubkey": serde_json::Value::Null,
+                                "fingerprint": serde_json::Value::Null,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "no signing key configured for '{me}' — run `weave key gen` to create one"
+                        );
+                    }
+                }
+            }
+        }
+        KeyCmd::Rotate { me } => {
+            let me = resolve_me(me, None, cfg);
+            let (old_pub, new_pub) = sign::rotate_keypair()?;
+            // Register the NEW key under this identity (upsert replaces the old row).
+            store.register_key(&me, &new_pub)?;
+            let new_fp = sign::fingerprint(&new_pub).unwrap_or_else(|| "<unavailable>".to_string());
+            println!("rotated signing key for '{me}'");
+            println!(
+                "private key: {} (0600, keep secret; old key archived alongside)",
+                sign::key_path().display()
+            );
+            match old_pub {
+                Some(old) => {
+                    let old_fp =
+                        sign::fingerprint(&old).unwrap_or_else(|| "<unavailable>".to_string());
+                    // FULL-digest forms — the ONLY values trust/revocation match on
+                    // (the truncated display fp above is never trusted/revoked, R3).
+                    let old_full = sign::fingerprint_full(&old)
+                        .map(|f| format!("SHA256:{f}"))
+                        .unwrap_or_else(|| old_fp.clone());
+                    let new_full = sign::fingerprint_full(&new_pub)
+                        .map(|f| format!("SHA256:{f}"))
+                        .unwrap_or_else(|| new_fp.clone());
+                    println!("old public key: {old}");
+                    println!("old fingerprint: {old_fp}");
+                    println!("new public key: {new_pub}");
+                    println!("new fingerprint: {new_fp}");
+                    println!(
+                        "OVERLAP: during rollover, RECEIVERS should trust BOTH keys' FULL \
+                         fingerprints in WEAVE_TRUST and keep the OLD pubkey registered \
+                         (`weave key add {me} {old}`) so in-flight messages signed by the old key \
+                         still verify:\n  WEAVE_TRUST={old_full},{new_full}\nOnce all peers have \
+                         your new key, `weave key revoke {old_full}` to retire the old one."
+                    );
+                }
+                None => {
+                    println!("new public key: {new_pub}");
+                    println!("new fingerprint: {new_fp}");
+                    println!("(no prior key was present — this was a fresh generate)");
+                }
+            }
+        }
+        KeyCmd::Revoke { fp } => {
+            // Config-driven revocation (no store table): validate the value and echo
+            // exactly what to add to WEAVE_REVOKED / the config `revoked` list. weave
+            // does not persist a managed config here, so we print the value rather
+            // than rewriting a file. Accepts a `SHA256:<hex>` fingerprint or a full
+            // pubkey hex; reject anything malformed so a footgun cannot enter the set.
+            let entry = fp.trim();
+            let normalized = if let Some(rest) = entry.strip_prefix("SHA256:") {
+                if rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    entry.to_string()
+                } else {
+                    anyhow::bail!(
+                        "invalid fingerprint: expected SHA256:<64 hex chars> \
+                         (the FULL digest from `weave key fingerprint` / `key list`)"
+                    );
+                }
+            } else {
+                // Treat as a full pubkey hex; derive its fingerprint for display.
+                if sign::check_pubkey(entry).is_err() {
+                    anyhow::bail!(
+                        "revoke expects a SHA256:<64-hex> fingerprint or a full 64-hex pubkey"
+                    );
+                }
+                // Show the full-digest fingerprint so it matches what trust compares
+                // against (the truncated display form is never trusted/revoked).
+                match sign::fingerprint_full(entry) {
+                    Some(full) => format!("SHA256:{full}"),
+                    None => entry.to_string(),
+                }
+            };
+            println!("to revoke this key, add its fingerprint to your revocation list:");
+            println!("  WEAVE_REVOKED={normalized}");
+            println!("or in ~/.config/weave/config.toml:");
+            println!("  revoked = [\"{normalized}\"]");
+            println!(
+                "a signature verifying against a revoked key is rejected UNCONDITIONALLY \
+                 (even with strict_verify = false)."
+            );
+        }
         KeyCmd::Add { identity, pubkey } => {
             // Validate the identity and the hex pubkey before it touches the store.
             store::check_ident("identity", &identity)?;
@@ -1634,21 +1845,54 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
         }
         KeyCmd::List { json } => {
             let keys = store.list_keys()?;
+            // Trust/revoked sets are receiver-local policy, surfaced read-only so the
+            // listing shows which registered keys are trusted/revoked. Secret-free.
+            let trust = cfg.trust_set();
+            let revoked = cfg.revoked_set();
+            let is_trusted = |pk: &str| trust.iter().any(|e| sign::fingerprint_matches(e, pk));
+            let is_revoked = |pk: &str| revoked.iter().any(|e| sign::fingerprint_matches(e, pk));
             if json {
                 let arr: Vec<_> = keys
                     .iter()
-                    .map(|(i, p)| serde_json::json!({ "identity": i, "pubkey": p }))
+                    .map(|(i, p)| {
+                        serde_json::json!({
+                            "identity": i,
+                            "pubkey": p,
+                            "fingerprint": sign::fingerprint(p),
+                            "trusted": is_trusted(p),
+                            "revoked": is_revoked(p),
+                        })
+                    })
                     .collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({ "keys": arr }))?
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "keys": arr,
+                        "trust_set": trust,
+                        "revoked_set": revoked,
+                    }))?
                 );
             } else if keys.is_empty() {
                 println!("no registered keys");
             } else {
                 println!("{} registered key(s):", keys.len());
-                for (identity, pubkey) in keys {
-                    println!("  {identity}  {pubkey}");
+                for (identity, pubkey) in &keys {
+                    let fp =
+                        sign::fingerprint(pubkey).unwrap_or_else(|| "<unavailable>".to_string());
+                    let mut tags = Vec::new();
+                    if is_trusted(pubkey) {
+                        tags.push("trusted");
+                    }
+                    if is_revoked(pubkey) {
+                        tags.push("REVOKED");
+                    }
+                    let suffix = if tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", tags.join(", "))
+                    };
+                    println!("  {identity}  {fp}{suffix}");
+                    println!("    {pubkey}");
                 }
             }
         }

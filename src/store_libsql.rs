@@ -40,8 +40,8 @@ use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
     merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
-    store_label, Origin, PeerView, Pulled, SessionInfo, SessionView, Store, MAX_BRANCH_LEN,
-    MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    store_label, Origin, PeerView, Pulled, SessionInfo, SessionView, Store, VerifyPolicy,
+    MAX_BRANCH_LEN, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS, MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -608,14 +608,17 @@ pub fn federated_sessions(local: &dyn Store, extra: &[StoreSource]) -> Result<Ve
 /// structural. Unreadable/locked/missing/no-`outbox` sources are skipped (stderr),
 /// never fatal; per-source commits are bounded by [`MAX_PULL_PER_DRAIN`].
 ///
-/// `strict` (`Config::strict_verify`, 2d) is forwarded to `commit_pulled`: under it
-/// an unsigned/unverifiable intent is dropped rather than committed. Inert without
-/// the `sign` feature.
+/// `policy` (`VerifyPolicy`, 2d) is forwarded to `commit_pulled`: it carries the
+/// trust set, revocation list, and tri-state strict override that decide whether an
+/// unsigned/unverifiable intent is committed or dropped. A revoked key's signed
+/// message and a forged signature are always rejected. Inert without the `sign`
+/// feature. Signature parity with `store::pull_from_store` (same shared
+/// `commit_pulled`).
 pub fn pull_from_store(
     local: &dyn Store,
     me: &str,
     allow: &[StoreSource],
-    strict: bool,
+    policy: &VerifyPolicy,
 ) -> Result<Pulled> {
     let mut out = Pulled::default();
     for src in allow {
@@ -641,7 +644,7 @@ pub fn pull_from_store(
                 continue;
             }
         };
-        let n = commit_pulled(local, me, &source, strict, intents)?;
+        let n = commit_pulled(local, me, &source, policy, intents)?;
         out.committed += n;
         if n > 0 {
             out.committed_sources.push(src.clone());
@@ -2363,7 +2366,7 @@ mod tests {
             LibsqlStore::open(&cfg).unwrap()
         };
         let allow = vec![StoreSource::Local(a_path.clone())];
-        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let pulled = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(pulled.committed, 1);
 
         let (rows, _) = b.inbox("bob", false, false, 50).unwrap();
@@ -2371,7 +2374,7 @@ mod tests {
         assert_eq!(rows[0].sender, "alice");
         assert_eq!(rows[0].body, "hello bob");
 
-        let again = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let again = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(again.committed, 0, "re-drain must not double-deliver");
         let (rows2, _) = b.inbox("bob", false, false, 50).unwrap();
         assert_eq!(rows2.len(), 1);

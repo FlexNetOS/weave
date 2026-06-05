@@ -997,19 +997,97 @@ pub struct Pulled {
 ///
 /// Best-effort: an unreadable / locked / missing / non-weave / no-`outbox` source
 /// is logged to **stderr** and skipped (the `federated_peers` failure-isolation
+/// The signed-identity verification POLICY threaded into the pull/commit path (2d).
+/// Carries the receiver's local trust domain: the tri-state strict override, the
+/// trust set, and the revocation list. Constructed from `Config` at every pull call
+/// site (`main`/`mcp`); it is the single input to the verification decision table.
+///
+/// Available in EVERY build (so the `pull_from_store`/`commit_pulled` signatures are
+/// backend-identical), but only CONSULTED on the `sign` path — in a no-`sign` build
+/// the fields are inert (the advisory model runs exactly as 2a–2c). The trust/revoked
+/// lists are FULL-fingerprint or full-pubkey-hex strings (R3: matched against the full
+/// SHA-256 digest, never a truncated display form).
+#[derive(Clone, Debug, Default)]
+// The fields are READ only on the `sign` pull path (trust/revocation/strict
+// decision); in a no-`sign` build they are inert policy data carried through the
+// backend-identical signature, so suppress the expected dead-field warning there.
+#[cfg_attr(not(feature = "sign"), allow(dead_code))]
+pub struct VerifyPolicy {
+    /// `WEAVE_STRICT_VERIFY` / `Config::strict_verify` tri-state override:
+    /// `Some(true)` force strict everywhere, `Some(false)` disable strict for the
+    /// unsigned/unknown path (NEVER re-admits a revoked key's signed message, R1),
+    /// `None` ⇒ the trust-set-aware default decides per sender.
+    pub strict_override: Option<bool>,
+    /// Trusted sender fingerprints / full pubkey hex. Non-empty ⇒ a trust set is
+    /// "configured": a trusted sender is verified STRICTLY by default.
+    pub trust: Vec<String>,
+    /// Revoked fingerprints / full pubkey hex. A signature verifying against one of
+    /// these is REJECTED unconditionally (R1).
+    pub revoked: Vec<String>,
+}
+
+impl VerifyPolicy {
+    /// The advisory (no-trust-set, no-override) policy: identical to today's
+    /// `strict=false`. A test/back-compat constructor (production builds the struct
+    /// from `Config` directly), so it is `cfg(test)`-scoped to stay warning-clean.
+    #[cfg(test)]
+    pub fn advisory() -> Self {
+        Self::default()
+    }
+
+    /// A policy with ONLY the global strict override set (no trust set, nothing
+    /// revoked) — the pre-trust-set behavior of the old bare `strict: bool` param.
+    /// `strict(false)` == [`advisory`](Self::advisory) plus an explicit disable;
+    /// `strict(true)` forces strict everywhere. Test/back-compat constructor, used
+    /// only by the sign-gated decision-table tests (which live in the sqlite test
+    /// module), so it is gated to exactly where it is referenced.
+    #[cfg(all(test, feature = "sqlite", feature = "sign"))]
+    pub fn strict(strict: bool) -> Self {
+        Self {
+            strict_override: Some(strict),
+            ..Self::default()
+        }
+    }
+
+    /// Is `pubkey_hex` (the sender's REGISTERED key) in the trust set? Matched
+    /// against the FULL SHA-256 digest / full pubkey hex (R3). Always `false` in a
+    /// no-`sign` build (no fingerprint to compute).
+    #[cfg(feature = "sign")]
+    fn is_trusted(&self, pubkey_hex: &str) -> bool {
+        self.trust
+            .iter()
+            .any(|e| crate::sign::fingerprint_matches(e, pubkey_hex))
+    }
+
+    /// Is `pubkey_hex` (the sender's REGISTERED key) in the revocation list?
+    #[cfg(feature = "sign")]
+    fn is_revoked(&self, pubkey_hex: &str) -> bool {
+        self.revoked
+            .iter()
+            .any(|e| crate::sign::fingerprint_matches(e, pubkey_hex))
+    }
+
+    /// Is a trust set CONFIGURED (non-empty)?
+    #[cfg(feature = "sign")]
+    fn trust_configured(&self) -> bool {
+        !self.trust.is_empty()
+    }
+}
+
 /// pattern) — it never breaks the local inbox drain. Per-source commits are bounded
 /// by [`MAX_PULL_PER_DRAIN`] (the rest arrive on later drains, never lost).
 ///
-/// `strict` (`Config::strict_verify`, 2d) controls the signed-identity fallback:
-/// when set, an unsigned/unverifiable intent is dropped rather than committed under
-/// the advisory model. A tampered/forged signature is rejected regardless. `strict`
-/// is inert in a build without the `sign` feature.
+/// `policy` (`VerifyPolicy`, 2d) controls the signed-identity decision: the tri-state
+/// strict override, the trust set, and the revocation list. A trusted sender is
+/// verified strictly; a revoked key's signed message is always rejected; a
+/// tampered/forged signature is rejected regardless. `policy` is inert in a build
+/// without the `sign` feature.
 #[cfg(feature = "sqlite")]
 pub fn pull_from_store(
     local: &dyn Store,
     me: &str,
     allow: &[StoreSource],
-    strict: bool,
+    policy: &VerifyPolicy,
 ) -> Result<Pulled> {
     let mut out = Pulled::default();
     for src in allow {
@@ -1040,7 +1118,7 @@ pub fn pull_from_store(
                 continue;
             }
         };
-        let n = commit_pulled(local, me, &source, strict, intents)?;
+        let n = commit_pulled(local, me, &source, policy, intents)?;
         out.committed += n;
         if n > 0 {
             out.committed_sources.push(src.clone());
@@ -1059,26 +1137,24 @@ pub fn pull_from_store(
 /// failing validation/commit is logged and skipped; the cursor still advances past
 /// it so a poison row cannot wedge the source forever.
 ///
-/// Signed identity (2d, `sign` feature): if an intent carries a signature, it is
-/// verified against the sender's registered public key (`local.get_key(from)`)
-/// over the canonical `(from,to,body)` bytes BEFORE commit — a tampered/forged
-/// signature is ALWAYS rejected (never committed), regardless of `strict`. An
-/// UNSIGNED or unverifiable-because-no-registered-key intent falls back to the
-/// advisory allowlist + origin-attribution model and is committed — UNLESS `strict`
-/// (config `strict_verify`) is set, in which case it is dropped with a stderr note.
-/// In a build without the `sign` feature, `strict` is irrelevant and `sig` is
-/// ignored (advisory model, exactly as 2a–2c). Verification reads only `local` (the
+/// Signed identity (2d, `sign` feature): the per-intent decision is delegated to
+/// [`verify_pulled_intent`] under the threaded [`VerifyPolicy`] (trust set,
+/// revocation list, tri-state strict override). A tampered/forged signature is
+/// ALWAYS rejected; a revoked key's signed message is always rejected; a trusted
+/// sender is verified strictly; everything else follows the advisory model. In a
+/// build without the `sign` feature, `policy` is inert and `sig` is ignored
+/// (advisory model, exactly as 2a–2c). Verification reads only `local` (the
 /// receiver's own key table); the source store is never written.
 pub fn commit_pulled(
     local: &dyn Store,
     me: &str,
     source: &str,
-    strict: bool,
+    policy: &VerifyPolicy,
     intents: Vec<Intent>,
 ) -> Result<usize> {
-    // `strict` is only consulted on the `sign` path; mark it used otherwise.
+    // `policy` is only consulted on the `sign` path; mark it used otherwise.
     #[cfg(not(feature = "sign"))]
-    let _ = strict;
+    let _ = policy;
     let mut committed = 0usize;
     for intent in intents {
         // Defense in depth: re-validate untrusted foreign data at the commit seam
@@ -1094,7 +1170,7 @@ pub fn commit_pulled(
         // no-registered-key intent is dropped only under `strict_verify`. Without
         // the feature, `ok` is just structural validity (advisory model, as 2a–2c).
         #[cfg(feature = "sign")]
-        let ok = valid && verify_pulled_intent(local, source, strict, &intent);
+        let ok = valid && verify_pulled_intent(local, source, policy, &intent);
         #[cfg(not(feature = "sign"))]
         let ok = valid;
         if ok {
@@ -1120,79 +1196,135 @@ pub fn commit_pulled(
     Ok(committed)
 }
 
-/// Signed-identity commit gate (2d, `sign` feature). Decides whether a structurally
-/// valid intent may be committed under the verification policy:
+/// Signed-identity commit gate (2d, `sign` feature). Implements the NEW
+/// trust-set-aware decision table under the threaded [`VerifyPolicy`]. Reads only
+/// `local` (the receiver's own `keys` table); never touches the source.
 ///
-/// - **Signed (`sig` non-empty):** verify it against the sender's registered public
-///   key over the canonical `(from,to,body)` bytes. A valid signature ⇒ commit
-///   (the strongest case: `from` is unforgeable). A signature present but invalid —
-///   tampered, forged, or no registered key to check it against — is ALWAYS rejected
-///   (never committed), regardless of `strict`: an actively-bad signature is a hard
-///   fail, not a fallback case.
-/// - **Unsigned (`sig` empty):** fall back to the advisory allowlist + origin-
-///   attribution model and COMMIT — UNLESS `strict` (`strict_verify`) is set, in
-///   which case it is dropped with a stderr note. (In strict mode the receiver only
-///   accepts intents it can cryptographically attribute.)
+/// Two load-bearing rules hold in EVERY row:
+///   1. A present-but-INVALID signature (tampered/forged/no-key-to-check) is ALWAYS
+///      rejected, regardless of any strict toggle (preserved verbatim from the
+///      original gate).
+///   2. **R1 — absolute revocation:** a signature that VERIFIES against a REVOKED
+///      key's fingerprint is REJECTED unconditionally, evaluated BEFORE the
+///      `Some(false)` disable toggle can relax anything. The global-disable toggle
+///      governs only the unsigned/unknown advisory path — it can NEVER re-admit a
+///      revoked key's signed message.
 ///
-/// Reads only `local` (the receiver's own `keys` table); never touches the source.
+/// Effective strictness for the UNSIGNED / no-key advisory path (R1 ordering):
+/// ```text
+/// if strict_override == Some(true)            => STRICT   (user forced)
+/// else if strict_override == Some(false)      => ADVISORY (user disabled)
+/// else if trust_configured && is_trusted(key) => STRICT   (NEW default)
+/// else                                        => ADVISORY (current default)
+/// ```
+/// (Revocation for the unsigned/identity-claim case is folded into the override:
+/// with `Some(false)` an unsigned message merely CLAIMING a revoked sender may relax
+/// to advisory; but any actual signature verifying against the revoked pubkey is
+/// rejected above, before the toggle is consulted.)
 #[cfg(feature = "sign")]
-fn verify_pulled_intent(local: &dyn Store, source: &str, strict: bool, intent: &Intent) -> bool {
-    if intent.sig.is_empty() {
-        // Unsigned: advisory model unless strict.
-        if strict {
-            eprintln!(
-                "[weave] dropping unsigned intent #{} from source '{source}' (strict_verify on)",
-                intent.id
-            );
-            return false;
-        }
-        return true;
-    }
-    // Signed: a present signature MUST verify, or it is rejected outright.
+fn verify_pulled_intent(
+    local: &dyn Store,
+    source: &str,
+    policy: &VerifyPolicy,
+    intent: &Intent,
+) -> bool {
+    // Look up the sender's REGISTERED key once: needed both to verify a signature and
+    // to evaluate trust/revocation (which are keyed by the registered key's
+    // fingerprint). A lookup error is a hard drop (cannot make a safe decision).
     let pubkey = match local.get_key(&intent.from) {
-        Ok(Some(pk)) => pk,
-        Ok(None) => {
-            // A signature we cannot check: under strict, reject (no attribution);
-            // otherwise fall back to advisory (commit) — the sig is simply ignored,
-            // matching the unsigned fallback. We do NOT treat "no key" as a forgery.
-            if strict {
-                eprintln!(
-                    "[weave] dropping signed intent #{} from '{}' via source '{source}': \
-                     no registered key for sender (strict_verify on)",
-                    intent.id, intent.from
-                );
-                return false;
-            }
-            return true;
-        }
+        Ok(pk) => pk,
         Err(e) => {
             eprintln!(
-                "[weave] dropping signed intent #{} from source '{source}': key lookup failed: {e}",
+                "[weave] dropping intent #{} from source '{source}': key lookup failed: {e}",
                 intent.id
             );
             return false;
         }
     };
-    match crate::sign::verify_intent(&pubkey, &intent.sig, &intent.from, &intent.to, &intent.body) {
-        Ok(true) => true,
-        Ok(false) => {
-            // A present-but-invalid signature is ALWAYS rejected (spoof/tamper),
-            // strict or not.
+
+    if !intent.sig.is_empty() {
+        // ---- SIGNED PATH ----
+        let pk = match &pubkey {
+            Some(pk) => pk,
+            // A signature we cannot check (no registered key): it is "present but
+            // unverifiable". This is NOT a trusted/revoked sender (no fp to match),
+            // so it falls to the advisory path's effective strictness below.
+            None => return self_unsigned_or_unknown(source, policy, &pubkey, intent),
+        };
+        match crate::sign::verify_intent(pk, &intent.sig, &intent.from, &intent.to, &intent.body) {
+            Ok(true) => {
+                // A VALID signature. R1: if it verifies against a REVOKED key, reject
+                // unconditionally — evaluated BEFORE any disable toggle.
+                if policy.is_revoked(pk) {
+                    eprintln!(
+                        "[weave] REJECTING intent #{} from '{}' via source '{source}': \
+                         signature verifies but the key is REVOKED",
+                        intent.id, intent.from
+                    );
+                    return false;
+                }
+                true
+            }
+            Ok(false) => {
+                // Present-but-invalid signature: ALWAYS rejected (spoof/tamper).
+                eprintln!(
+                    "[weave] REJECTING intent #{} from '{}' via source '{source}': signature \
+                     verification failed (possible forgery)",
+                    intent.id, intent.from
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "[weave] dropping intent #{} from source '{source}': verify error: {e}",
+                    intent.id
+                );
+                false
+            }
+        }
+    } else {
+        // ---- UNSIGNED PATH ----
+        self_unsigned_or_unknown(source, policy, &pubkey, intent)
+    }
+}
+
+/// The advisory-or-strict decision for an UNSIGNED intent, or a SIGNED intent whose
+/// sender has no registered key to check it against. Computes effective strictness
+/// per the R1 ordering and commits (advisory) or drops (strict). `pubkey` is the
+/// sender's registered key (if any), used only to evaluate trust.
+#[cfg(feature = "sign")]
+fn self_unsigned_or_unknown(
+    source: &str,
+    policy: &VerifyPolicy,
+    pubkey: &Option<String>,
+    intent: &Intent,
+) -> bool {
+    let strict = match policy.strict_override {
+        Some(true) => true,   // user forced strict everywhere
+        Some(false) => false, // user disabled strict for the advisory path
+        None => {
+            // Trust-set-aware default: a TRUSTED sender (registered key in the trust
+            // set) is verified strictly; everyone else stays advisory.
+            policy.trust_configured() && pubkey.as_deref().is_some_and(|pk| policy.is_trusted(pk))
+        }
+    };
+    if strict {
+        if intent.sig.is_empty() {
             eprintln!(
-                "[weave] REJECTING intent #{} from '{}' via source '{source}': signature \
-                 verification failed (possible forgery)",
+                "[weave] dropping unsigned intent #{} from '{}' via source '{source}' \
+                 (strict verification: trusted/forced sender must sign)",
                 intent.id, intent.from
             );
-            false
-        }
-        Err(e) => {
+        } else {
             eprintln!(
-                "[weave] dropping intent #{} from source '{source}': verify error: {e}",
-                intent.id
+                "[weave] dropping signed intent #{} from '{}' via source '{source}': \
+                 no registered key for sender (strict verification)",
+                intent.id, intent.from
             );
-            false
         }
+        return false;
     }
+    true
 }
 
 /// Canonical per-source label for the `pull_cursor` key: the canonicalized path
@@ -2731,7 +2863,9 @@ mod tests {
 
         // Normal pull commits all three; cursor now at 3.
         assert_eq!(
-            pull_from_store(&b, "bob", &allow, false).unwrap().committed,
+            pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
             3
         );
         assert_eq!(b.pull_cursor_get(&source).unwrap(), 3);
@@ -2739,7 +2873,9 @@ mod tests {
 
         // Normal re-pull is duplicate-free (cursor persisted past every intent).
         assert_eq!(
-            pull_from_store(&b, "bob", &allow, false).unwrap().committed,
+            pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
             0,
             "normal re-drain must deliver nothing (no crash) — duplicate-free"
         );
@@ -2750,7 +2886,7 @@ mod tests {
         // re-reads ONLY id>2 (i.e. just #3), so the at-least-once re-delivery is
         // bounded to that single un-acknowledged intent — never the whole batch.
         b.pull_cursor_set(&source, 2).unwrap();
-        let replay = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let replay = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(
             replay.committed, 1,
             "a crash before the cursor advance re-delivers AT MOST the one \
@@ -2783,7 +2919,7 @@ mod tests {
 
         let b = SqliteStore::open(&b_path).unwrap();
         let allow = vec![StoreSource::Local(a_path.clone())];
-        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let pulled = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(pulled.committed, 1);
 
         // The message landed in B's inbox, attributed to A's `from`.
@@ -2793,7 +2929,7 @@ mod tests {
         assert_eq!(rows[0].body, "hello bob");
 
         // Re-pull is idempotent: cursor blocks the already-committed intent.
-        let again = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let again = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(again.committed, 0, "re-drain must not double-deliver");
         let (rows2, _) = b.inbox("bob", false, false, 50).unwrap();
         assert_eq!(rows2.len(), 1, "still exactly one inbox row");
@@ -2826,7 +2962,7 @@ mod tests {
             StoreSource::Local(dir.join("missing.db")),
             StoreSource::Local(a_path.clone()),
         ];
-        let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
+        let pulled = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
         assert_eq!(pulled.committed, 0);
         assert_eq!(pulled.sources_skipped, 1, "missing source skipped");
         let (rows, _) = b.inbox("bob", false, false, 50).unwrap();
@@ -2944,25 +3080,40 @@ mod tests {
             b.register_key("alice", &pubkey).unwrap();
             // Valid sig commits.
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&good), false)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&good),
+                    &VerifyPolicy::strict(false)
+                )
+                .unwrap()
+                .committed,
                 1,
                 "a valid signature commits"
             );
             // Forged sig is rejected even in non-strict mode.
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&forged), false)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&forged),
+                    &VerifyPolicy::strict(false)
+                )
+                .unwrap()
+                .committed,
                 0,
                 "a forged signature is ALWAYS rejected"
             );
             // Unsigned commits under advisory fallback.
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&unsigned), false)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&unsigned),
+                    &VerifyPolicy::strict(false)
+                )
+                .unwrap()
+                .committed,
                 1,
                 "unsigned commits under advisory (non-strict)"
             );
@@ -2973,25 +3124,359 @@ mod tests {
             let b = SqliteStore::open(&dir.join("b2.db")).unwrap();
             b.register_key("alice", &pubkey).unwrap();
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&good), true)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&good),
+                    &VerifyPolicy::strict(true)
+                )
+                .unwrap()
+                .committed,
                 1,
                 "a valid signature commits even under strict"
             );
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&forged), true)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&forged),
+                    &VerifyPolicy::strict(true)
+                )
+                .unwrap()
+                .committed,
                 0,
                 "a forged signature is rejected under strict too"
             );
             assert_eq!(
-                pull_from_store(&b, "bob", std::slice::from_ref(&unsigned), true)
-                    .unwrap()
-                    .committed,
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&unsigned),
+                    &VerifyPolicy::strict(true)
+                )
+                .unwrap()
+                .committed,
                 0,
                 "an unsigned intent is DROPPED under strict_verify"
+            );
+        }
+    }
+
+    /// The NEW trust-set-aware decision table (2d), every cell, with FIXED-seed keys
+    /// (never OsRng) for determinism. Covers: trusted+good/bad/unsigned,
+    /// untrusted+good/bad/unsigned, no-trust-set, global forced/disabled, and the
+    /// R1 absolute-revocation cases (revoked-signed rejected EVEN with Some(false)).
+    #[cfg(feature = "sign")]
+    #[test]
+    fn verify_decision_table_every_cell() {
+        use crate::sign::{fingerprint, sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let alice = SigningKey::from_bytes(&[10u8; 32]);
+        let alice_pk = to_hex(alice.verifying_key().as_bytes());
+        let alice_fp = fingerprint(&alice_pk).unwrap(); // display only; trust uses full
+        let alice_full = format!(
+            "SHA256:{}",
+            crate::sign::fingerprint_full(&alice_pk).unwrap()
+        );
+        let _ = alice_fp;
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-dtable-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tag = 0u64;
+        // Build a fresh source store containing one intent and return it.
+        let mut src = |from: &str, body: &str, sig: &str| -> StoreSource {
+            tag += 1;
+            let p = dir.join(format!("s{tag}.db"));
+            let a = SqliteStore::open(&p).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            StoreSource::Local(p)
+        };
+        // Fresh receiver B with alice's key registered.
+        let rcv = |n: u32| -> SqliteStore {
+            let b = SqliteStore::open(&dir.join(format!("b{n}.db"))).unwrap();
+            b.register_key("alice", &alice_pk).unwrap();
+            b
+        };
+        let committed = |b: &SqliteStore, s: &StoreSource, policy: &VerifyPolicy| -> usize {
+            pull_from_store(b, "bob", std::slice::from_ref(s), policy)
+                .unwrap()
+                .committed
+        };
+
+        let good = sign_intent(&alice, "alice", "bob", "hi");
+        let trust_alice = VerifyPolicy {
+            strict_override: None,
+            trust: vec![alice_full.clone()],
+            revoked: vec![],
+        };
+
+        // --- trust set configured, alice TRUSTED, no override ---
+        // trusted + good sig ⇒ COMMIT
+        assert_eq!(
+            committed(&rcv(1), &src("alice", "hi", &good), &trust_alice),
+            1,
+            "trusted+good commits"
+        );
+        // trusted + bad sig ⇒ REJECT (present-but-invalid always)
+        assert_eq!(
+            committed(&rcv(2), &src("alice", "TAMPER", &good), &trust_alice),
+            0,
+            "trusted+bad rejected"
+        );
+        // trusted + unsigned ⇒ REJECT (NEW: trusted ⇒ strict)
+        assert_eq!(
+            committed(&rcv(3), &src("alice", "hi", ""), &trust_alice),
+            0,
+            "trusted+unsigned rejected"
+        );
+
+        // --- trust set configured, sender UNTRUSTED (carol not in trust) ---
+        let carol = SigningKey::from_bytes(&[20u8; 32]);
+        let carol_pk = to_hex(carol.verifying_key().as_bytes());
+        let carol_good = sign_intent(&carol, "carol", "bob", "yo");
+        let rcv_carol = |n: u32| -> SqliteStore {
+            let b = SqliteStore::open(&dir.join(format!("bc{n}.db"))).unwrap();
+            b.register_key("alice", &alice_pk).unwrap();
+            b.register_key("carol", &carol_pk).unwrap();
+            b
+        };
+        // untrusted + good sig ⇒ COMMIT (advisory: verified, just not in trust set)
+        assert_eq!(
+            committed(
+                &rcv_carol(1),
+                &src("carol", "yo", &carol_good),
+                &trust_alice
+            ),
+            1,
+            "untrusted+good commits"
+        );
+        // untrusted + bad sig ⇒ REJECT (present-but-invalid always)
+        assert_eq!(
+            committed(
+                &rcv_carol(2),
+                &src("carol", "BAD", &carol_good),
+                &trust_alice
+            ),
+            0,
+            "untrusted+bad rejected"
+        );
+        // untrusted + unsigned ⇒ COMMIT (advisory; unsigned operation preserved)
+        assert_eq!(
+            committed(&rcv_carol(3), &src("carol", "yo", ""), &trust_alice),
+            1,
+            "untrusted+unsigned commits"
+        );
+
+        // --- NO trust set (default) ---
+        let no_trust = VerifyPolicy::default();
+        assert_eq!(
+            committed(&rcv(4), &src("alice", "hi", ""), &no_trust),
+            1,
+            "no-trust-set unsigned commits (unchanged)"
+        );
+        assert_eq!(
+            committed(&rcv(5), &src("alice", "BAD", &good), &no_trust),
+            0,
+            "no-trust-set bad sig rejected"
+        );
+
+        // --- global override forced/disabled ---
+        let forced = VerifyPolicy::strict(true);
+        assert_eq!(
+            committed(&rcv(6), &src("alice", "hi", ""), &forced),
+            0,
+            "global forced ⇒ unsigned rejected"
+        );
+        let disabled = VerifyPolicy::strict(false);
+        assert_eq!(
+            committed(&rcv(7), &src("alice", "hi", ""), &disabled),
+            1,
+            "global disabled ⇒ unsigned commits"
+        );
+        // Even with a trust set, a forced override applies to everyone.
+        let forced_trust = VerifyPolicy {
+            strict_override: Some(true),
+            trust: vec![alice_full.clone()],
+            revoked: vec![],
+        };
+        assert_eq!(
+            committed(&rcv(8), &src("carol", "yo", ""), &forced_trust),
+            0,
+            "forced ⇒ even untrusted unsigned rejected"
+        );
+
+        // --- R1 absolute revocation: a VALID signature against a REVOKED key ---
+        let revoke_alice = VerifyPolicy {
+            strict_override: None,
+            trust: vec![],
+            revoked: vec![alice_full.clone()],
+        };
+        assert_eq!(
+            committed(&rcv(9), &src("alice", "hi", &good), &revoke_alice),
+            0,
+            "revoked + good sig REJECTED"
+        );
+        // R1 hard case: revoked + good sig is STILL rejected even with Some(false).
+        let revoke_disabled = VerifyPolicy {
+            strict_override: Some(false),
+            trust: vec![],
+            revoked: vec![alice_full.clone()],
+        };
+        assert_eq!(
+            committed(&rcv(10), &src("alice", "hi", &good), &revoke_disabled),
+            0,
+            "R1: revoked key's SIGNED message rejected even when strict disabled"
+        );
+        // But an UNSIGNED message merely claiming a revoked sender may relax to
+        // advisory under Some(false) (the toggle governs the unsigned path).
+        assert_eq!(
+            committed(&rcv(11), &src("alice", "hi", ""), &revoke_disabled),
+            1,
+            "R1: unsigned claim under Some(false) relaxes to advisory"
+        );
+
+        // --- SIGNED but NO REGISTERED KEY (plan cell "Trusted + signed, no key"):
+        // a present signature we cannot check (sender has no registered pubkey) is
+        // "present but unverifiable" — it CANNOT be trusted (no fp to match), so it
+        // follows the advisory path: COMMIT under advisory, DROP under forced-strict.
+        let rcv_nokey = |n: u32| -> SqliteStore {
+            // A receiver that has NO key for "alice" (do not register one).
+            SqliteStore::open(&dir.join(format!("bn{n}.db"))).unwrap()
+        };
+        // advisory (no trust set): a signed-but-uncheckable intent commits.
+        assert_eq!(
+            committed(&rcv_nokey(1), &src("alice", "hi", &good), &no_trust),
+            1,
+            "signed + no registered key ⇒ advisory commit (cannot be trusted, sig ignored)"
+        );
+        // forced strict: a signed-but-uncheckable intent is dropped.
+        assert_eq!(
+            committed(&rcv_nokey(2), &src("alice", "hi", &good), &forced),
+            0,
+            "signed + no registered key ⇒ dropped under forced strict"
+        );
+        // trust set configured but this sender has no key ⇒ cannot match trust ⇒
+        // advisory commit (a trust entry without a registered key never grants trust).
+        assert_eq!(
+            committed(&rcv_nokey(3), &src("alice", "hi", &good), &trust_alice),
+            1,
+            "signed + no key under a trust set ⇒ untrusted ⇒ advisory commit"
+        );
+    }
+
+    /// Rotation overlap (R6, config-based): trusting BOTH old and new fingerprints
+    /// lets messages signed by EITHER key verify during the window; revoking the OLD
+    /// fingerprint then makes the old key's SIGNED messages fail while the new key's
+    /// still commit. Fixed-seed keys for determinism.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn rotation_overlap_then_revoke_old() {
+        use crate::sign::{fingerprint_full, sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let old = SigningKey::from_bytes(&[30u8; 32]);
+        let new = SigningKey::from_bytes(&[31u8; 32]);
+        let old_pk = to_hex(old.verifying_key().as_bytes());
+        let new_pk = to_hex(new.verifying_key().as_bytes());
+        let old_fp = format!("SHA256:{}", fingerprint_full(&old_pk).unwrap());
+        let new_fp = format!("SHA256:{}", fingerprint_full(&new_pk).unwrap());
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-rotate-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tag = 0u64;
+        let mut src = |pk_signer: &SigningKey, body: &str| -> StoreSource {
+            tag += 1;
+            let p = dir.join(format!("r{tag}.db"));
+            let a = SqliteStore::open(&p).unwrap();
+            let sig = sign_intent(pk_signer, "alice", "bob", body);
+            a.enqueue_intent("bob", "", "alice", None, body, &sig)
+                .unwrap();
+            StoreSource::Local(p)
+        };
+
+        // Overlap: B trusts BOTH fps, but "alice" can only register ONE pubkey at a
+        // time (PRIMARY KEY upsert). During overlap the receiver keeps the OLD pubkey
+        // registered (per the rotate guidance) so old-key messages still verify.
+        let overlap = VerifyPolicy {
+            strict_override: None,
+            trust: vec![old_fp.clone(), new_fp.clone()],
+            revoked: vec![],
+        };
+
+        // While "alice" is registered to the OLD key, an old-key signature commits.
+        {
+            let b = SqliteStore::open(&dir.join("b_old.db")).unwrap();
+            b.register_key("alice", &old_pk).unwrap();
+            assert_eq!(
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&src(&old, "during-overlap")),
+                    &overlap
+                )
+                .unwrap()
+                .committed,
+                1,
+                "old key still verifies during overlap (old pubkey registered + trusted)"
+            );
+        }
+        // After re-registering "alice" to the NEW key, a new-key signature commits.
+        {
+            let b = SqliteStore::open(&dir.join("b_new.db")).unwrap();
+            b.register_key("alice", &new_pk).unwrap();
+            assert_eq!(
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&src(&new, "post-rotate")),
+                    &overlap
+                )
+                .unwrap()
+                .committed,
+                1,
+                "new key verifies once registered + trusted"
+            );
+        }
+        // Revoke the OLD fp: while "alice" is still on the OLD key, its SIGNED message
+        // is rejected (revocation wins), but the NEW key (registered) still commits.
+        let revoke_old = VerifyPolicy {
+            strict_override: None,
+            trust: vec![new_fp.clone()],
+            revoked: vec![old_fp.clone()],
+        };
+        {
+            let b = SqliteStore::open(&dir.join("b_revold.db")).unwrap();
+            b.register_key("alice", &old_pk).unwrap();
+            assert_eq!(
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&src(&old, "old-after-revoke")),
+                    &revoke_old
+                )
+                .unwrap()
+                .committed,
+                0,
+                "old key's signed message rejected after its fp is revoked"
+            );
+        }
+        {
+            let b = SqliteStore::open(&dir.join("b_revnew.db")).unwrap();
+            b.register_key("alice", &new_pk).unwrap();
+            assert_eq!(
+                pull_from_store(
+                    &b,
+                    "bob",
+                    std::slice::from_ref(&src(&new, "new-after-revoke")),
+                    &revoke_old
+                )
+                .unwrap()
+                .committed,
+                1,
+                "new key still commits after the old fp is revoked"
             );
         }
     }

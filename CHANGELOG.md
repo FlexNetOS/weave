@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased] — tighten signed identity (trust-set strict, rotation/revocation, fingerprints)
+
+> All behind the existing `sign` feature; the default and `libsql`-no-sign builds
+> gain nothing (no new compiled crate — `sha2` was already transitive via
+> `ed25519-dalek`). No schema/`Store`-trait change: trust and revocation are
+> receiver-local config.
+
+### Added
+- **config:** `WEAVE_TRUST` env var (and `trust = [...]` config) — a comma- or
+  whitespace-separated list of **trusted** sender fingerprints (`SHA256:<64-hex>`)
+  or full pubkey hex. Configuring a non-empty trust set makes **strict verification
+  the default** for the senders in it: a trusted sender's unsigned/unverifiable
+  pulled intent is **dropped**, while every other sender keeps the advisory model.
+  Entries are validated, control-char-rejected, per-entry-capped
+  (`MAX_FP_ENTRY_LEN` = 256), deduped, and total-capped (`MAX_TRUST` = 64).
+- **config:** `WEAVE_REVOKED` env var (and `revoked = [...]` config) — a list of
+  **revoked** fingerprints. A signature that verifies against a revoked key is
+  rejected **unconditionally** (absolute for signed messages — even with
+  `WEAVE_STRICT_VERIFY=0` / advisory mode). Same validation/cap discipline.
+- **cli (`sign`):** `weave key fingerprint` (`--json`) prints this session's
+  `SHA256:<16-hex>` fingerprint; `weave key rotate` archives the old private key
+  (`0600` backup), generates a new key, registers it, and prints **both**
+  fingerprints + config-based overlap guidance (trust both during the window, keep
+  the old pubkey registered, then revoke the old fingerprint); `weave key revoke
+  <fp>` validates a `SHA256:<64-hex>`/full-pubkey-hex value and echoes the
+  `WEAVE_REVOKED=` / `revoked = [...]` line to add (config-driven; no store table).
+- **cli (`sign`):** `weave key show` / `weave key list` (`--json`) and `weave
+  doctor` now surface fingerprints (and, in `doctor`, the strict mode + trusted /
+  revoked counts) — all secret-free (public keys / fingerprints / paths only).
+
+### Changed
+- **config:** `WEAVE_STRICT_VERIFY` (and `strict_verify`) is now **tri-state**:
+  unset = the trust-set-aware default; `1`/`true` = force strict everywhere;
+  `0`/`false` = advisory everywhere — but never re-admits a revoked key's signed
+  message. New `strict_verify_override()` accessor preserving the tri-state.
+- **store (both backends):** `pull_from_store` / `commit_pulled` take a
+  `&VerifyPolicy` (trust set, revocation list, tri-state override) instead of a bare
+  `strict: bool`; `verify_pulled_intent` implements the new trust-set-aware decision
+  table. **Verification was only tightened** — the table adds two reject cells
+  (`trusted+unsigned`, `revoked+valid-sig`); a present-but-invalid signature is
+  still always rejected, and no previously-rejected case became a commit.
+
+### Notes
+- **Fingerprints** are `SHA256:` + a display prefix of the SHA-256 digest of the
+  **raw 32-byte public key** — secret-free, never derived from the private key.
+  Trust/revocation match the **full** digest, so the truncated display form can
+  never cause a mis-trust.
+
 ## [Unreleased] — session scan / identify / tag (repo · branch · worktree)
 
 ### Added

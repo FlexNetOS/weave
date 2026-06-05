@@ -138,6 +138,64 @@ pub fn generate_keypair() -> Result<String> {
     Ok(to_hex(signing.verifying_key().as_bytes()))
 }
 
+/// Rotate this session's signing key (R6, config-based overlap). If a key file
+/// exists, ARCHIVE it (rename to a non-clobbering `ed25519.key.<unix_ts>.bak`,
+/// 0600) instead of refusing, then generate a fresh keypair and write it. Returns
+/// `(old_pubkey_hex, new_pubkey_hex)` — `old` is `None` when there was no prior key
+/// (rotation reduces to a plain generate). The OLD PRIVATE key is moved, never
+/// printed; only PUBLIC keys/fingerprints are returned. This is the ONLY path that
+/// may displace an existing key file; plain `generate_keypair` still refuses to
+/// clobber. During overlap the receiver should trust BOTH fingerprints in
+/// `WEAVE_TRUST` and keep the OLD pubkey registered (`weave key add`).
+pub fn rotate_keypair() -> Result<(Option<String>, String)> {
+    let path = key_path();
+    let old_pub = if path.exists() {
+        // Recover the OLD public key BEFORE moving the file, so the caller can
+        // print/keep it registered during the overlap window. A corrupt old key is
+        // non-fatal here: archive it anyway and report no old pubkey.
+        let old = load_signing_key()
+            .ok()
+            .flatten()
+            .map(|sk| to_hex(sk.verifying_key().as_bytes()));
+        let backup = archive_path(&path);
+        std::fs::rename(&path, &backup).with_context(|| {
+            format!(
+                "archiving existing signing key {} -> {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+        }
+        old
+    } else {
+        None
+    };
+    let new_pub = generate_keypair()?;
+    Ok((old_pub, new_pub))
+}
+
+/// A non-clobbering archive path for the current key file:
+/// `<key_path>.<unix_ts>.bak`, bumping a counter suffix on the (rare) collision so
+/// two rotations in the same second never overwrite each other.
+fn archive_path(path: &std::path::Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = format!("{}.{ts}.bak", path.display());
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 1u32;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{base}.{n}"));
+        n += 1;
+    }
+    candidate
+}
+
 /// Construct a fresh signing key from 32 OS-CSPRNG bytes. We fill the secret
 /// scalar directly via `getrandom` (the OS entropy source) and build the key with
 /// `SigningKey::from_bytes`, avoiding any coupling to dalek's `rand_core` version.
@@ -235,6 +293,72 @@ pub fn verify_intent(
     let signature = Signature::from_bytes(&sig_arr);
     let msg = canonical_message(from, to, body);
     Ok(verifying.verify(&msg, &signature).is_ok())
+}
+
+/// Number of hex chars of the SHA-256 digest shown in the DISPLAY fingerprint
+/// (`SHA256:` + this many chars). 16 hex = 8 bytes = 64 bits — short and stable
+/// for a local mesh. This is a DISPLAY/UX convenience ONLY: trust decisions are
+/// NEVER made on the truncated form (see [`fingerprint_full`]); verification is
+/// always over the full pubkey + signature, never the fingerprint.
+pub const FINGERPRINT_DISPLAY_HEX: usize = 16;
+
+/// The FULL SHA-256 digest of a hex public key, rendered as 64 lowercase hex
+/// chars, WITHOUT the `SHA256:` label. This is the canonical value a trust/revoked
+/// entry is matched against (R3: never truncate a trust decision). Returns `None`
+/// for a malformed/oversized (`> MAX_KEY_HEX_LEN`) or non-32-byte pubkey; never
+/// panics, and NEVER takes or hashes the secret key (the input is the PUBLIC key).
+pub fn fingerprint_full(pubkey_hex: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let trimmed = pubkey_hex.trim();
+    if trimmed.len() > MAX_KEY_HEX_LEN {
+        return None;
+    }
+    let bytes = from_hex(trimmed).ok()?;
+    if bytes.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
+        return None;
+    }
+    let digest = Sha256::digest(&bytes);
+    Some(to_hex(&digest))
+}
+
+/// The DISPLAY fingerprint of a hex public key: `"SHA256:"` + the first
+/// [`FINGERPRINT_DISPLAY_HEX`] hex chars of the full SHA-256 digest. Short, stable,
+/// and derived ONLY from the PUBLIC key. Returns `None` for a malformed/oversized
+/// pubkey; never panics. DISPLAY ONLY — never the basis of a trust decision (use
+/// [`fingerprint_full`] / [`fingerprint_matches`] for that).
+pub fn fingerprint(pubkey_hex: &str) -> Option<String> {
+    let full = fingerprint_full(pubkey_hex)?;
+    let short = &full[..FINGERPRINT_DISPLAY_HEX.min(full.len())];
+    Some(format!("SHA256:{short}"))
+}
+
+/// Does a trust/revoked-list `entry` designate the pubkey `pubkey_hex`? Two accepted
+/// forms, BOTH compared against the FULL SHA-256 digest or the full pubkey hex (R3 —
+/// never the truncated display form):
+///
+/// 1. a `SHA256:<full-64-hex>` fingerprint (full digest, case-insensitive hex),
+/// 2. a bare full pubkey hex (64 chars) — its own digest is compared.
+///
+/// A truncated `SHA256:<16-hex>` display string does NOT match (deliberately: a
+/// trust decision must use the full digest, never the display prefix). Returns
+/// `false` on any malformed input; never panics. The caller passes the receiver's
+/// registered pubkey for `from`, so an entry only matches a sender weave actually
+/// has a key for (R5).
+pub fn fingerprint_matches(entry: &str, pubkey_hex: &str) -> bool {
+    let full = match fingerprint_full(pubkey_hex) {
+        Some(f) => f,
+        None => return false,
+    };
+    let entry = entry.trim();
+    // Form 1: `SHA256:<hex>` — compare the full digest, case-insensitively.
+    if let Some(rest) = entry.strip_prefix("SHA256:") {
+        return rest.eq_ignore_ascii_case(&full);
+    }
+    // Form 2: a bare full pubkey hex — derive its digest and compare.
+    if let Some(other) = fingerprint_full(entry) {
+        return other == full;
+    }
+    false
 }
 
 /// Validate a hex public key supplied by a user (`weave key add`) before it is
@@ -346,9 +470,112 @@ mod tests {
         assert!(check_pubkey("zz").is_err(), "non-hex");
     }
 
+    /// The fingerprint is deterministic, correctly formatted (`SHA256:` + 16
+    /// lowercase hex), and distinguishes distinct keys. The full digest is 64 hex.
+    #[test]
+    fn fingerprint_determinism_and_format() {
+        let a = to_hex(test_key(3).verifying_key().as_bytes());
+        let b = to_hex(test_key(4).verifying_key().as_bytes());
+
+        let fa = fingerprint(&a).unwrap();
+        let fa2 = fingerprint(&a).unwrap();
+        assert_eq!(fa, fa2, "same pubkey ⇒ same fingerprint");
+        assert_ne!(
+            fingerprint(&b).unwrap(),
+            fa,
+            "different pubkey ⇒ different fp"
+        );
+
+        assert!(fa.starts_with("SHA256:"), "labeled with SHA256:");
+        let short = fa.strip_prefix("SHA256:").unwrap();
+        assert_eq!(short.len(), FINGERPRINT_DISPLAY_HEX, "16-hex display");
+        assert!(
+            short
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex only"
+        );
+
+        let full = fingerprint_full(&a).unwrap();
+        assert_eq!(full.len(), 64, "full SHA-256 is 64 hex chars");
+        assert!(
+            full.starts_with(short),
+            "display is a prefix of the full digest"
+        );
+    }
+
+    /// A malformed/oversized pubkey yields `None` (never a panic), for every form.
+    #[test]
+    fn fingerprint_none_on_malformed() {
+        assert!(fingerprint("").is_none(), "empty");
+        assert!(fingerprint("zz").is_none(), "non-hex");
+        assert!(
+            fingerprint("deadbeef").is_none(),
+            "too short (not 32 bytes)"
+        );
+        assert!(
+            fingerprint(&"f".repeat(MAX_KEY_HEX_LEN + 2)).is_none(),
+            "oversized"
+        );
+        assert!(fingerprint_full("abc").is_none(), "odd length");
+    }
+
+    /// Trust matching uses the FULL digest (R3): a `SHA256:<full-64-hex>` or a bare
+    /// full-pubkey-hex entry matches; the truncated 16-hex display form NEVER does.
+    #[test]
+    fn fingerprint_matches_full_only() {
+        let pk = to_hex(test_key(11).verifying_key().as_bytes());
+        let full = fingerprint_full(&pk).unwrap();
+        let display = fingerprint(&pk).unwrap(); // SHA256:<16-hex>
+
+        assert!(
+            fingerprint_matches(&format!("SHA256:{full}"), &pk),
+            "full SHA256: matches"
+        );
+        assert!(
+            fingerprint_matches(&format!("SHA256:{}", full.to_uppercase()), &pk),
+            "case-insensitive"
+        );
+        assert!(
+            fingerprint_matches(&pk, &pk),
+            "bare full pubkey hex matches"
+        );
+        assert!(
+            !fingerprint_matches(&display, &pk),
+            "truncated display NEVER matches (R3)"
+        );
+
+        let other = to_hex(test_key(12).verifying_key().as_bytes());
+        assert!(
+            !fingerprint_matches(&format!("SHA256:{full}"), &other),
+            "wrong key never matches"
+        );
+        assert!(
+            !fingerprint_matches("garbage", &pk),
+            "malformed entry never matches"
+        );
+    }
+
     use proptest::prelude::*;
 
     proptest! {
+        /// `fingerprint`/`fingerprint_full` are TOTAL (Some/None without panic) on any
+        /// hex-ish input and STABLE across calls; a `Some` always carries the label
+        /// and 16-hex display whose prefix equals the full digest.
+        #[test]
+        fn fingerprint_total_and_stable(s in "[0-9a-fA-F]{0,300}") {
+            let a = fingerprint(&s);
+            let b = fingerprint(&s);
+            prop_assert_eq!(&a, &b, "stable across calls");
+            if let Some(fp) = a {
+                prop_assert!(fp.starts_with("SHA256:"));
+                let short = fp.strip_prefix("SHA256:").unwrap();
+                prop_assert_eq!(short.len(), FINGERPRINT_DISPLAY_HEX);
+                let full = fingerprint_full(&s).unwrap();
+                prop_assert!(full.starts_with(short));
+            }
+        }
+
         /// For ANY `(from, to, body)`, a signature over them verifies; and ANY
         /// single-field mutation breaks verification (the new-invariant property).
         #[test]
