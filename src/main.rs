@@ -227,11 +227,29 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List known sessions with unread counts.
+    /// List known sessions with unread counts. With `--watch`, render a read-only
+    /// presence dashboard (grouped by repo then branch) that re-renders every
+    /// `--interval` seconds until interrupted (Ctrl-C); `--iterations N` renders
+    /// exactly N frames then exits (bounded test mode).
     Sessions {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// re-render a read-only presence dashboard until interrupted (Ctrl-C)
+        #[arg(long)]
+        watch: bool,
+        /// dashboard poll interval in seconds (clamped to a sane range)
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        /// render exactly N frames then exit (0 ⇒ loop forever; bounded test mode)
+        #[arg(long, default_value_t = 0)]
+        iterations: u64,
+        /// only show sessions whose repo tag equals this value
+        #[arg(long)]
+        repo: Option<String>,
+        /// only show sessions whose branch tag equals this value
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Scan, identify, and tag running sessions: refresh your own row's git tags,
     /// then list every (federated) peer joined with liveness and its
@@ -897,6 +915,188 @@ fn fmt_peer_tags(p: &model::Peer) -> String {
 /// Upper bound on messages returned for a `thread` view.
 const MAX_THREAD: i64 = 1_000;
 
+// ---------------------------------------------------------------------------
+// `weave sessions --watch` presence dashboard (read-only, dependency-light).
+// ---------------------------------------------------------------------------
+
+/// Per-(repo, branch) section row budget for the dashboard. A group with more than
+/// this many rows is truncated to the budget plus a `+N more` line, so an enormous
+/// federated mesh can never blow up one frame's height. Not user-tunable in v1.
+const DASHBOARD_GROUP_ROW_BUDGET: usize = 20;
+
+/// ANSI clear-screen + cursor-home: clears the scrollback-visible screen and parks
+/// the cursor at the top-left so each watch frame overwrites the last in place. A
+/// plain literal (never built from runtime input); emitted ONLY when the clear gate
+/// (`clear_enabled`) is on — never for `--json`, a non-TTY, or `NO_COLOR`/`WEAVE_NO_CLEAR`.
+const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
+
+/// A single session row flattened from a [`store::PeerView`] for the presence
+/// dashboard. Pure data (no store/`Peer` reference) so [`render_sessions_dashboard`]
+/// is unit-testable from hand-built snapshots with no store. Carries ONLY display
+/// tags — name/repo/branch/worktree/mux/host/alive/origin — never a token or URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRow {
+    name: String,
+    repo: String,
+    branch: String,
+    worktree: String,
+    mux: String,
+    host: String,
+    alive: bool,
+    /// foreign-origin label (e.g. `messages.db`) for `(via …)`, empty when local.
+    via: String,
+}
+
+/// Pure-render options for the presence dashboard. `clear` toggles the ANSI
+/// clear-home prefix (resolved by the caller from the TTY/`NO_COLOR`/`WEAVE_NO_CLEAR`
+/// gate, off for `--json`); `repo`/`branch` are the active exact-match filters,
+/// echoed into the header for context. No I/O lives here — the render is total.
+#[derive(Debug, Clone, Default)]
+struct DashboardOpts {
+    clear: bool,
+    repo: Option<String>,
+    branch: Option<String>,
+}
+
+/// Decide whether the ANSI clear-home prefix should be emitted: only when stdout is
+/// a real TTY AND neither `NO_COLOR` nor `WEAVE_NO_CLEAR` is set (either, even empty,
+/// disables it). For `--json` the caller forces this off. Reads env + the terminal —
+/// the impure companion to the pure [`render_sessions_dashboard`].
+fn clear_enabled() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("WEAVE_NO_CLEAR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
+/// Flatten + sort federated peer views into deterministic dashboard rows, grouped
+/// downstream by (repo, branch). Sorting here (repo, branch, name) makes the rendered
+/// frame stable regardless of store row order — important for hermetic tests. Pure.
+fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
+    let mut rows: Vec<SessionRow> = views
+        .iter()
+        .map(|v| {
+            let p = &v.peer;
+            SessionRow {
+                name: p.name.clone(),
+                repo: p.repo.clone(),
+                branch: p.branch.clone(),
+                worktree: p.worktree_id.clone(),
+                mux: p.mux.clone(),
+                host: p.host.clone(),
+                alive: is_alive(p),
+                via: if v.origin.is_foreign() {
+                    v.origin.label().to_string()
+                } else {
+                    String::new()
+                },
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.repo, &a.branch, &a.name).cmp(&(&b.repo, &b.branch, &b.name)));
+    rows
+}
+
+/// Render one presence-dashboard frame as a `String` (the testable seam). PURE: no
+/// I/O, no clock, no sleep — `now` is passed in so frame contents are deterministic.
+///
+/// Layout: an optional ANSI clear-home prefix (when `opts.clear`), a header summary
+/// (`now`, total sessions, alive count, #repos, #branches, active filters), then one
+/// section per (repo, branch) group — in the sorted order of [`dashboard_rows`] —
+/// each listing `name·worktree·mux·host·alive` rows. A group exceeding
+/// [`DASHBOARD_GROUP_ROW_BUDGET`] renders the budgeted rows plus a `+N more` line.
+/// The empty snapshot renders a stable `no sessions` body. Output is secret-free
+/// (tags only; the `via` label is the redacted store basename, never a token/URL).
+fn render_sessions_dashboard(rows: &[SessionRow], opts: &DashboardOpts, now: i64) -> String {
+    let mut out = String::new();
+    if opts.clear {
+        out.push_str(ANSI_CLEAR_HOME);
+    }
+
+    let total = rows.len();
+    let alive = rows.iter().filter(|r| r.alive).count();
+    // Distinct repos / branches in first-seen (already sorted) order.
+    let mut repos: Vec<&str> = Vec::new();
+    let mut branches: Vec<(&str, &str)> = Vec::new();
+    for r in rows {
+        if !repos.contains(&r.repo.as_str()) {
+            repos.push(&r.repo);
+        }
+        let key = (r.repo.as_str(), r.branch.as_str());
+        if !branches.contains(&key) {
+            branches.push(key);
+        }
+    }
+
+    let mut filt = String::new();
+    if let Some(r) = opts.repo.as_deref() {
+        filt.push_str(&format!(" repo={r}"));
+    }
+    if let Some(b) = opts.branch.as_deref() {
+        filt.push_str(&format!(" branch={b}"));
+    }
+    out.push_str(&format!(
+        "weave sessions [{}] — {total} session(s), {alive} alive, {} repo(s), {} branch(es){filt}\n",
+        model::fmt_ts(now),
+        repos.len(),
+        branches.len(),
+    ));
+
+    if rows.is_empty() {
+        out.push_str("no sessions\n");
+        return out;
+    }
+
+    // Emit one section per (repo, branch) group, in sorted row order. `rows` is
+    // already sorted by (repo, branch, name), so equal-key rows are contiguous.
+    fn dash(s: &str) -> &str {
+        if s.is_empty() {
+            "-"
+        } else {
+            s
+        }
+    }
+    let mut i = 0;
+    while i < rows.len() {
+        let repo = &rows[i].repo;
+        let branch = &rows[i].branch;
+        let mut j = i;
+        while j < rows.len() && &rows[j].repo == repo && &rows[j].branch == branch {
+            j += 1;
+        }
+        let group = &rows[i..j];
+        let g_alive = group.iter().filter(|r| r.alive).count();
+        out.push_str(&format!(
+            "\n[{} / {}] {} session(s), {g_alive} alive\n",
+            dash(repo),
+            dash(branch),
+            group.len(),
+        ));
+        let shown = group.len().min(DASHBOARD_GROUP_ROW_BUDGET);
+        for r in &group[..shown] {
+            let status = if r.alive { "alive" } else { "offline" };
+            let via = if r.via.is_empty() {
+                String::new()
+            } else {
+                format!(" (via {})", r.via)
+            };
+            out.push_str(&format!(
+                "  {} [{status}] worktree={} mux={} host={}{via}\n",
+                r.name,
+                dash(&r.worktree),
+                dash(&r.mux),
+                dash(&r.host),
+            ));
+        }
+        if group.len() > shown {
+            out.push_str(&format!("  +{} more\n", group.len() - shown));
+        }
+        i = j;
+    }
+    out
+}
+
 /// Emit a shell completion script to stdout.
 fn print_completions(shell: CompletionShell) -> Result<()> {
     use clap::CommandFactory;
@@ -1387,7 +1587,100 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Sessions { json } => {
+        Cmd::Sessions {
+            json,
+            watch,
+            interval,
+            iterations,
+            repo,
+            branch,
+        } if watch => {
+            // Presence dashboard (read-only). Groups federated PEER rows (which carry
+            // repo/branch/worktree + liveness, unlike SessionView) by repo→branch.
+            // The loop writes NOTHING per tick; at most one pre-loop owner self-
+            // refresh (mirroring `scan`) so the watcher's own row shows current.
+            let (me, explicit) = resolve_me_explicit(None, None, &cfg);
+            if explicit {
+                let t = inject::detect_target();
+                let cwd_val = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let tags = git_tags_for(cwd_val.as_deref());
+                if let Err(e) = store.register_peer_full(
+                    &me,
+                    t.mux.as_str(),
+                    &t.id,
+                    &t.socket,
+                    cwd_val.as_deref(),
+                    Some(std::process::id() as i64),
+                    &config::this_host(),
+                    &tags.repo,
+                    &tags.branch,
+                    &tags.worktree_id,
+                ) {
+                    eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
+                }
+            }
+            let extra = cfg.peer_db_sources();
+
+            // Build one snapshot (read-only) from federated peers, applying the same
+            // exact-match repo/branch filters as `scan`. Closure so the loop re-reads
+            // fresh data each tick without re-applying filter parsing.
+            let snapshot = |store: &dyn Store| -> Result<Vec<SessionRow>> {
+                let mut views = store::federated_peers(store, &extra)?;
+                if let Some(r) = repo.as_deref() {
+                    views.retain(|v| v.peer.repo == r);
+                }
+                if let Some(b) = branch.as_deref() {
+                    views.retain(|v| v.peer.branch == b);
+                }
+                Ok(dashboard_rows(&views))
+            };
+
+            if json {
+                // `--watch --json` ⇒ a SINGLE snapshot then exit (no clear, no loop):
+                // a stream of cleared frames is not machine-consumable. Same shape as
+                // the non-watch scan JSON (presence-focused).
+                let rows = snapshot(store)?;
+                let arr: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name, "repo": r.repo, "branch": r.branch,
+                            "worktree": r.worktree, "mux": r.mux, "host": r.host,
+                            "alive": r.alive, "via": r.via,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                let opts = DashboardOpts {
+                    clear: clear_enabled(),
+                    repo: repo.clone(),
+                    branch: branch.clone(),
+                };
+                let interval = config::clamp_watch_interval(interval);
+                eprintln!("[weave] watching sessions every {interval}s (Ctrl-C to stop)");
+                // Bounded by ITERATION COUNT (never a wall-clock assertion): `0` ⇒
+                // loop forever (interactive); `n>0` ⇒ render exactly n frames. Sleep
+                // happens BETWEEN frames, never after the last, so `--iterations 1`
+                // returns immediately after one render (no trailing wait, no hang).
+                let mut n: u64 = 0;
+                loop {
+                    let rows = snapshot(store)?;
+                    print!("{}", render_sessions_dashboard(&rows, &opts, model::now()));
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    n += 1;
+                    if iterations != 0 && n >= iterations {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(interval));
+                }
+            }
+        }
+
+        Cmd::Sessions { json, .. } => {
             // Tier-1 federation: union local sessions with read-only extra stores,
             // origin-tagged. Foreign sessions are kept distinct (no unread summing —
             // Tier 1 has no cross-store inbox). Default ⇒ identical-to-today.
@@ -2010,4 +2303,169 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
         other => eprintln!("[weave] unknown hook event: {other}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed clock for every render test: frame contents must be deterministic, so
+    /// `now` is always passed in — never `model::now()`. (2021-01-01T00:00:00Z.)
+    const FIXED_NOW: i64 = 1_609_459_200;
+
+    fn row(name: &str, repo: &str, branch: &str, alive: bool) -> SessionRow {
+        SessionRow {
+            name: name.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            worktree: "(main)".to_string(),
+            mux: "tmux".to_string(),
+            host: "h1".to_string(),
+            alive,
+            via: String::new(),
+        }
+    }
+
+    /// Empty snapshot ⇒ a stable header + `no sessions` body, zeroed counts.
+    #[test]
+    fn dashboard_empty_case() {
+        let out = render_sessions_dashboard(&[], &DashboardOpts::default(), FIXED_NOW);
+        assert!(out.contains("0 session(s), 0 alive, 0 repo(s), 0 branch(es)"));
+        assert!(out.contains("no sessions"));
+        // No per-group section header (those contain " / ") is emitted when empty.
+        assert!(
+            !out.contains(" / "),
+            "empty frame had a group section: {out}"
+        );
+    }
+
+    /// Header summary counts: total sessions, alive count, #repos, #branches.
+    #[test]
+    fn dashboard_header_summary_counts() {
+        let rows = vec![
+            row("a", "repoA", "main", true),
+            row("b", "repoA", "feat", false),
+            row("c", "repoB", "main", true),
+        ];
+        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        // 3 sessions, 2 alive, 2 repos, 3 distinct (repo,branch) branches.
+        assert!(
+            out.contains("3 session(s), 2 alive, 2 repo(s), 3 branch(es)"),
+            "header was: {out}"
+        );
+    }
+
+    /// Grouping by repo then branch: equal-key rows form one section with a header,
+    /// and sections appear in sorted (repo, branch) order.
+    #[test]
+    fn dashboard_groups_by_repo_then_branch() {
+        let rows = dashboard_rows_sorted(vec![
+            row("z", "repoB", "main", true),
+            row("a", "repoA", "main", true),
+            row("m", "repoA", "feat", false),
+        ]);
+        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        // Section headers present.
+        assert!(out.contains("[repoA / feat]"), "{out}");
+        assert!(out.contains("[repoA / main]"), "{out}");
+        assert!(out.contains("[repoB / main]"), "{out}");
+        // repoA sections precede repoB; within repoA, feat precedes main.
+        let i_feat = out.find("[repoA / feat]").unwrap();
+        let i_main = out.find("[repoA / main]").unwrap();
+        let i_b = out.find("[repoB / main]").unwrap();
+        assert!(i_feat < i_main && i_main < i_b, "ordering wrong: {out}");
+        // Per-group alive count: repoA/main has 1 session, 1 alive.
+        assert!(out.contains("[repoA / main] 1 session(s), 1 alive"));
+    }
+
+    /// Helper to sort rows like `dashboard_rows` does (the render assumes sorted,
+    /// contiguous equal-key rows). Tests that build rows by hand reuse this.
+    fn dashboard_rows_sorted(mut rows: Vec<SessionRow>) -> Vec<SessionRow> {
+        rows.sort_by(|a, b| (&a.repo, &a.branch, &a.name).cmp(&(&b.repo, &b.branch, &b.name)));
+        rows
+    }
+
+    /// `--repo`/`--branch` filters are echoed in the header; the caller pre-filters
+    /// the rows, so a narrowed snapshot renders only the surviving group.
+    #[test]
+    fn dashboard_filter_echo_and_narrowing() {
+        let rows = vec![row("a", "repoA", "main", true)];
+        let opts = DashboardOpts {
+            clear: false,
+            repo: Some("repoA".to_string()),
+            branch: Some("main".to_string()),
+        };
+        let out = render_sessions_dashboard(&rows, &opts, FIXED_NOW);
+        assert!(out.contains("repo=repoA"), "{out}");
+        assert!(out.contains("branch=main"), "{out}");
+        assert!(out.contains("[repoA / main]"));
+        // A filter that excludes everything yields the stable empty body.
+        let empty = render_sessions_dashboard(&[], &opts, FIXED_NOW);
+        assert!(empty.contains("no sessions"));
+    }
+
+    /// A group exceeding the row budget renders the budgeted rows plus `+N more`.
+    #[test]
+    fn dashboard_truncates_oversized_group() {
+        let n = DASHBOARD_GROUP_ROW_BUDGET + 5;
+        let rows: Vec<SessionRow> = (0..n)
+            .map(|i| row(&format!("s{i:03}"), "repoA", "main", true))
+            .collect();
+        let rows = dashboard_rows_sorted(rows);
+        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        assert!(out.contains("+5 more"), "{out}");
+        // Exactly the budgeted number of session rows are printed (lines starting
+        // with two spaces and "[alive]").
+        let shown = out.matches("[alive]").count();
+        assert_eq!(shown, DASHBOARD_GROUP_ROW_BUDGET);
+    }
+
+    /// alive/total accounting across the whole frame and per group.
+    #[test]
+    fn dashboard_alive_and_total_counts() {
+        let rows = dashboard_rows_sorted(vec![
+            row("a", "repoA", "main", true),
+            row("b", "repoA", "main", false),
+            row("c", "repoA", "main", true),
+        ]);
+        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        assert!(out.contains("3 session(s), 2 alive"));
+        assert!(out.contains("[repoA / main] 3 session(s), 2 alive"));
+    }
+
+    /// ANSI-on vs plain: enabling the clear adds EXACTLY the clear-home prefix; the
+    /// plain frame contains no escape byte at all.
+    #[test]
+    fn dashboard_ansi_prefix_vs_plain() {
+        let rows = vec![row("a", "repoA", "main", true)];
+        let plain = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        let ansi = render_sessions_dashboard(
+            &rows,
+            &DashboardOpts {
+                clear: true,
+                ..DashboardOpts::default()
+            },
+            FIXED_NOW,
+        );
+        // Plain output has no ESC byte.
+        assert!(
+            !plain.as_bytes().contains(&0x1b),
+            "plain frame had an escape"
+        );
+        // ANSI output is exactly the prefix + the plain frame.
+        assert_eq!(ansi, format!("{ANSI_CLEAR_HOME}{plain}"));
+        assert!(ansi.starts_with("\x1b[2J\x1b[H"));
+    }
+
+    /// Empty/missing tag fields render as `-` (never a blank column or a panic).
+    #[test]
+    fn dashboard_empty_tags_render_dash() {
+        let mut r = row("a", "", "", true);
+        r.worktree = String::new();
+        r.mux = String::new();
+        r.host = String::new();
+        let out = render_sessions_dashboard(&[r], &DashboardOpts::default(), FIXED_NOW);
+        assert!(out.contains("[- / -]"), "{out}");
+        assert!(out.contains("worktree=- mux=- host=-"), "{out}");
+    }
 }

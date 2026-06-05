@@ -4208,3 +4208,371 @@ fn which_git() -> Option<std::path::PathBuf> {
         .map(|d| d.join("git"))
         .find(|p| p.is_file())
 }
+
+// ---------------------------------------------------------------------------
+// O. Presence dashboard: `weave sessions --watch` (Feature #5)
+//
+// All hermetic & NON-HANGING: every watch run is bounded by `--iterations N`
+// (NEVER a wall-clock sleep assertion). `run`/`run_ok` only return once the
+// child has EXITED, so a returning call is itself proof the loop terminated —
+// a true hang would wedge the test, not silently pass. `WEAVE_NO_CLEAR=1` keeps
+// frames escape-byte-free regardless of the runner's TTY state. Peers carry
+// deterministic worktree tags via a crafted `.git` FILE (no real git / no
+// network), grouping under `[- / -]`; a separate gated test covers real
+// repo/branch grouping when a `git` binary is present.
+// ---------------------------------------------------------------------------
+
+/// Extra env that forces the watch dashboard into its plain (escape-free) path
+/// no matter what terminal the test runner has, so captured stdout is stable.
+const NO_CLEAR: [(&str, &str); 2] = [("WEAVE_NO_CLEAR", "1"), ("NO_COLOR", "1")];
+
+/// Count rendered frames by the per-frame header line the renderer always emits.
+fn frame_count(stdout: &str) -> usize {
+    stdout.matches("weave sessions [").count()
+}
+
+/// `weave sessions --watch --iterations 1` renders EXACTLY ONE frame, EXITS 0
+/// (no hang — the harness returning proves termination, bounded by iteration
+/// count not a sleep), and the frame carries the grouped section + header
+/// summary + both peers' tags. A tiny `--interval` is irrelevant because the
+/// single-iteration path never sleeps (sleep is BETWEEN frames only).
+#[test]
+fn sessions_watch_iterations_one_emits_one_frame_and_exits() {
+    let db = TestDb::new();
+    let cwd_a = linked_worktree_cwd("watch-wt-a");
+    let cwd_b = linked_worktree_cwd("watch-wt-b");
+    run_in_cwd(&db, &["register", "--name", "wone"], &cwd_a.path);
+    run_in_cwd(&db, &["register", "--name", "wtwo"], &cwd_b.path);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "sessions",
+            "--watch",
+            "--iterations",
+            "1",
+            "--interval",
+            "1",
+        ],
+        &NO_CLEAR,
+    );
+    assert!(
+        ok,
+        "watch --iterations 1 must exit 0 (no hang); stderr: {err}"
+    );
+    // Exactly one frame.
+    assert_eq!(frame_count(&out), 1, "expected exactly one frame:\n{out}");
+    // Header summary present (presence-focused counts).
+    assert!(
+        out.contains("session(s),") && out.contains("alive,") && out.contains("repo(s),"),
+        "frame missing header summary:\n{out}"
+    );
+    // Both peers appear, with their deterministic worktree tags, under the
+    // empty-repo/branch group section.
+    assert!(out.contains("wone"), "frame missing peer wone:\n{out}");
+    assert!(out.contains("wtwo"), "frame missing peer wtwo:\n{out}");
+    assert!(
+        out.contains("worktree=watch-wt-a") && out.contains("worktree=watch-wt-b"),
+        "frame missing worktree tags:\n{out}"
+    );
+    assert!(
+        out.contains("[- / -]"),
+        "frame missing the grouped section header:\n{out}"
+    );
+    // Plain path: no escape bytes leak into captured stdout.
+    assert!(
+        !out.as_bytes().contains(&0x1b),
+        "plain watch frame must carry no ANSI escape:\n{out:?}"
+    );
+}
+
+/// `--iterations 2` emits TWO frames and still exits. This is the multi-tick
+/// non-hang proof: the loop sleeps `--interval` BETWEEN the two frames then
+/// returns (never an infinite loop, never a post-last sleep).
+#[test]
+fn sessions_watch_iterations_two_emits_two_frames_and_exits() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("watch-2x");
+    run_in_cwd(&db, &["register", "--name", "twice"], &cwd.path);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "sessions",
+            "--watch",
+            "--iterations",
+            "2",
+            "--interval",
+            "1",
+        ],
+        &NO_CLEAR,
+    );
+    assert!(
+        ok,
+        "watch --iterations 2 must exit 0 (no hang); stderr: {err}"
+    );
+    assert_eq!(frame_count(&out), 2, "expected exactly two frames:\n{out}");
+}
+
+/// `weave sessions --watch --json` emits a SINGLE JSON snapshot and exits — no
+/// loop, no clear prefix, no escape bytes — and the array carries the presence
+/// shape (name/repo/branch/worktree/alive/via), never a token or URL.
+#[test]
+fn sessions_watch_json_single_snapshot_and_exits() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("watch-json");
+    run_in_cwd(&db, &["register", "--name", "jsonpeer"], &cwd.path);
+
+    let out = run_ok_env(&db, &["sessions", "--watch", "--json"], &NO_CLEAR);
+    // No clear-screen / ANSI escape in JSON mode, ever.
+    assert!(
+        !out.as_bytes().contains(&0x1b),
+        "watch --json must carry no ANSI escape:\n{out:?}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&out).expect("watch --json emits a single JSON snapshot");
+    let arr = v.as_array().expect("watch --json is an array");
+    let row = arr
+        .iter()
+        .find(|r| r["name"] == "jsonpeer")
+        .expect("registered peer present in watch --json");
+    for key in [
+        "name", "repo", "branch", "worktree", "mux", "host", "alive", "via",
+    ] {
+        assert!(
+            row.get(key).is_some(),
+            "watch json row has key {key:?}: {row}"
+        );
+    }
+    assert_eq!(
+        row["worktree"], "watch-json",
+        "worktree tag roundtrips: {row}"
+    );
+    // Secret-free: no token/URL shape leaks via `via` for a purely-local peer.
+    assert_eq!(row["via"], "", "local peer has an empty `via` label: {row}");
+}
+
+/// A `--repo` filter that matches NOTHING narrows the watch frame to the stable
+/// empty body (`no sessions`) and still exits — proving the #1 exact-match
+/// filter composes with `--watch` and is never ignored.
+#[test]
+fn sessions_watch_nonmatching_repo_filter_narrows_to_empty() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("watch-filter");
+    run_in_cwd(&db, &["register", "--name", "filt"], &cwd.path);
+
+    // Unfiltered: the peer is present.
+    let all = run_env(
+        &db,
+        &["sessions", "--watch", "--iterations", "1"],
+        &NO_CLEAR,
+    );
+    assert!(
+        all.1.contains("filt"),
+        "unfiltered watch lists the peer:\n{}",
+        all.1
+    );
+
+    // A repo filter that cannot match the (empty) repo tag yields the empty body.
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "sessions",
+            "--watch",
+            "--iterations",
+            "1",
+            "--repo",
+            "no-such-repo",
+        ],
+        &NO_CLEAR,
+    );
+    assert!(ok, "filtered watch must exit 0; stderr: {err}");
+    assert!(
+        out.contains("no sessions") && !out.contains("filt"),
+        "a non-matching --repo filter must narrow the watch frame to empty:\n{out}"
+    );
+    assert!(
+        out.contains("repo=no-such-repo"),
+        "filter echoed in header:\n{out}"
+    );
+}
+
+/// REGRESSION: plain `weave sessions` and `weave sessions --json` (NO `--watch`)
+/// behave EXACTLY as before — the #1 display-join tag shape is intact and the
+/// non-watch path renders the legacy unread-oriented session listing, never the
+/// dashboard. (Guards against the new arm hijacking the default path.)
+#[test]
+fn sessions_without_watch_unchanged_regression() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("nowatch-wt");
+    run_in_cwd(&db, &["register", "--name", "legacy"], &cwd.path);
+    // A message so `legacy` is a session (sessions are message-derived).
+    run_ok(
+        &db,
+        &[
+            "send", "--from", "legacy", "--to", "legacy", "--body", "ping",
+        ],
+    );
+
+    // Human: the legacy "N unread (last …)" line, NOT a dashboard header.
+    let human = run_ok(&db, &["sessions"]);
+    assert!(
+        human.contains("legacy") && human.contains("unread"),
+        "legacy sessions human line intact: {human}"
+    );
+    assert!(
+        !human.contains("weave sessions ["),
+        "non-watch sessions must NOT render a dashboard frame: {human}"
+    );
+
+    // JSON: the documented legacy session-array shape (unread/last_activity +
+    // the #1 display-joined repo/branch/worktree), unchanged.
+    let out = run_ok(&db, &["sessions", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("sessions --json parses");
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "legacy")
+        .expect("session present");
+    for key in [
+        "name",
+        "unread",
+        "last_activity",
+        "repo",
+        "branch",
+        "worktree",
+        "origin",
+        "foreign",
+    ] {
+        assert!(
+            row.get(key).is_some(),
+            "legacy sessions json key {key:?}: {row}"
+        );
+    }
+    assert_eq!(
+        row["worktree"], "nowatch-wt",
+        "display-joined tag intact: {row}"
+    );
+}
+
+/// READ-ONLY proof (owner-only-writes): the watch loop writes NOTHING per tick.
+/// We snapshot the WEAVE_DB bytes (+ `-wal`) before and after a 3-iteration run
+/// driven with NO explicit identity (so even the optional pre-loop self-refresh
+/// is skipped) and assert the store is byte-identical across every tick.
+#[test]
+fn sessions_watch_is_read_only_store_unchanged_across_ticks() {
+    let db = TestDb::new();
+    let cwd = linked_worktree_cwd("readonly-wt");
+    run_in_cwd(&db, &["register", "--name", "observer"], &cwd.path);
+
+    // Snapshot every sqlite file for this DB before the watch run.
+    let snapshot = || -> Vec<(String, Vec<u8>)> {
+        let base = db.path.to_string_lossy().into_owned();
+        ["", "-wal", "-shm", "-journal"]
+            .iter()
+            .filter_map(|suf| {
+                let p = format!("{base}{suf}");
+                std::fs::read(&p).ok().map(|bytes| (p, bytes))
+            })
+            .collect()
+    };
+    let before = snapshot();
+    assert!(!before.is_empty(), "store file must exist after register");
+
+    // 3 ticks, no explicit --me/--session (scrub_env clears WEAVE_SESSION) so the
+    // owner self-refresh is skipped: every tick must be a pure read.
+    let (ok, _out, err) = run_env(
+        &db,
+        &[
+            "sessions",
+            "--watch",
+            "--iterations",
+            "3",
+            "--interval",
+            "1",
+        ],
+        &NO_CLEAR,
+    );
+    assert!(ok, "read-only watch must exit 0; stderr: {err}");
+
+    let after = snapshot();
+    assert_eq!(
+        before, after,
+        "watch loop must not write to the store on any tick (owner-only-writes)"
+    );
+}
+
+/// GATED real-git variant: when a `git` binary is present, two peers in DISTINCT
+/// real repos on distinct branches render as DISTINCT `[repo / branch]` sections
+/// in the watch frame — the genuine repo→branch grouping proof. Skipped with no
+/// `git` so zero-git CI still passes (the hermetic tests above cover the rest).
+#[test]
+fn sessions_watch_groups_distinct_repos_with_real_git() {
+    let git = match which_git() {
+        Some(g) => g,
+        None => {
+            eprintln!("skipping: no `git` binary available");
+            return;
+        }
+    };
+    let db = TestDb::new();
+    let mk_repo = |slug: &str, branch: &str| -> TempCwd {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-watch-git-{}-{}-{}",
+            std::process::id(),
+            slug,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_git = |args: &[&str]| {
+            Command::new(&git)
+                .args(args)
+                .current_dir(&dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        assert!(run_git(&["init", "-q", "-b", branch]) || run_git(&["init", "-q"]));
+        TempCwd { path: dir }
+    };
+    let repo_a = mk_repo("alpharepo", "trunk");
+    let repo_b = mk_repo("betarepo", "trunk");
+    let name_a = repo_a
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let name_b = repo_b
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    run_in_cwd(&db, &["register", "--name", &name_a], &repo_a.path);
+    run_in_cwd(&db, &["register", "--name", &name_b], &repo_b.path);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &["sessions", "--watch", "--iterations", "1"],
+        &NO_CLEAR,
+    );
+    assert!(ok, "real-git watch must exit 0; stderr: {err}");
+    // Two distinct repo basenames ⇒ at least two distinct repo group sections,
+    // and the header reports ≥2 repos.
+    assert!(
+        out.contains(&name_a) && out.contains(&name_b),
+        "both real-repo peers present in the frame:\n{out}"
+    );
+    // Each peer's repo basename names its own group section header `[<repo> / …]`.
+    assert!(
+        out.contains(&format!("[{name_a} / ")) && out.contains(&format!("[{name_b} / ")),
+        "distinct [repo / branch] sections expected:\n{out}"
+    );
+}

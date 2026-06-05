@@ -54,6 +54,8 @@ weave attach --name desktop          # adopt a *running* session into the store 
 weave peers                          # list peers + whether each is alive + injectable (now with repo/branch/worktree tags)
 weave scan                           # refresh your own git tags, then list every (federated) peer + liveness + tags
 weave scan --repo weave --branch feat/x --json   # filter by exact repo/branch tag; machine-readable output
+weave sessions --watch               # live read-only presence dashboard, grouped by repo then branch (Ctrl-C to stop)
+weave sessions --watch --interval 5 --repo weave  # re-render every 5s, narrowed to one repo
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
@@ -96,6 +98,41 @@ any git/fs failure simply yields empty tags — it never blocks registration.
 it is within the presence TTL **and** (for a peer on this host with a known PID)
 its process is still running; presence fails open for remote / cross-machine
 peers that can't be probed locally.
+
+### Live presence dashboard (`weave sessions --watch`)
+
+`weave sessions --watch` turns the session listing into a **read-only presence
+dashboard** that re-renders the federated peers (the same `scan` model: peers
+joined with liveness via `is_alive`) on a fixed interval. It is **read-only** —
+the watch loop writes nothing per tick (at most one owner-only self-refresh of
+*your own* row runs once before the loop, exactly like `scan`, only when your
+identity is explicit), so observing presence never perturbs it.
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--watch` | off | render the dashboard, looping until Ctrl-C |
+| `--interval <secs>` | `2` | seconds between frames, **clamped to `[1, 3600]`** |
+| `--iterations <N>` | `0` | `0` ⇒ loop forever (interactive); `N` ⇒ render exactly N frames then exit (scripting / tests) |
+| `--repo <R>` | — | only sessions whose repo tag equals `R` (composes with `--watch`) |
+| `--branch <B>` | — | only sessions whose branch tag equals `B` (composes with `--watch`) |
+| `--json` | off | with `--watch`, emit a **single** JSON snapshot (no loop, no clear-screen) and exit |
+
+The frame is a **header summary** —
+`weave sessions [<ts>] — N session(s), A alive, R repo(s), B branch(es)` (with any
+active `repo=…`/`branch=…` filters echoed) — followed by one section per
+`(repo, branch)` group in sorted order. Each section header reads
+`[<repo> / <branch>] G session(s), GA alive` (an empty tag renders as `-`), and
+each row is `  <name> [alive|offline] worktree=… mux=… host=…`, plus ` (via <store>)`
+for a federated peer from another store. A group exceeding the per-section row
+budget (20) prints the first 20 rows then a `  +N more` line. An empty snapshot
+renders the zeroed header plus `no sessions`.
+
+The dashboard is **dependency-light** (std-only): the loop is
+`std::thread::sleep` between frames, and the in-place redraw uses a plain ANSI
+clear-home (`\x1b[2J\x1b[H`) emitted **only** when stdout is a TTY
+(`std::io::IsTerminal`) and neither `NO_COLOR` nor `WEAVE_NO_CLEAR` is set —
+otherwise frames print as plain escape-free text. No TUI, signal, or async crate
+is pulled in.
 
 ## MCP tools
 

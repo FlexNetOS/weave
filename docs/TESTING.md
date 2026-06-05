@@ -414,6 +414,45 @@ tags), all of which run the worktree-id path without spawning `git` at all.
   `;touch PWNED` worktree-id segment never creates the sentinel file (the tag never
   reaches a shell — argv-only `git`).
 
+### Hermetic presence-dashboard (`weave sessions --watch`) testing
+
+A re-rendering watch loop is normally the hardest thing to test (it sleeps and
+never returns). weave keeps it fully hermetic by splitting the loop into a **pure
+render** and a **bounded** driver — every timing-bounded test is bounded by
+**iteration count, never a wall-clock assertion**:
+
+- **Pure render unit tests (in `src/main.rs` `#[cfg(test)]`):**
+  `render_sessions_dashboard(rows, opts, now)` is a pure function, so the frame is
+  asserted from hand-built `SessionRow`s against a **fixed `now`** (never
+  `model::now()` / the wall clock), making output byte-deterministic. Cases cover
+  grouping by `(repo, branch)`, the header summary counts (sessions / alive /
+  #repos / #branches), per-group alive/total, the `--repo`/`--branch` filter echo,
+  `+N more` truncation past the row budget, the empty-snapshot `no sessions` body,
+  the empty-tag `-` rendering, and ANSI-on vs. plain (the only byte difference is
+  the `\x1b[2J\x1b[H` clear-home prefix).
+- **Bounded integration path (`tests/integration.rs`, via `CARGO_BIN_EXE_weave` +
+  scrubbed env + temp `WEAVE_DB`):** `weave sessions --watch --iterations 1` (and
+  `--iterations N` for multi-frame) renders exactly N frames and **exits 0** — the
+  harness `run_ok` *returning at all* proves there is no hang, with **no `sleep`
+  to "wait for" a frame** and no elapsed-time assertion. The frame is asserted to
+  carry both peer names and a group header; `--watch --repo`/`--branch` narrows
+  it; `--watch --json` emits a single snapshot with **no clear prefix**.
+- **Read-only proof:** capture the `WEAVE_DB` file bytes before and after
+  `weave sessions --watch --iterations 3` with **no explicit identity** (so even
+  the one pre-loop self-refresh is skipped) and assert the store is byte-unchanged
+  across ticks — proving the loop writes nothing.
+- **Escape-free capture:** integration runs set `WEAVE_NO_CLEAR` (and/or run
+  non-TTY) so captured stdout is plain text with no ANSI clear-home to match
+  around — the clear prefix is asserted only by the pure unit test that toggles
+  `opts.clear` directly.
+- **Clamp proptest (`tests/prop.rs`):** `clamp_watch_interval` totality — any
+  `u64` maps into `[1, 3600]` and the clamp is idempotent (mirrors the
+  `parse_clamp_timeout` property).
+
+Both backends run this suite: the render consumes store types compiled under
+`--features libsql` too, and since there is **no new column** there is no
+migration/roundtrip case to add (see §6).
+
 ## 6. Dual-backend testing (sqlite **and** libSQL)
 
 weave ships two mutually-exclusive storage backends — bundled `rusqlite`
