@@ -4820,3 +4820,314 @@ fn sessions_watch_groups_distinct_repos_with_real_git() {
         "distinct [repo / branch] sections expected:\n{out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Feature #7 — MULTI-KEY REGISTRY rotation overlap, end-to-end through the
+// COMPILED binary. The HEADLINE capability that was IMPOSSIBLE before #7:
+// register BOTH the old and the new pubkey for ONE identity at the receiver
+// (`weave key add alice <old>` AND `weave key add alice <new>`), and a signed
+// cross-store intent verifies whether it was signed by the OLD or the NEW key —
+// true overlap with NO config trickery. Pre-#7 the second `key add` OVERWROTE the
+// first, so only the most-recently-added key could verify. Then revoke the OLD
+// fingerprint and prove the OLD-key message is REJECTED (R1) while the NEW key's
+// still commits — all against the SAME multi-key receiver store. Mirrors the
+// `signed_cross_store_send_is_verified_then_committed` idiom (real key files,
+// per-actor isolated XDG_CONFIG_HOME, hermetic, no network).
+// ---------------------------------------------------------------------------
+
+/// Multi-key registry overlap E2E: receiver B registers BOTH alice's old and new
+/// pubkeys under the single identity "alice"; a cross-store intent signed by the
+/// OLD key COMMITS and one signed by the NEW key COMMITS (both keys verify for one
+/// identity — the #7 headline). Revoking the OLD fingerprint then REJECTS the
+/// OLD-key intent while the NEW-key intent still commits. Strict mode throughout,
+/// so a commit proves cryptographic verification (never advisory acceptance).
+#[cfg(feature = "sign")]
+#[test]
+fn multikey_registry_old_and_new_both_verify_then_revoke_old_through_binary() {
+    // Two signing actors share the identity "alice" but hold DISTINCT key files —
+    // they model alice's key BEFORE and AFTER rotation.
+    let old_store = TestDb::new();
+    let new_store = TestDb::new();
+    let b = TestDb::new(); // ONE receiver, ONE identity, TWO registered keys.
+    let old_cfg = sign_config_home_it();
+    let new_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let old_cfg_s = old_cfg.to_string_lossy().into_owned();
+    let new_cfg_s = new_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // alice's OLD and NEW keypairs (real key files on disk).
+    let old_pub = pubkey_from_gen(&run_ok_env(
+        &old_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    ));
+    let new_pub = pubkey_from_gen(&run_ok_env(
+        &new_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    ));
+    assert_ne!(old_pub, new_pub, "rotation produces a distinct key");
+
+    // B registers BOTH keys under the SAME identity. Pre-#7 the second add would
+    // OVERWRITE the first; with #7 both are retained (rotation overlap window).
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &old_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &new_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    // `key list` shows BOTH keys for the one identity (proof the registry kept both).
+    let listing = run_ok_env(
+        &b,
+        &["key", "list", "--json"],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let lv: serde_json::Value = serde_json::from_str(&listing).expect("key list --json parses");
+    let alice_keys: Vec<&str> = lv["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["identity"] == "alice")
+        .map(|e| e["pubkey"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        alice_keys.len(),
+        2,
+        "both old and new keys registered for ONE identity (#7 registry): {listing}"
+    );
+    assert!(alice_keys.contains(&old_pub.as_str()) && alice_keys.contains(&new_pub.as_str()));
+
+    // Resolve the OLD fingerprint (full digest) for the revoke step.
+    let fp_helper = TestDb::new();
+    let fph_cfg = sign_config_home_it();
+    let fph_cfg_s = fph_cfg.to_string_lossy().into_owned();
+    let old_full = full_fp_of_registered(&fp_helper, &fph_cfg_s, &old_pub);
+
+    // Helper: A signs a cross-store intent for bob into B's PULL SOURCE store.
+    let send_signed = |src: &TestDb, cfg_s: &str, body: &str| {
+        run_ok_env(
+            src,
+            &[
+                "send",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--body",
+                body,
+                "--to-store",
+                &b.path_str(),
+            ],
+            &[("XDG_CONFIG_HOME", cfg_s)],
+        );
+    };
+
+    // --- OVERLAP: BOTH keys verify against the multi-key receiver (STRICT) ---
+    send_signed(&old_store, &old_cfg_s, "via-old-key");
+    let p_old = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &old_store.path_str()),
+            ("WEAVE_STRICT_VERIFY", "1"),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_old.contains("pulled 1 message"),
+        "the OLD key verifies against the multi-key registry under strict: {p_old}"
+    );
+
+    send_signed(&new_store, &new_cfg_s, "via-new-key");
+    let p_new = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &new_store.path_str()),
+            ("WEAVE_STRICT_VERIFY", "1"),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_new.contains("pulled 1 message"),
+        "the NEW key ALSO verifies against the SAME multi-key registry: {p_new}"
+    );
+
+    // Both committed messages are in B's inbox, both attributed to alice.
+    let inbox = run_ok_env(
+        &b,
+        &["inbox", "--me", "bob", "--json", "--peek"],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let iv: serde_json::Value = serde_json::from_str(&inbox).expect("inbox parses");
+    let bodies: Vec<&str> = iv["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert!(
+        bodies.contains(&"via-old-key") && bodies.contains(&"via-new-key"),
+        "both old- and new-key signed messages committed (overlap): {inbox}"
+    );
+
+    // --- REVOKE the OLD fp: old-key intent REJECTED, new-key intent still COMMITS ---
+    let b2 = TestDb::new(); // fresh receiver, same dual-key registration
+    run_ok_env(
+        &b2,
+        &["key", "add", "alice", &old_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b2,
+        &["key", "add", "alice", &new_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let new_full = full_fp_of_registered(&fp_helper, &fph_cfg_s, &new_pub);
+
+    let old_src2 = TestDb::new();
+    run_ok_env(
+        &old_src2,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "old-after-revoke",
+            "--to-store",
+            &b2.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    );
+    let p_revoked = run_ok_env(
+        &b2,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &old_src2.path_str()),
+            ("WEAVE_TRUST", &new_full),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_revoked.contains("pulled 0 message"),
+        "the OLD key in a multi-key set is REJECTED once its fp is revoked (R1), \
+         even though it cryptographically verifies: {p_revoked}"
+    );
+
+    let new_src2 = TestDb::new();
+    run_ok_env(
+        &new_src2,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "new-after-revoke",
+            "--to-store",
+            &b2.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    );
+    let p_new2 = run_ok_env(
+        &b2,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &new_src2.path_str()),
+            ("WEAVE_TRUST", &new_full),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_new2.contains("pulled 1 message"),
+        "the NEW (non-revoked) registered key still commits after the OLD is revoked: {p_new2}"
+    );
+
+    let _ = std::fs::remove_dir_all(&old_cfg);
+    let _ = std::fs::remove_dir_all(&new_cfg);
+    let _ = std::fs::remove_dir_all(&fph_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// `weave key add` APPENDS (#7): adding a SECOND key for an identity keeps the
+/// first; `key list` then shows BOTH, and `key remove` prunes exactly one, leaving
+/// the survivor. Proves the registry is genuinely multi-key through the CLI seam.
+#[cfg(feature = "sign")]
+#[test]
+fn key_add_appends_and_remove_prunes_one_through_binary() {
+    let gen_a = TestDb::new();
+    let gen_b = TestDb::new();
+    let ga_cfg = sign_config_home_it();
+    let gb_cfg = sign_config_home_it();
+    let b = TestDb::new();
+    let b_cfg = sign_config_home_it();
+    let ga_cfg_s = ga_cfg.to_string_lossy().into_owned();
+    let gb_cfg_s = gb_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let k1 = pubkey_from_gen(&run_ok_env(
+        &gen_a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &ga_cfg_s)],
+    ));
+    let k2 = pubkey_from_gen(&run_ok_env(
+        &gen_b,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &gb_cfg_s)],
+    ));
+    assert_ne!(k1, k2);
+
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &k1],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &k2],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+
+    let count_alice = |db: &TestDb| -> usize {
+        let out = run_ok_env(
+            db,
+            &["key", "list", "--json"],
+            &[("XDG_CONFIG_HOME", &b_cfg_s)],
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        v["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["identity"] == "alice")
+            .count()
+    };
+    assert_eq!(count_alice(&b), 2, "key add APPENDS — both keys present");
+
+    // Remove exactly one (by full pubkey hex). The other survives.
+    let rm = run_ok_env(
+        &b,
+        &["key", "remove", "alice", &k1],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert!(rm.contains("removed"), "remove reports success: {rm}");
+    assert_eq!(
+        count_alice(&b),
+        1,
+        "exactly one key pruned, survivor remains"
+    );
+
+    let _ = std::fs::remove_dir_all(&ga_cfg);
+    let _ = std::fs::remove_dir_all(&gb_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}

@@ -69,8 +69,15 @@ formatter reports no diff, and all tests pass.
   public keys, fingerprints, and paths; rotate *moves* the old private key, it does
   not read or print it. **Verification is RNG-free**, so its tests must seed keys
   from **fixed bytes** (never `OsRng`) and stay deterministic across repeat runs.
-  **Trust and revocation are receiver-local config** (`WEAVE_TRUST` / `WEAVE_REVOKED`
-  / `trust` / `revoked`), **not a store table** — no schema or `Store`-trait change.
+  **Keys are multi-per-identity** (#7): the `identity_keys` registry holds several
+  pubkeys per identity, so `register_key` (and `weave key add`) **appends** rather
+  than overwrites, and `verify_pulled_intent` commits a signed intent IFF it verifies
+  against **any registered NON-REVOKED key** for the sender (a revoked key is always
+  skipped — R1). Keep that "match any non-revoked registered key" rule when touching
+  verification; never let a present-but-invalid sig or a revoked-only match commit.
+  **Trust and revocation lists stay receiver-local config** (`WEAVE_TRUST` /
+  `WEAVE_REVOKED` / `trust` / `revoked`) — the keys live in the store, but the
+  trust/revoke *decision* is config, not a store table.
 - **Keep modules layered.** `model` has no I/O; `inject` and `store` depend only
   on `model`; `mcp`/`main` sit on top. Don't add upward dependencies.
 - **Doc comments** (`//!` module headers, `///` on public items) explain *why*,

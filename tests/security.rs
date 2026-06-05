@@ -1962,3 +1962,354 @@ fn hostile_cwd_tag_never_reaches_a_shell() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Feature #7 — MULTI-KEY REGISTRY security. The registry now holds several
+// pubkeys per identity; these prove the additivity NEVER weakens verification:
+//   (1) a REVOKED key inside a multi-key set can NEVER grant a commit, even
+//       though it cryptographically verifies (R1 absolute revocation), and the
+//       other registered key is unaffected;
+//   (2) NO private-key bytes ever appear in `key add` / `key list` / `key remove`
+//       / `doctor` stdout (read the on-disk secret hex, assert it never substrings
+//       any output);
+//   (3) a signature that verifies against NONE of the registered keys is
+//       rejected (forgery) even when several keys are registered.
+// All `--features sign`, hermetic, per-actor isolated XDG_CONFIG_HOME, real key
+// files on disk. Drives the COMPILED binary end-to-end.
+// ---------------------------------------------------------------------------
+
+/// The FULL-digest fingerprint (`SHA256:<64-hex>`) for `pubkey`, as the binary
+/// derives it (`weave key revoke <pubkey>` echoes the canonical `WEAVE_REVOKED=`
+/// value). Never a hand-rolled hash — exactly what production matches against (R3).
+#[cfg(feature = "sign")]
+fn sign_full_fp(db: &TestDb, cfg_home: &str, pubkey: &str) -> String {
+    let out = run_ok_env(
+        db,
+        &["key", "revoke", pubkey],
+        &[("XDG_CONFIG_HOME", cfg_home)],
+    );
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("WEAVE_REVOKED="))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| panic!("`weave key revoke <pubkey>` did not echo a full fp:\n{out}"))
+}
+
+/// #7 R1 in a MULTI-KEY set: a receiver registers BOTH alice's old and new key;
+/// once the OLD fp is `WEAVE_REVOKED`, an intent signed by the OLD key is REJECTED
+/// (a revoked key can never grant a commit, even in a multi-key set and even though
+/// it verifies), while a NEW-key signed intent still commits. The source store is
+/// byte-unchanged (owner-only-writes).
+#[cfg(feature = "sign")]
+#[test]
+fn revoked_key_in_multikey_set_never_commits() {
+    let old_store = TestDb::new();
+    let new_store = TestDb::new();
+    let b = TestDb::new();
+    let old_cfg = sign_config_home();
+    let new_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let old_cfg_s = old_cfg.to_string_lossy().into_owned();
+    let new_cfg_s = new_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let old_pub = sign_pubkey_from_gen(&run_ok_env(
+        &old_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    ));
+    let new_pub = sign_pubkey_from_gen(&run_ok_env(
+        &new_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    ));
+
+    // BOTH keys registered for the SAME identity at the receiver.
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &old_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &new_pub],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let old_full = sign_full_fp(&b, &b_cfg_s, &old_pub);
+
+    // OLD key signs an intent into B's pull source.
+    run_ok_env(
+        &old_store,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "revoked-must-not-commit",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &old_cfg_s)],
+    );
+    let old_src_before = std::fs::read(&old_store.path).expect("read old source");
+
+    // Pull with the OLD fp REVOKED: the message must be REJECTED (R1), even though
+    // the old key is registered AND the signature cryptographically verifies.
+    let p_rev = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &old_store.path_str()),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_rev.contains("pulled 0 message"),
+        "a REVOKED key in a multi-key set can NEVER grant a commit (R1): {p_rev}"
+    );
+    assert_eq!(
+        sign_inbox_len(&b, "bob", &b_cfg_s),
+        0,
+        "the revoked-key message must leave B's inbox empty"
+    );
+    // Owner-only-writes: verification never mutates the source store.
+    assert_eq!(
+        old_src_before,
+        std::fs::read(&old_store.path).expect("read old source after"),
+        "verification must not write the pulled-from source store"
+    );
+
+    // The OTHER registered key is unaffected: a NEW-key signed intent still commits
+    // under the SAME revocation (old fp revoked, new key registered & not revoked).
+    run_ok_env(
+        &new_store,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "new-key-ok",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &new_cfg_s)],
+    );
+    let p_new = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[
+            ("WEAVE_PULL_FROM", &new_store.path_str()),
+            ("WEAVE_REVOKED", &old_full),
+            ("XDG_CONFIG_HOME", &b_cfg_s),
+        ],
+    );
+    assert!(
+        p_new.contains("pulled 1 message"),
+        "the non-revoked registered key in the set still commits: {p_new}"
+    );
+
+    let _ = std::fs::remove_dir_all(&old_cfg);
+    let _ = std::fs::remove_dir_all(&new_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// #7 secret hygiene: NO private-key bytes ever appear in `key add`, `key list`
+/// (text + `--json`), `key remove`, or `doctor` (text + `--json`) stdout. We read
+/// the actual secret hex written to disk by `key gen` and assert it never substrings
+/// any of those outputs, across a MULTI-KEY registry (two keys for one identity).
+#[cfg(feature = "sign")]
+#[test]
+fn multikey_key_and_doctor_surfaces_never_leak_the_secret() {
+    let gen_a = TestDb::new();
+    let gen_b = TestDb::new();
+    let b = TestDb::new();
+    let a_cfg = sign_config_home();
+    let bb_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let bb_cfg_s = bb_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let k1 = sign_pubkey_from_gen(&run_ok_env(
+        &gen_a,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    ));
+    let k2 = sign_pubkey_from_gen(&run_ok_env(
+        &gen_b,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &bb_cfg_s)],
+    ));
+
+    // The two on-disk SECRET hex strings — must never appear in any surface below.
+    let secret1 = std::fs::read_to_string(a_cfg.join("weave").join("ed25519.key"))
+        .expect("key file written")
+        .trim()
+        .to_string();
+    let secret2 = std::fs::read_to_string(bb_cfg.join("weave").join("ed25519.key"))
+        .expect("key file written")
+        .trim()
+        .to_string();
+    assert!(!secret1.is_empty() && !secret2.is_empty());
+
+    let assert_clean = |label: &str, out: &str| {
+        assert!(
+            !out.contains(&secret1) && !out.contains(&secret2),
+            "{label} leaked a private key:\n{out}"
+        );
+    };
+
+    // `key add` (twice — multi-key registry) is secret-free.
+    let add1 = run_ok_env(
+        &b,
+        &["key", "add", "alice", &k1],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert_clean("key add #1", &add1);
+    let add2 = run_ok_env(
+        &b,
+        &["key", "add", "alice", &k2],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert_clean("key add #2", &add2);
+
+    // `key list` (text + json) over a multi-key identity is secret-free.
+    assert_clean(
+        "key list",
+        &run_ok_env(&b, &["key", "list"], &[("XDG_CONFIG_HOME", &b_cfg_s)]),
+    );
+    assert_clean(
+        "key list --json",
+        &run_ok_env(
+            &b,
+            &["key", "list", "--json"],
+            &[("XDG_CONFIG_HOME", &b_cfg_s)],
+        ),
+    );
+
+    // `doctor` (text + json) reports multi-key COUNTS only — secret-free.
+    assert_clean(
+        "doctor",
+        &run_ok_env(&b, &["doctor"], &[("XDG_CONFIG_HOME", &b_cfg_s)]),
+    );
+    assert_clean(
+        "doctor --json",
+        &run_ok_env(&b, &["doctor", "--json"], &[("XDG_CONFIG_HOME", &b_cfg_s)]),
+    );
+
+    // `key remove` is secret-free (and the surviving key's list stays clean).
+    assert_clean(
+        "key remove",
+        &run_ok_env(
+            &b,
+            &["key", "remove", "alice", &k1],
+            &[("XDG_CONFIG_HOME", &b_cfg_s)],
+        ),
+    );
+    assert_clean(
+        "key list after remove",
+        &run_ok_env(&b, &["key", "list"], &[("XDG_CONFIG_HOME", &b_cfg_s)]),
+    );
+
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&bb_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// #7 forgery in a multi-key set: a signature that verifies against NONE of the
+/// (several) registered keys is REJECTED — multiple registered keys do not widen
+/// the door to an unregistered signer.
+#[cfg(feature = "sign")]
+#[test]
+fn signed_by_unregistered_key_rejected_even_with_multikey_set() {
+    let k1_store = TestDb::new();
+    let k2_store = TestDb::new();
+    let attacker = TestDb::new();
+    let b = TestDb::new();
+    let k1_cfg = sign_config_home();
+    let k2_cfg = sign_config_home();
+    let atk_cfg = sign_config_home();
+    let b_cfg = sign_config_home();
+    let k1_cfg_s = k1_cfg.to_string_lossy().into_owned();
+    let k2_cfg_s = k2_cfg.to_string_lossy().into_owned();
+    let atk_cfg_s = atk_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let k1 = sign_pubkey_from_gen(&run_ok_env(
+        &k1_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &k1_cfg_s)],
+    ));
+    let k2 = sign_pubkey_from_gen(&run_ok_env(
+        &k2_store,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &k2_cfg_s)],
+    ));
+    // The attacker has its OWN key, which is NOT registered for alice.
+    run_ok_env(
+        &attacker,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &atk_cfg_s)],
+    );
+
+    // B registers alice's two LEGITIMATE keys (multi-key set).
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &k1],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &k2],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+
+    // The attacker signs as "alice" with its UNREGISTERED key.
+    run_ok_env(
+        &attacker,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "forged-claim",
+            "--to-store",
+            &b.path_str(),
+        ],
+        &[("XDG_CONFIG_HOME", &atk_cfg_s)],
+    );
+
+    // Advisory (non-strict) and strict both REJECT: the sig matches none of the
+    // registered keys ⇒ present-but-invalid ⇒ hard fail.
+    for strict in ["0", "1"] {
+        let p = run_ok_env(
+            &b,
+            &["pull", "--me", "bob"],
+            &[
+                ("WEAVE_PULL_FROM", &attacker.path_str()),
+                ("WEAVE_STRICT_VERIFY", strict),
+                ("XDG_CONFIG_HOME", &b_cfg_s),
+            ],
+        );
+        assert!(
+            p.contains("pulled 0 message"),
+            "a sig matching NO registered key is rejected (strict={strict}): {p}"
+        );
+    }
+    assert_eq!(
+        sign_inbox_len(&b, "bob", &b_cfg_s),
+        0,
+        "no forged message reaches the inbox"
+    );
+
+    let _ = std::fs::remove_dir_all(&k1_cfg);
+    let _ = std::fs::remove_dir_all(&k2_cfg);
+    let _ = std::fs::remove_dir_all(&atk_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}

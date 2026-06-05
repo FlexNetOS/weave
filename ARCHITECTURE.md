@@ -197,9 +197,11 @@ pub trait Store: Send {
     fn outbox_all(&self, limit:i64) -> Result<Vec<Intent>>;
     fn pull_cursor_get(&self, source:&str) -> Result<i64>;
     fn pull_cursor_set(&self, source:&str, last_id:i64) -> Result<()>;
-    // Tier-2 signed identity (§10), additive (the keys table is always present):
-    fn register_key(&self, identity:&str, pubkey:&str) -> Result<()>;
-    fn get_key(&self, identity:&str) -> Result<Option<String>>;
+    // Tier-2 signed identity (§10), additive (the identity_keys table is always present):
+    fn register_key(&self, identity:&str, pubkey:&str) -> Result<()>; // APPENDS (multi-key)
+    fn get_key(&self, identity:&str) -> Result<Option<String>>;        // most-recent shim
+    fn get_keys(&self, identity:&str) -> Result<Vec<String>>;          // ALL keys, oldest-first
+    fn remove_key(&self, identity:&str, pubkey:&str) -> Result<bool>;  // prune a retired key
     fn list_keys(&self) -> Result<Vec<(String,String)>>;
 }
 ```
@@ -434,8 +436,10 @@ peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
 -- Tier-2 cross-store delivery (§10):
 outbox      (id INTEGER PK AUTOINCREMENT, ts INTEGER, to_peer TEXT, to_host TEXT NOT NULL DEFAULT '',
              from_peer TEXT, subject TEXT NULL, body TEXT, sig TEXT NOT NULL DEFAULT '')
-pull_cursor (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)
-keys        (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)
+pull_cursor   (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)
+keys          (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)   -- DEPRECATED shadow (#7)
+identity_keys (identity TEXT NOT NULL, pubkey TEXT NOT NULL, added_ts INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (identity, pubkey))                    -- multi-key registry (#7)
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
@@ -458,10 +462,24 @@ keys        (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)
   `sig` is empty unless `--features sign` signed the intent.
 - **`pull_cursor`** — the receiver's per-source high-water mark on the source's
   `outbox.id`, the idempotency key for pull/commit.
-- **`keys`** — registered `(identity, public key)` pairs for signed-identity
-  verification (always present plain data; the SIGN/VERIFY crypto is `sign`-gated).
-- The three Tier-2 tables are whole **new** tables created on every open in **both**
-  backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER.
+- **`identity_keys`** — the multi-key registry (#7): registered `(identity, pubkey)`
+  pairs for signed-identity verification, holding **multiple** keys per identity so
+  rotation can OVERLAP (old + new both verify during a window). `added_ts` orders the
+  keys (newest-first for the `get_key` shim, oldest-first for `get_keys`/`list`).
+  Always-present plain data; the SIGN/VERIFY crypto is `sign`-gated. Created on every
+  open in **both** backends via an **additive, guarded, idempotent** migration that
+  also copies any legacy single-key `keys` rows in (`INSERT OR IGNORE … SELECT identity,
+  pubkey, 0 FROM keys`, keyed on the `(identity,pubkey)` primary key so a re-run is a
+  clean no-op). A NEW key is APPENDED (`ON CONFLICT(identity,pubkey) DO NOTHING`); a
+  duplicate is a no-op; the per-identity count is capped at `MAX_KEYS_PER_IDENT` (16,
+  a store constant — bounds a hostile registry; a duplicate never counts against it,
+  and exceeding it returns an error, never a panic).
+- **`keys`** — the **deprecated** legacy single-key table (`identity PRIMARY KEY`),
+  RETAINED as a shadow (no DROP) for crash-safety and old-binary coexistence. Nothing
+  reads it anymore; new writes go ONLY to `identity_keys`.
+- The Tier-2 tables are whole **new** tables created on every open in **both**
+  backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER;
+  `identity_keys` additionally absorbs the legacy `keys` rows on first open.
 
 ### Presence: `liveness_for` / `is_alive` vs `is_online`
 
@@ -916,10 +934,21 @@ compiled crate to any graph** — the default and `libsql`-no-sign builds gain n
 **Sign on enqueue** (A signs its outbound intent if it has a key); **verify on
 commit** in `store::verify_pulled_intent` (B, before its local write), under the
 threaded `VerifyPolicy` (tri-state strict override, trust set, revocation list).
-B looks up the sender's **registered** key once (a lookup error is a hard drop),
-then decides. `is_trusted` / `is_revoked` match the registered key's full digest
-against B's trust/revoked lists; `trust_configured` = trust set non-empty. The
-effective strictness for the unsigned / no-registered-key advisory path is:
+B looks up the sender's **registered keys** once via `get_keys` (a lookup error is a
+hard drop), then decides. Since #7 the registry is **multi-key** (`identity_keys`): a
+signed intent COMMITS IFF the signature verifies against **at least one registered
+NON-REVOKED key** for the sender — a revoked key that cryptographically verifies is
+*skipped* (R1, absolute revocation), the first non-revoked verifying key is sufficient,
+and a signature that verifies against **none** of the registered keys is REJECTED as
+before. This is **additive**: with exactly ONE registered key the decision is identical
+to the prior single-key model (the table below). The new COMMIT path is legitimate
+rotation OVERLAP (old + new key both verify during a window) — something #3's
+config-based overlap could only express as trust/strictness, never at the
+verification layer (which key may actually verify a message). `is_trusted` /
+`is_revoked` match a key's full digest against B's trust/revoked lists;
+`trust_configured` = trust set non-empty; an identity is **trusted** if ANY of its
+registered keys is in the trust set. The effective strictness for the unsigned /
+no-registered-key advisory path is:
 
 ```text
 if strict_override == Some(true)            => STRICT   (user forced everywhere)
@@ -929,10 +958,15 @@ else                                        => ADVISORY (current default)
 ```
 
 Every cell below matches `verify_pulled_intent` exactly (COMMIT = local write,
-REJECT = dropped, cursor still advances). Two load-bearing rules hold in *every*
-row: a **present-but-invalid** signature is ALWAYS rejected, and **R1** — a valid
-signature against a **revoked** key is rejected unconditionally (the revocation
-check sits inside the valid-signature branch, evaluated BEFORE any disable toggle).
+REJECT = dropped, cursor still advances). Read "the registered key" as "**any
+registered non-revoked key**" since #7 — with a single registered key the rows are
+unchanged. Two load-bearing rules hold in *every* row: a **present-but-invalid**
+signature (verifies against NONE of the registered keys) is ALWAYS rejected, and
+**R1** — a signature that verifies ONLY against **revoked** key(s) is rejected
+unconditionally (each verifying key's revocation is checked BEFORE acceptance,
+before any disable toggle). When a signature verifies against both a revoked and a
+non-revoked registered key, the non-revoked match wins (COMMIT) — revocation targets
+a specific key, not the identity.
 
 | Sender | Signature | DECISION |
 |---|---|---|
@@ -942,33 +976,43 @@ check sits inside the valid-signature branch, evaluated BEFORE any disable toggl
 | untrusted (trust set configured, sender outside it) | valid | **COMMIT** (advisory — verified, just not pinned) |
 | untrusted | unsigned | **COMMIT** (advisory — unsigned operation preserved) |
 | any | present-but-invalid | **REJECT** (always) |
-| revoked (registered key in revoked list) | valid | **REJECT ALWAYS** (R1 — even with strict disabled) |
+| rotation overlap (old + new registered) | valid against either non-revoked key | **COMMIT** (#7 — both keys verify during the window) |
+| revoked (verifies ONLY against revoked key(s)) | valid | **REJECT ALWAYS** (R1 — even with strict disabled) |
 | no trust set configured | unsigned | **COMMIT** (advisory — UNCHANGED from today) |
 | no trust set configured | present-but-invalid | **REJECT** (always) |
 | signed but no registered key for sender | present (unverifiable) | advisory path (no fp to trust) ⇒ STRICT only if forced |
 | global strict forced (`Some(true)`) | unsigned/unverifiable | **REJECT** (strict everywhere) |
 | global strict disabled (`Some(false)`) | unsigned/unverifiable | **COMMIT** (advisory everywhere — but R1 revoked-signed still rejected) |
 
-Only two cells changed from the prior model from COMMIT→REJECT: `trusted+unsigned`
-(new strict-by-default) and `revoked+valid-sig` (R1). Every no-trust-set row is
-byte-for-byte today's behavior; every present-but-invalid row is still REJECT.
-Verification reads only B's own `keys` table + B's receiver-local config; the source
-is opened read-only (owner-only-writes intact).
+Two cells went COMMIT→REJECT from the original (pre-Tier-2) model: `trusted+unsigned`
+(strict-by-default) and `revoked+valid-sig` (R1). #7 adds exactly one new COMMIT
+path — rotation overlap, a sig verifying against a SECOND non-revoked registered key —
+and refines R1 to "verifies only against revoked key(s)"; **no row flips
+REJECT→COMMIT**, and the single-key model is preserved verbatim. Every no-trust-set
+row is byte-for-byte the original behavior; every present-but-invalid row is still
+REJECT. Verification reads only B's own `identity_keys` table + B's receiver-local
+config; the source is opened read-only (owner-only-writes intact).
 
-#### Rotation & revocation (config-based, no schema)
+#### Rotation & revocation (multi-key registry + receiver-local config)
 
-Trust and revocation are **receiver-local config**, not a store table — no schema,
-no dual-backend migration, no multi-key registry. `weave key rotate` archives the
-old private key (`fs::rename` to a `0600` `ed25519.key.<ts>.bak`, never read or
-printed), generates a new key, registers it (upsert), and prints **both**
-fingerprints plus config-based **overlap** guidance: trust BOTH full fingerprints in
-`WEAVE_TRUST` and keep the old pubkey registered (`weave key add`) during the window
-so in-flight messages signed by the old key still verify; once peers have the new
-key, `weave key revoke <old-full-fp>` retires it. `weave key revoke <fp>` validates
-the value and echoes the `WEAVE_REVOKED=` / `revoked = [...]` line to add (it does
-not rewrite a managed config); revocation is unconditional (R1). The emitted
-rotate/revoke values are the **full** `SHA256:<64-hex>` form so they are actually
-accepted by trust/revoke matching.
+Trust and revocation lists are **receiver-local config** (no store table); the
+**keys** themselves now live in the multi-key `identity_keys` registry (#7). `weave
+key add <identity> <pubkey>` **APPENDS** a key (it no longer overwrites), so old + new
+coexist for rotation overlap. `weave key rotate` archives the old private key
+(`fs::rename` to a `0600` `ed25519.key.<ts>.bak`, never read or printed), generates a
+new key, **registers (appends) it without displacing the old one**, and prints **both**
+fingerprints plus overlap guidance: keep BOTH keys registered (`weave key add`) so
+in-flight messages signed by EITHER key verify during the window, and trust BOTH full
+fingerprints in `WEAVE_TRUST`; once peers have the new key, prune the old with `weave
+key remove <identity> <old>` and retire it with `weave key revoke <old-full-fp>`.
+`weave key remove <identity> <pubkey-or-fingerprint>` deletes one registration (a full
+hex pubkey, or a `SHA256:<64-hex>` fingerprint resolved against that identity's
+registered set; ambiguous/no match errors). `weave key revoke <fp>` validates the
+value and echoes the `WEAVE_REVOKED=` / `revoked = [...]` line to add (it does not
+rewrite a managed config); revocation is unconditional (R1). The emitted rotate/revoke
+values are the **full** `SHA256:<64-hex>` form so they are actually accepted by
+trust/revoke matching. `doctor` reports secret-free per-identity key counts
+(`sign_key_identities`, `sign_registered_keys`, `sign_identities_multi_key`).
 
 `sign` is a low module (`model ← config ← sign`); `store` depends down on it for
 verify-on-commit; `main`/`mcp` depend down on both. `VerifyPolicy` lives in `store`

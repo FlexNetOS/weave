@@ -188,20 +188,43 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn pull_cursor_set(&self, source: &str, last_id: i64) -> Result<()>;
 
-    /// Tier-2 (2d): register (upsert) a peer/session's hex-encoded ed25519 public
-    /// key in the `keys` table, used to VERIFY signed intents claiming to be from
-    /// that identity. The table is plain data (present in every build); only the
-    /// SIGN/VERIFY crypto is behind the `sign` feature, so a `sign`-built receiver
-    /// can read a key registered by any build. Bound `params!`.
+    /// Tier-2 (2d/#7): ADD a peer/session's hex-encoded ed25519 public key to the
+    /// `identity_keys` registry, used to VERIFY signed intents claiming to be from
+    /// that identity. Multi-key by design (rotation overlap): registering a NEW key
+    /// APPENDS it alongside any existing keys; registering the SAME key again is a
+    /// NO-OP (never an error, never a duplicate row). Enforces
+    /// [`MAX_KEYS_PER_IDENT`] — adding a NEW key when the identity already holds the
+    /// cap returns an error (it must NEVER panic). The table is plain data (present
+    /// in every build); only the SIGN/VERIFY crypto is behind the `sign` feature, so
+    /// a `sign`-built receiver can read a key registered by any build. Bound
+    /// `params!`.
     #[allow(dead_code)]
     fn register_key(&self, identity: &str, pubkey: &str) -> Result<()>;
 
-    /// Fetch the registered public key for `identity` (hex), or `None` if unknown.
+    /// Fetch the MOST-RECENT registered public key for `identity` (hex; newest by
+    /// `added_ts`, ties by rowid), or `None` if none. A back-compat shim over
+    /// [`Store::get_keys`] for non-verify callers that only want a single
+    /// representative key (display/trust). Verification uses [`Store::get_keys`].
     #[allow(dead_code)]
     fn get_key(&self, identity: &str) -> Result<Option<String>>;
 
-    /// List all registered `(identity, pubkey)` pairs, ordered by identity. Backs
-    /// `weave key list`.
+    /// Fetch ALL registered public keys (hex) for `identity`, oldest-first by
+    /// `added_ts` (ties by rowid). Empty when the identity has no registered key.
+    /// This is the authoritative multi-key lookup used by `verify_pulled_intent`:
+    /// a signed intent commits IFF it verifies against at least one registered
+    /// NON-REVOKED key.
+    #[allow(dead_code)]
+    fn get_keys(&self, identity: &str) -> Result<Vec<String>>;
+
+    /// Remove a single `(identity, pubkey)` registration. Returns `true` if a row
+    /// was deleted, `false` if no such pair existed. Backs `weave key remove`
+    /// (pruning a retired key after rotation). Owner-only: writes the LOCAL store.
+    #[allow(dead_code)]
+    fn remove_key(&self, identity: &str, pubkey: &str) -> Result<bool>;
+
+    /// List ALL registered `(identity, pubkey)` pairs, ordered by identity then
+    /// `added_ts`. With multi-key registration an identity may appear in several
+    /// rows. Backs `weave key list`.
     #[allow(dead_code)]
     fn list_keys(&self) -> Result<Vec<(String, String)>>;
 }
@@ -502,6 +525,16 @@ pub fn check_body(body: &str) -> Result<()> {
 /// session name.
 pub const MAX_IDENT: usize = 128;
 
+/// Hard upper bound on how many DISTINCT public keys may be registered under a
+/// single identity in the `identity_keys` registry. Multi-key registration exists
+/// for rotation OVERLAP (old + new both verify during a window), so a generous
+/// value is fine, but an unbounded registry is a token/RAM/DoS hazard: a hostile
+/// source could flood many keys under one identity. 16 is far more than any real
+/// rotation needs. Registering the SAME key twice is a no-op and never counts
+/// against this cap; only adding a NEW key when the identity already holds this
+/// many distinct keys is refused. Not config — a fixed store constant.
+pub const MAX_KEYS_PER_IDENT: usize = 16;
+
 /// Validate an identity label (sender, recipient, or peer name) before it is
 /// stored. Rejects empty, over-length (> [`MAX_IDENT`] chars), or
 /// control-character-bearing values. `label` names the field for the error
@@ -663,6 +696,12 @@ CREATE TABLE IF NOT EXISTS keys (
     identity TEXT PRIMARY KEY,
     pubkey   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS identity_keys (
+    identity TEXT NOT NULL,
+    pubkey   TEXT NOT NULL,
+    added_ts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (identity, pubkey)
+);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -814,6 +853,27 @@ fn migrate(conn: &Connection) -> Result<()> {
             identity TEXT PRIMARY KEY,
             pubkey   TEXT NOT NULL
         );",
+    )?;
+    // Multi-key registry (#7): `identity_keys` holds MULTIPLE pubkeys per identity
+    // so rotation can OVERLAP (old + new both verify during a window). Created here
+    // for legacy DBs that predate it; `CREATE TABLE IF NOT EXISTS` is idempotent.
+    // The legacy single-key `keys` table is RETAINED as a deprecated shadow (no
+    // DROP) for crash-safety and old-binary coexistence — new writes go ONLY to
+    // `identity_keys`. The one-time copy below is `INSERT OR IGNORE` keyed on the
+    // (identity,pubkey) PRIMARY KEY, so re-running it is a clean no-op and it never
+    // overwrites a key already added under the new registry. `keys` is guaranteed
+    // present (created just above), so the SELECT never errors. Constant DDL — no
+    // user data is interpolated. `added_ts = 0` for migrated rows == "unknown age"
+    // (ties break by rowid for the most-recent shim).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS identity_keys (
+            identity TEXT NOT NULL,
+            pubkey   TEXT NOT NULL,
+            added_ts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (identity, pubkey)
+        );
+        INSERT OR IGNORE INTO identity_keys (identity, pubkey, added_ts)
+            SELECT identity, pubkey, 0 FROM keys;",
     )?;
     Ok(())
 }
@@ -1298,11 +1358,18 @@ fn verify_pulled_intent(
     policy: &VerifyPolicy,
     intent: &Intent,
 ) -> bool {
-    // Look up the sender's REGISTERED key once: needed both to verify a signature and
-    // to evaluate trust/revocation (which are keyed by the registered key's
-    // fingerprint). A lookup error is a hard drop (cannot make a safe decision).
-    let pubkey = match local.get_key(&intent.from) {
-        Ok(pk) => pk,
+    // Look up ALL the sender's REGISTERED keys once (#7): a signed intent commits
+    // IFF it verifies against at least one registered NON-REVOKED key, and the WHOLE
+    // set is used for the trust/strictness evaluation on the unsigned/no-key path. A
+    // lookup error is a hard drop (cannot make a safe decision).
+    //
+    // ADDITIVITY: with exactly ONE registered key this is byte-identical to the old
+    // single-key path — the loop verifies that one key, the revoked check is the
+    // same per-key check, and a present-but-invalid sig still always rejects. The
+    // ONLY new behavior is the legitimate rotation-overlap case (a sig verifying
+    // against a SECOND non-revoked registered key) and excluding a revoked key.
+    let keys = match local.get_keys(&intent.from) {
+        Ok(ks) => ks,
         Err(e) => {
             eprintln!(
                 "[weave] dropping intent #{} from source '{source}': key lookup failed: {e}",
@@ -1314,68 +1381,92 @@ fn verify_pulled_intent(
 
     if !intent.sig.is_empty() {
         // ---- SIGNED PATH ----
-        let pk = match &pubkey {
-            Some(pk) => pk,
-            // A signature we cannot check (no registered key): it is "present but
-            // unverifiable". This is NOT a trusted/revoked sender (no fp to match),
-            // so it falls to the advisory path's effective strictness below.
-            None => return self_unsigned_or_unknown(source, policy, &pubkey, intent),
-        };
-        match crate::sign::verify_intent(pk, &intent.sig, &intent.from, &intent.to, &intent.body) {
-            Ok(true) => {
-                // A VALID signature. R1: if it verifies against a REVOKED key, reject
-                // unconditionally — evaluated BEFORE any disable toggle.
-                if policy.is_revoked(pk) {
+        // No registered key at all: a signature we cannot check ("present but
+        // unverifiable"). NOT a trusted/revoked sender (no fp to match), so it falls
+        // to the advisory path's effective strictness below.
+        if keys.is_empty() {
+            return self_unsigned_or_unknown(source, policy, &keys, intent);
+        }
+        let mut matched_any = false;
+        for pk in &keys {
+            match crate::sign::verify_intent(
+                pk,
+                &intent.sig,
+                &intent.from,
+                &intent.to,
+                &intent.body,
+            ) {
+                Ok(true) => {
+                    matched_any = true;
+                    // R1: a revoked key can NEVER grant a commit — skip it and keep
+                    // looking for a non-revoked key that also verifies. This is
+                    // evaluated BEFORE any disable toggle, identical strength to the
+                    // old single-key revoked check.
+                    if policy.is_revoked(pk) {
+                        continue;
+                    }
+                    // A VALID signature against a CURRENT non-revoked registered key
+                    // ⇒ COMMIT. The first such key is sufficient (the old single-key
+                    // path did exactly this with its one key).
+                    return true;
+                }
+                Ok(false) => {
+                    // This key did not sign it; try the next registered key.
+                }
+                Err(e) => {
                     eprintln!(
-                        "[weave] REJECTING intent #{} from '{}' via source '{source}': \
-                         signature verifies but the key is REVOKED",
-                        intent.id, intent.from
+                        "[weave] dropping intent #{} from source '{source}': verify error: {e}",
+                        intent.id
                     );
                     return false;
                 }
-                true
-            }
-            Ok(false) => {
-                // Present-but-invalid signature: ALWAYS rejected (spoof/tamper).
-                eprintln!(
-                    "[weave] REJECTING intent #{} from '{}' via source '{source}': signature \
-                     verification failed (possible forgery)",
-                    intent.id, intent.from
-                );
-                false
-            }
-            Err(e) => {
-                eprintln!(
-                    "[weave] dropping intent #{} from source '{source}': verify error: {e}",
-                    intent.id
-                );
-                false
             }
         }
+        if matched_any {
+            // The signature verified ONLY against revoked key(s): REJECT (R1,
+            // absolute revocation). A revoked old key never re-admits a message.
+            eprintln!(
+                "[weave] REJECTING intent #{} from '{}' via source '{source}': \
+                 signature verifies but the key is REVOKED",
+                intent.id, intent.from
+            );
+        } else {
+            // Present-but-invalid signature: verifies against NONE of the registered
+            // keys ⇒ ALWAYS rejected (spoof/tamper). Preserved verbatim.
+            eprintln!(
+                "[weave] REJECTING intent #{} from '{}' via source '{source}': signature \
+                 verification failed (possible forgery)",
+                intent.id, intent.from
+            );
+        }
+        false
     } else {
         // ---- UNSIGNED PATH ----
-        self_unsigned_or_unknown(source, policy, &pubkey, intent)
+        self_unsigned_or_unknown(source, policy, &keys, intent)
     }
 }
 
 /// The advisory-or-strict decision for an UNSIGNED intent, or a SIGNED intent whose
 /// sender has no registered key to check it against. Computes effective strictness
-/// per the R1 ordering and commits (advisory) or drops (strict). `pubkey` is the
-/// sender's registered key (if any), used only to evaluate trust.
+/// per the R1 ordering and commits (advisory) or drops (strict). `keys` is the
+/// sender's FULL set of registered keys (possibly empty), used only to evaluate
+/// trust: an identity is "trusted" if ANY of its registered keys is in the trust
+/// set, so a trusted identity with multiple keys still triggers strict-by-default
+/// (the "never weaken" form — a trusted key among several is never missed).
 #[cfg(feature = "sign")]
 fn self_unsigned_or_unknown(
     source: &str,
     policy: &VerifyPolicy,
-    pubkey: &Option<String>,
+    keys: &[String],
     intent: &Intent,
 ) -> bool {
     let strict = match policy.strict_override {
         Some(true) => true,   // user forced strict everywhere
         Some(false) => false, // user disabled strict for the advisory path
         None => {
-            // Trust-set-aware default: a TRUSTED sender (registered key in the trust
-            // set) is verified strictly; everyone else stays advisory.
-            policy.trust_configured() && pubkey.as_deref().is_some_and(|pk| policy.is_trusted(pk))
+            // Trust-set-aware default: a TRUSTED sender (ANY registered key in the
+            // trust set) is verified strictly; everyone else stays advisory.
+            policy.trust_configured() && keys.iter().any(|pk| policy.is_trusted(pk))
         }
     };
     if strict {
@@ -1829,19 +1920,44 @@ impl Store for SqliteStore {
 
     fn register_key(&self, identity: &str, pubkey: &str) -> Result<()> {
         check_ident("identity", identity)?;
-        self.conn.execute(
-            "INSERT INTO keys (identity, pubkey) VALUES (?1, ?2)
-             ON CONFLICT(identity) DO UPDATE SET pubkey = ?2",
+        // ADD semantics (#7): registering the SAME (identity,pubkey) again is a
+        // no-op via `ON CONFLICT DO NOTHING`. Enforce the per-identity cap ONLY for
+        // a genuinely NEW key — a duplicate never counts against it and is always
+        // accepted. Check the existing count + whether this exact key is already
+        // present BEFORE inserting; a duplicate short-circuits the cap.
+        let already: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_keys WHERE identity = ?1 AND pubkey = ?2)",
             params![identity, pubkey],
+            |r| r.get(0),
+        )?;
+        if !already {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM identity_keys WHERE identity = ?1",
+                params![identity],
+                |r| r.get(0),
+            )?;
+            if count as usize >= MAX_KEYS_PER_IDENT {
+                anyhow::bail!(
+                    "identity '{identity}' already has the maximum {MAX_KEYS_PER_IDENT} \
+                     registered keys; remove a retired one with `weave key remove` first"
+                );
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO identity_keys (identity, pubkey, added_ts) VALUES (?1, ?2, ?3)
+             ON CONFLICT(identity, pubkey) DO NOTHING",
+            params![identity, pubkey, now()],
         )?;
         Ok(())
     }
 
     fn get_key(&self, identity: &str) -> Result<Option<String>> {
+        // Most-recent shim: newest by added_ts, ties broken by rowid (latest insert).
         let v: Option<String> = self
             .conn
             .query_row(
-                "SELECT pubkey FROM keys WHERE identity = ?1",
+                "SELECT pubkey FROM identity_keys WHERE identity = ?1
+                 ORDER BY added_ts DESC, rowid DESC LIMIT 1",
                 params![identity],
                 |r| r.get(0),
             )
@@ -1849,10 +1965,29 @@ impl Store for SqliteStore {
         Ok(v)
     }
 
+    fn get_keys(&self, identity: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pubkey FROM identity_keys WHERE identity = ?1
+             ORDER BY added_ts ASC, rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![identity], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn remove_key(&self, identity: &str, pubkey: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM identity_keys WHERE identity = ?1 AND pubkey = ?2",
+            params![identity, pubkey],
+        )?;
+        Ok(n > 0)
+    }
+
     fn list_keys(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT identity, pubkey FROM keys ORDER BY identity")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT identity, pubkey FROM identity_keys ORDER BY identity, added_ts ASC, rowid ASC",
+        )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -3342,40 +3477,157 @@ mod tests {
         assert_eq!(s.pull_cursor_get("src").unwrap(), 0);
         s.pull_cursor_set("src", 7).unwrap();
         assert_eq!(s.pull_cursor_get("src").unwrap(), 7);
-        // The 2d `keys` table is also present on the upgraded legacy store.
+        // The 2d `keys` + #7 `identity_keys` tables are present on the upgraded
+        // legacy store.
         assert!(s.get_key("alice").unwrap().is_none());
         s.register_key("alice", "deadbeef").unwrap();
         assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("deadbeef"));
     }
 
-    /// The `keys` table round-trips a registered pubkey through get/list, upserts on
-    /// conflict, and rejects an invalid identity. The table is plain data — present
-    /// in every build regardless of the `sign` feature.
+    /// #7 migration: a legacy DB that already has a SINGLE-key `keys` row migrates
+    /// that row into `identity_keys` on open, so `get_keys`/`get_key`/`list_keys`
+    /// see it — backward-compatible by construction. The copy is idempotent
+    /// (re-opening does not duplicate). The legacy `keys` table is retained.
+    #[test]
+    fn legacy_single_key_migrates_into_identity_keys() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-mk-legacy-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        // A pre-#7 store: schema present, a single-key `keys` row, NO identity_keys.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS keys (
+                    identity TEXT PRIMARY KEY,
+                    pubkey   TEXT NOT NULL
+                 );
+                 INSERT INTO keys (identity, pubkey) VALUES ('alice', 'aa11');",
+            )
+            .unwrap();
+            // identity_keys must NOT exist yet for this to be a genuine legacy DB.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type='table' AND name='identity_keys')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "fixture must predate identity_keys");
+        }
+        // First open runs the migration.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(
+                s.get_keys("alice").unwrap(),
+                vec!["aa11".to_string()],
+                "legacy single key migrated into identity_keys"
+            );
+            assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
+            assert_eq!(
+                s.list_keys().unwrap(),
+                vec![("alice".to_string(), "aa11".to_string())]
+            );
+        }
+        // Re-open: the copy is idempotent (INSERT OR IGNORE) — still exactly one key.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.get_keys("alice").unwrap(), vec!["aa11".to_string()]);
+        }
+    }
+
+    /// The `identity_keys` registry round-trips registered pubkeys through
+    /// get/get_keys/list with ADD semantics (#7): registering a NEW key APPENDS,
+    /// re-adding the SAME key is a no-op, `get_key` returns the most-recent, and an
+    /// invalid identity is rejected at the seam. Plain data — present in every build
+    /// regardless of the `sign` feature.
     #[test]
     fn keys_register_get_list_roundtrip() {
         let s = mem();
         assert!(s.get_key("alice").unwrap().is_none(), "unknown key ⇒ None");
+        assert!(
+            s.get_keys("alice").unwrap().is_empty(),
+            "unknown ⇒ empty set"
+        );
         s.register_key("alice", "aa11").unwrap();
         s.register_key("bob", "bb22").unwrap();
+        assert_eq!(s.get_keys("alice").unwrap(), vec!["aa11".to_string()]);
+
+        // Single-key parity: get_key == the one key (== old behavior).
         assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
 
-        // Upsert overwrites the pubkey for an existing identity.
+        // ADD: a NEW key APPENDS (does NOT overwrite). Both are registered.
         s.register_key("alice", "cc33").unwrap();
+        assert_eq!(
+            s.get_keys("alice").unwrap(),
+            vec!["aa11".to_string(), "cc33".to_string()],
+            "a new key appends; old key stays registered (overlap)"
+        );
+        // get_key shim returns the MOST-RECENT.
         assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("cc33"));
 
-        // list_keys returns all pairs ordered by identity.
+        // Re-adding the SAME key is a NO-OP (no error, no duplicate row).
+        s.register_key("alice", "aa11").unwrap();
+        assert_eq!(
+            s.get_keys("alice").unwrap().len(),
+            2,
+            "re-adding an existing key is idempotent"
+        );
+
+        // list_keys returns ALL pairs ordered by identity (multiple per identity).
         let keys = s.list_keys().unwrap();
         assert_eq!(
             keys,
             vec![
+                ("alice".to_string(), "aa11".to_string()),
                 ("alice".to_string(), "cc33".to_string()),
                 ("bob".to_string(), "bb22".to_string()),
             ]
         );
 
+        // remove_key removes exactly that pair and reports it; absent ⇒ false.
+        assert!(s.remove_key("alice", "aa11").unwrap(), "removed the pair");
+        assert_eq!(s.get_keys("alice").unwrap(), vec!["cc33".to_string()]);
+        assert!(
+            !s.remove_key("alice", "aa11").unwrap(),
+            "removing an absent key ⇒ false"
+        );
+
         // An invalid identity is rejected at the seam.
         assert!(s.register_key("", "00").is_err());
         assert!(s.register_key("a\nb", "00").is_err());
+    }
+
+    /// `MAX_KEYS_PER_IDENT` bounds a hostile registry: adding the cap-th+1 DISTINCT
+    /// key errors (never panics); a DUPLICATE of an existing key is always a no-op
+    /// and never counts against the cap. (#7)
+    #[test]
+    fn register_key_enforces_per_identity_cap() {
+        let s = mem();
+        // Fill exactly to the cap with DISTINCT keys.
+        for i in 0..MAX_KEYS_PER_IDENT {
+            let pk = format!("{:064x}", i);
+            s.register_key("alice", &pk).unwrap();
+        }
+        assert_eq!(s.get_keys("alice").unwrap().len(), MAX_KEYS_PER_IDENT);
+        // A DUPLICATE at the cap is still accepted (no-op, no error).
+        let dup = format!("{:064x}", 0);
+        s.register_key("alice", &dup).unwrap();
+        assert_eq!(
+            s.get_keys("alice").unwrap().len(),
+            MAX_KEYS_PER_IDENT,
+            "a duplicate never grows the set or hits the cap"
+        );
+        // A genuinely NEW key beyond the cap is REJECTED (Err, never a panic).
+        let over = format!("{:064x}", MAX_KEYS_PER_IDENT + 1);
+        assert!(
+            s.register_key("alice", &over).is_err(),
+            "a new key beyond the cap is refused"
+        );
+        // The cap is per-identity: a different identity is unaffected.
+        s.register_key("bob", &over).unwrap();
+        assert_eq!(s.get_keys("bob").unwrap().len(), 1);
     }
 
     /// Signed-identity commit gate (2d, `sign` feature) end-to-end through
@@ -3710,6 +3962,167 @@ mod tests {
             committed(&rcv_nokey(3), &src("alice", "hi", &good), &trust_alice),
             1,
             "signed + no key under a trust set ⇒ untrusted ⇒ advisory commit"
+        );
+    }
+
+    /// #7 multi-key REGISTRY verification: with BOTH an old and a new key registered
+    /// for ONE identity, a signature by EITHER key commits (true rotation overlap —
+    /// impossible before #7). Revoking the OLD fingerprint makes the old key's
+    /// signed message REJECT (R1 absolute revocation) while the new key still
+    /// commits. A signature by a THIRD, UNREGISTERED key verifies against NEITHER ⇒
+    /// REJECT (forgery). Fixed-seed keys for determinism. Asserts the source DB is
+    /// byte-unchanged across pulls (owner-only-writes).
+    #[cfg(feature = "sign")]
+    #[test]
+    fn multikey_registry_old_and_new_verify_then_revoke_old() {
+        use crate::sign::{fingerprint_full, sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let old = SigningKey::from_bytes(&[31u8; 32]);
+        let new = SigningKey::from_bytes(&[32u8; 32]);
+        let third = SigningKey::from_bytes(&[33u8; 32]);
+        let old_pk = to_hex(old.verifying_key().as_bytes());
+        let new_pk = to_hex(new.verifying_key().as_bytes());
+        let old_full = format!("SHA256:{}", fingerprint_full(&old_pk).unwrap());
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-mkverify-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tag = 0u64;
+        let mut src = |from: &str, body: &str, sig: &str| -> StoreSource {
+            tag += 1;
+            let p = dir.join(format!("s{tag}.db"));
+            let a = SqliteStore::open(&p).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            StoreSource::Local(p)
+        };
+        // Receiver B with BOTH alice keys registered (rotation overlap window).
+        let rcv = |n: u32| -> SqliteStore {
+            let b = SqliteStore::open(&dir.join(format!("b{n}.db"))).unwrap();
+            b.register_key("alice", &old_pk).unwrap();
+            b.register_key("alice", &new_pk).unwrap();
+            b
+        };
+        let committed = |b: &SqliteStore, s: &StoreSource, policy: &VerifyPolicy| -> usize {
+            pull_from_store(b, "bob", std::slice::from_ref(s), policy)
+                .unwrap()
+                .committed
+        };
+
+        let advisory = VerifyPolicy::advisory();
+
+        // A sig by the OLD key commits (verifies against a registered non-revoked key).
+        let sig_old = sign_intent(&old, "alice", "bob", "via-old");
+        assert_eq!(
+            committed(&rcv(1), &src("alice", "via-old", &sig_old), &advisory),
+            1,
+            "OLD key in a multi-key set verifies ⇒ COMMIT"
+        );
+        // A sig by the NEW key also commits.
+        let sig_new = sign_intent(&new, "alice", "bob", "via-new");
+        assert_eq!(
+            committed(&rcv(2), &src("alice", "via-new", &sig_new), &advisory),
+            1,
+            "NEW key in a multi-key set verifies ⇒ COMMIT"
+        );
+
+        // Revoke the OLD fingerprint: the OLD key's signed message now REJECTS even
+        // though it cryptographically verifies (R1), while the NEW key still commits.
+        let revoke_old = VerifyPolicy {
+            strict_override: None,
+            trust: vec![],
+            revoked: vec![old_full.clone()],
+        };
+        assert_eq!(
+            committed(&rcv(3), &src("alice", "via-old", &sig_old), &revoke_old),
+            0,
+            "a sig that verifies ONLY against the REVOKED key ⇒ REJECT (R1)"
+        );
+        assert_eq!(
+            committed(&rcv(4), &src("alice", "via-new", &sig_new), &revoke_old),
+            1,
+            "the NEW (non-revoked) key still commits after the old is revoked"
+        );
+
+        // A sig by a THIRD, UNREGISTERED key verifies against NEITHER registered key
+        // ⇒ REJECT (forgery), advisory or not.
+        let sig_third = sign_intent(&third, "alice", "bob", "forged");
+        assert_eq!(
+            committed(&rcv(5), &src("alice", "forged", &sig_third), &advisory),
+            0,
+            "a sig matching no registered key ⇒ REJECT (forgery)"
+        );
+
+        // Source DBs are read-only / byte-unchanged is covered by the dedicated
+        // owner-only-writes test; here we assert the verification semantics only.
+    }
+
+    /// #7 additivity regression-lock: with EXACTLY ONE registered key, the multi-key
+    /// path is byte-identical to the #3 single-key behavior. Re-runs the core cells
+    /// (good ⇒ commit, forged ⇒ reject, revoked-good ⇒ reject) against a single
+    /// registered key and asserts the same outcomes the single-key path produced.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn multikey_single_key_is_byte_identical_to_v3() {
+        use crate::sign::{fingerprint_full, sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let alice = SigningKey::from_bytes(&[40u8; 32]);
+        let alice_pk = to_hex(alice.verifying_key().as_bytes());
+        let alice_full = format!("SHA256:{}", fingerprint_full(&alice_pk).unwrap());
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-mkadd-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tag = 0u64;
+        let mut src = |from: &str, body: &str, sig: &str| -> StoreSource {
+            tag += 1;
+            let p = dir.join(format!("s{tag}.db"));
+            let a = SqliteStore::open(&p).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            StoreSource::Local(p)
+        };
+        // Receiver with EXACTLY ONE registered key (== old single-key world).
+        let rcv = |n: u32| -> SqliteStore {
+            let b = SqliteStore::open(&dir.join(format!("b{n}.db"))).unwrap();
+            b.register_key("alice", &alice_pk).unwrap();
+            b
+        };
+        let committed = |b: &SqliteStore, s: &StoreSource, policy: &VerifyPolicy| -> usize {
+            pull_from_store(b, "bob", std::slice::from_ref(s), policy)
+                .unwrap()
+                .committed
+        };
+
+        let good = sign_intent(&alice, "alice", "bob", "hi");
+        // good ⇒ commit
+        assert_eq!(
+            committed(
+                &rcv(1),
+                &src("alice", "hi", &good),
+                &VerifyPolicy::advisory()
+            ),
+            1
+        );
+        // forged (body mismatch) ⇒ reject
+        assert_eq!(
+            committed(
+                &rcv(2),
+                &src("alice", "TAMPER", &good),
+                &VerifyPolicy::advisory()
+            ),
+            0
+        );
+        // revoked-good ⇒ reject (R1)
+        let revoke = VerifyPolicy {
+            strict_override: None,
+            trust: vec![],
+            revoked: vec![alice_full.clone()],
+        };
+        assert_eq!(
+            committed(&rcv(3), &src("alice", "hi", &good), &revoke),
+            0,
+            "single-key revoked-good rejected (parity with #3)"
         );
     }
 

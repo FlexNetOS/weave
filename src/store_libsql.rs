@@ -41,7 +41,8 @@ use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
     merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
     store_label, Origin, PeerView, Pulled, SessionInfo, SessionView, Store, VerifyPolicy,
-    MAX_BRANCH_LEN, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_SESSIONS,
+    MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -96,6 +97,12 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS keys (
         identity TEXT PRIMARY KEY,
         pubkey   TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS identity_keys (
+        identity TEXT NOT NULL,
+        pubkey   TEXT NOT NULL,
+        added_ts INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (identity, pubkey)
     )",
 ];
 
@@ -327,6 +334,33 @@ impl LibsqlStore {
                         .with_context(|| format!("adding {col} column"))?;
                 }
             }
+            // Migration (#7): the multi-key `identity_keys` registry. A DB created
+            // before multi-key support lacks the table; create it idempotently
+            // (mirrors SqliteStore::migrate) and one-time-copy the legacy single-key
+            // `keys` rows into it. `INSERT OR IGNORE` keyed on the (identity,pubkey)
+            // PRIMARY KEY makes the copy a clean no-op on re-run and never overwrites
+            // a key already added under the new registry. The legacy `keys` table is
+            // RETAINED as a deprecated shadow (no DROP) for crash-safety / old-binary
+            // coexistence; new writes go ONLY to `identity_keys`. Constant DDL — no
+            // user data interpolated. Standard SQLite SQL under libsql's dialect.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS identity_keys (
+                    identity TEXT NOT NULL,
+                    pubkey   TEXT NOT NULL,
+                    added_ts INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (identity, pubkey)
+                )",
+                (),
+            )
+            .await
+            .context("creating identity_keys table")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO identity_keys (identity, pubkey, added_ts)
+                    SELECT identity, pubkey, 0 FROM keys",
+                (),
+            )
+            .await
+            .context("copying legacy keys into identity_keys")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1301,11 +1335,47 @@ impl Store for LibsqlStore {
         self.guard_writable()?;
         check_ident("identity", identity)?;
         self.rt.block_on(async {
+            // ADD semantics (#7): registering the SAME (identity,pubkey) again is a
+            // no-op via `ON CONFLICT DO NOTHING`. Enforce the per-identity cap ONLY
+            // for a genuinely NEW key — a duplicate never counts against it. Probe
+            // existence + count BEFORE inserting so a duplicate short-circuits the
+            // cap and never errors.
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM identity_keys \
+                     WHERE identity = ?1 AND pubkey = ?2)",
+                    params(vec![identity.into(), pubkey.into()]),
+                )
+                .await?;
+            let already: i64 = match it.next().await? {
+                Some(r) => r.get::<i64>(0)?,
+                None => 0,
+            };
+            if already == 0 {
+                let mut cit = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM identity_keys WHERE identity = ?1",
+                        params(vec![identity.into()]),
+                    )
+                    .await?;
+                let count: i64 = match cit.next().await? {
+                    Some(r) => r.get::<i64>(0)?,
+                    None => 0,
+                };
+                if count as usize >= MAX_KEYS_PER_IDENT {
+                    anyhow::bail!(
+                        "identity '{identity}' already has the maximum {MAX_KEYS_PER_IDENT} \
+                         registered keys; remove a retired one with `weave key remove` first"
+                    );
+                }
+            }
             self.conn
                 .execute(
-                    "INSERT INTO keys (identity, pubkey) VALUES (?1, ?2) \
-                     ON CONFLICT(identity) DO UPDATE SET pubkey = ?2",
-                    params(vec![identity.into(), pubkey.into()]),
+                    "INSERT INTO identity_keys (identity, pubkey, added_ts) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(identity, pubkey) DO NOTHING",
+                    params(vec![identity.into(), pubkey.into(), now().into()]),
                 )
                 .await?;
             Ok(())
@@ -1317,7 +1387,8 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT pubkey FROM keys WHERE identity = ?1",
+                    "SELECT pubkey FROM identity_keys WHERE identity = ?1 \
+                     ORDER BY added_ts DESC, rowid DESC LIMIT 1",
                     params(vec![identity.into()]),
                 )
                 .await?;
@@ -1328,11 +1399,47 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn get_keys(&self, identity: &str) -> Result<Vec<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT pubkey FROM identity_keys WHERE identity = ?1 \
+                     ORDER BY added_ts ASC, rowid ASC",
+                    params(vec![identity.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(r.get::<String>(0)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn remove_key(&self, identity: &str, pubkey: &str) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM identity_keys WHERE identity = ?1 AND pubkey = ?2",
+                    params(vec![identity.into(), pubkey.into()]),
+                )
+                .await?;
+            Ok(n > 0)
+        })
+    }
+
     fn list_keys(&self) -> Result<Vec<(String, String)>> {
         self.rt.block_on(async {
             let mut it = self
                 .conn
-                .query("SELECT identity, pubkey FROM keys ORDER BY identity", ())
+                .query(
+                    "SELECT identity, pubkey FROM identity_keys \
+                     ORDER BY identity, added_ts ASC, rowid ASC",
+                    (),
+                )
                 .await?;
             let mut out = Vec::new();
             while let Some(r) = it.next().await? {
@@ -2416,27 +2523,126 @@ mod tests {
         assert_eq!(s.pull_cursor_get("/other.db").unwrap(), 0);
     }
 
-    /// The 2d `keys` table round-trips a registered pubkey through get/list and
-    /// upserts on conflict (libsql mirror). Plain data; present regardless of the
+    /// The `identity_keys` registry round-trips registered pubkeys through
+    /// get/get_keys/list with ADD semantics + remove (libsql mirror of the sqlite
+    /// `keys_register_get_list_roundtrip`). Plain data; present regardless of the
     /// `sign` feature.
     #[test]
     fn keys_register_get_list_roundtrip_libsql() {
         let s = mem();
         assert!(s.get_key("alice").unwrap().is_none());
+        assert!(s.get_keys("alice").unwrap().is_empty());
         s.register_key("alice", "aa11").unwrap();
         s.register_key("bob", "bb22").unwrap();
+        assert_eq!(s.get_keys("alice").unwrap(), vec!["aa11".to_string()]);
         assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
+
+        // ADD: a NEW key APPENDS (does NOT overwrite); both are registered.
         s.register_key("alice", "cc33").unwrap();
+        assert_eq!(
+            s.get_keys("alice").unwrap(),
+            vec!["aa11".to_string(), "cc33".to_string()]
+        );
         assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("cc33"));
+
+        // Re-adding the SAME key is a NO-OP.
+        s.register_key("alice", "aa11").unwrap();
+        assert_eq!(s.get_keys("alice").unwrap().len(), 2);
+
         let keys = s.list_keys().unwrap();
         assert_eq!(
             keys,
             vec![
+                ("alice".to_string(), "aa11".to_string()),
                 ("alice".to_string(), "cc33".to_string()),
                 ("bob".to_string(), "bb22".to_string()),
             ]
         );
+
+        // remove_key removes exactly that pair; absent ⇒ false.
+        assert!(s.remove_key("alice", "aa11").unwrap());
+        assert_eq!(s.get_keys("alice").unwrap(), vec!["cc33".to_string()]);
+        assert!(!s.remove_key("alice", "aa11").unwrap());
+
         assert!(s.register_key("", "00").is_err());
+    }
+
+    /// `MAX_KEYS_PER_IDENT` cap enforced on libsql (mirror): a duplicate is a no-op
+    /// and never counts; the cap-th+1 DISTINCT key errors (never panics).
+    #[test]
+    fn register_key_enforces_per_identity_cap_libsql() {
+        let s = mem();
+        for i in 0..MAX_KEYS_PER_IDENT {
+            let pk = format!("{:064x}", i);
+            s.register_key("alice", &pk).unwrap();
+        }
+        assert_eq!(s.get_keys("alice").unwrap().len(), MAX_KEYS_PER_IDENT);
+        let dup = format!("{:064x}", 0);
+        s.register_key("alice", &dup).unwrap();
+        assert_eq!(s.get_keys("alice").unwrap().len(), MAX_KEYS_PER_IDENT);
+        let over = format!("{:064x}", MAX_KEYS_PER_IDENT + 1);
+        assert!(s.register_key("alice", &over).is_err());
+    }
+
+    /// #7 migration on libsql: a legacy DB with a single-key `keys` row migrates
+    /// that row into `identity_keys` on open; the copy is idempotent across opens.
+    #[test]
+    fn legacy_single_key_migrates_into_identity_keys_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-mklegacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // Build a pre-#7 DB: a `keys` table with one row, NO identity_keys table,
+        // via a raw libsql connection.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let db = Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS keys (
+                        identity TEXT PRIMARY KEY,
+                        pubkey   TEXT NOT NULL
+                    )",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO keys (identity, pubkey) VALUES ('alice', 'aa11')",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
+        }
+
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        // First open runs the migration.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(s.get_keys("alice").unwrap(), vec!["aa11".to_string()]);
+            assert_eq!(s.get_key("alice").unwrap().as_deref(), Some("aa11"));
+        }
+        // Re-open: idempotent copy — still exactly one key.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(s.get_keys("alice").unwrap(), vec!["aa11".to_string()]);
+        }
     }
 
     /// End-to-end pull on libsql: A enqueues for B; B pulls read-only and commits
