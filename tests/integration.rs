@@ -3806,6 +3806,250 @@ fn federation_remote_host_peer_is_ttl_judged_not_pid_probed() {
     );
 }
 
+/// Feature #6: `weave scan --json` surfaces a federated REMOTE-host peer with the
+/// additive `remote:true` + `liveness:"alive_remote"` keys (TTL-judged, never
+/// pid-probed), while leaving every pre-existing key intact (backward-compat).
+/// Uses the proven forced-`HOSTNAME` + `WEAVE_PEER_DBS` foreign-store fixture so
+/// it is hermetic: no wall-clock, no sleep, no backdate. A just-registered remote
+/// row is recent ⇒ AliveRemote.
+#[test]
+fn scan_json_surfaces_remote_host_peer_alive_remote_additive_keys() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    // Register the local peer under the SAME forced host the scan will use, so it
+    // is genuinely same-host (host is captured at registration time).
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    // Foreign peer "owned" by a different machine: force a different HOSTNAME so
+    // the federated read sees a remote-host row.
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["scan", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    assert!(ok, "scan --json must succeed; stderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("scan --json parses");
+    let arr = v.as_array().expect("scan --json is an array");
+
+    let remote = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("remotepeer"))
+        .unwrap_or_else(|| panic!("foreign remote peer surfaced via federation: {out}"));
+
+    // The new additive keys.
+    assert_eq!(
+        remote["remote"].as_bool(),
+        Some(true),
+        "remotepeer host differs from this-machine => remote:true: {out}"
+    );
+    assert_eq!(
+        remote["liveness"].as_str(),
+        Some("alive_remote"),
+        "a recent remote-host peer is alive_remote (TTL-judged, not pid-probed): {out}"
+    );
+    // Pre-existing keys UNCHANGED (backward-compat: same names + values).
+    assert_eq!(remote["host"].as_str(), Some("some-other-machine"), "{out}");
+    assert_eq!(
+        remote["alive"].as_bool(),
+        Some(true),
+        "recent remote peer is alive (bool unchanged): {out}"
+    );
+    assert_eq!(
+        remote["foreign"].as_bool(),
+        Some(true),
+        "federated row is foreign: {out}"
+    );
+    // Every documented key is present (no key dropped by the additive change).
+    for k in [
+        "name", "repo", "branch", "worktree", "mux", "pane", "host", "alive", "origin", "foreign",
+        "liveness", "remote",
+    ] {
+        assert!(
+            remote.get(k).is_some(),
+            "scan --json row missing key {k}: {out}"
+        );
+    }
+    // No secret/token bytes leak into scan output.
+    assert!(
+        !out.to_lowercase().contains("token") && !out.contains("libsql://"),
+        "scan --json must be secret-free: {out}"
+    );
+
+    // The LOCAL peer is same-host => remote:false (deterministic). Its liveness is
+    // alive_local OR stale depending on the registered pid nuance: `register`
+    // stored that short-lived process's pid, which has exited by scan time, so on
+    // Linux a same-host dead pid reads stale; either way it is NEVER alive_remote.
+    let localp = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("localpeer"))
+        .unwrap_or_else(|| panic!("local peer present: {out}"));
+    assert_eq!(localp["remote"].as_bool(), Some(false), "{out}");
+    let lv = localp["liveness"].as_str().unwrap_or("");
+    assert!(
+        lv == "alive_local" || lv == "stale",
+        "same-host peer is alive_local or stale (pid nuance), never alive_remote: {out}"
+    );
+}
+
+/// Feature #6: the HUMAN `weave scan` output shows the `<remote>` marker, the
+/// `[alive (remote, ttl)]` reason, and a `summary:` line whose counts match the
+/// rows (1 local-alive + 1 remote-alive). Same hermetic foreign fixture.
+#[test]
+fn scan_human_shows_remote_marker_reason_and_summary_counts() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let out = run_ok_env(
+        &local,
+        &["scan"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    // Remote marker + remote reason appear for the foreign-host row.
+    assert!(
+        out.contains("<remote>"),
+        "human scan shows the remote marker: {out}"
+    );
+    assert!(
+        out.contains("alive (remote, ttl)"),
+        "human scan shows the remote TTL reason: {out}"
+    );
+    // The local row shows a local reason (pid-confirmed, this short-lived process
+    // is the registered pid and may have exited — so accept either local reason
+    // OR stale for the local row's PID nuance; the marker is what matters here).
+    assert!(
+        out.contains("localpeer"),
+        "local peer present in human scan: {out}"
+    );
+    // Summary line with matching counts: exactly one remote-alive row.
+    let summary = out
+        .lines()
+        .find(|l| l.starts_with("summary:"))
+        .unwrap_or_else(|| panic!("summary line present: {out}"));
+    assert!(
+        summary.contains("1 remote-alive"),
+        "summary counts the single remote-alive row: {summary}"
+    );
+    // Two rows total; the local row is either local-alive or stale (pid nuance),
+    // but the remote count is deterministic.
+    assert!(
+        summary.contains("local-alive") && summary.contains("stale"),
+        "summary lists all three buckets: {summary}"
+    );
+}
+
+/// Backward-compat: a plain `weave scan --json` with NO federated/remote rows
+/// behaves as before — the only peer is the local self row, `remote:false`,
+/// `liveness:"alive_local"` (or stale via pid nuance), and the historical keys
+/// are all present. No remote marker, single-host summary.
+#[test]
+fn scan_no_remote_rows_is_backward_compatible() {
+    let db = TestDb::new();
+    run_env(
+        &db,
+        &["register", "--name", "solo"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    let out = run_ok_env(&db, &["scan", "--json"], &[("HOSTNAME", "this-machine")]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("scan --json parses");
+    let arr = v.as_array().expect("array");
+    let solo = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("solo"))
+        .unwrap_or_else(|| panic!("solo peer present: {out}"));
+    assert_eq!(
+        solo["remote"].as_bool(),
+        Some(false),
+        "no foreign host => remote:false: {out}"
+    );
+    assert_eq!(
+        solo["foreign"].as_bool(),
+        Some(false),
+        "the local self row is not foreign: {out}"
+    );
+    // Human plain scan has no remote marker.
+    let human = run_ok_env(&db, &["scan"], &[("HOSTNAME", "this-machine")]);
+    assert!(
+        !human.contains("<remote>"),
+        "no remote marker without a remote row: {human}"
+    );
+    assert!(
+        human.lines().any(|l| l.starts_with("summary:")),
+        "summary line still printed for a single local row: {human}"
+    );
+}
+
+/// Feature #6 MCP parity: the `weave_scan` tool mirrors the human surfacing —
+/// a federated REMOTE-host peer shows the `<remote>` marker, the
+/// `alive (remote, ttl)` reason, and the `summary:` line, all secret-free (no
+/// token / no `libsql://` bytes). Hermetic forced-`HOSTNAME` + `WEAVE_PEER_DBS`.
+#[test]
+fn mcp_weave_scan_surfaces_remote_marker_reason_summary() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    let (err, text) = mcp.call_tool("weave_scan", serde_json::json!({}));
+    assert!(!err, "weave_scan is not an error: {text}");
+    assert!(
+        text.contains("remotepeer"),
+        "weave_scan lists the federated remote peer: {text}"
+    );
+    assert!(
+        text.contains("<remote>"),
+        "weave_scan mirrors the remote marker: {text}"
+    );
+    assert!(
+        text.contains("alive (remote, ttl)"),
+        "weave_scan mirrors the remote TTL reason: {text}"
+    );
+    assert!(
+        text.contains("summary:") && text.contains("remote-alive"),
+        "weave_scan mirrors the summary line: {text}"
+    );
+    // Secret-free: no token bytes, no remote URL scheme.
+    assert!(
+        !text.to_lowercase().contains("token") && !text.contains("libsql://"),
+        "weave_scan output must be secret-free: {text}"
+    );
+    mcp.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Tier-2 v2 — LIVE remote (Turso) pull. ENV-GATED + `#[ignore]`: CI never sets
 // the env and never passes `--ignored`, so the default suite stays HERMETIC (no

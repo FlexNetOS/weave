@@ -356,9 +356,20 @@ pub fn merge_session_views(views: Vec<SessionView>) -> Vec<SessionView> {
     chosen
 }
 
-/// True if `last_seen` is within the online window relative to now.
+/// True if `last_seen` is within the online (TTL) window relative to `now_ts`.
+/// Pure: the single source of truth for the recency comparison, parameterized on
+/// the clock so it is deterministic in tests (used by [`liveness_for`]).
+pub fn is_online_at(last_seen: i64, now_ts: i64) -> bool {
+    now_ts.saturating_sub(last_seen) <= ONLINE_TTL_SECS
+}
+
+/// True if `last_seen` is within the online window relative to the real now.
+/// Thin wrapper over [`is_online_at`] reading the wall clock. Test-only since
+/// `is_alive` now delegates to [`liveness_for`] (which uses [`is_online_at`]);
+/// kept for the recency-boundary assertions in both backends' test suites.
+#[cfg(test)]
 pub fn is_online(last_seen: i64) -> bool {
-    now().saturating_sub(last_seen) <= ONLINE_TTL_SECS
+    is_online_at(last_seen, now())
 }
 
 /// True if a process with PID `pid` currently exists on THIS machine.
@@ -383,10 +394,73 @@ pub fn pid_alive(_pid: i64) -> bool {
     true
 }
 
-/// Real liveness verdict for a peer: it must be within the TTL window AND, when
-/// its PID/host say we *can* probe, the process must actually exist.
+/// Host-aware liveness verdict for a peer (the "A2 — fail-open by host" rule).
 ///
-/// Rules:
+/// This is the single, PURE classifier behind presence. It takes `this_host`
+/// and `now_ts` as parameters so it is exhaustively testable with fixed values
+/// (no real hostname/clock); the only I/O is the same-host PID probe, which is
+/// gated to the local arm and never runs for a remote host.
+///
+/// Three regimes:
+/// - [`Liveness::AliveLocal`] — `peer.host == this_host` AND within the TTL
+///   window AND (the PID probe passes OR the PID is unknown). A same-host
+///   null-pid recent row is alive-by-TTL (still local).
+/// - [`Liveness::AliveRemote`] — `peer.host != this_host` (INCLUDING an empty
+///   host, since `this_host` is never empty) AND within the TTL window. A
+///   remote peer is NEVER pid-probed — we cannot probe a process on another
+///   machine, so we fail OPEN to the recency guess (the Turso/shared-DB case).
+/// - [`Liveness::Stale`] — offline (past the TTL window), OR a same-host row
+///   whose known PID is dead. A dead-but-recent local process reads stale.
+///
+/// The pid-confirmed-vs-TTL-presumed nuance is surfaced only in the human reason
+/// string ([`Liveness::reason`]), not as a fourth variant.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Liveness {
+    /// Same host, online, and pid-confirmed (or null-pid TTL fallback).
+    AliveLocal,
+    /// Remote host (incl. empty host), online by TTL only — never pid-probed.
+    AliveRemote,
+    /// Offline (past TTL) or a same-host known-dead pid.
+    Stale,
+}
+
+impl Liveness {
+    /// Stable snake_case token for machine-readable output (`scan --json`).
+    pub fn token(self) -> &'static str {
+        match self {
+            Liveness::AliveLocal => "alive_local",
+            Liveness::AliveRemote => "alive_remote",
+            Liveness::Stale => "stale",
+        }
+    }
+}
+
+/// Host-aware liveness classifier — see [`Liveness`]. Pure except for the
+/// same-host PID probe (which is gated to the `AliveLocal` arm).
+pub fn liveness_for(peer: &Peer, this_host: &str, now_ts: i64) -> Liveness {
+    // Recency guard first: anything past the TTL window is stale regardless of host.
+    if !is_online_at(peer.last_seen, now_ts) {
+        return Liveness::Stale;
+    }
+    if peer.host == this_host {
+        // Same host: the PID is authoritative when known; a dead local pid is
+        // stale even though it is recent. A null pid falls back to the TTL window.
+        match peer.pid {
+            Some(pid) if !pid_alive(pid) => Liveness::Stale,
+            _ => Liveness::AliveLocal,
+        }
+    } else {
+        // Remote host (incl. empty host): fail OPEN to the TTL verdict — NEVER
+        // probe a pid we cannot resolve on this machine.
+        Liveness::AliveRemote
+    }
+}
+
+/// Real liveness verdict for a peer as a bool — the recency + host-aware rule.
+/// Thin wrapper over [`liveness_for`] reading the real `this_host()`/`now()` so
+/// every existing bool call site sees byte-identical results.
+///
+/// Rules (unchanged from the previous direct implementation):
 /// - Always require `is_online(last_seen)` (the recency guard).
 /// - If `host == this_host()` AND a PID is known, additionally require
 ///   [`pid_alive`] — a dead-but-recent local process reads offline.
@@ -394,14 +468,10 @@ pub fn pid_alive(_pid: i64) -> bool {
 ///   probe a remote PID (Turso/shared-DB case) or an unknown one, so we fall
 ///   back to the TTL recency guess. A remote/legacy peer must NOT read dead.
 pub fn is_alive(peer: &Peer) -> bool {
-    if !is_online(peer.last_seen) {
-        return false;
-    }
-    match peer.pid {
-        Some(pid) if peer.host == crate::config::this_host() => pid_alive(pid),
-        // PID unknown, or a peer on another host we cannot probe: fail open.
-        _ => true,
-    }
+    !matches!(
+        liveness_for(peer, &crate::config::this_host(), now()),
+        Liveness::Stale
+    )
 }
 
 /// Hard upper bound on a query `LIMIT`. A negative limit means *unbounded* in
@@ -1869,6 +1939,52 @@ mod federation_tests {
         assert_eq!(merged[0].origin, Origin::Local);
     }
 
+    /// Merge tie-break lock through the `is_alive` wrapper for the new enum:
+    /// a same-`(name, host)` collision where one row classifies `AliveRemote`
+    /// (remote host, recent) and the other `Stale` (same remote host, past the
+    /// TTL) must keep the ALIVE row — alive-beats-stale holds even though both
+    /// rows are remote (so neither is pid-probed). This locks that `liveness_for`
+    /// surfacing did not perturb `peer_view_beats` (which still keys off the
+    /// `is_alive` bool).
+    #[test]
+    fn merge_alive_remote_beats_stale_remote_same_key() {
+        // Both rows are on the SAME remote host so they collide on (name, host);
+        // `now()` is the real clock here (the merge layer uses the bool wrapper),
+        // but recent-vs-(now - TTL - 100) is unambiguously alive-vs-stale.
+        let remote_host = "some-other-machine";
+        let alive_remote = PeerView {
+            peer: peer("svc", remote_host, now(), Some(999_999_999)),
+            origin: Origin::Foreign("a.db".to_string()),
+        };
+        let stale_remote = PeerView {
+            peer: peer(
+                "svc",
+                remote_host,
+                now() - ONLINE_TTL_SECS - 100,
+                Some(999_999_999),
+            ),
+            origin: Origin::Foreign("b.db".to_string()),
+        };
+        // Sanity: with this_host != remote_host these classify AliveRemote / Stale.
+        assert_eq!(
+            liveness_for(&alive_remote.peer, "this-host", now()),
+            Liveness::AliveRemote
+        );
+        assert_eq!(
+            liveness_for(&stale_remote.peer, "this-host", now()),
+            Liveness::Stale
+        );
+        // Order-independent: the alive remote row survives both feed orders.
+        let m1 = merge_peer_views(vec![alive_remote.clone(), stale_remote.clone()]);
+        let m2 = merge_peer_views(vec![stale_remote, alive_remote]);
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m2.len(), 1);
+        assert!(is_alive(&m1[0].peer), "alive remote survives (order A)");
+        assert!(is_alive(&m2[0].peer), "alive remote survives (order B)");
+        assert_eq!(m1[0].origin, Origin::Foreign("a.db".to_string()));
+        assert_eq!(m2[0].origin, Origin::Foreign("a.db".to_string()));
+    }
+
     /// On equal aliveness AND equal recency, the LOCAL origin wins the tie.
     #[test]
     fn merge_local_wins_final_tie() {
@@ -2278,6 +2394,89 @@ mod tests {
             // Idempotent.
             proptest::prop_assert_eq!(sanitize_tag(&out, cap), out.clone());
         }
+
+        /// `liveness_for` TOTALITY + DETERMINISM, with FIXED `this_host` + `now_ts`
+        /// (never the real hostname/clock — the determinism mandate). For ANY
+        /// `(host, this_host, last_seen, now_ts)`:
+        /// - it never panics,
+        /// - it is deterministic (two calls with the same inputs are equal),
+        /// - the no-cross-host-probe guarantee: a row whose host differs from
+        ///   `this_host` (incl. the empty host) is NEVER `Stale` *because of a pid*
+        ///   — it is `Stale` IFF it is offline, and `AliveRemote` otherwise,
+        ///   regardless of the (absurd) pid it carries.
+        ///
+        /// The pid is held to `None` or our OWN live pid so the property stays
+        /// `/proc`-stable on the same-host arm (the only arm that probes). The
+        /// same-host known-dead-pid regime is covered exhaustively by the unit
+        /// matrix (`liveness_for_matrix_fixed_host_and_now`), not here, to keep
+        /// this property independent of `/proc` contents for arbitrary pids.
+        #[test]
+        fn prop_liveness_for_total_deterministic_no_cross_host_probe(
+            host in "[a-z0-9-]{0,20}",
+            this_host in "[a-z0-9-]{1,20}",
+            last_seen in proptest::prelude::any::<i64>(),
+            now_ts in proptest::prelude::any::<i64>(),
+            use_own_pid in proptest::prelude::any::<bool>(),
+        ) {
+            // pid is either absent or our OWN (live) pid — never an arbitrary pid,
+            // so the same-host arm's /proc probe is deterministic regardless of the
+            // machine the suite runs on.
+            let pid = if use_own_pid {
+                Some(std::process::id() as i64)
+            } else {
+                None
+            };
+            let p = Peer {
+                name: "x".to_string(),
+                mux: "tmux".to_string(),
+                target: "%1".to_string(),
+                socket: String::new(),
+                cwd: None,
+                last_seen,
+                pid,
+                host: host.clone(),
+                repo: String::new(),
+                branch: String::new(),
+                worktree_id: String::new(),
+            };
+
+            // Determinism: two evaluations of the same inputs agree.
+            let a = liveness_for(&p, &this_host, now_ts);
+            let b = liveness_for(&p, &this_host, now_ts);
+            proptest::prop_assert_eq!(a, b, "liveness_for must be deterministic");
+
+            // Totality + the Stale characterization.
+            let online = is_online_at(last_seen, now_ts);
+            if !online {
+                proptest::prop_assert_eq!(
+                    a, Liveness::Stale,
+                    "offline (past TTL) must be Stale regardless of host/pid"
+                );
+            } else if host == this_host {
+                // Same host, online: our own live pid (or null) => AliveLocal.
+                // (A dead pid would be Stale, but we never feed an arbitrary pid.)
+                proptest::prop_assert_eq!(
+                    a, Liveness::AliveLocal,
+                    "same-host online with null/own-live pid => AliveLocal"
+                );
+            } else {
+                // No-cross-host-probe: a remote/empty-host online row is NEVER
+                // Stale by pid — it is AliveRemote, even with our own pid present.
+                proptest::prop_assert_eq!(
+                    a, Liveness::AliveRemote,
+                    "remote/empty host online => AliveRemote (never pid-probed)"
+                );
+            }
+
+            // Cross-cut: the Stale verdict implies (offline) OR (same-host).
+            // A remote/empty-host online row can never be Stale.
+            if a == Liveness::Stale {
+                proptest::prop_assert!(
+                    !online || host == this_host,
+                    "Stale => offline OR same-host (never a remote-host pid probe)"
+                );
+            }
+        }
     }
 
     /// The three git tags round-trip through `register_peer_full`, `get_peer`,
@@ -2647,6 +2846,154 @@ mod tests {
             !is_alive(&stale),
             "stale last_seen is offline even with a live pid"
         );
+    }
+
+    /// `liveness_for` matrix with FIXED `this_host` + `now_ts` (no real
+    /// hostname/clock). Covers every regime + the boundaries + the `is_alive`
+    /// delegation regression-lock.
+    #[test]
+    fn liveness_for_matrix_fixed_host_and_now() {
+        let now_ts: i64 = 1_000_000_000;
+        let this = "this-host";
+        let recent = now_ts; // 0s old, within the window.
+        let base = Peer {
+            name: "x".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: recent,
+            pid: None,
+            host: this.to_string(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+        };
+
+        // same-host + live pid (our own) => AliveLocal.
+        let live_local = Peer {
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&live_local, this, now_ts),
+            Liveness::AliveLocal,
+            "same-host live pid => AliveLocal"
+        );
+
+        // same-host + null pid + recent => AliveLocal (TTL fallback, no probe).
+        assert_eq!(
+            liveness_for(&base, this, now_ts),
+            Liveness::AliveLocal,
+            "same-host null pid + recent => AliveLocal"
+        );
+
+        // same-host + dead (absurd) pid + recent => Stale (pid beats recency).
+        // Linux-gated: on non-Linux pid_alive degrades to true.
+        let dead_local = Peer {
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                liveness_for(&dead_local, this, now_ts),
+                Liveness::Stale,
+                "same-host dead pid + recent => Stale"
+            );
+        }
+
+        // remote-host + recent + absurd pid => AliveRemote (NEVER probed).
+        let remote = Peer {
+            host: format!("{this}-other"),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&remote, this, now_ts),
+            Liveness::AliveRemote,
+            "remote host + recent => AliveRemote (absurd pid NOT probed)"
+        );
+
+        // remote-host + old last_seen => Stale.
+        let remote_stale = Peer {
+            host: format!("{this}-other"),
+            pid: Some(999_999_999),
+            last_seen: now_ts - ONLINE_TTL_SECS - 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&remote_stale, this, now_ts),
+            Liveness::Stale,
+            "remote host + old last_seen => Stale"
+        );
+
+        // empty host + recent => AliveRemote (fail-open; this_host is never empty).
+        let empty_host = Peer {
+            host: String::new(),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&empty_host, this, now_ts),
+            Liveness::AliveRemote,
+            "empty host classifies as remote (fail-open)"
+        );
+
+        // this_host == peer.host boundary: exact equality flips local/remote.
+        let just_remote = Peer {
+            host: format!("{this}x"),
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&just_remote, this, now_ts),
+            Liveness::AliveRemote,
+            "host != this_host (by one char) => remote"
+        );
+
+        // TTL boundary: last_seen == now_ts - ONLINE_TTL_SECS is inclusive-alive.
+        let edge_alive = Peer {
+            last_seen: now_ts - ONLINE_TTL_SECS,
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&edge_alive, this, now_ts),
+            Liveness::AliveLocal,
+            "TTL boundary (== now - TTL) is inclusive-alive"
+        );
+        let edge_stale = Peer {
+            last_seen: now_ts - ONLINE_TTL_SECS - 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            liveness_for(&edge_stale, this, now_ts),
+            Liveness::Stale,
+            "one second past the TTL boundary is Stale"
+        );
+
+        // is_alive delegation regression-lock: (liveness_for != Stale) must equal
+        // the real is_alive() for the SAME peers, using the REAL this_host()/now().
+        for p in [
+            &base,
+            &live_local,
+            &dead_local,
+            &remote,
+            &remote_stale,
+            &empty_host,
+        ] {
+            let bool_from_enum =
+                liveness_for(p, &crate::config::this_host(), now()) != Liveness::Stale;
+            assert_eq!(
+                bool_from_enum,
+                is_alive(p),
+                "is_alive must equal (liveness_for != Stale) for {}",
+                p.host
+            );
+        }
+
+        // token() strings are the documented stable tokens.
+        assert_eq!(Liveness::AliveLocal.token(), "alive_local");
+        assert_eq!(Liveness::AliveRemote.token(), "alive_remote");
+        assert_eq!(Liveness::Stale.token(), "stale");
     }
 
     /// `pid_alive`: our own process is alive; an absurd/unused pid (and pid<=0) is

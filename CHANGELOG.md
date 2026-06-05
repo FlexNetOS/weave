@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] — scan surfaces remote-host sessions (host-aware liveness)
+
+> Pure observability upgrade: **no new dependency, no schema/migration, no
+> `Store`-trait or SQL change**, and the `is_alive` truth table is **unchanged**
+> (it now delegates to the new classifier but returns byte-identical bools at
+> every call site). The host-aware liveness logic already existed inside
+> `is_alive`; this surfaces its *reason*. Both backends gain only the mirrored
+> classifier unit test (the enum is pure and lives once in `store.rs`).
+
+### Added
+- **store:** `pub enum Liveness { AliveLocal, AliveRemote, Stale }` + the pure
+  `liveness_for(peer, this_host, now_ts)` classifier formalizing the **A2 —
+  fail-open by host** rule (same-host pid-authoritative; remote-host TTL-only,
+  *never* a cross-machine pid/network probe; an empty host classifies remote).
+  `Liveness::token()` yields the stable tokens `alive_local` / `alive_remote` /
+  `stale`. `is_alive` now delegates to it (truth table preserved); the pure
+  recency predicate is exposed as `is_online_at(last_seen, now_ts)`.
+- **cli:** `weave scan` distinguishes remote-host sessions (a ` <remote>` marker)
+  and shows a per-row liveness reason — `alive (local, pid)` / `alive (local,
+  ttl)` / `alive (remote, ttl)` / `stale` — plus a trailing `summary: N
+  local-alive, M remote-alive, K stale` line. `--json` gains two additive keys:
+  `liveness` (the stable token) and `remote` (bool, `host != this_host`).
+- **mcp:** `weave_scan` mirrors the same `<remote>` marker, reason strings, and
+  summary line in its text result (stdout discipline preserved — JSON-RPC frames
+  only; diagnostics to stderr).
+
 ## [Unreleased] — session presence dashboard (`weave sessions --watch`)
 
 > Read-only, **dependency-light** (std-only — no TUI/signal/async crate) and

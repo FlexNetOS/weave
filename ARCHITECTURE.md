@@ -463,26 +463,81 @@ keys        (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)
 - The three Tier-2 tables are whole **new** tables created on every open in **both**
   backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER.
 
-### Presence: `is_alive` vs `is_online`
+### Presence: `liveness_for` / `is_alive` vs `is_online`
 
-`is_online(last_seen)` is the pure recency guard (within `ONLINE_TTL_SECS` =
-900 s). **Presence display now means *alive*, not "wrote recently":**
+`is_online_at(last_seen, now_ts)` is the pure recency guard (within
+`ONLINE_TTL_SECS` = 900 s, the single freshness window — there is no separate
+presence const). **Presence display now means *alive*, not "wrote recently".**
 
-```text
-is_alive(peer) = is_online(peer.last_seen)
-               ∧ match peer.pid {
-                     Some(pid) if peer.host == this_host() => pid_alive(pid),
-                     _                                      => true,   // fail open
-                 }
+#### A2 — fail-open by host (named principle)
+
+Presence is governed by one rule the tests cite as **A2**: liveness is
+**pid-authoritative on the same host, TTL-only (fail-open) on a remote host**.
+weave can probe a process only on the machine it runs on, so:
+
+- **Same host** (`peer.host == this_host()`) with a known PID → the PID is
+  authoritative: a dead-but-recent local process reads stale.
+- **Remote host** (`peer.host != this_host()`, *including an empty host* — see
+  below) → **never pid-probed**; weave fails OPEN to the TTL recency verdict (the
+  Turso/libSQL shared-DB case). A remote/legacy peer must never falsely read dead,
+  and we never probe a PID that might collide with an unrelated local process.
+
+This is a security/correctness invariant, not a heuristic: there is **no
+cross-machine pid/network/ssh/ping probe anywhere** — the only probe is the
+same-host `/proc/<pid>` check, gated to the local arm. An *empty* host always
+classifies remote because `this_host()` is never empty (it falls back to
+`"local"`), so `"" != this_host()` holds and the empty-host row fails open by TTL.
+
+#### `liveness_for` — the pure host-aware classifier
+
+The A2 rule lives in one **pure** function in `store` that takes `this_host` and
+`now_ts` as parameters (so it is exhaustively testable with a fixed host/clock —
+the only I/O is the same-host PID probe, gated to the local arm):
+
+```rust
+pub enum Liveness { AliveLocal, AliveRemote, Stale }
+
+pub fn liveness_for(peer: &Peer, this_host: &str, now_ts: i64) -> Liveness {
+    if !is_online_at(peer.last_seen, now_ts) { return Liveness::Stale; }   // recency first
+    if peer.host == this_host {
+        match peer.pid {
+            Some(pid) if !pid_alive(pid) => Liveness::Stale,  // local dead pid ⇒ stale
+            _                            => Liveness::AliveLocal, // null pid ⇒ TTL fallback
+        }
+    } else {
+        Liveness::AliveRemote   // remote (incl. empty host): TTL-only, NEVER pid-probed
+    }
+}
 ```
 
-- A peer on **this host** with a known PID is confirmed by probing the process;
-  `pid_alive` is a Linux `/proc/<pid>` existence check (no new dependency) and
-  **degrades to assume-alive** off Linux via `cfg`.
-- The probe **fails open** for a remote / cross-machine peer (`host != this_host()`,
-  e.g. a Turso/libSQL shared DB) or an unknown PID (`pid:NULL`) — a peer we cannot
-  probe must never read dead. So a dead local session drops from presence the
-  moment its process exits, while a remote peer still relies on the TTL.
+- `Liveness::AliveLocal` — same host, within the TTL window, and pid-confirmed
+  (or a null-pid TTL fallback, still local).
+- `Liveness::AliveRemote` — remote host (incl. empty), within the TTL window,
+  liveness presumed by recency only (fail open).
+- `Liveness::Stale` — past the TTL window, **or** a same-host row whose known PID
+  is dead. `Liveness::token()` returns the stable machine tokens `"alive_local"` /
+  `"alive_remote"` / `"stale"`. The pid-confirmed-vs-TTL-presumed nuance is
+  surfaced only in the human reason string, not as a fourth variant.
+
+`pid_alive` is a Linux `/proc/<pid>` existence check (no new dependency) and
+**degrades to assume-alive** off Linux via `cfg`.
+
+#### `is_alive` delegates (truth table unchanged)
+
+`is_alive(peer) -> bool` is now a thin wrapper —
+`!matches!(liveness_for(peer, &this_host(), now()), Liveness::Stale)` — reading the
+real `this_host()`/`now()`, so every existing bool call site (`peers`,
+`sessions --watch`, `doctor`, the MCP tools) sees **byte-identical** results. The
+truth table is unchanged; the enum only adds an observability dimension
+(local-vs-remote + reason) on top of the same alive/stale boundary.
+
+#### Scan surfaces the liveness reason
+
+`weave scan` (and the `weave_scan` MCP tool) consume `liveness_for` per row to
+distinguish remote-host sessions and show *why* a peer is alive — a `<remote>`
+marker, a per-row reason string, additive `--json` keys, and a `summary` count
+line (see README). Cross-machine liveness inherits the same `ONLINE_TTL_SECS` =
+900 s freshness window: a remote peer seen within 15 minutes is presumed alive.
 
 Read paths keep `last_seen` warm: `weave peers` and a long-lived `weave watch`
 each refresh presence (heartbeat-on-read, explicit-identity only) so a session
