@@ -23,13 +23,19 @@ Deep design lives in `ARCHITECTURE.md`; contributor rules in `CONTRIBUTING.md`; 
 
 ## Mandatory session-start ritual
 
-**Start every session in a fresh git worktree** — do not work directly on a shared checkout of a long-lived branch. At session start:
+**Start every session in a fresh git worktree, branched off the freshly-fetched `develop`** — never work directly on a shared checkout, and never branch off a possibly-stale *local* ref. At session start:
 
 ```bash
-git worktree add ../weave-<task-slug> -b <task-branch>    # isolate this session's work
+git fetch origin                                                       # never branch off outdated local refs
+git worktree add ../weave-<task-slug> -b <task-branch> origin/develop  # isolate this session on the latest base
 ```
 
 Then operate inside that worktree. This keeps concurrent agent sessions from colliding on the working tree (weave's whole reason to exist is multi-session work) and keeps each session's diff reviewable in isolation. Remove the worktree when the branch is merged (`git worktree remove`).
+
+**Branch model (`develop` mirrors `master`):**
+- **`master`** is the protected trunk and the **PR target**. It requires the four CI checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)` — to be green and the branch to be up to date before merge (admins may bypass in emergencies). Do not push to `master` directly.
+- **`develop`** is a long-lived branch kept **fast-forwarded to `master`**. It exists solely as the always-current base sessions branch their worktrees from, so a stale local checkout can never seed a session with outdated code. Always create worktrees from `origin/develop` after a `git fetch` (as above).
+- **Flow:** worktree off `origin/develop` → work → open a PR **into `master`** → merge once the four checks pass → fast-forward `develop` to the new `master` (`git push origin master:develop`). Keep `develop` at or behind `master`, never ahead.
 
 ## CRITICAL: keep weave Rust-native — guard against language drift
 
