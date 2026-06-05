@@ -35,7 +35,7 @@
 //! `Row`, `Value`). NOTE: `PRAGMA journal_mode=WAL` returns a row, so it is issued
 //! via `query`, not `execute` (libsql's `execute` rejects row-returning statements).
 
-use crate::config::{Config, StoreSource};
+use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
@@ -99,24 +99,27 @@ const SCHEMA: &[&str] = &[
     )",
 ];
 
-/// Default wall-clock bound (ms) for a single REMOTE network call (connect or a
-/// SELECT `block_on`). libsql 0.9.30 has NO client-side connect/request timeout
+/// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
+/// or a SELECT `block_on`). libsql 0.9.30 has NO client-side connect/request timeout
 /// knob (`busy_timeout` is a no-op for remote — proven from the vendored crate), so
 /// we wrap each remote `block_on` future in `tokio::time::timeout`. A timeout is
 /// treated as just another source skip (the existing failure-isolation contract):
-/// stderr + continue, never a panic, never a partial commit. Override with
-/// `WEAVE_PULL_TIMEOUT_MS`.
-const REMOTE_TIMEOUT_MS_DEFAULT: u64 = 5_000;
-
-/// Resolve the remote-call timeout: `WEAVE_PULL_TIMEOUT_MS` if a positive integer,
-/// else [`REMOTE_TIMEOUT_MS_DEFAULT`]. A value of `0`/garbage falls back to the
-/// default (we never disable the bound — an unbounded remote could hang a drain).
-fn remote_timeout() -> std::time::Duration {
-    let ms = std::env::var("WEAVE_PULL_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(REMOTE_TIMEOUT_MS_DEFAULT);
+/// stderr + continue, never a panic, never a partial commit.
+///
+/// Precedence: a `per_source` value (already resolved + clamped in `config` from
+/// `WEAVE_PULL_TIMEOUT_MS_<LABEL>`) wins; else the global `WEAVE_PULL_TIMEOUT_MS` (if
+/// a positive integer); else [`REMOTE_TIMEOUT_MS_DEFAULT`] (owned by `config` — ONE
+/// source of truth shared with the config-resolved path, drift guard). A `0`/garbage
+/// global value falls back to the default; we NEVER disable the bound (an unbounded
+/// remote could hang a drain).
+fn remote_timeout_for(per_source: Option<u64>) -> std::time::Duration {
+    let ms = per_source.unwrap_or_else(|| {
+        std::env::var("WEAVE_PULL_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(REMOTE_TIMEOUT_MS_DEFAULT)
+    });
     std::time::Duration::from_millis(ms)
 }
 
@@ -131,6 +134,14 @@ pub struct LibsqlStore {
     /// the cross-machine owner-only-writes invariant. The primary RW `open` sets it
     /// `false`; `open_readonly`/`open_readonly_remote` set it `true`.
     read_only: bool,
+    /// The resolved per-source REMOTE-call timeout (ms) for a remote handle: `Some`
+    /// only on a handle opened via [`open_readonly_remote`] with a per-source value;
+    /// `None` for local/RW opens AND for a remote opened with no per-source override
+    /// (in which case [`remote_timeout_for`] falls back to the global/default). Read
+    /// by [`block_on_bounded`] so the bounded SELECTs honor the SAME per-source value
+    /// the connect used. Inert on a local handle (`block_on_bounded` runs it
+    /// unbounded).
+    remote_timeout: Option<u64>,
 }
 
 /// Convert a libsql row column into our owned `Message`. Column order matches
@@ -335,6 +346,7 @@ impl LibsqlStore {
             conn,
             _db: db,
             read_only: false,
+            remote_timeout: None,
         })
     }
 
@@ -390,6 +402,7 @@ impl LibsqlStore {
             conn,
             _db: db,
             read_only: true,
+            remote_timeout: None,
         })
     }
 
@@ -404,21 +417,29 @@ impl LibsqlStore {
     ///   (read-only is a server-side Turso token-scope property — a server-enforced
     ///   read-only token is the recommended deployment contract; see docs). Our
     ///   client-side enforcement is the read-only flag + the SELECT-only code path;
-    /// - the connect is wrapped in [`remote_timeout`] so an unreachable remote cannot
-    ///   hang the caller — a timeout surfaces as an `Err`, which the pull/federation
-    ///   free fns treat as a per-source skip (stderr + continue).
+    /// - the connect is wrapped in [`remote_timeout_for`] so an unreachable remote
+    ///   cannot hang the caller — a timeout surfaces as an `Err`, which the
+    ///   pull/federation free fns treat as a per-source skip (stderr + continue). The
+    ///   resolved per-source `timeout_ms` (from `config`) bounds BOTH the connect and
+    ///   the later SELECTs (stored on the handle for [`block_on_bounded`]); `None`
+    ///   falls back to the global/default exactly as before.
     ///
     /// `Builder::new_remote` creates NO local file (the `DbType::Remote` carries no
     /// path), so this leaves no local artifact. The `token` is a SECRET: it reaches
-    /// only the libsql client, never a shell/argv/SQL/log.
-    pub fn open_readonly_remote(url: &str, token: Option<&str>) -> Result<Self> {
+    /// only the libsql client, never a shell/argv/SQL/log. `timeout_ms` is a plain
+    /// integer (not a secret).
+    pub fn open_readonly_remote(
+        url: &str,
+        token: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("building tokio runtime for read-only remote libsql store")?;
         let url = url.to_string();
         let token = token.unwrap_or_default().to_string();
-        let dur = remote_timeout();
+        let dur = remote_timeout_for(timeout_ms);
         let (db, conn) = rt.block_on(async move {
             let build = Builder::new_remote(url, token).build();
             // Bound the connect: an unreachable remote must not hang the drain.
@@ -437,20 +458,23 @@ impl LibsqlStore {
             conn,
             _db: db,
             read_only: true,
+            remote_timeout: timeout_ms,
         })
     }
 
-    /// Run a SELECT-bearing future on the runtime, bounded by [`remote_timeout`] when
-    /// this handle is remote/read-only. Used by the read-only foreign-handle SELECTs
-    /// ([`list_peers`]/[`sessions`]/[`list_outbox`]) so a slow/unreachable remote
-    /// surfaces as an `Err` (a source skip) rather than hanging. A local handle runs
-    /// unbounded (its `busy_timeout` already bounds local lock contention).
+    /// Run a SELECT-bearing future on the runtime, bounded by
+    /// [`remote_timeout_for`] (honoring this handle's resolved per-source
+    /// `remote_timeout`) when the handle is remote/read-only. Used by the read-only
+    /// foreign-handle SELECTs ([`list_peers`]/[`sessions`]/[`list_outbox`]) so a
+    /// slow/unreachable remote surfaces as an `Err` (a source skip) rather than
+    /// hanging. A local handle runs unbounded (its `busy_timeout` already bounds local
+    /// lock contention).
     fn block_on_bounded<F, T>(&self, fut: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
     {
         if self.read_only {
-            let dur = remote_timeout();
+            let dur = remote_timeout_for(self.remote_timeout);
             self.rt.block_on(async move {
                 tokio::time::timeout(dur, fut)
                     .await
@@ -484,9 +508,11 @@ pub fn federation_status(extra: &[StoreSource]) -> (usize, usize) {
 fn open_source_readonly(src: &StoreSource) -> Result<LibsqlStore> {
     match src {
         StoreSource::Local(path) => LibsqlStore::open_readonly(path),
-        StoreSource::Remote { url, token } => {
-            LibsqlStore::open_readonly_remote(url, token.as_deref())
-        }
+        StoreSource::Remote {
+            url,
+            token,
+            timeout_ms,
+        } => LibsqlStore::open_readonly_remote(url, token.as_deref(), *timeout_ms),
     }
 }
 
