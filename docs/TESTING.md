@@ -76,20 +76,35 @@ fastest layer and carry most of the injector and store coverage.
   per-source cursor is duplicate-free on a clean re-drain and bounded to **exactly
   one** intent across a simulated crash-before-advance; a misaddressed / bad-source
   intent is skipped without wedging the source; a legacy (pre-Tier-2) DB gains the
-  `outbox` / `pull_cursor` / `keys` tables on open. The signed-identity store layer
-  (gated `#[cfg(feature = "sign")]`) covers the `keys` register/get/list roundtrip
-  and `signed_pull_verifies_commits_and_rejects_forgery` (valid signature commits;
+  `outbox` / `pull_cursor` / `keys` / `identity_keys` tables on open. The
+  **multi-key registry** (#7) is covered by `keys_register_get_list_roundtrip`
+  (append/no-op/remove/most-recent-shim semantics), `register_key_enforces_per_identity_cap`
+  (the `MAX_KEYS_PER_IDENT` = 16 cap: cap+1 distinct keys errors on the last, a
+  duplicate never counts, per-identity isolation holds), and
+  `legacy_single_key_migrates_into_identity_keys` — a genuine pre-#7 DB (a single-key
+  `keys` row, no `identity_keys`) migrates the row into `identity_keys` on open and a
+  SECOND open does **not** duplicate it (the additive, idempotent migration roundtrip).
+  The signed-identity store layer (gated `#[cfg(feature = "sign")]`) covers
+  `signed_pull_verifies_commits_and_rejects_forgery` (valid signature commits;
   a forged signature is **always** rejected; an unsigned intent commits advisory but
-  is dropped under `strict_verify`). The tightened model adds
-  `verify_decision_table_every_cell` — a table-driven test exercising **every cell**
-  of `verify_pulled_intent` (trusted+good/bad/unsigned, untrusted+good/unsigned,
-  no-trust-set, global strict forced/disabled, and R1: a valid signature against a
-  **revoked** key rejected even with strict disabled) — and
-  `rotation_overlap_then_revoke_old` (both old+new keys trusted verify during
-  overlap; after revoking the old fingerprint the old key's signed message is
-  rejected while the new key's still commits). Both seed keys from **fixed bytes**
-  (`SigningKey::from_bytes`), and ed25519 verify is RNG-free, so they are bit-stable
-  across repeat runs. Because the store-internals
+  is dropped under `strict_verify`) and `verify_decision_table_every_cell` — a
+  table-driven test exercising **every cell** of `verify_pulled_intent`
+  (trusted+good/bad/unsigned, untrusted+good/unsigned, no-trust-set, global strict
+  forced/disabled, and R1: a valid signature against a **revoked** key rejected even
+  with strict disabled). The multi-key verification core adds
+  `multikey_registry_old_and_new_verify_then_revoke_old` (the decision matrix: a sig
+  by the OLD or the NEW registered key both COMMIT; after revoking the old fingerprint
+  the old key's sig is REJECTED while the new key's still commits; a sig by a THIRD
+  unregistered key verifies against neither ⇒ REJECT) and the **rotation-overlap
+  E2E** `rotation_overlap_then_revoke_old` (a receiver registers BOTH old + new keys;
+  intents signed by either both commit during the window; revoking the old fingerprint
+  then drops the old-key intent while the new-key intent still commits, with the
+  source DB byte-unchanged — owner-only-writes). `multikey_single_key_is_byte_identical_to_v3`
+  is the **regression-lock**: with exactly one registered key, good⇒commit /
+  forged⇒reject / revoked-good⇒reject is byte-identical to the #3 single-key model.
+  Both seed keys from **fixed bytes** (`SigningKey::from_bytes(&[seed; 32])`, never
+  `OsRng`), and ed25519 verify is RNG-free, so they are bit-stable across repeat runs.
+  Because the store-internals
   tests touch backend internals (`s.conn.execute`, the concrete `SqliteStore`),
   that module is gated to the `sqlite` feature — see the dual-backend note below
   for how the *same* behaviors (including the mirrored `register_peer_full`,
@@ -340,8 +355,15 @@ between semi-trusted agent sessions:
   is rejected (`pulled 0`); **R1** — a **revoked** fingerprint's signed message is
   rejected even with `WEAVE_STRICT_VERIFY=false` (revocation is absolute for signed
   messages); and the secret-never-printed assertion is extended across the new
-  `key fingerprint` / `rotate` / `revoke` / `doctor` commands (the on-disk key hex,
-  and every `.bak` archive from rotate, never substrings any command's stdout).
+  `key fingerprint` / `rotate` / `revoke` / `key remove` / `doctor` commands (the
+  on-disk key hex, and every `.bak` archive from rotate, never substrings any
+  command's stdout — including the multi-key `key list` and `key remove` output).
+  For the #7 multi-key registry: a key that is revoked **within a multi-key set**
+  still cannot verify (R1 holds even when other registered keys exist for the same
+  identity), and no private-key bytes appear in any `key list` / `key remove` /
+  `doctor` output (only pubkeys, fingerprints, and per-identity counts are surfaced).
+  The `--features "libsql sign"` column proves the same security parity on the alt
+  backend.
 
 ## 4. Property-based tests (`tests/prop.rs`)
 
@@ -537,9 +559,14 @@ store-unit tests: `register_peer_full` round-trips `pid`/`host`, the legacy
 fail-open / Turso shared-DB case), the `liveness_for` host-aware matrix against
 **real libSQL rows** (the same fixed-`this_host` + fixed-`now_ts` regimes, with the
 stale paths seeded via the `backdate_peer` helper, plus the `is_alive` delegation
-regression-lock), and the `open_readonly` read-only proof (a write
+regression-lock), the `open_readonly` read-only proof (a write
 through the RO handle is engine-rejected and the foreign DB file stays
-byte-identical). So both the sqlite count and the libSQL count grow together when
+byte-identical), and — for the #7 multi-key registry —
+`keys_register_get_list_roundtrip_libsql` (append + remove semantics),
+`register_key_enforces_per_identity_cap_libsql` (the `MAX_KEYS_PER_IDENT` cap on the
+alt backend), and `legacy_single_key_migrates_into_identity_keys_libsql` (the
+additive, idempotent legacy-`keys`→`identity_keys` migration roundtrip under libSQL).
+So both the sqlite count and the libSQL count grow together when
 a mirrored store layer is added — the backends differ only in the count of their
 own store-unit module, never in covered behavior. The pure `merge_*_views`
 federation tests are not feature-gated and run under both.

@@ -378,15 +378,39 @@ on pull/commit using Ed25519 over the canonical `(from, to, body)`:
 weave key gen --me desktop          # generate a keypair; private key stored 0600, public key + fingerprint registered + printed
 weave key show --me desktop         # print this session's public key + fingerprint (never the private key)
 weave key fingerprint --me desktop  # print just the SHA256:<16-hex> fingerprint peers add to WEAVE_TRUST (--json)
-weave key add envctl <hex-pubkey>   # register a peer's public key so their signed intents verify
-weave key list                      # list registered (identity, public key, fingerprint) triples (--json)
-weave key rotate --me desktop       # archive the old key (0600), generate a new one, print both fingerprints + overlap guidance
+weave key add envctl <hex-pubkey>   # APPEND a peer's public key (multi-key: old + new coexist for rotation overlap)
+weave key remove envctl <key-or-fp> # prune a retired key (full hex pubkey OR a SHA256:<64-hex> fingerprint)
+weave key list                      # list ALL registered (identity, public key, fingerprint) keys, with [trusted]/[REVOKED] tags (--json)
+weave key rotate --me desktop       # archive the old key (0600), generate a new one, KEEP the old registered during overlap, print both fingerprints
 weave key revoke <fingerprint>      # print the value to add to WEAVE_REVOKED to retire a key (config-driven; no store table)
 ```
 
 The private key lives at `~/.config/weave/ed25519.key` (mode `0600`) and is never
 logged or printed. A signed intent makes the cross-store `from` **unforgeable**; a
 **tampered or spoofed signature is always rejected** regardless of mode.
+
+Keys live in a **multi-key registry** (`identity_keys`): each identity may have
+**several** registered keys at once. A signed pulled intent commits IFF its signature
+verifies against **at least one registered non-revoked key** for the sender. `weave
+key add` **appends** (it no longer overwrites — re-adding the same key is a no-op);
+`weave key list` shows every key per identity (with its fingerprint and a `[trusted]`
+or `[REVOKED]` tag); `weave key remove` prunes one; and `weave doctor` reports
+secret-free per-identity key counts. Up to `16` distinct keys per identity are allowed.
+
+#### Rotation overlap (zero-drop key change)
+
+Because the registry is multi-key, an old and a new key can both verify during a
+rotation window — no in-flight message signed by the old key is dropped:
+
+1. On the rotating session: `weave key rotate --me desktop` generates the new key and
+   keeps the old one registered locally; it prints both fingerprints.
+2. On each receiver: `weave key add desktop <new-pubkey>` (the old key stays
+   registered alongside it), and trust BOTH full fingerprints in `WEAVE_TRUST`.
+   Messages signed by EITHER key now verify and commit.
+3. Once every peer has the new key, retire the old one:
+   `weave key remove desktop <old-pubkey-or-fp>` to drop it from the registry and
+   `weave key revoke <old-full-fp>` to revoke it (R1 — a signature against a revoked
+   key is rejected unconditionally even if it cryptographically verifies).
 
 #### Fingerprints
 

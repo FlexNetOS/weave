@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — multi-key-per-identity registry (true rotation overlap)
+
+> **No new dependency.** Additive, guarded, idempotent schema migration in **both**
+> backends; the legacy single-key `keys` table is retained as a deprecated shadow
+> (not dropped) and its rows are copied into the new registry on first open. The #3
+> single-key verification behavior is **preserved verbatim** — with exactly one
+> registered key the decision table is byte-identical; no row flips REJECT→COMMIT.
+> The crypto stays `sign`-gated; the registry itself is plain data in every build.
+
+### Added
+- **store:** `identity_keys(identity, pubkey, added_ts, PRIMARY KEY(identity,pubkey))`
+  registry holding **multiple** keys per identity, enabling true rotation OVERLAP
+  (old + new key both verify during a window) — impossible before at the verification
+  layer. New `Store` methods `get_keys` (all keys, oldest-first) and `remove_key`;
+  `get_key` becomes a most-recent shim; `list_keys` reads the new table. Mirrored in
+  both `store.rs` (sqlite) and `store_libsql.rs` (libSQL). `MAX_KEYS_PER_IDENT` (16)
+  caps a hostile registry (a duplicate never counts; exceeding it errors, never
+  panics).
+- **cli:** `weave key remove <identity> <pubkey-or-fingerprint>` prunes a retired key
+  (full hex pubkey, or a `SHA256:<64-hex>` fingerprint resolved against the registered
+  set). `weave doctor` reports secret-free per-identity key counts
+  (`sign_key_identities`, `sign_registered_keys`, `sign_identities_multi_key`).
+
+### Changed
+- **store:** `register_key` now **APPENDS** (`ON CONFLICT(identity,pubkey) DO
+  NOTHING`) instead of overwriting; re-registering the same key is a no-op.
+  `verify_pulled_intent` now commits a signed intent IFF it verifies against **at
+  least one registered NON-REVOKED key** for the sender (a revoked key is skipped —
+  R1 preserved; verifies-against-none and present-but-invalid still always rejected).
+- **cli:** `weave key add` appends (old + new coexist for rotation overlap) rather
+  than overwriting; `weave key rotate` keeps the old key registered during the
+  overlap window; `weave key list` shows ALL keys per identity, each with its
+  fingerprint and a `[trusted]`/`[REVOKED]` tag.
+
 ## [Unreleased] — scan surfaces remote-host sessions (host-aware liveness)
 
 > Pure observability upgrade: **no new dependency, no schema/migration, no

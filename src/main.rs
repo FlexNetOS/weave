@@ -380,14 +380,29 @@ enum KeyCmd {
         fp: String,
     },
     /// Register a PEER's public key so signed intents claiming to be from them can
-    /// be verified. `pubkey` is the 64-hex-char Ed25519 public key.
+    /// be verified. APPENDS to the registry: a peer may have MULTIPLE keys
+    /// registered at once (rotation overlap — old + new both verify during a
+    /// window). Re-adding the same key is a no-op. `pubkey` is the 64-hex-char
+    /// Ed25519 public key.
     Add {
         /// the peer's identity (sender name as it appears on their intents)
         identity: String,
         /// the peer's hex-encoded Ed25519 public key
         pubkey: String,
     },
-    /// List all registered (identity, public key) pairs.
+    /// Remove (prune) a registered key from a peer's identity — e.g. retiring an
+    /// OLD key after a rotation window has closed. The key may be given as a full
+    /// hex pubkey or as a `SHA256:<full-64-hex>` fingerprint (resolved against the
+    /// registered set). Single positional `key`; no shell involved.
+    Remove {
+        /// the peer's identity
+        identity: String,
+        /// the key to remove: a full hex pubkey OR a SHA256:<full-64-hex> fingerprint
+        key: String,
+    },
+    /// List all registered (identity, public key) pairs. With multi-key
+    /// registration an identity may appear several times; each row shows its
+    /// fingerprint and a [trusted]/[REVOKED] tag where applicable.
     List {
         #[arg(long)]
         json: bool,
@@ -745,6 +760,21 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 .and_then(|pk| sign::fingerprint(&pk));
             obj.insert("sign_trust_set".into(), trust.len().into());
             obj.insert("sign_revoked_set".into(), revoked.len().into());
+            // Multi-key registry health (#7), secret-free: how many identities have a
+            // registered key, the total registered keys, and any identity holding
+            // more than one key (rotation overlap in progress). Pubkeys are NOT
+            // surfaced here (use `weave key list`); only counts.
+            if let Ok(pairs) = store.list_keys() {
+                use std::collections::BTreeMap;
+                let mut per_ident: BTreeMap<String, usize> = BTreeMap::new();
+                for (ident, _pk) in &pairs {
+                    *per_ident.entry(ident.clone()).or_insert(0) += 1;
+                }
+                obj.insert("sign_key_identities".into(), per_ident.len().into());
+                obj.insert("sign_registered_keys".into(), pairs.len().into());
+                let multi = per_ident.values().filter(|&&c| c > 1).count();
+                obj.insert("sign_identities_multi_key".into(), multi.into());
+            }
             obj.insert(
                 "sign_strict_verify".into(),
                 match cfg.strict_verify_override() {
@@ -2091,7 +2121,10 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
         KeyCmd::Rotate { me } => {
             let me = resolve_me(me, None, cfg);
             let (old_pub, new_pub) = sign::rotate_keypair()?;
-            // Register the NEW key under this identity (upsert replaces the old row).
+            // Register the NEW key under this identity. With multi-key registration
+            // (#7) this APPENDS — the OLD key (if any) stays registered for overlap,
+            // so in-flight messages signed by the old key still verify against THIS
+            // store until the old key is explicitly removed/revoked.
             store.register_key(&me, &new_pub)?;
             let new_fp = sign::fingerprint(&new_pub).unwrap_or_else(|| "<unavailable>".to_string());
             println!("rotated signing key for '{me}'");
@@ -2116,11 +2149,12 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
                     println!("new public key: {new_pub}");
                     println!("new fingerprint: {new_fp}");
                     println!(
-                        "OVERLAP: during rollover, RECEIVERS should trust BOTH keys' FULL \
-                         fingerprints in WEAVE_TRUST and keep the OLD pubkey registered \
-                         (`weave key add {me} {old}`) so in-flight messages signed by the old key \
-                         still verify:\n  WEAVE_TRUST={old_full},{new_full}\nOnce all peers have \
-                         your new key, `weave key revoke {old_full}` to retire the old one."
+                        "OVERLAP: the OLD key is kept registered locally alongside the new one, so \
+                         in-flight messages signed by EITHER key verify during the window. RECEIVERS \
+                         should also `weave key add {me} {old}` (multi-key: both stay registered) \
+                         and trust BOTH keys' FULL fingerprints:\n  WEAVE_TRUST={old_full},{new_full}\n\
+                         Once all peers have your new key, prune the old one with \
+                         `weave key remove {me} {old}` and `weave key revoke {old_full}`."
                     );
                 }
                 None => {
@@ -2175,6 +2209,42 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
             sign::check_pubkey(&pubkey)?;
             store.register_key(&identity, &pubkey)?;
             println!("registered public key for '{identity}'");
+        }
+        KeyCmd::Remove { identity, key } => {
+            // Validate the identity at the seam. The `key` may be a full hex pubkey
+            // or a SHA256:<full-64-hex> fingerprint; resolve a fingerprint to the
+            // exact registered pubkey so the DELETE targets the right row. No shell.
+            store::check_ident("identity", &identity)?;
+            let entry = key.trim();
+            let target = if sign::check_pubkey(entry).is_ok() {
+                // A full hex pubkey: remove it directly.
+                entry.to_string()
+            } else {
+                // Treat as a fingerprint and resolve it against this identity's
+                // registered keys (FULL-digest match; R3). Only keys weave actually
+                // has registered for this identity are candidates.
+                let registered: Vec<String> = store
+                    .get_keys(&identity)?
+                    .into_iter()
+                    .filter(|pk| sign::fingerprint_matches(entry, pk))
+                    .collect();
+                match registered.len() {
+                    1 => registered.into_iter().next().unwrap(),
+                    0 => anyhow::bail!(
+                        "no registered key for '{identity}' matches '{entry}' \
+                         (give a full hex pubkey or a SHA256:<64-hex> fingerprint)"
+                    ),
+                    _ => anyhow::bail!(
+                        "'{entry}' matches multiple registered keys for '{identity}'; \
+                         remove by full pubkey hex instead"
+                    ),
+                }
+            };
+            if store.remove_key(&identity, &target)? {
+                println!("removed registered key for '{identity}'");
+            } else {
+                println!("no matching registered key for '{identity}' (nothing removed)");
+            }
         }
         KeyCmd::List { json } => {
             let keys = store.list_keys()?;
