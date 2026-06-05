@@ -3675,6 +3675,234 @@ fn mcp_doctor_reports_per_source_timeout_token_free() {
     mcp.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Feature #9 — federation token/timeout PARITY: the `pull_from` (Tier-2
+// delivery) side is now SURFACED in `doctor` at parity with `peer_db`. These
+// drive the compiled binary with `.invalid` hosts (NO live network) and assert
+// the NEW additive `federation_pull_*` keys + the human "pull sources/tokens/
+// timeout" block, that ALL existing `federation_*` (peer_db) keys are
+// unchanged, that a local-only/unconfigured config emits NO pull block
+// (backward-compat), and the headline: no token byte ever reaches stdout/stderr
+// across the new pull surface. Resolution is backend-agnostic, so counts hold
+// on BOTH the default sqlite and the `--features libsql` builds.
+// ---------------------------------------------------------------------------
+
+/// A MIX of federation sources: `WEAVE_PULL_FROM` carries a labelled remote
+/// (`.invalid`, with its own per-source token + per-source timeout) plus a local
+/// path, AND `WEAVE_PEER_DBS` carries a second labelled remote with its own
+/// token + timeout. `weave doctor --json` must surface the NEW
+/// `federation_pull_*` keys (the previously-MISSING pull token tier now
+/// reported), keep the existing peer_db `federation_remote_*` keys correct, and
+/// keep the effective ms range within the clamp bounds. NEITHER token byte ever
+/// appears on stdout/stderr. Holds on both backends.
+#[test]
+fn doctor_surfaces_pull_from_federation_health() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+    // A DISTINCT foreign local store (the resolver canonical-dedups any source
+    // equal to the caller's own db_path, so it must NOT be `local`).
+    let foreign_local = TestDb::new();
+    run_ok(&foreign_local, &["register", "--name", "fedlocal"]);
+
+    const PULL_TOK: &str = "pull-side-per-source-token-FFF";
+    const PEER_TOK: &str = "peer-side-per-source-token-GGG";
+
+    // pull_from: one labelled remote (per-source token 250ms) + one local.
+    let pull_from = format!(
+        "PULLP=libsql://pull-prod.invalid,{}",
+        foreign_local.path_str()
+    );
+    // peer_db: one labelled remote (per-source token, global-timeout fallback).
+    let peer_dbs = "PEERP=libsql://peer-prod.invalid";
+
+    let env: &[(&str, &str)] = &[
+        ("WEAVE_PULL_FROM", &pull_from),
+        ("WEAVE_PULL_TOKEN_PULLP", PULL_TOK),
+        ("WEAVE_PULL_TIMEOUT_MS_PULLP", "250"),
+        ("WEAVE_PEER_DBS", peer_dbs),
+        ("WEAVE_PULL_TOKEN_PEERP", PEER_TOK),
+        ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+    ];
+
+    let (ok, out, err) = run_env(&local, &["doctor", "--json"], env);
+    assert!(ok, "doctor --json must succeed; stderr:\n{err}");
+
+    // Headline secret-hygiene: neither token appears anywhere.
+    assert!(!out.contains(PULL_TOK), "pull token in json stdout: {out}");
+    assert!(!err.contains(PULL_TOK), "pull token in json stderr: {err}");
+    assert!(!out.contains(PEER_TOK), "peer token in json stdout: {out}");
+    assert!(!err.contains(PEER_TOK), "peer token in json stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+
+    // NEW pull-side keys: 2 sources (1 local + 1 remote); the remote resolves the
+    // per-source token tier + the per-source timeout tier (the formerly-MISSING
+    // pull token surface is now reported).
+    assert_eq!(
+        v["federation_pull_sources"].as_u64(),
+        Some(2),
+        "pull_from: one local + one remote = 2 sources: {out}"
+    );
+    assert_eq!(v["federation_pull_local"].as_u64(), Some(1), "{out}");
+    assert_eq!(v["federation_pull_remote"].as_u64(), Some(1), "{out}");
+    assert_eq!(
+        v["federation_pull_token_per_source"].as_u64(),
+        Some(1),
+        "pull remote resolves its OWN per-source token tier: {out}"
+    );
+    assert_eq!(v["federation_pull_token_shared"].as_u64(), Some(0), "{out}");
+    assert_eq!(v["federation_pull_token_none"].as_u64(), Some(0), "{out}");
+    assert_eq!(
+        v["federation_pull_timeout_per_source"].as_u64(),
+        Some(1),
+        "pull remote resolves the per-source 250ms timeout tier: {out}"
+    );
+    let pmin = v["federation_pull_timeout_ms_min"]
+        .as_u64()
+        .expect("pull ms_min present when a remote pull source exists");
+    let pmax = v["federation_pull_timeout_ms_max"]
+        .as_u64()
+        .expect("pull ms_max present when a remote pull source exists");
+    assert_eq!(
+        pmin, 250,
+        "pull effective min ms is the per-source 250: {out}"
+    );
+    assert_eq!(pmax, 250, "single pull remote ⇒ min==max==250: {out}");
+    assert!(
+        (50..=600_000).contains(&pmin) && (50..=600_000).contains(&pmax),
+        "pull ms within clamp bounds: {out}"
+    );
+
+    // EXISTING peer_db keys remain correct (additive, no regression): one remote
+    // peer_db source resolving its OWN per-source token + the global timeout tier.
+    assert_eq!(
+        v["federation_remote_stores"].as_u64(),
+        Some(1),
+        "one peer_db remote configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(1),
+        "peer_db remote resolves its per-source token tier: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_timeout_global"].as_u64(),
+        Some(1),
+        "peer_db remote falls back to the global 1000ms timeout: {out}"
+    );
+
+    // The human form prints the additive pull block (token-free).
+    let (ok2, out2, err2) = run_env(&local, &["doctor"], env);
+    assert!(ok2, "human doctor must succeed; stderr:\n{err2}");
+    assert!(
+        !out2.contains(PULL_TOK),
+        "pull token in human stdout: {out2}"
+    );
+    assert!(
+        !out2.contains(PEER_TOK),
+        "peer token in human stdout: {out2}"
+    );
+    assert!(
+        out2.contains("pull sources:"),
+        "human doctor surfaces the pull-source line: {out2}"
+    );
+    assert!(
+        out2.contains("pull tokens:") && out2.contains("pull timeout:"),
+        "human doctor surfaces the pull token + timeout lines: {out2}"
+    );
+}
+
+/// Backward-compat: with NO federation configured (no `WEAVE_PULL_FROM`, no
+/// `WEAVE_PEER_DBS`), `doctor --json` carries NONE of the new `federation_pull_*`
+/// keys and the human form prints NO pull block — so existing local-only output
+/// is byte-unchanged. A local-only `WEAVE_PULL_FROM` reports a count but emits no
+/// remote tier/timeout keys (no misleading 0-0).
+#[test]
+fn doctor_pull_block_absent_when_no_federation() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+    // A distinct foreign local store for the local-only case (the resolver
+    // canonical-dedups any source equal to the caller's own db_path).
+    let foreign_local = TestDb::new();
+    run_ok(&foreign_local, &["register", "--name", "fedlocal"]);
+
+    // (1) Nothing configured: pull block absent entirely.
+    let (ok, out, err) = run_env(&local, &["doctor", "--json"], &[]);
+    assert!(ok, "doctor --json must succeed; stderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert!(
+        v.get("federation_pull_sources").is_none(),
+        "no pull block when unconfigured: {out}"
+    );
+    assert!(
+        v.get("federation_pull_token_per_source").is_none(),
+        "no pull token keys when unconfigured: {out}"
+    );
+
+    let (okh, outh, errh) = run_env(&local, &["doctor"], &[]);
+    assert!(okh, "human doctor must succeed; stderr:\n{errh}");
+    assert!(
+        !outh.contains("pull sources:"),
+        "no pull block in human form when unconfigured: {outh}"
+    );
+
+    // (2) Local-only pull_from: a count surfaces but NO remote tier/ms keys.
+    let (ok2, out2, err2) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[("WEAVE_PULL_FROM", &foreign_local.path_str())],
+    );
+    assert!(ok2, "doctor --json must succeed; stderr:\n{err2}");
+    let v2: serde_json::Value = serde_json::from_str(&out2).expect("doctor --json parses");
+    assert_eq!(
+        v2["federation_pull_sources"].as_u64(),
+        Some(1),
+        "local-only pull_from reports a source count: {out2}"
+    );
+    assert_eq!(v2["federation_pull_local"].as_u64(), Some(1), "{out2}");
+    assert_eq!(v2["federation_pull_remote"].as_u64(), Some(0), "{out2}");
+    assert!(
+        v2.get("federation_pull_timeout_ms_min").is_none(),
+        "no ms range over zero remote pull sources: {out2}"
+    );
+}
+
+/// MCP `weave_doctor` mirrors the CLI pull-side block: with a labelled remote in
+/// `WEAVE_PULL_FROM` + its per-source token, the tool RESULT contains the `pull
+/// sources:`/`pull tokens:` lines and NO token byte leaks. Successful tool result.
+#[test]
+fn mcp_doctor_surfaces_pull_from_block_token_free() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const PULL_TOK: &str = "mcp-pull-per-source-token-HHH";
+    let pull_from = "MCPPULL=libsql://mcp-pull.invalid/db";
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PULL_FROM", pull_from),
+            ("WEAVE_PULL_TOKEN_MCPPULL", PULL_TOK),
+            ("WEAVE_PULL_TIMEOUT_MS_MCPPULL", "250"),
+        ],
+    );
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "doctor degradation is not a tool error: {dtext}");
+    assert!(
+        !dtext.contains(PULL_TOK),
+        "no pull token byte leaks into the MCP doctor result: {dtext}"
+    );
+    assert!(
+        dtext.contains("pull sources:"),
+        "MCP doctor surfaces the pull-source line: {dtext}"
+    );
+    assert!(
+        dtext.contains("pull tokens:") && dtext.contains("1 per-source"),
+        "MCP doctor surfaces the pull token tier line: {dtext}"
+    );
+    mcp.shutdown();
+}
+
 /// Item-2 confirmation (headline): a per-source `WEAVE_PULL_TOKEN_<LABEL>` is
 /// selected for a `WEAVE_PEER_DBS` (peer_db) remote — proving the LABEL namespace
 /// covers peer_db, not just `pull_from`. Run `weave peers` AND `weave doctor

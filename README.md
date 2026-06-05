@@ -367,6 +367,38 @@ export WEAVE_PULL_TIMEOUT_MS=1000       # global fallback for the rest
   the JSON keys `federation_remote_timeout_{per_source,global,default}` /
   `federation_remote_timeout_ms_{min,max}`.
 
+#### `weave doctor` federation-health rollup — both source kinds, symmetric
+
+`weave doctor` reports a **federation-health rollup** that now covers **both**
+federation source kinds — `peer_db` (read-only visibility) **and** `pull_from`
+(cross-store delivery) — symmetrically. For each kind it summarizes:
+
+- **source counts** — total resolved, split into local-file vs remote-URL;
+- **per-source token tiers** — how each remote resolved its token (per-source /
+  shared / none);
+- **per-source timeout tiers** — how each remote resolved its call timeout
+  (per-source / global / default) plus the effective ms range over the remotes.
+
+The `peer_db` side renders on the existing `remote sources:` / `remote tokens:` /
+`remote timeout:` lines (JSON keys `federation_remote_*`). The `pull_from` side
+renders on `pull sources:` / `pull tokens:` / `pull timeout:` lines, emitted **only
+when `pull_from` is configured** so a local-only config is byte-unchanged. The new
+`--json` keys (counts/tiers only) are:
+
+- `federation_pull_sources`, `federation_pull_local`, `federation_pull_remote`
+- `federation_pull_token_{per_source,shared,none}`
+- `federation_pull_timeout_{per_source,global,default}`
+- `federation_pull_timeout_ms_{min,max}` (only when a remote pull source exists, so
+  an all-local set never renders a misleading `0-0`)
+
+The rollup is **secret-free** — it carries only tier *counts* and an ms range, never
+a token byte nor a label↔token pairing — and is mirrored in the `weave_doctor` MCP
+tool. It completes per-source token/timeout **parity** across both federation source
+kinds: the same knobs were already resolved and applied for `pull_from`, and
+`doctor` now surfaces them at the same level as `peer_db`. The pull-side rollup is a
+read-only view of the already-resolved config — it adds **no** network probe (no
+reachability is shown for `pull_from`).
+
 #### Live nudge on a pulled message — DEFAULT ON (consent)
 
 When a pull commits a message from an allow-listed source, weave **also fires a

@@ -730,6 +730,11 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         .count();
     let timeout_ms_min = timeout_tiers.iter().map(|(ms, _)| *ms).min();
     let timeout_ms_max = timeout_tiers.iter().map(|(ms, _)| *ms).max();
+    // Secret-free federation-health rollup over BOTH source kinds (peer_db AND the
+    // previously-unsurfaced pull_from delivery set). Counts/tiers only — never a
+    // token. Reads config/env only; no new network probe (reachability for the
+    // peer_db set is the already-computed fed_ok/fed_skipped above).
+    let fed_health = cfg.federation_health();
     let total = store.total_messages()?;
     let claude = inject::have("claude");
     let db = cfg.db_path();
@@ -832,6 +837,44 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 }
             }
         }
+        // Additive (token-free) federation-health rollup for the `pull_from` delivery
+        // set — the side `doctor` never surfaced before (parity with the peer_db keys
+        // above). Emitted ONLY when `pull_from` is configured, so local-only configs
+        // are byte-unchanged. Counts/tiers only; never a token. ms range only when a
+        // remote pull source exists (no misleading 0-0 over zero remotes).
+        let ph = &fed_health.pull_from;
+        if ph.total > 0 {
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("federation_pull_sources".into(), ph.total.into());
+                obj.insert("federation_pull_local".into(), ph.local.into());
+                obj.insert("federation_pull_remote".into(), ph.remote.into());
+                obj.insert(
+                    "federation_pull_token_per_source".into(),
+                    ph.token_per_source.into(),
+                );
+                obj.insert(
+                    "federation_pull_token_shared".into(),
+                    ph.token_shared.into(),
+                );
+                obj.insert("federation_pull_token_none".into(), ph.token_none.into());
+                obj.insert(
+                    "federation_pull_timeout_per_source".into(),
+                    ph.timeout_per_source.into(),
+                );
+                obj.insert(
+                    "federation_pull_timeout_global".into(),
+                    ph.timeout_global.into(),
+                );
+                obj.insert(
+                    "federation_pull_timeout_default".into(),
+                    ph.timeout_default.into(),
+                );
+                if let (Some(min), Some(max)) = (ph.ms_min, ph.ms_max) {
+                    obj.insert("federation_pull_timeout_ms_min".into(), min.into());
+                    obj.insert("federation_pull_timeout_ms_max".into(), max.into());
+                }
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let tgt = if target.id.is_empty() {
@@ -907,6 +950,29 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "  note: using non-default WEAVE_DB — peers on a different store won't be visible (default: {})",
                 db_default.display()
             );
+        }
+        // Additive secret-free "federation health" block for the `pull_from` delivery
+        // set — the side `doctor` never surfaced before (now at parity with peer_db).
+        // Printed ONLY when `pull_from` is configured, so local-only output is
+        // byte-unchanged. Counts/tiers only; never a token. No reachability is shown
+        // for pull_from (would require a new probe — forbidden): resolved view only.
+        let ph = &fed_health.pull_from;
+        if ph.total > 0 {
+            println!(
+                "  pull sources:   {} configured ({} local, {} remote)",
+                ph.total, ph.local, ph.remote
+            );
+            if ph.remote > 0 {
+                println!(
+                    "  pull tokens:    {} per-source, {} shared, {} none",
+                    ph.token_per_source, ph.token_shared, ph.token_none
+                );
+                let (pmin, pmax) = (ph.ms_min.unwrap_or(0), ph.ms_max.unwrap_or(0));
+                println!(
+                    "  pull timeout:   {} per-source, {} global, {} default (effective {pmin}-{pmax} ms)",
+                    ph.timeout_per_source, ph.timeout_global, ph.timeout_default
+                );
+            }
         }
     }
     Ok(())

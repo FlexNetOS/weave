@@ -610,6 +610,70 @@ fn doctor_never_prints_pull_token() {
     mcp.shutdown();
 }
 
+/// Secret-hygiene HEADLINE for Feature #9 (the newly-surfaced `pull_from` side):
+/// with per-source AND shared tokens set for BOTH `WEAVE_PULL_FROM` and
+/// `WEAVE_PEER_DBS`, `weave doctor` must NEVER print a token byte — in `--json`,
+/// in the human form, OR in the MCP `weave_doctor` tool result. The new pull-side
+/// federation-health block renders only tier COUNTS + a plain ms range, never a
+/// token nor a label↔token pairing. The pull block is asserted present so the
+/// redaction is exercised against the new surface, not a no-op. Both backends.
+#[test]
+fn doctor_never_prints_pull_from_token() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const PULL_PER_SOURCE: &str = "fed9-pull-per-source-token-JJJ";
+    const PEER_PER_SOURCE: &str = "fed9-peer-per-source-token-KKK";
+    const SHARED: &str = "fed9-shared-token-LLL";
+
+    // BOTH source kinds carry a labelled remote with its OWN per-source token,
+    // plus the shared token fallback. `.invalid` hosts; short timeouts.
+    let pull_from = "PULLP=libsql://fed9-pull.invalid/db";
+    let peer_dbs = "PEERP=libsql://fed9-peer.invalid/db";
+    let env: &[(&str, &str)] = &[
+        ("WEAVE_PULL_FROM", pull_from),
+        ("WEAVE_PULL_TOKEN_PULLP", PULL_PER_SOURCE),
+        ("WEAVE_PULL_TIMEOUT_MS_PULLP", "250"),
+        ("WEAVE_PEER_DBS", peer_dbs),
+        ("WEAVE_PULL_TOKEN_PEERP", PEER_PER_SOURCE),
+        ("WEAVE_PULL_TOKEN", SHARED),
+        ("WEAVE_PULL_TIMEOUT_MS", "1000"),
+    ];
+
+    let assert_token_free = |label: &str, s: &str| {
+        assert!(!s.contains(PULL_PER_SOURCE), "pull token in {label}: {s}");
+        assert!(!s.contains(PEER_PER_SOURCE), "peer token in {label}: {s}");
+        assert!(!s.contains(SHARED), "shared token in {label}: {s}");
+    };
+
+    // (1) doctor --json.
+    let (ok_j, out_j, err_j) = run_env(&local, &["doctor", "--json"], env);
+    assert!(ok_j, "doctor --json must succeed; stderr:\n{err_j}");
+    assert_token_free("json stdout", &out_j);
+    assert_token_free("json stderr", &err_j);
+
+    // (2) doctor (human) — and confirm the new pull block is actually rendered.
+    let (ok_h, out_h, err_h) = run_env(&local, &["doctor"], env);
+    assert!(ok_h, "human doctor must succeed; stderr:\n{err_h}");
+    assert_token_free("human stdout", &out_h);
+    assert_token_free("human stderr", &err_h);
+    assert!(
+        out_h.contains("pull sources:") && out_h.contains("pull tokens:"),
+        "human doctor must render the new pull-side block (so redaction is exercised): {out_h}"
+    );
+
+    // (3) MCP weave_doctor tool result.
+    let mut mcp = McpServer::spawn_env(&local, env);
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "MCP doctor is not a tool error: {dtext}");
+    assert_token_free("MCP result", &dtext);
+    assert!(
+        dtext.contains("pull sources:"),
+        "MCP doctor must render the new pull-side block: {dtext}"
+    );
+    mcp.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Tier-2 cross-store delivery — owner-only-writes and authorization hardening.
 // ---------------------------------------------------------------------------

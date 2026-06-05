@@ -899,6 +899,44 @@ A delivery / federation source need not be a local file. A `StoreSource` (define
   `peer_db_remote_timeout_tiers`, plus the effective ms range) — never adjacent to a
   token, never a token byte.
 
+### Per-source token/timeout parity across both source kinds
+
+The two per-source knobs — `WEAVE_PULL_TOKEN_<LABEL>` and
+`WEAVE_PULL_TIMEOUT_MS_<LABEL>` — hold at **parity** across **both** federation
+source kinds (`peer_db` Tier-1 visibility and `pull_from` Tier-2 delivery) along
+three axes:
+
+- **RESOLVED.** Both `peer_db_sources` and `pull_from_sources` route through the SAME
+  `resolve_store_sources_with_tiers`, so a labelled remote resolves its token AND
+  timeout identically regardless of which list it appears in (one shared LABEL
+  namespace, one resolver — no fork).
+- **APPLIED.** Every foreign remote open — Tier-1 (`federated_peers` /
+  `federated_sessions`) and Tier-2 (`pull_from_store`) — funnels through the single
+  `open_source_readonly` → `open_readonly_remote(url, token, timeout_ms)` seam. The
+  token reaches `Builder::new_remote`; the timeout bounds both connect and SELECTs.
+  There is no source kind that resolves a knob but fails to apply it.
+- **SURFACED.** `weave doctor` now reports the resolved tiers/counts for **both**
+  kinds. The `peer_db` side already rendered (`federation_remote_*`); the
+  previously-missing `pull_from` side is closed by adding the symmetric
+  `Config::pull_from_remote_token_tiers` accessor (the sibling of
+  `peer_db_remote_token_tiers`) so the rollup treats both kinds uniformly.
+
+The single secret-free rollup is `Config::federation_health() -> FederationHealth`,
+holding a `FederationKindHealth` per kind (`peer_db`, `pull_from`) with **only**
+counts (`total`/`local`/`remote`, the token tiers, the timeout tiers) and an
+effective-ms range (`ms_min`/`ms_max`, `None` over zero remotes so an empty set never
+renders a misleading `0-0`) — **never** a token byte nor a label↔token pairing. It is
+a **read-only aggregation over already-resolved config tiers** (env/config only),
+backend-agnostic, computed via the per-kind `federation_kind_health` helper over the
+same `resolve_store_sources_with_tiers` the apply path uses. It adds **no new network
+probe**: reachability (ok/skipped) for the `peer_db` set stays the already-computed
+`store::federation_status`; the `pull_from` side surfaces resolved counts/tiers only
+(opening pull sources for health would be a forbidden new network touch). Both the
+CLI `weave doctor` and the `weave_doctor` MCP tool consume this ONE method, so the two
+surfaces cannot drift; `main` adds the additive `federation_pull_*` JSON keys + a
+`pull sources:` / `pull tokens:` / `pull timeout:` human block, and `mcp` mirrors the
+same three human lines.
+
 ### Consent nudge on a pulled message — DEFAULT ON
 
 When B commits a message from an **allow-listed** source, B also fires the existing
