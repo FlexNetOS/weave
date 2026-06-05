@@ -230,9 +230,27 @@ impl McpServer {
     /// Spawn `weave mcp` against `db` with extra env applied after [`scrub_env`]
     /// (so they win — e.g. `WEAVE_PEER_DBS` for federation tests).
     pub fn spawn_env(db: &TestDb, extra_env: &[(&str, &str)]) -> Self {
-        let mut cmd = weave_cmd(db, &["mcp"]);
+        Self::spawn_full(db, &["mcp"], extra_env, None)
+    }
+
+    /// Spawn `weave <args...>` (used for `["mcp", "--session", ...]`) against `db`
+    /// with extra env and an optional working directory. Pinning the child's cwd is
+    /// the seam that exercises `resolve_me`'s `basename(cwd)` fallback (the MCP
+    /// server has no per-call `--from` flag), so identity-fallback tests can run the
+    /// server in a temp dir whose basename is a known valid session name.
+    pub fn spawn_full(
+        db: &TestDb,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> Self {
+        let mut cmd = weave_cmd(db, args);
         for (k, v) in extra_env {
             cmd.env(k, v);
+        }
+        if let Some(d) = cwd {
+            std::fs::create_dir_all(d).ok();
+            cmd.current_dir(d);
         }
         let mut child = cmd
             .stdin(Stdio::piped())
