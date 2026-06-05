@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] — session presence dashboard (`weave sessions --watch`)
+
+> Read-only, **dependency-light** (std-only — no TUI/signal/async crate) and
+> additive: no `Store`-trait, SQL, or schema change. Reuses the existing scan
+> model (`federated_peers` + `is_alive`); both backends are unaffected beyond the
+> shared gate.
+
+### Added
+- **cli:** `weave sessions --watch` renders a live, **read-only** presence
+  dashboard — federated peers grouped by `(repo, branch)`, with a header summary
+  (sessions / alive / #repos / #branches) and `name·worktree·mux·host·alive` rows,
+  truncating a group past 20 rows to `+N more`. It re-renders until Ctrl-C and
+  **writes nothing per tick** (at most one owner-only self-refresh before the loop).
+  Flags: `--interval <secs>` (clamped to `[1, 3600]`, default 2), `--iterations N`
+  (`0` ⇒ loop forever; `N` ⇒ render N frames then exit, for scripting/tests),
+  `--repo`/`--branch` exact-match filters (compose with `--watch`), and
+  `--watch --json` (a single JSON snapshot, no clear-screen). The in-place redraw
+  uses a plain ANSI clear-home gated on a TTY (`std::io::IsTerminal`) and honoring
+  `NO_COLOR` / `WEAVE_NO_CLEAR` with a plain escape-free fallback.
+- **config:** `clamp_watch_interval` + `WATCH_INTERVAL_MIN_SECS` (1) /
+  `WATCH_INTERVAL_MAX_SECS` (3600) — pure, total clamp for the `--watch` interval.
+
 ## [Unreleased] — CI: gate the optional crypto path + the libSQL test suite
 
 ### Changed

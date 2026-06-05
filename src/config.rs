@@ -227,6 +227,25 @@ pub const MIN_TIMEOUT_MS: u64 = 50;
 /// drain hang ~forever. Mirrors the `clamp_limit` input-cap discipline.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// Lower clamp on the `weave sessions --watch` poll interval (seconds). A `0`s
+/// interval would busy-spin the read loop, so a foot-gun `--interval 0` is raised
+/// to this floor. Mirrors the `MIN_TIMEOUT_MS` input-cap discipline.
+pub const WATCH_INTERVAL_MIN_SECS: u64 = 1;
+
+/// Upper clamp on the `weave sessions --watch` poll interval (1 hour): a hostile /
+/// garbage huge value (`--interval 99999999999`) cannot freeze the dashboard for an
+/// absurd span. Mirrors the `MAX_TIMEOUT_MS` ceiling discipline.
+pub const WATCH_INTERVAL_MAX_SECS: u64 = 3_600;
+
+/// Clamp an untrusted `weave sessions --watch` interval (seconds) into
+/// `[WATCH_INTERVAL_MIN_SECS, WATCH_INTERVAL_MAX_SECS]`. Pure; total on any `u64`
+/// (a `0` clamps UP to the floor, an enormous value clamps DOWN to the ceiling) and
+/// idempotent. Mirrors the `parse_clamp_timeout` clamp idiom but takes an already-
+/// parsed `u64` (the clap `--interval` is `u64`), so it never disables the bound.
+pub fn clamp_watch_interval(secs: u64) -> u64 {
+    secs.clamp(WATCH_INTERVAL_MIN_SECS, WATCH_INTERVAL_MAX_SECS)
+}
+
 /// Which timeout tier resolved for a remote source, for token-FREE `doctor`
 /// observability. A pure classification of WHERE the source's effective remote-call
 /// timeout came from. Mirrors [`PullTokenTier`]; carries no secret.
@@ -2413,6 +2432,35 @@ mod tests {
         assert_eq!(parse_clamp_timeout("  250  "), Some(250));
     }
 
+    /// `clamp_watch_interval`: a sane value passes through; `0` clamps UP to the
+    /// floor; an enormous value clamps DOWN to the ceiling; the exact bounds are
+    /// accepted unchanged; clamping is idempotent.
+    #[test]
+    fn clamp_watch_interval_cases() {
+        assert_eq!(clamp_watch_interval(2), 2, "sane value passes through");
+        assert_eq!(
+            clamp_watch_interval(0),
+            WATCH_INTERVAL_MIN_SECS,
+            "0 clamps UP to floor (no busy-spin)"
+        );
+        assert_eq!(
+            clamp_watch_interval(u64::MAX),
+            WATCH_INTERVAL_MAX_SECS,
+            "huge value clamps DOWN to ceiling"
+        );
+        assert_eq!(
+            clamp_watch_interval(WATCH_INTERVAL_MIN_SECS),
+            WATCH_INTERVAL_MIN_SECS
+        );
+        assert_eq!(
+            clamp_watch_interval(WATCH_INTERVAL_MAX_SECS),
+            WATCH_INTERVAL_MAX_SECS
+        );
+        // Idempotent: re-clamping a clamped value is a no-op.
+        let once = clamp_watch_interval(0);
+        assert_eq!(clamp_watch_interval(once), once);
+    }
+
     /// `per_source_timeout` precedence (mirrors `per_source_token`): a sane label-env
     /// wins (tier `PerSourceLabel`); a set-but-garbage label-env falls THROUGH to the
     /// global (tier `Global`); per-source + global both set ⇒ per-source wins; neither
@@ -2633,6 +2681,20 @@ mod tests {
         #[test]
         fn per_source_timeout_is_total_on_arbitrary_label(s in ".*") {
             let _ = per_source_timeout(Some(&s));
+        }
+
+        /// `clamp_watch_interval` is TOTAL on ANY `u64` (incl. 0, the boundary
+        /// values, and `u64::MAX`): it never panics, always lands inside
+        /// `[WATCH_INTERVAL_MIN_SECS, WATCH_INTERVAL_MAX_SECS]`, and is IDEMPOTENT
+        /// (clamping an already-clamped value is a no-op). This is the foot-gun
+        /// guard for the `--watch --interval` flag — a `0` can never busy-spin the
+        /// read loop and a garbage huge value can never freeze the dashboard.
+        #[test]
+        fn clamp_watch_interval_is_total_and_bounded(secs in any::<u64>()) {
+            let c = clamp_watch_interval(secs);
+            prop_assert!(c >= WATCH_INTERVAL_MIN_SECS, "below floor: {c}");
+            prop_assert!(c <= WATCH_INTERVAL_MAX_SECS, "above ceiling: {c}");
+            prop_assert_eq!(clamp_watch_interval(c), c, "clamp must be idempotent");
         }
 
         /// `resolve_store_sources` is IDEMPOTENT under dedup and stable in order:

@@ -488,6 +488,41 @@ Read paths keep `last_seen` warm: `weave peers` and a long-lived `weave watch`
 each refresh presence (heartbeat-on-read, explicit-identity only) so a session
 stays visible even with no message traffic.
 
+### Presence dashboard: `weave sessions --watch`
+
+`weave sessions --watch` re-renders a **read-only** presence view of the
+federated peers — the same scan model (`federated_peers` joined with `is_alive`),
+grouped by `(repo, branch)` — on a fixed interval. The design keeps weave
+dependency-light and the loop testable:
+
+- **Pure render seam.** A single pure function
+  `render_sessions_dashboard(snapshot, opts, now) -> String` does all formatting:
+  no I/O, no clock (the `now` is passed in), no sleep. The impure watch loop only
+  re-reads a snapshot, calls the pure renderer, prints, and sleeps. This mirrors
+  the `commands_for` purity discipline — the renderer is unit-testable from
+  hand-built rows against a fixed `now`, with no store and no terminal.
+- **Std-only loop, no new dependency.** The loop is `std::thread::sleep` between
+  frames; the in-place redraw is a plain ANSI clear-home literal
+  (`\x1b[2J\x1b[H`) gated by `std::io::IsTerminal` on stdout **and** `NO_COLOR` /
+  `WEAVE_NO_CLEAR` being unset (otherwise frames are plain, escape-free text). No
+  TUI / signal / async crate is introduced — termination is the default SIGINT
+  (Ctrl-C), and no raw mode is ever entered, so the terminal cannot be left in a
+  bad state. This deliberately mirrors the existing inbox `watch` loop.
+- **Read-only.** The loop writes **nothing per tick** — observing presence must
+  not perturb it. At most one owner-only self-refresh of the watcher's own row
+  runs *once before* the loop (gated on explicit identity, reusing
+  `register_peer_full` exactly as `scan` does), never per frame.
+- **No store / schema change.** The dashboard consumes already-fetched
+  `PeerView` data through the existing backend-agnostic `federated_peers` +
+  `is_alive`; there is **no** new `Store` method, no SQL, and no `SessionView`
+  change, so both backends are unaffected beyond the shared gate.
+- **Bounded iterations for hermetic tests.** `--iterations N` renders exactly `N`
+  frames then exits (`0` ⇒ loop forever); the sleep happens *between* frames,
+  never after the last, so `--iterations 1` returns immediately. An integration
+  test thus drives a single deterministic frame with no hang and no wall-clock
+  assertion. The poll `--interval` is clamped in `config` to `[1, 3600]`s
+  (`clamp_watch_interval`), reusing the input-cap discipline.
+
 Unread for `me` = messages addressed to `me` or to a broadcast alias, not sent by
 `me`, with no matching `reads` row for `me`. Timestamps are UNIX seconds
 (`model::now()`), formatted to UTC ISO-8601 only at display time
