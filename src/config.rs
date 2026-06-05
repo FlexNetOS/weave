@@ -2267,10 +2267,6 @@ mod tests {
     // Per-source pull tokens (WEAVE_PULL_TOKEN_<LABEL>).
     // ---------------------------------------------------------------------
 
-    /// Serializes the env-mutating per-source-token tests (they set/clear process
-    /// env vars, which is global state) so they cannot race each other.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// `is_valid_label` accepts a non-empty `[A-Za-z0-9_]` string up to
     /// `MAX_LABEL_LEN`, and rejects empty, over-length, and any other charset.
     #[test]
@@ -2349,9 +2345,10 @@ mod tests {
     /// shared token; with neither, `None`. Asserts the paired `PullTokenTier`.
     #[test]
     fn per_source_token_precedence() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let var = "WEAVE_PULL_TOKEN_PSTEST";
-        std::env::remove_var(var);
+        // RAII: capture+clear prior, restored (removed if absent) on drop.
+        let _v = crate::testenv::EnvVarGuard::remove(var);
 
         // Label-env set + sane ⇒ per-source token, tier PerSourceLabel.
         std::env::set_var(var, "per-source-jwt");
@@ -2392,7 +2389,6 @@ mod tests {
         let (tok, tier) = per_source_token(Some("PSTEST"), None);
         assert!(tok.is_none());
         assert_eq!(tier, PullTokenTier::None);
-        std::env::remove_var(var);
     }
 
     /// End-to-end through `resolve_store_sources`: a labelled remote picks up its
@@ -2401,9 +2397,9 @@ mod tests {
     /// one resolve. The redacted `Debug` of the result still leaks neither token.
     #[test]
     fn resolve_store_sources_per_source_and_shared_coexist() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let var = "WEAVE_PULL_TOKEN_PROD";
-        std::env::set_var(var, "prod-only-jwt");
+        let _v = crate::testenv::EnvVarGuard::set(var, "prod-only-jwt");
 
         let cfg = Config {
             pull_token: Some("shared-jwt".to_string()),
@@ -2455,8 +2451,6 @@ mod tests {
         let dbg = format!("{sources:?}");
         assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
         assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
-
-        std::env::remove_var(var);
     }
 
     /// A per-source `WEAVE_PULL_TOKEN_<LABEL>` over the cap / with control chars is
@@ -2464,9 +2458,9 @@ mod tests {
     /// sanitize behavior), end-to-end through `resolve_store_sources`.
     #[test]
     fn resolve_per_source_token_capped_falls_through_to_shared() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let var = "WEAVE_PULL_TOKEN_STAGE";
-        std::env::set_var(var, "x".repeat(MAX_TOKEN_LEN + 1));
+        let _v = crate::testenv::EnvVarGuard::set(var, &"x".repeat(MAX_TOKEN_LEN + 1));
 
         let cfg = Config {
             pull_token: Some("shared-jwt".to_string()),
@@ -2478,7 +2472,6 @@ mod tests {
             matches!(&sources[0], StoreSource::Remote { token, .. } if token.as_deref() == Some("shared-jwt")),
             "over-cap per-source token must fall through to shared: {sources:?}"
         );
-        std::env::remove_var(var);
     }
 
     /// `split_source_list` keeps an inline `LABEL=<remote-url>` fragment OPAQUE: the
@@ -2608,11 +2601,11 @@ mod tests {
     /// set ⇒ `(None, Default)`.
     #[test]
     fn per_source_timeout_precedence() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let label_var = "WEAVE_PULL_TIMEOUT_MS_TOTEST";
         let global_var = "WEAVE_PULL_TIMEOUT_MS";
-        std::env::remove_var(label_var);
-        std::env::remove_var(global_var);
+        let _vl = crate::testenv::EnvVarGuard::remove(label_var);
+        let _vg = crate::testenv::EnvVarGuard::remove(global_var);
 
         // Neither set ⇒ default tier, no resolved value (store applies its default).
         let (ms, tier) = per_source_timeout(Some("TOTEST"));
@@ -2648,8 +2641,6 @@ mod tests {
         let (ms, tier) = per_source_timeout(None);
         assert!(ms.is_none());
         assert_eq!(tier, PullTimeoutTier::Default);
-
-        std::env::remove_var(global_var);
     }
 
     /// End-to-end: `resolve_store_sources_with_tiers` carries the clamped per-source
@@ -2658,11 +2649,11 @@ mod tests {
     /// `Global` tier. The `source_cursor_key`-relevant URL is untouched by the timeout.
     #[test]
     fn resolve_store_sources_carries_per_source_timeout_and_tier() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let label_var = "WEAVE_PULL_TIMEOUT_MS_PROD";
         let global_var = "WEAVE_PULL_TIMEOUT_MS";
-        std::env::set_var(label_var, "250");
-        std::env::set_var(global_var, "1000");
+        let _vl = crate::testenv::EnvVarGuard::set(label_var, "250");
+        let _vg = crate::testenv::EnvVarGuard::set(global_var, "1000");
 
         let cfg = Config {
             pull_from: Some(vec![
@@ -2713,18 +2704,15 @@ mod tests {
         for (ms, _) in &tiers {
             assert!(*ms >= MIN_TIMEOUT_MS && *ms <= MAX_TIMEOUT_MS);
         }
-
-        std::env::remove_var(label_var);
-        std::env::remove_var(global_var);
     }
 
     /// A labelled remote with NO timeout env set resolves to the `Default` tier and the
     /// doctor method substitutes `REMOTE_TIMEOUT_MS_DEFAULT` as the effective ms.
     #[test]
     fn resolve_store_sources_timeout_defaults_when_unset() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_NOENVDB");
+        let _g = crate::testenv::lock_env();
+        let _v1 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS");
+        let _v2 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS_NOENVDB");
 
         let cfg = Config {
             pull_from: Some(vec!["NOENVDB=libsql://h.turso.io".to_string()]),
@@ -2745,9 +2733,9 @@ mod tests {
     /// omitted. NEVER carries a token byte (asserted via the redacting Debug).
     #[test]
     fn pull_from_remote_token_tiers_resolves_symmetrically() {
-        let _g = ENV_GUARD.lock().unwrap();
+        let _g = crate::testenv::lock_env();
         let var = "WEAVE_PULL_TOKEN_PROD";
-        std::env::set_var(var, "prod-only-jwt");
+        let _v = crate::testenv::EnvVarGuard::set(var, "prod-only-jwt");
 
         let cfg = Config {
             pull_token: Some("shared-jwt".to_string()),
@@ -2789,8 +2777,6 @@ mod tests {
         let dbg = format!("{pull:?}");
         assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
         assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
-
-        std::env::remove_var(var);
     }
 
     /// `federation_health` aggregates correct symmetric counts/tiers for a configured
@@ -2800,10 +2786,10 @@ mod tests {
     /// (pure config/env resolution). NEVER carries a token byte.
     #[test]
     fn federation_health_aggregates_mixed_set() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::set_var("WEAVE_PULL_TOKEN_PROD", "prod-only-jwt");
-        std::env::set_var("WEAVE_PULL_TIMEOUT_MS_PROD", "250");
-        std::env::set_var("WEAVE_PULL_TIMEOUT_MS", "1000");
+        let _g = crate::testenv::lock_env();
+        let _v1 = crate::testenv::EnvVarGuard::set("WEAVE_PULL_TOKEN_PROD", "prod-only-jwt");
+        let _v2 = crate::testenv::EnvVarGuard::set("WEAVE_PULL_TIMEOUT_MS_PROD", "250");
+        let _v3 = crate::testenv::EnvVarGuard::set("WEAVE_PULL_TIMEOUT_MS", "1000");
 
         let mix = vec![
             "PROD=libsql://prod.invalid".to_string(), // per-source token + per-source timeout
@@ -2844,10 +2830,6 @@ mod tests {
         let dbg = format!("{health:?}");
         assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
         assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
-
-        std::env::remove_var("WEAVE_PULL_TOKEN_PROD");
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_PROD");
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
     }
 
     /// `federation_health` over an empty / local-only config yields zeroed counts and
@@ -2855,8 +2837,8 @@ mod tests {
     /// misleading `0-0` ms range.
     #[test]
     fn federation_health_empty_and_local_only() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+        let _g = crate::testenv::lock_env();
+        let _v = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS");
 
         // Fully empty.
         let empty = Config::default().federation_health();
@@ -2881,9 +2863,9 @@ mod tests {
     /// global env) and reports `REMOTE_TIMEOUT_MS_DEFAULT` as the effective ms bound.
     #[test]
     fn federation_health_default_timeout_tier() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
-        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_DFLT");
+        let _g = crate::testenv::lock_env();
+        let _v1 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS");
+        let _v2 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS_DFLT");
 
         let cfg = Config {
             pull_from: Some(vec!["DFLT=libsql://d.invalid".to_string()]),
@@ -3012,9 +2994,9 @@ mod tests {
             // resolutions below — or mid-resolution across entries — making the
             // `first == second` stability assertion flaky under load. The dedup
             // property under test is independent of the timeout value.
-            let _g = ENV_GUARD.lock().unwrap();
-            std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
-            std::env::remove_var("WEAVE_PULL_TOKEN");
+            let _g = crate::testenv::lock_env();
+            let _v1 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TIMEOUT_MS");
+            let _v2 = crate::testenv::EnvVarGuard::remove("WEAVE_PULL_TOKEN");
             // Build a list with each host twice (plain + trailing slash) to force
             // dedup; first-seen order must be the de-duplicated host order.
             let mut raw: Vec<String> = Vec::new();

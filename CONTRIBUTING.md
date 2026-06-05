@@ -91,6 +91,11 @@ formatter reports no diff, and all tests pass.
   matters, a test asserting absence from the default shippable graph).
 - Prefer pure, unit-testable functions (like `commands_for`) over functions that
   both compute and perform I/O.
+- **Serialize env in unit tests.** A unit test that reads or writes a `WEAVE_*`
+  (or any process-global) env var MUST acquire `crate::testenv::lock_env()` and
+  mutate via `EnvVarGuard` — the test runner is multithreaded, so unguarded
+  `set_var`/`remove_var` on `WEAVE_*` races. Integration/security/prop tests are
+  exempt (separate process, scrubbed env). See [docs/TESTING.md](docs/TESTING.md) §1.
 
 ## Adding a new mux adapter
 

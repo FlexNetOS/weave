@@ -43,6 +43,8 @@ mod sign;
 mod store;
 #[cfg(feature = "libsql")]
 mod store_libsql;
+#[cfg(test)]
+mod testenv;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

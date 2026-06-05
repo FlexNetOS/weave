@@ -1357,15 +1357,14 @@ mod tests {
     /// binary, no process-global resolution that could race other parallel tests.
     #[test]
     fn weave_mux_dir_precedes_system_dirs() {
-        // Keep the env mutation local to this test body and restore the prior
-        // value afterward so we don't leak state to other tests.
-        let prev = std::env::var_os("WEAVE_MUX_DIR");
-        std::env::set_var("WEAVE_MUX_DIR", "/tmp/weave-fake-mux");
+        // Serialize on the ONE canonical env lock so this WEAVE_MUX_DIR mutation
+        // mutually excludes with every other WEAVE_*-touching unit test (config's
+        // token/timeout tests, the concurrency stress test, and any reader of
+        // trusted_dirs()). The EnvVarGuard restores the prior value (or removes it
+        // if it was absent) on drop — even on panic — so no state leaks.
+        let _g = crate::testenv::lock_env();
+        let _v = crate::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", "/tmp/weave-fake-mux");
         let dirs = trusted_dirs();
-        match prev {
-            Some(v) => std::env::set_var("WEAVE_MUX_DIR", v),
-            None => std::env::remove_var("WEAVE_MUX_DIR"),
-        }
 
         let opt_in = std::path::Path::new("/tmp/weave-fake-mux");
         let usr_bin = std::path::Path::new("/usr/bin");
@@ -1487,5 +1486,40 @@ mod tests {
         assert!(id_present(Mux::Kitty, "window 7 active", "7"));
         // The id as a bare substring of a longer token must still not match.
         assert!(!id_present(Mux::Kitty, "window 77 active", "7"));
+    }
+
+    /// Proof that the canonical env guard serializes concurrent `WEAVE_MUX_DIR`
+    /// mutation against `trusted_dirs()` reads. N threads × K iterations each take
+    /// `crate::testenv::lock_env()`, set a UNIQUE `WEAVE_MUX_DIR` via `EnvVarGuard`,
+    /// then assert the dir they just set is the FIRST entry of `trusted_dirs()`. With
+    /// the unified lock every critical section is exclusive, so the read always sees
+    /// the writer's own value; without it, another thread's set/remove could
+    /// interleave and the assertion would observe the wrong (or no) leading dir —
+    /// the exact `set_var`/`getenv` data race #10 removes. Iteration-count bounded
+    /// (no wall-clock) per the anti-flake rule.
+    #[test]
+    fn env_guard_serializes_concurrent_weave_mux_dir() {
+        const THREADS: usize = 8;
+        const ITERS: usize = 200;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..ITERS {
+                        let unique = format!("/tmp/weave-stress-{t}-{i}");
+                        let _g = crate::testenv::lock_env();
+                        let _v = crate::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", &unique);
+                        let dirs = trusted_dirs();
+                        assert_eq!(
+                            dirs.first().map(|p| p.as_path()),
+                            Some(std::path::Path::new(&unique)),
+                            "under the guard, the just-set WEAVE_MUX_DIR must lead trusted_dirs()"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("stress worker thread panicked");
+        }
     }
 }

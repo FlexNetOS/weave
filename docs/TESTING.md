@@ -179,6 +179,40 @@ fastest layer and carry most of the injector and store coverage.
   look-alikes (`myweave …`, `weave mcp`, an un-installed event), so
   `setup`/`uninstall` only touch weave's own `settings.json` entries.
 
+### Test env hygiene — the canonical `WEAVE_*` env guard
+
+`std::env::set_var` / `remove_var` mutate **process-global** state, and cargo
+runs the unit-test layer **multithreaded** — so any two in-process tests that
+touch overlapping `WEAVE_*` vars (one writing while another reads, e.g.
+`inject::trusted_dirs` reading `WEAVE_MUX_DIR`) race without a shared lock. The
+crate carries **one** canonical serialization guard for this:
+
+- **`crate::testenv`** (`src/testenv.rs`, `#[cfg(test)]`, std-only) — a leaf
+  test-support module reachable as `crate::testenv` from every module's
+  `#[cfg(test)]` block. It is **not** compiled into the shippable binary.
+  - **`lock_env() -> MutexGuard<'static, ()>`** — a poison-tolerant
+    `OnceLock<Mutex<()>>` accessor; **all** `WEAVE_*`-touching unit tests
+    serialize on this one lock. Poison tolerance means a panicking test surfaces
+    as its own failure instead of deadlocking the rest of the suite.
+  - **`EnvVarGuard`** — RAII set/remove that records the prior value on
+    construction and **restores the exact prior state on Drop** (sets it back, or
+    removes it if it was absent), even on panic — so no test leaks env into
+    another. Hold `lock_env()` for the guard's whole lifetime: the lock provides
+    exclusion, the guard provides restoration.
+
+> **Contributor invariant:** every unit test that **reads or writes a `WEAVE_*`**
+> (or any process-global env var) MUST `let _g = crate::testenv::lock_env();` as
+> its first statement and mutate via `crate::testenv::EnvVarGuard` — never call
+> `set_var`/`remove_var` on a `WEAVE_*` var in a unit test without the lock.
+> Integration / security / property tests do **not** need it: they spawn the
+> compiled binary as a separate process with a scrubbed env (§2), so they are
+> already process-isolated.
+
+The serialization is proven by `env_guard_serializes_concurrent_weave_mux_dir`
+(8 threads × 200 iterations, each `lock_env()` + `EnvVarGuard::set` + a
+`trusted_dirs()` read), plus `testenv`'s own RAII restore/remove self-tests. The
+count is **iteration-bounded, never wall-clock** (the anti-flake rule).
+
 ## 2. Integration tests — black-box binary (`tests/integration.rs`)
 
 Everything here drives the **built** binary through `std::process::Command`; the
@@ -681,7 +715,8 @@ hermetically — never a real network bound:
   the exact bounds pass through) plus a **proptest** that it is total on arbitrary input
   and any `Some(n)` is within `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`. `per_source_timeout`
   precedence (per-source label-env wins; set-but-garbage falls through to the global;
-  global-only → `Global`; neither → `(None, Default)`), serialized via the env guard.
+  global-only → `Global`; neither → `(None, Default)`), serialized via the canonical
+  `crate::testenv::lock_env()` guard (§1).
   `resolve_store_sources_with_tiers` carries the clamped `timeout_ms` onto
   `StoreSource::Remote` and returns the `PerSourceLabel` / `Global` timeout tier, and
   the default-tier doctor method substitutes `REMOTE_TIMEOUT_MS_DEFAULT`.
@@ -759,6 +794,12 @@ done:
    path hermetically over fixtures / a crafted temp `.git` and gate any real-binary
    assertion on a trusted-path probe (`inject::have` / `inject::resolve_trusted`)
    so the suite passes with the binary absent (see §5).
+   - **Reads or writes a `WEAVE_*` (or any process-global) env var → serialize on
+     `crate::testenv`** (§1): `let _g = crate::testenv::lock_env();` first, then
+     mutate via `EnvVarGuard` so the value restores even on panic. Never call
+     `set_var`/`remove_var` on a `WEAVE_*` var in a unit test without the lock —
+     the multithreaded runner will otherwise race. (Integration/security/prop
+     tests are exempt — separate process, scrubbed env.)
 2. **New CLI subcommand / flag → an integration test** in `tests/integration.rs`
    using the `tests/common` helpers (`run_ok`, `run`, `run_hook`,
    `run_stdin_full`). If it has machine-readable output, assert the `--json`
