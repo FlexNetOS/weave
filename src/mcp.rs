@@ -4,13 +4,13 @@
 //!
 //! stdout is reserved for protocol messages; all logging goes to stderr.
 
+use crate::config::StoreSource;
 use crate::inject::{self, Nudge, Target};
 use crate::model::{self, fmt_ts};
 use crate::store::{self, is_alive, Store};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 
 const SERVER_NAME: &str = "weave";
 const SERVER_VERSION: &str = "0.1.0";
@@ -41,14 +41,15 @@ pub fn log(msg: &str) {
 /// pane. This keeps the full `Config` out of `mcp` (the deliberate non-plumbing
 /// noted below) while still letting the drain gate the nudge correctly.
 pub struct PullConsent {
-    /// Validated `pull_from` source paths (the delivery allow-list).
-    pub from: Vec<PathBuf>,
+    /// Validated `pull_from` sources (the delivery allow-list): local store paths
+    /// AND remote libSQL/Turso URLs (Tier-2 v2).
+    pub from: Vec<StoreSource>,
     /// Decision-5 master toggle (default true): fire the consent nudge on a
     /// pulled message from an allow-listed source. `false` ⇒ pure queue-only.
     pub inject_pulled: bool,
     /// Optional finer gate; `None` ⇒ "same as `from`" (every pull source is
     /// inject-eligible). When `Some`, only listed sources trigger the nudge.
-    pub allow_inject_from: Option<Vec<PathBuf>>,
+    pub allow_inject_from: Option<Vec<StoreSource>>,
     /// Tier-2 signed-identity strictness (2d, `Config::strict_verify`): when true an
     /// unsigned/unverifiable pulled intent is dropped rather than committed under the
     /// advisory model. Forwarded to `pull_from_store`; inert without the `sign`
@@ -57,19 +58,35 @@ pub struct PullConsent {
 }
 
 impl PullConsent {
-    /// Is `source` (an `allow`-listed pull path) permitted to trigger the consent
-    /// nudge? Mirrors `Config::inject_allowed_from`: unset gate ⇒ every source is
-    /// eligible; set gate ⇒ canonical-aware membership in the subset.
-    fn inject_allowed_from(&self, source: &std::path::Path) -> bool {
+    /// Is `source` (an `allow`-listed pull source) permitted to trigger the consent
+    /// nudge? Mirrors `Config::inject_allowed_from_source`: unset gate ⇒ every source
+    /// is eligible; set gate ⇒ a Local matches by canonical path, a Remote matches by
+    /// trailing-slash-normalized URL (never cross-kind).
+    fn inject_allowed_from(&self, source: &StoreSource) -> bool {
         let allow = match &self.allow_inject_from {
             None => return true,
             Some(list) => list,
         };
-        let key = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
-        allow.iter().any(|p| {
-            let pk = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            pk == key
-        })
+        match source {
+            StoreSource::Local(p) => {
+                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                allow.iter().any(|a| match a {
+                    StoreSource::Local(ap) => {
+                        std::fs::canonicalize(ap).unwrap_or_else(|_| ap.clone()) == key
+                    }
+                    StoreSource::Remote { .. } => false,
+                })
+            }
+            StoreSource::Remote { url, .. } => {
+                let key = url.strip_suffix('/').unwrap_or(url);
+                allow.iter().any(|a| match a {
+                    StoreSource::Remote { url: au, .. } => {
+                        au.strip_suffix('/').unwrap_or(au) == key
+                    }
+                    StoreSource::Local(_) => false,
+                })
+            }
+        }
     }
 }
 
@@ -101,7 +118,7 @@ pub fn run(
     store: &dyn Store,
     me_default: Option<String>,
     nudge_template: Option<&str>,
-    extra_dbs: Vec<PathBuf>,
+    extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
 ) -> Result<()> {
     log(&format!(
@@ -222,7 +239,7 @@ fn handle(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
-    extra_dbs: &[PathBuf],
+    extra_dbs: &[StoreSource],
     pull: &PullConsent,
     req: &Value,
 ) -> Option<String> {
@@ -298,7 +315,7 @@ fn call_tool(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
-    extra_dbs: &[PathBuf],
+    extra_dbs: &[StoreSource],
     pull: &PullConsent,
     name: &str,
     args: &Value,
@@ -561,7 +578,12 @@ fn tool_inbox(
 /// Falls back silently to queue-only when this session's pane is not injectable
 /// (`mux=none`) or not alive. Best-effort: any failure is logged to STDERR (never
 /// stdout, which carries only JSON-RPC frames) and never breaks the drain.
-fn nudge_pulled(store: &dyn Store, pull: &PullConsent, me: &str, committed_sources: &[PathBuf]) {
+fn nudge_pulled(
+    store: &dyn Store,
+    pull: &PullConsent,
+    me: &str,
+    committed_sources: &[StoreSource],
+) {
     if !pull.inject_pulled {
         return;
     }
@@ -631,7 +653,7 @@ fn tool_history(store: &dyn Store, def: &Option<String>, args: &Value) -> Result
 fn tool_sessions(
     store: &dyn Store,
     def: &Option<String>,
-    extra_dbs: &[PathBuf],
+    extra_dbs: &[StoreSource],
     _args: &Value,
 ) -> Result<String, String> {
     let me = def.clone().unwrap_or_default();
@@ -689,7 +711,7 @@ fn tool_clear(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
     Ok(format!("Marked {n} message(s) read for '{me}'."))
 }
 
-fn tool_peers(store: &dyn Store, extra_dbs: &[PathBuf]) -> Result<String, String> {
+fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, String> {
     // Tier-1 federation: union local peers with read-only extra stores,
     // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
     let views = store::federated_peers(store, extra_dbs).map_err(e)?;
@@ -843,7 +865,7 @@ fn tool_receipts(store: &dyn Store, args: &Value) -> Result<String, String> {
 /// into the MCP server (it only receives the live `Store`). We surface every
 /// diagnostic reachable from the store + current process environment; for the
 /// db/config file locations, run the `weave doctor` CLI.
-fn tool_doctor(store: &dyn Store, extra_dbs: &[PathBuf]) -> Result<String, String> {
+fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, String> {
     let target = inject::detect_target();
     // Tier-1 federation: report the union peer count (local + read-only extras).
     let views = store::federated_peers(store, extra_dbs).map_err(e)?;
@@ -882,6 +904,15 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[PathBuf]) -> Result<String, Strin
             "\n  federation:     {} extra store(s) ({fed_ok} ok, {fed_skipped} skipped)",
             extra_dbs.len()
         ));
+        let remote_count = extra_dbs.iter().filter(|s| s.is_remote()).count();
+        if remote_count > 0 {
+            out.push_str(&format!("\n  remote sources: {remote_count} configured"));
+            if !cfg!(feature = "libsql") {
+                out.push_str(&format!(
+                    "\n  note: {remote_count} remote source(s) skipped — rebuild weave with --features libsql to use them"
+                ));
+            }
+        }
     }
     out.push_str("\n  (db/config paths: run `weave doctor` on the CLI)");
     // FR6: warn when the resolved store is NOT the well-known XDG default — the most

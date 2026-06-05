@@ -498,7 +498,15 @@ injected and stored text is handled**, not on network attackers.
   (the storage engine rejects any write to the read-only handle), proven by a
   byte-unchanged-source test on both backends. It is what keeps "identity is
   advisory" acceptable across stores: store A cannot mutate store B, so the only
-  thing cross-store carries is data B chooses to pull and commit itself.
+  thing cross-store carries is data B chooses to pull and commit itself. This now
+  holds **cross-machine**: a remote `libsql`/Turso source (Tier-2 v2, §10) is opened
+  read-only too (SELECT-only + write-guard `bail!` + no schema/migrate), so weave
+  never writes a remote source. libSQL 0.9.30 has no client-side read-only handle, so
+  the recommended deployment contract is a server-enforced read-only Turso token
+  (defense-in-depth); weave's own enforcement stands regardless. The remote auth token
+  is secret — capped, control-char-rejected, redacted in `Debug`, and never logged,
+  injected, or argv'd. The default (sqlite) build refuses remote sources outright with
+  a loud stderr note.
 - **Signed sender identity is optional (Tier-2, `sign` feature).** By default
   cross-store `from` is advisory, exactly like a same-store send. A `--features
   sign` build (Ed25519, §10) makes a signed `from` unforgeable and **always**
@@ -618,6 +626,47 @@ intent** — a **bounded, single-intent at-least-once** guarantee, not whole-bat
 replay. A misaddressed or malformed intent is skipped and the cursor still advances
 past it, so one poison row cannot wedge a source. Each drain is bounded to
 `MAX_PULL_PER_DRAIN` intents per source (DoS guard).
+
+### Remote sources — cross-machine pull (Tier-2 v2)
+
+A delivery / federation source need not be a local file. A `StoreSource` (defined in
+`config`, below `store`/`main` in the DAG) is either `Local(PathBuf)` or
+`Remote { url, token }`, classified by URL scheme (`classify_source`:
+`libsql://`/`https://`/`wss://` ⇒ remote, else a local path). Source lists split
+**comma-first** (`split_source_list`) so a remote URL is kept whole; the platform
+`:`/`;` split still applies only to local fragments. The remote auth token comes from
+`pull_token` / `WEAVE_PULL_TOKEN`.
+
+- **Read-only enforcement, now cross-machine.** A remote source is opened with
+  `LibsqlStore::open_readonly_remote` (`Builder::new_remote(url, token)`), which sets
+  `read_only = true`, runs **no schema/migration/hardening**, and creates no local
+  file (a pure `new_remote` connection has no path). The foreign handle is touched
+  SELECT-only (`list_peers`/`sessions`/`list_outbox`), every write method hard-traps
+  via `guard_writable()` (a `bail!`, not a debug-only assert), and commits land in the
+  local owned store with a local per-source cursor advance. The owner-only-writes
+  invariant (§7) therefore holds across machines, not just across local files.
+- **libSQL 0.9.30 has no client-side read-only handle** — read-only for a pure remote
+  connection is a server-side (Turso auth-token scope) property only. The recommended
+  deployment contract is a **server-enforced read-only token**
+  (`turso db tokens create <db> --read-only`), validated by the server regardless of
+  client behavior. weave **cannot mint or introspect** that scope; its own SELECT-only
+  + write-guard + commit-local enforcement stands independently as defense-in-depth.
+- **Default-backend (sqlite) loud rejection.** The default build has no libsql client,
+  so its `store` free functions skip every `Remote` source with a loud stderr note
+  (`reject_remote_source`, scheme+host only via `remote_scheme_host`) and count it as
+  unsupported (`weave doctor` surfaces `federation_remote_unsupported`). Remote
+  sources require a `--features libsql` build.
+- **Token hygiene.** The token is capped at `MAX_TOKEN_LEN` (8192) with control chars
+  rejected (`sanitize_token`), redacted to `<redacted>` by the manual `Debug` on
+  `StoreSource::Remote` and on `Config`, and reaches **only** `Builder::new_remote` —
+  never a log line, never an argv, never interpolated into SQL or a command string.
+- **Network-failure handling.** libSQL exposes no client timeout knob for a remote
+  connection, so each remote `block_on` is bounded by `tokio::time::timeout` (the
+  `time` tokio sub-feature, gated behind the existing `libsql` feature — the default
+  build gains nothing). A connect/query/timeout error is just another **per-source
+  skip** (the existing failure-isolation path: note on stderr, continue), and because
+  commits land local-only with a per-intent local cursor advance, the bounded
+  single-intent at-least-once / one-intent-per-crash guarantee is preserved unchanged.
 
 ### Consent nudge on a pulled message — DEFAULT ON
 

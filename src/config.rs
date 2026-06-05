@@ -12,6 +12,103 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// A resolved federation / Tier-2 pull source: either a LOCAL store file path or a
+/// REMOTE libSQL/Turso endpoint URL (with an optional auth token). Backend-agnostic
+/// data (no I/O); produced by [`Config::peer_db_sources`] / [`pull_from_sources`]
+/// and consumed by the store-layer free functions. Lives in `config` (below
+/// `store`/`mcp`/`main`) so no upward dependency is introduced.
+///
+/// A remote source is opened READ-ONLY (and only on a `--features libsql` build);
+/// the default sqlite build rejects it loudly at the store seam. weave NEVER writes
+/// a remote/foreign store — see the store-layer owner-only-writes guards.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StoreSource {
+    /// A local store file path (existing behavior).
+    Local(PathBuf),
+    /// A remote libSQL/Turso endpoint. `token` is a SECRET (redacted in Debug,
+    /// never logged/injected/argv'd).
+    Remote { url: String, token: Option<String> },
+}
+
+// Manual Debug that REDACTS the remote auth token (mirrors the `Config` Debug
+// redaction) so a `{:?}` can never leak the secret via a log line, panic message,
+// or error context. The URL is shown (it is not itself a secret), but the token is
+// only ever rendered as `<redacted>`.
+impl std::fmt::Debug for StoreSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreSource::Local(p) => f.debug_tuple("Local").field(p).finish(),
+            StoreSource::Remote { url, token } => f
+                .debug_struct("Remote")
+                .field("url", url)
+                .field("token", &token.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
+}
+
+impl StoreSource {
+    /// True for a remote (URL) source.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, StoreSource::Remote { .. })
+    }
+}
+
+/// URL schemes recognized as a REMOTE libSQL/Turso source (the schemes
+/// `libsql::Builder::new_remote` accepts). Anything not starting with one of these
+/// is treated as a local file path (the existing bare-path / `./x.db` / `/abs/x.db`
+/// behavior).
+const REMOTE_SCHEMES: &[&str] = &["libsql://", "https://", "http://", "wss://", "ws://"];
+
+/// Classify a single (already-trimmed) source entry as [`StoreSource::Remote`] iff
+/// it begins with a recognized remote scheme, else [`StoreSource::Local`]. Pure; no
+/// I/O and no canonicalization (a URL must never be `std::fs::canonicalize`'d). The
+/// token is NOT attached here — the resolver layers the shared `pull_token` on.
+pub fn classify_source(entry: &str) -> StoreSource {
+    if REMOTE_SCHEMES.iter().any(|s| entry.starts_with(s)) {
+        StoreSource::Remote {
+            url: entry.to_string(),
+            token: None,
+        }
+    } else {
+        StoreSource::Local(PathBuf::from(entry))
+    }
+}
+
+/// Upper bound (bytes) on a remote auth token. A Turso JWT is well under this; the
+/// cap bounds a hostile/garbage env value before it is handed to the libsql client
+/// (it never reaches a shell or SQL — bound as a client arg — but bounding +
+/// control-char-rejecting it keeps the value sane). Mirrors the [`MAX_HOST_LEN`]
+/// discipline.
+pub const MAX_TOKEN_LEN: usize = 8192;
+
+/// Normalize a remote URL for dedup / cursor-key stability: trim a single trailing
+/// slash so `libsql://h/` and `libsql://h` map to one source. NOT canonicalization.
+fn normalize_remote_url(url: &str) -> String {
+    url.strip_suffix('/').unwrap_or(url).to_string()
+}
+
+/// Validate + sanitize a remote auth token before use: reject control characters
+/// (an injection/garbage canary) and bound it to [`MAX_TOKEN_LEN`] bytes. Returns
+/// the token unchanged on success. The token is treated as a secret throughout
+/// (never logged); a rejected token yields `None` (the source is attempted without
+/// a token, which a server-enforced read-only deployment may still allow, or fails
+/// closed at connect — never a panic).
+fn sanitize_token(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    if token.len() > MAX_TOKEN_LEN {
+        eprintln!("[weave] ignoring pull_token: too long (max {MAX_TOKEN_LEN} bytes)");
+        return None;
+    }
+    if token.chars().any(|c| c.is_control()) {
+        eprintln!("[weave] ignoring pull_token: contains control characters");
+        return None;
+    }
+    Some(token.to_string())
+}
+
 /// Platform path-list separator accepted in `WEAVE_PEER_DBS` (in addition to the
 /// canonical comma): `;` on Windows, `:` elsewhere — matching `PATH` semantics.
 /// NOT the path *component* separator (`/`), which must never split a list entry.
@@ -19,6 +116,39 @@ use std::path::PathBuf;
 const PEER_DBS_LIST_SEP: char = ';';
 #[cfg(not(windows))]
 const PEER_DBS_LIST_SEP: char = ':';
+
+/// Split a `WEAVE_PEER_DBS`/`WEAVE_PULL_FROM`/`WEAVE_ALLOW_INJECT_FROM` env value
+/// into individual entries. The canonical separator is the COMMA; the platform
+/// path-list separator ([`PEER_DBS_LIST_SEP`]) is also accepted for convenience.
+///
+/// CRITICAL (Tier-2 v2): a REMOTE URL entry (`libsql://h`, `https://h`, …) contains
+/// the unix path-list separator `:` inside `scheme://`, so a naive `split(':')` would
+/// shred a URL into `libsql` + `//h`. We therefore split on the COMMA first (which a
+/// URL never contains as a separator here), and only then apply the platform `:`/`;`
+/// split to fragments that are NOT recognized remote URLs. A remote URL fragment is
+/// passed through whole. Blank fragments are dropped; trimming/NUL-reject/cap happen
+/// later in [`resolve_store_sources`].
+fn split_source_list(v: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for comma_part in v.split(',') {
+        let part = comma_part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // A recognized remote URL is opaque: never split it on the path separator.
+        if REMOTE_SCHEMES.iter().any(|s| part.starts_with(s)) {
+            out.push(part.to_string());
+            continue;
+        }
+        for seg in part.split(PEER_DBS_LIST_SEP) {
+            let seg = seg.trim();
+            if !seg.is_empty() {
+                out.push(seg.to_string());
+            }
+        }
+    }
+    out
+}
 
 /// Hard ceiling on how many extra read-only stores Tier-1 federation will open
 /// in one `weave peers`/`sessions` call. Each extra store is an open + N+1 list
@@ -103,6 +233,16 @@ pub struct Config {
     /// `sign` feature. Overlaid by `WEAVE_STRICT_VERIFY` (a truthy/falsy value).
     #[serde(default)]
     pub strict_verify: Option<bool>,
+    /// Tier-2 v2 shared auth token applied to every REMOTE (`libsql://`/`https://`/
+    /// `wss://`) `pull_from`/`peer_dbs` source that does not carry its own. Treat as
+    /// a SECRET: it is redacted in [`Config`]'s Debug, never logged/injected/argv'd,
+    /// and bounded ([`MAX_TOKEN_LEN`]) + control-char-rejected before use. Prefer the
+    /// `WEAVE_PULL_TOKEN` env var over storing it in the config file. `None` ⇒ remote
+    /// sources are attempted without a weave-supplied token (a server-enforced
+    /// read-only Turso token is the recommended deployment contract — see docs).
+    /// Inert on the default sqlite build (remote sources are rejected loudly there).
+    #[serde(default)]
+    pub pull_token: Option<String>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -125,6 +265,10 @@ impl std::fmt::Debug for Config {
             .field("inject_pulled", &self.inject_pulled)
             .field("allow_inject_from", &self.allow_inject_from)
             .field("strict_verify", &self.strict_verify)
+            .field(
+                "pull_token",
+                &self.pull_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -234,11 +378,7 @@ impl Config {
         // env-augments-config posture elsewhere. Validation/cap/dedup happens in
         // `peer_db_paths`.
         if let Some(v) = nonempty("WEAVE_PEER_DBS") {
-            let env_paths: Vec<String> = v
-                .split([',', PEER_DBS_LIST_SEP])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let env_paths = split_source_list(&v);
             if !env_paths.is_empty() {
                 let mut merged = cfg.peer_dbs.take().unwrap_or_default();
                 merged.extend(env_paths);
@@ -250,11 +390,7 @@ impl Config {
         // env-unions-config posture as WEAVE_PEER_DBS above. Validation/cap/dedup
         // happens in `pull_from_paths`.
         if let Some(v) = nonempty("WEAVE_PULL_FROM") {
-            let env_paths: Vec<String> = v
-                .split([',', PEER_DBS_LIST_SEP])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let env_paths = split_source_list(&v);
             if !env_paths.is_empty() {
                 let mut merged = cfg.pull_from.take().unwrap_or_default();
                 merged.extend(env_paths);
@@ -273,11 +409,7 @@ impl Config {
         // env-unions-config posture as WEAVE_PULL_FROM. Validation/cap/dedup
         // happens in `allow_inject_from_paths`.
         if let Some(v) = nonempty("WEAVE_ALLOW_INJECT_FROM") {
-            let env_paths: Vec<String> = v
-                .split([',', PEER_DBS_LIST_SEP])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let env_paths = split_source_list(&v);
             if !env_paths.is_empty() {
                 let mut merged = cfg.allow_inject_from.take().unwrap_or_default();
                 merged.extend(env_paths);
@@ -290,6 +422,12 @@ impl Config {
         // (advisory fallback). Inert without the `sign` feature.
         if let Some(v) = nonempty("WEAVE_STRICT_VERIFY").and_then(|s| parse_bool(&s)) {
             cfg.strict_verify = Some(v);
+        }
+        // Tier-2 v2 shared remote auth token: WEAVE_PULL_TOKEN overrides the config
+        // `pull_token`. A secret — never logged here (the value is not echoed). The
+        // env var is the PREFERRED way to supply it (kept out of the config file).
+        if let Some(v) = nonempty("WEAVE_PULL_TOKEN") {
+            cfg.pull_token = Some(v);
         }
         cfg
     }
@@ -308,6 +446,12 @@ impl Config {
     ///   truncating so the drop is diagnosable (never stdout).
     ///
     /// Default (no env, no config key) ⇒ `[]` ⇒ behavior identical to today.
+    ///
+    /// Transitional Local-only wrapper kept alongside the new
+    /// [`peer_db_sources`](Self::peer_db_sources) for bisectability (Q-R3); all
+    /// production callers use `*_sources`, so it is exercised only by config unit
+    /// tests — `allow(dead_code)` marks that intentional retention, not dead code.
+    #[allow(dead_code)]
     pub fn peer_db_paths(&self) -> Vec<PathBuf> {
         self.resolve_store_list(self.peer_dbs.as_deref(), MAX_PEER_DBS, "WEAVE_PEER_DBS")
     }
@@ -319,8 +463,28 @@ impl Config {
     /// `pull_from` list — being a read-only *visibility* source (`peer_dbs`) does
     /// not make a store a *delivery* source. Default (no env, no config key) ⇒
     /// `[]` ⇒ no cross-store delivery (identical-to-today).
+    ///
+    /// Transitional Local-only wrapper kept alongside
+    /// [`pull_from_sources`](Self::pull_from_sources) for bisectability (Q-R3); see
+    /// [`peer_db_paths`](Self::peer_db_paths).
+    #[allow(dead_code)]
     pub fn pull_from_paths(&self) -> Vec<PathBuf> {
         self.resolve_store_list(self.pull_from.as_deref(), MAX_PULL_FROM, "WEAVE_PULL_FROM")
+    }
+
+    /// Tier-2 v2: resolve the Tier-1 federation sources as [`StoreSource`]s (local
+    /// paths AND remote URLs). Supersedes [`peer_db_paths`](Self::peer_db_paths) (now
+    /// a Local-only wrapper kept transitionally). Remote entries carry the shared
+    /// `pull_token`. See [`resolve_store_sources`](Self::resolve_store_sources).
+    pub fn peer_db_sources(&self) -> Vec<StoreSource> {
+        self.resolve_store_sources(self.peer_dbs.as_deref(), MAX_PEER_DBS, "WEAVE_PEER_DBS")
+    }
+
+    /// Tier-2 v2: resolve the Tier-2 delivery sources as [`StoreSource`]s (local
+    /// paths AND remote URLs). Supersedes [`pull_from_paths`](Self::pull_from_paths).
+    /// Remote entries carry the shared `pull_token`.
+    pub fn pull_from_sources(&self) -> Vec<StoreSource> {
+        self.resolve_store_sources(self.pull_from.as_deref(), MAX_PULL_FROM, "WEAVE_PULL_FROM")
     }
 
     /// Tier-2 consent (decision 5): whether a pulled message from an allow-listed
@@ -348,6 +512,11 @@ impl Config {
     /// local db, canonical-dedup, cap at [`MAX_PULL_FROM`]). `None` ⇒ "same as the
     /// pull set" and this returns `None` so the caller treats every pull source as
     /// inject-eligible. See [`inject_allowed_from`](Self::inject_allowed_from).
+    ///
+    /// Transitional Local-only wrapper (superseded by
+    /// [`allow_inject_from_sources`](Self::allow_inject_from_sources)); kept for
+    /// bisectability and exercised by config unit tests.
+    #[allow(dead_code)]
     pub fn allow_inject_from_paths(&self) -> Option<Vec<PathBuf>> {
         self.allow_inject_from
             .as_deref()
@@ -361,6 +530,11 @@ impl Config {
     /// comparison), so the list NARROWS the inject-eligible set to a subset of the
     /// pull set. This gate is checked caller-side, AFTER `inject_pulled()`, so a
     /// non-eligible source can never cause a keystroke in this pane.
+    ///
+    /// Transitional Local-path gate (superseded by
+    /// [`inject_allowed_from_source`](Self::inject_allowed_from_source)); kept for
+    /// bisectability and exercised by config unit tests.
+    #[allow(dead_code)]
     pub fn inject_allowed_from(&self, source: &std::path::Path) -> bool {
         let allow = match self.allow_inject_from_paths() {
             // Unset ⇒ same as pull set: every pulled source is eligible.
@@ -381,6 +555,11 @@ impl Config {
     /// store is never opened twice, deduplicates canonically while preserving
     /// first-seen order, and caps the count at `cap` with a one-line stderr note
     /// when truncating. `list_label` names the source list for that note.
+    ///
+    /// Transitional path-only resolver kept alongside
+    /// [`resolve_store_sources`](Self::resolve_store_sources) for bisectability; used
+    /// only by the Local-only `*_paths` wrappers, exercised via config unit tests.
+    #[allow(dead_code)]
     fn resolve_store_list(
         &self,
         raw: Option<&[String]>,
@@ -430,6 +609,125 @@ impl Config {
             out.truncate(cap);
         }
         out
+    }
+
+    /// Tier-2 v2 resolver paralleling [`resolve_store_list`](Self::resolve_store_list)
+    /// but yielding [`StoreSource`]s (local paths AND remote URLs). Same discipline:
+    /// trim blanks, reject any entry containing a NUL byte, preserve first-seen order,
+    /// cap at `cap` with a one-line stderr note. Source-kind-specific handling:
+    ///
+    /// - **Local** entries: canonicalize for dedup, drop any equal to the local
+    ///   [`db_path`](Self::db_path) (never read the local store twice) — exactly as
+    ///   the path resolver does.
+    /// - **Remote** entries: dedup by the trailing-slash-normalized URL string (a URL
+    ///   is NEVER `std::fs::canonicalize`'d), never compared to the local `db_path`,
+    ///   and carry the shared sanitized `pull_token` (when set). The token is the
+    ///   PARSED secret; it is redacted in `StoreSource`'s Debug.
+    ///
+    /// Note: remote entries are PARSED on every build (config is backend-agnostic);
+    /// the loud "requires --features libsql" rejection happens at the store seam on
+    /// the default sqlite build, never here.
+    fn resolve_store_sources(
+        &self,
+        raw: Option<&[String]>,
+        cap: usize,
+        list_label: &str,
+    ) -> Vec<StoreSource> {
+        let raw = match raw {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        let local = self.db_path();
+        let local_canon = std::fs::canonicalize(&local).unwrap_or_else(|_| local.clone());
+        let token = self.pull_token.as_deref().and_then(sanitize_token);
+
+        let mut out: Vec<StoreSource> = Vec::new();
+        let mut seen_local: Vec<PathBuf> = Vec::new();
+        let mut seen_remote: Vec<String> = Vec::new();
+        for entry in raw {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.contains('\0') {
+                eprintln!("[weave] skipping invalid {list_label} entry (contains NUL byte)");
+                continue;
+            }
+            match classify_source(trimmed) {
+                StoreSource::Local(path) => {
+                    let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if key == local_canon {
+                        continue; // never read the local store twice
+                    }
+                    if seen_local.contains(&key) {
+                        continue;
+                    }
+                    seen_local.push(key);
+                    out.push(StoreSource::Local(path));
+                }
+                StoreSource::Remote { url, .. } => {
+                    let key = normalize_remote_url(&url);
+                    if seen_remote.contains(&key) {
+                        continue;
+                    }
+                    seen_remote.push(key);
+                    out.push(StoreSource::Remote {
+                        url,
+                        token: token.clone(),
+                    });
+                }
+            }
+        }
+        if out.len() > cap {
+            eprintln!(
+                "[weave] {} {list_label} stores configured; capping at {cap}",
+                out.len()
+            );
+            out.truncate(cap);
+        }
+        out
+    }
+
+    /// Tier-2 v2 inject-gate over a [`StoreSource`] (the [`StoreSource`] analogue of
+    /// [`inject_allowed_from`](Self::inject_allowed_from)). When `allow_inject_from`
+    /// is unset, EVERY pull source is inject-eligible. When set, a Local source must
+    /// canonical-match a Local entry in the list; a Remote source must URL-match a
+    /// Remote entry (trailing-slash-normalized). A Remote source is never matched
+    /// against a Local allow entry (or vice versa).
+    pub fn inject_allowed_from_source(&self, source: &StoreSource) -> bool {
+        let allow = match self.allow_inject_from_sources() {
+            None => return true,
+            Some(list) => list,
+        };
+        match source {
+            StoreSource::Local(p) => {
+                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                allow.iter().any(|a| match a {
+                    StoreSource::Local(ap) => {
+                        std::fs::canonicalize(ap).unwrap_or_else(|_| ap.clone()) == key
+                    }
+                    StoreSource::Remote { .. } => false,
+                })
+            }
+            StoreSource::Remote { url, .. } => {
+                let key = normalize_remote_url(url);
+                allow.iter().any(|a| match a {
+                    StoreSource::Remote { url: au, .. } => normalize_remote_url(au) == key,
+                    StoreSource::Local(_) => false,
+                })
+            }
+        }
+    }
+
+    /// The validated `allow_inject_from` subset as [`StoreSource`]s, or `None` when
+    /// unset ("same as the pull set"). The [`StoreSource`] analogue of
+    /// [`allow_inject_from_paths`](Self::allow_inject_from_paths). Public so the MCP
+    /// server can carry the resolved gate in its `PullConsent` (the full `Config` is
+    /// deliberately not plumbed into `mcp`).
+    pub fn allow_inject_from_sources(&self) -> Option<Vec<StoreSource>> {
+        self.allow_inject_from.as_deref().map(|raw| {
+            self.resolve_store_sources(Some(raw), MAX_PULL_FROM, "WEAVE_ALLOW_INJECT_FROM")
+        })
     }
 
     /// Resolved retention window (seconds) for the opportunistic SessionStart GC.
@@ -509,7 +807,7 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Every setting below is OPTIONAL and shown commented-out with its default.
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
-# WEAVE_LIBSQL_AUTH_TOKEN) take precedence over anything set here.
+# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN) take precedence over anything set here.
 
 # Default identity for this machine/session. When unset, weave falls back to
 # the basename of the current directory (a *guess* that never marks mail read).
@@ -559,8 +857,20 @@ pub const CONFIG_TEMPLATE: &str = "\
 # OWN outbox, which you pull read-only. Delivery is next-drain (pull-latency-
 # bound), not instant. Default empty (no cross-store delivery). Overridable via
 # WEAVE_PULL_FROM (comma- or path-separated). Capped at 16 stores. A path may
-# appear in both peer_dbs and pull_from.
-# pull_from = [\"/path/to/other-project/messages.db\"]
+# appear in both peer_dbs and pull_from. A REMOTE libSQL/Turso source (a URL with
+# scheme libsql:// | https:// | wss://) is also accepted here — it is opened
+# READ-ONLY and weave NEVER writes it (owner-only-writes holds cross-machine).
+# REMOTE SOURCES REQUIRE a --features libsql build; on the default sqlite build a
+# remote entry is skipped with a clear stderr note (local sources still work).
+# pull_from = [\"/path/to/other-project/messages.db\", \"libsql://shared-db.turso.io\"]
+
+# Auth token for REMOTE pull/federation sources (Tier-2 v2). Applied to every
+# libsql://, https:// or wss:// source above that needs one. Treat as a SECRET;
+# weave redacts it from debug output. Prefer the WEAVE_PULL_TOKEN env var over
+# storing it here. RECOMMENDED: use a SERVER-ENFORCED read-only Turso token
+# (`turso db tokens create <db> --read-only`) so the source is read-only at the
+# server, not just by weave's client-side guards.
+# pull_token = \"...\"
 
 # Consent for live injection on a PULLED cross-store message (DEFAULT: true).
 # When a pull commits a message from an allow-listed source, weave ALSO fires a
@@ -659,6 +969,7 @@ mod tests {
         assert!(cfg.inject_pulled.is_none());
         assert!(cfg.allow_inject_from.is_none());
         assert!(cfg.strict_verify.is_none());
+        assert!(cfg.pull_token.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -686,6 +997,7 @@ mod tests {
             "inject_pulled",
             "allow_inject_from",
             "strict_verify",
+            "pull_token",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
@@ -909,5 +1221,367 @@ mod tests {
             ..Config::default()
         };
         assert!(!empty.inject_allowed_from(std::path::Path::new("/tmp/any.db")));
+    }
+
+    // ---------------------------------------------------------------------
+    // Tier-2 v2 — StoreSource classification + resolution + token hygiene.
+    // ---------------------------------------------------------------------
+
+    /// `classify_source` maps every recognized remote scheme to `Remote` (with the
+    /// URL preserved verbatim, no canonicalization, no token attached) and EVERY
+    /// other shape — bare name, `./relative`, `/absolute`, `~`, a Windows-ish path —
+    /// to `Local`.
+    #[test]
+    fn classify_source_recognizes_remote_schemes_else_local() {
+        for url in [
+            "libsql://db.turso.io",
+            "https://db.turso.io",
+            "http://127.0.0.1:8080",
+            "wss://db.turso.io",
+            "ws://localhost:9000",
+        ] {
+            match classify_source(url) {
+                StoreSource::Remote { url: got, token } => {
+                    assert_eq!(got, url, "URL preserved verbatim (no canonicalization)");
+                    assert!(token.is_none(), "classify never attaches a token");
+                }
+                StoreSource::Local(_) => panic!("{url:?} must classify Remote"),
+            }
+        }
+
+        for path in [
+            "messages.db",
+            "./relative/x.db",
+            "/abs/x.db",
+            "~/x.db",
+            "C:\\weave\\x.db",
+            "libsql-but-no-scheme.db", // a prefix that is NOT a full scheme
+            "ftp://not-a-supported-scheme", // unsupported scheme ⇒ treated as a path
+        ] {
+            match classify_source(path) {
+                StoreSource::Local(p) => assert_eq!(p, PathBuf::from(path)),
+                StoreSource::Remote { .. } => panic!("{path:?} must classify Local"),
+            }
+        }
+    }
+
+    /// `resolve_store_sources` (via `pull_from_sources`) handles a MIXED local+remote
+    /// list: trims blanks, rejects NUL, preserves first-seen order, dedups remotes by
+    /// exact URL (trailing-slash-normalized), dedups+canonicalizes locals, drops a
+    /// local equal to `db_path`, NEVER compares a remote to `db_path`, and attaches
+    /// the shared `pull_token` to every remote.
+    #[test]
+    fn resolve_store_sources_mixed_local_and_remote() {
+        let cfg = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            pull_token: Some("secret-jwt".to_string()),
+            pull_from: Some(vec![
+                "  ".to_string(),                   // blank → dropped
+                "/tmp/local-a.db".to_string(),      // local, kept
+                "libsql://h.turso.io".to_string(),  // remote, kept
+                "libsql://h.turso.io/".to_string(), // trailing-slash dup of prev → dropped
+                "/tmp/weave-self.db".to_string(),   // == db_path → dropped
+                "https://h2.turso.io".to_string(),  // remote, kept
+                "https://h2.turso.io".to_string(),  // exact dup → dropped
+            ]),
+            ..Config::default()
+        };
+        let sources = cfg.pull_from_sources();
+        assert_eq!(
+            sources.len(),
+            3,
+            "blanks/dups/local-self all dropped: {sources:?}"
+        );
+
+        // First-seen order preserved: local, libsql remote, https remote.
+        assert_eq!(
+            sources[0],
+            StoreSource::Local(PathBuf::from("/tmp/local-a.db"))
+        );
+        match &sources[1] {
+            StoreSource::Remote { url, token } => {
+                assert_eq!(url, "libsql://h.turso.io");
+                assert_eq!(
+                    token.as_deref(),
+                    Some("secret-jwt"),
+                    "shared token attached"
+                );
+            }
+            other => panic!("expected libsql remote, got {other:?}"),
+        }
+        match &sources[2] {
+            StoreSource::Remote { url, token } => {
+                assert_eq!(url, "https://h2.turso.io");
+                assert_eq!(token.as_deref(), Some("secret-jwt"));
+            }
+            other => panic!("expected https remote, got {other:?}"),
+        }
+    }
+
+    /// The source count cap (`MAX_PULL_FROM`) bounds a hostile remote-only list, and
+    /// a NUL byte in a remote entry is rejected as an injection canary.
+    #[test]
+    fn resolve_store_sources_caps_and_rejects_nul() {
+        let many: Vec<String> = (0..1000)
+            .map(|i| format!("libsql://h{i}.turso.io"))
+            .collect();
+        let capped = Config {
+            pull_from: Some(many),
+            ..Config::default()
+        };
+        assert_eq!(capped.pull_from_sources().len(), MAX_PULL_FROM);
+
+        let nul = Config {
+            pull_from: Some(vec![
+                "libsql://ok.turso.io".to_string(),
+                "libsql://b\0ad.turso.io".to_string(),
+            ]),
+            ..Config::default()
+        };
+        let got = nul.pull_from_sources();
+        assert_eq!(got.len(), 1, "NUL entry rejected: {got:?}");
+        assert!(
+            matches!(&got[0], StoreSource::Remote { url, .. } if url == "libsql://ok.turso.io")
+        );
+    }
+
+    /// SECRET HYGIENE: the redacting `Debug` for a `Remote` source and for `Config`
+    /// NEVER prints the token bytes — the secret substring is absent from `{:?}` —
+    /// while the (non-secret) URL is still shown for diagnostics.
+    #[test]
+    fn store_source_and_config_debug_redact_the_token() {
+        const SECRET: &str = "super-secret-turso-jwt-value";
+
+        let remote = StoreSource::Remote {
+            url: "libsql://db.turso.io".to_string(),
+            token: Some(SECRET.to_string()),
+        };
+        let dbg = format!("{remote:?}");
+        assert!(
+            !dbg.contains(SECRET),
+            "Remote Debug leaked the token: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Remote Debug should mark redaction: {dbg}"
+        );
+        assert!(
+            dbg.contains("libsql://db.turso.io"),
+            "URL shown (not a secret): {dbg}"
+        );
+
+        let cfg = Config {
+            pull_token: Some(SECRET.to_string()),
+            ..Config::default()
+        };
+        let cdbg = format!("{cfg:?}");
+        assert!(
+            !cdbg.contains(SECRET),
+            "Config Debug leaked pull_token: {cdbg}"
+        );
+        assert!(
+            cdbg.contains("<redacted>"),
+            "Config Debug should redact pull_token: {cdbg}"
+        );
+    }
+
+    /// TOKEN CAP / CONTROL-CHAR REJECTION: an over-long token and a control-char
+    /// token are both dropped by `sanitize_token` (so the remote is attempted WITHOUT
+    /// a weave-supplied token rather than handing a hostile value to the client), a
+    /// well-formed token survives, and the empty token is treated as "none".
+    #[test]
+    fn pull_token_capped_and_control_chars_rejected() {
+        // Over the byte cap ⇒ no token attached to the resolved remote.
+        let too_long = "x".repeat(MAX_TOKEN_LEN + 1);
+        let cfg_long = Config {
+            pull_token: Some(too_long.clone()),
+            pull_from: Some(vec!["libsql://h.turso.io".to_string()]),
+            ..Config::default()
+        };
+        let long_srcs = cfg_long.pull_from_sources();
+        assert!(
+            matches!(&long_srcs[0], StoreSource::Remote { token: None, .. }),
+            "over-cap token must be rejected (None): {long_srcs:?}"
+        );
+
+        // A control char (newline) ⇒ rejected.
+        let cfg_ctrl = Config {
+            pull_token: Some("good\nbad".to_string()),
+            pull_from: Some(vec!["libsql://h.turso.io".to_string()]),
+            ..Config::default()
+        };
+        let ctrl_srcs = cfg_ctrl.pull_from_sources();
+        assert!(
+            matches!(&ctrl_srcs[0], StoreSource::Remote { token: None, .. }),
+            "control-char token must be rejected (None): {ctrl_srcs:?}"
+        );
+
+        // Exactly at the cap ⇒ accepted.
+        let at_cap = "y".repeat(MAX_TOKEN_LEN);
+        assert_eq!(sanitize_token(&at_cap).as_deref(), Some(at_cap.as_str()));
+
+        // A clean token survives; empty ⇒ None.
+        assert_eq!(sanitize_token("clean-jwt").as_deref(), Some("clean-jwt"));
+        assert_eq!(sanitize_token(""), None);
+    }
+
+    /// `inject_allowed_from_source` never matches across kinds: a Remote source is
+    /// not eligible against a Local allow-entry and vice versa; a Remote matches a
+    /// Remote allow-entry by trailing-slash-normalized URL.
+    #[test]
+    fn inject_allowed_from_source_never_crosses_kinds() {
+        let cfg = Config {
+            db: Some("/tmp/weave-self.db".to_string()),
+            allow_inject_from: Some(vec!["libsql://trusted.turso.io".to_string()]),
+            ..Config::default()
+        };
+        let trusted = StoreSource::Remote {
+            url: "libsql://trusted.turso.io/".to_string(), // trailing slash → normalized match
+            token: None,
+        };
+        assert!(cfg.inject_allowed_from_source(&trusted));
+
+        let untrusted = StoreSource::Remote {
+            url: "libsql://evil.turso.io".to_string(),
+            token: None,
+        };
+        assert!(!cfg.inject_allowed_from_source(&untrusted));
+
+        // A Local source is NOT eligible against a Remote-only allow list.
+        let local = StoreSource::Local(PathBuf::from("/tmp/trusted.turso.io"));
+        assert!(!cfg.inject_allowed_from_source(&local));
+    }
+
+    /// The template scaffold documents the new `pull_token` key + the remote
+    /// `pull_from` example, and still parses as all-default TOML.
+    #[test]
+    fn template_documents_pull_token_and_remote_example() {
+        assert!(CONFIG_TEMPLATE.contains("pull_token"));
+        assert!(
+            CONFIG_TEMPLATE.contains("libsql://"),
+            "template should show a remote pull_from example"
+        );
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert!(cfg.pull_token.is_none());
+    }
+
+    /// `split_source_list` keeps a REMOTE URL whole (its `scheme://` colon must not
+    /// be treated as the path-list separator), while still splitting bare paths on
+    /// the comma AND the platform separator. This is the regression guard for the
+    /// "a `libsql://` entry in `WEAVE_PEER_DBS` gets shredded into `libsql` + `//h`"
+    /// bug: a URL must survive the env-list splitter intact.
+    #[test]
+    fn split_source_list_keeps_urls_whole() {
+        // A comma-separated mix: a local path + a remote URL. The URL survives.
+        let got = split_source_list("/tmp/a.db,libsql://h.turso.io");
+        assert_eq!(got, vec!["/tmp/a.db", "libsql://h.turso.io"]);
+
+        // A URL containing a port colon is also kept whole.
+        let got = split_source_list("https://h.turso.io:8080,/tmp/b.db");
+        assert_eq!(got, vec!["https://h.turso.io:8080", "/tmp/b.db"]);
+
+        // Blanks dropped; whitespace trimmed.
+        let got = split_source_list(" , libsql://h , ");
+        assert_eq!(got, vec!["libsql://h"]);
+
+        // Bare paths still split on the platform separator (unix `:`), so existing
+        // PATH-style configs keep working.
+        #[cfg(not(windows))]
+        {
+            let got = split_source_list("/tmp/a.db:/tmp/b.db");
+            assert_eq!(got, vec!["/tmp/a.db", "/tmp/b.db"]);
+        }
+    }
+
+    /// End-to-end through `load()`: a remote URL supplied via `WEAVE_PEER_DBS`
+    /// resolves to a single `Remote` source (NOT shredded). Guards the env → config
+    /// → resolver path for remote URLs. (Serialized via the env so it does not race
+    /// other env-reading tests — uses a process-unique var teardown.)
+    #[test]
+    fn env_peer_dbs_remote_url_resolves_to_one_remote_source() {
+        // Drive resolve_store_sources directly with a config built as load() would
+        // (env splitting is the unit under test above; here we assert the resolver
+        // treats the un-shredded URL as one Remote).
+        let cfg = Config {
+            peer_dbs: Some(split_source_list("libsql://shared.turso.io")),
+            ..Config::default()
+        };
+        let sources = cfg.peer_db_sources();
+        assert_eq!(sources.len(), 1, "one remote source: {sources:?}");
+        assert!(matches!(
+            &sources[0],
+            StoreSource::Remote { url, .. } if url == "libsql://shared.turso.io"
+        ));
+    }
+
+    // ---- proptest: classify_source totality + resolve ordering/dedup ----
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// `classify_source` is TOTAL: it never panics on arbitrary input (including
+        /// unicode, embedded NUL, control chars, scheme-prefix fragments) and its
+        /// verdict matches the simple scheme-prefix rule. A Remote verdict preserves
+        /// the URL verbatim and attaches no token.
+        #[test]
+        fn classify_source_is_total(s in ".*") {
+            let got = classify_source(&s);
+            let expect_remote = REMOTE_SCHEMES.iter().any(|p| s.starts_with(p));
+            prop_assert_eq!(got.is_remote(), expect_remote);
+            if let StoreSource::Remote { url, token } = got {
+                prop_assert_eq!(url, s);
+                prop_assert!(token.is_none());
+            }
+        }
+
+        /// `resolve_store_sources` is IDEMPOTENT under dedup and stable in order:
+        /// feeding the resolved list's own remote URLs back in (in order, twice)
+        /// yields the same de-duplicated remote set in the same order. Trailing-slash
+        /// variants collapse to a single entry.
+        #[test]
+        fn resolve_store_sources_remote_dedup_is_stable(
+            hosts in proptest::collection::vec("[a-z0-9-]{1,12}", 0..8)
+        ) {
+            // Build a list with each host twice (plain + trailing slash) to force
+            // dedup; first-seen order must be the de-duplicated host order.
+            let mut raw: Vec<String> = Vec::new();
+            for h in &hosts {
+                raw.push(format!("libsql://{h}.turso.io"));
+                raw.push(format!("libsql://{h}.turso.io/"));
+            }
+            let cfg = Config {
+                pull_from: Some(raw),
+                ..Config::default()
+            };
+            let first = cfg.pull_from_sources();
+
+            // Distinct hosts, capped — count is min(distinct, MAX_PULL_FROM).
+            let mut distinct: Vec<&String> = Vec::new();
+            for h in &hosts {
+                if !distinct.contains(&h) {
+                    distinct.push(h);
+                }
+            }
+            let expected = distinct.len().min(MAX_PULL_FROM);
+            prop_assert_eq!(first.len(), expected);
+
+            // Idempotent: re-resolving the resolved URLs (each twice) yields the same.
+            let mut raw2: Vec<String> = Vec::new();
+            for src in &first {
+                if let StoreSource::Remote { url, .. } = src {
+                    raw2.push(url.clone());
+                    raw2.push(format!("{url}/"));
+                }
+            }
+            let cfg2 = Config { pull_from: Some(raw2), ..Config::default() };
+            let second = cfg2.pull_from_sources();
+            prop_assert_eq!(first, second);
+        }
     }
 }

@@ -67,7 +67,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 # `preserve_order` keeps the user's settings.json key order intact on rewrite, so
 # `weave setup`/`uninstall` only diff weave's own additions/removals.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
-tokio = { version = "1.52.3", features = ["rt"], optional = true }
+# `rt` drives the embedded current-thread runtime; `time` is required for
+# `tokio::time::timeout`, which bounds every REMOTE libsql network call (connect +
+# SELECT) so an unreachable Turso source cannot hang a drain (libsql 0.9.30 has no
+# client-side connect/request timeout knob). Both ride the optional `libsql`
+# feature; the default sqlite build pulls in neither.
+tokio = { version = "1.52.3", features = ["rt", "time"], optional = true }
 toml = "1.1.2"
 
 [dev-dependencies]

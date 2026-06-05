@@ -154,6 +154,39 @@ recipient's store.
   committing a message and advancing the cursor, which re-delivers **at most one**
   intent on the next drain (a bounded at-least-once guarantee).
 
+#### Remote sources — cross-machine pull (`--features libsql`)
+
+A `WEAVE_PULL_FROM` / `WEAVE_PEER_DBS` entry may be a **remote URL**
+(`libsql://`, `https://`, or `wss://`) instead of a local file, so you can pull
+cross-store delivery from a Turso / libSQL database on another machine. Set the
+auth token with `WEAVE_PULL_TOKEN` (preferred — env over config; it is secret and
+redacted in logs) or `pull_token = "..."` in `config.toml`.
+
+- **Remote sources require a `--no-default-features --features libsql` build.** The
+  default (sqlite) build does **not** support remote sources: it skips any remote
+  entry with a loud stderr note and processes only local sources, so a mixed list
+  still works for its local entries.
+- **Owner-only-writes holds cross-machine.** weave opens a remote source read-only,
+  reads only the intents addressed to you, and commits them into **your own** local
+  inbox; it **never writes the remote source** (no schema, no migration, SELECT-only,
+  every write trapped). Each remote call is time-bounded; a failed or timed-out
+  remote is skipped, not fatal, and delivery stays bounded-once.
+- **Cross-machine liveness stays TTL-only** — a remote-host peer reads online purely
+  from the presence TTL; weave never probes a PID on another machine.
+
+> **Deployment recommendation — use a read-only Turso token.** libSQL (0.9.30) has
+> **no client-side read-only handle**, so the read-only scope is enforced by the
+> token the server validates. Mint a server-enforced read-only token for the source
+> DB and set it as `WEAVE_PULL_TOKEN`:
+>
+> ```bash
+> turso db tokens create <db> --read-only
+> ```
+>
+> This is defense-in-depth on top of weave's own read-only enforcement (SELECT-only
+> + write-guard + commit-local). weave cannot mint or verify the token's scope; that
+> guarantee is the server's.
+
 #### Live nudge on a pulled message — DEFAULT ON (consent)
 
 When a pull commits a message from an allow-listed source, weave **also fires a

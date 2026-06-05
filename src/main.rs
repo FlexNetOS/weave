@@ -481,7 +481,7 @@ fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
 /// under a guessed identity is fine: it only commits intents explicitly addressed
 /// to that name (no read-marking, so no inbox is consumed).
 fn try_pull(store: &dyn Store, cfg: &Config, me: &str) {
-    let allow = cfg.pull_from_paths();
+    let allow = cfg.pull_from_sources();
     if allow.is_empty() {
         return;
     }
@@ -516,7 +516,7 @@ fn nudge_pulled(
     store: &dyn Store,
     cfg: &Config,
     me: &str,
-    committed_sources: &[std::path::PathBuf],
+    committed_sources: &[config::StoreSource],
 ) {
     // Master toggle: false ⇒ pure queue-only, no keystroke at all.
     if !cfg.inject_pulled() {
@@ -526,7 +526,7 @@ fn nudge_pulled(
     // delivered its message to the inbox but must never trigger a keystroke.
     if !committed_sources
         .iter()
-        .any(|src| cfg.inject_allowed_from(src))
+        .any(|src| cfg.inject_allowed_from_source(src))
     {
         return;
     }
@@ -574,11 +574,19 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let target = inject::detect_target();
     // Tier-1 federation: report the union peer count (local + read-only extra
     // stores). `extra` empty ⇒ exactly the local peers, identical-to-today.
-    let extra = cfg.peer_db_paths();
+    let extra = cfg.peer_db_sources();
+    let remote_count = extra.iter().filter(|s| s.is_remote()).count();
     let views = store::federated_peers(store, &extra)?;
     let total_peers = views.len();
     let online = views.iter().filter(|v| is_alive(&v.peer)).count();
     let (fed_ok, fed_skipped) = store::federation_status(&extra);
+    // On the default sqlite build a remote source cannot be opened — surface how
+    // many were skipped purely for lack of the libsql feature so the user is told.
+    let remote_unsupported = if cfg!(feature = "libsql") {
+        0
+    } else {
+        remote_count
+    };
     let total = store.total_messages()?;
     let claude = inject::have("claude");
     let db = cfg.db_path();
@@ -606,6 +614,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "federation_stores": extra.len(),
                 "federation_stores_ok": fed_ok,
                 "federation_stores_skipped": fed_skipped,
+                "federation_remote_stores": remote_count,
+                "federation_remote_unsupported": remote_unsupported,
             }))?
         );
     } else {
@@ -636,6 +646,14 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 "  federation:     {} extra store(s) ({fed_ok} ok, {fed_skipped} skipped)",
                 extra.len()
             );
+            if remote_count > 0 {
+                println!("  remote sources: {remote_count} configured");
+                if remote_unsupported > 0 {
+                    println!(
+                        "  note: {remote_unsupported} remote source(s) skipped — rebuild weave with --features libsql to use them"
+                    );
+                }
+            }
         } else if !db_is_default {
             println!(
                 "  note: using non-default WEAVE_DB — peers on a different store won't be visible (default: {})",
@@ -817,15 +835,15 @@ fn main() -> Result<()> {
             let nudge_tpl = cfg.nudge_template().map(str::to_owned);
             // Tier-1 federation: pass the validated read-only extra store paths so
             // the MCP peers/sessions/doctor tools aggregate them too.
-            let extra_dbs = cfg.peer_db_paths();
+            let extra_dbs = cfg.peer_db_sources();
             // Tier-2: cross-store delivery sources the MCP inbox drain will pull
             // intents from (DISTINCT from extra_dbs, which is read-only
             // visibility), bundled with the decision-5 consent state so the drain
             // can fire the caller-side nudge into this session's OWN pane.
             let pull = mcp::PullConsent {
-                from: cfg.pull_from_paths(),
+                from: cfg.pull_from_sources(),
                 inject_pulled: cfg.inject_pulled(),
-                allow_inject_from: cfg.allow_inject_from_paths(),
+                allow_inject_from: cfg.allow_inject_from_sources(),
                 strict_verify: cfg.strict_verify(),
             };
             mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs, pull)?;
@@ -912,7 +930,7 @@ fn main() -> Result<()> {
         Cmd::Pull { me } => {
             let (me, explicit) = resolve_me_explicit(me, None, &cfg);
             refresh_presence(store, &me, explicit);
-            let allow = cfg.pull_from_paths();
+            let allow = cfg.pull_from_sources();
             let pulled = store::pull_from_store(store, &me, &allow, cfg.strict_verify())?;
             println!(
                 "pulled {} message(s) into '{me}' from {} source(s){}",
@@ -1077,7 +1095,7 @@ fn main() -> Result<()> {
             // read-only extra stores, origin-tagged. Default (no WEAVE_PEER_DBS /
             // [federation] peer_dbs) ⇒ `extra` is empty ⇒ output is the local
             // listing tagged `local`, byte-identical to single-store behavior.
-            let extra = cfg.peer_db_paths();
+            let extra = cfg.peer_db_sources();
             let views = store::federated_peers(store, &extra)?;
             if json {
                 let arr: Vec<_> = views
@@ -1131,7 +1149,7 @@ fn main() -> Result<()> {
             // Tier-1 federation: union local sessions with read-only extra stores,
             // origin-tagged. Foreign sessions are kept distinct (no unread summing —
             // Tier 1 has no cross-store inbox). Default ⇒ identical-to-today.
-            let extra = cfg.peer_db_paths();
+            let extra = cfg.peer_db_sources();
             let views = store::federated_sessions(store, &extra)?;
             if json {
                 let arr: Vec<_> = views
