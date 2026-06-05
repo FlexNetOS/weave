@@ -37,15 +37,17 @@
 
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
-    ask_id_valid, is_broadcast, new_ask_id, now, Ask, AskRole, AskState, Intent, Message, Peer,
+    ask_id_valid, ask_many_id_valid, classify_ask_many, is_broadcast, new_ask_id, new_ask_many_id,
+    now, Ask, AskGroup, AskManyChildView, AskManyResult, AskRole, AskState, Intent, Message, Peer,
     BROADCAST_SQL,
 };
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_field, clamp_limit, commit_pulled,
     merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
-    store_label, Origin, PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo,
-    SessionView, Store, VerifyPolicy, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
-    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    store_label, AskManyOutcome, Origin, PeerView, Pulled, RevocationEvent, RevocationKind,
+    SessionInfo, SessionView, Store, VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN,
+    MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS,
+    MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -127,7 +129,16 @@ const SCHEMA: &[&str] = &[
         close_note      TEXT,
         opened_ts       INTEGER NOT NULL,
         updated_ts      INTEGER NOT NULL,
-        closed_ts       INTEGER
+        closed_ts       INTEGER,
+        parent_id       TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS ask_groups (
+        parent_id    TEXT PRIMARY KEY,
+        asker        TEXT NOT NULL,
+        subject      TEXT,
+        body         TEXT NOT NULL,
+        opened_ts    INTEGER NOT NULL,
+        target_count INTEGER NOT NULL
     )",
 ];
 
@@ -228,6 +239,9 @@ fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
         opened_ts: r.get::<i64>(9)?,
         updated_ts: r.get::<i64>(10)?,
         closed_ts: r.get::<Option<i64>>(11)?,
+        // 13th projected column (P2). Every `get_ask`/`list_asks` projection now
+        // selects `parent_id` last so positional index 12 is always present.
+        parent_id: r.get::<Option<String>>(12)?,
     })
 }
 
@@ -453,6 +467,39 @@ impl LibsqlStore {
             )
             .await
             .context("creating asks table")?;
+            // Migration (P2): a legacy P1-era DB whose `asks` table predates ask-many
+            // lacks `parent_id`. Add it idempotently (mirrors SqliteStore::migrate, the
+            // `peers.pid` template) defaulting to NULL for existing rows == a standalone
+            // ask, not part of a group. The `pragma_table_info` guard makes a re-run a
+            // no-op; constant DDL — no user data interpolated.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='parent_id'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute("ALTER TABLE asks ADD COLUMN parent_id TEXT", ())
+                    .await
+                    .context("adding asks.parent_id column")?;
+            }
+            // Migration (P2): the ask-many PARENT anchor table. Created via SCHEMA above
+            // for a fresh DB; also created idempotently here for a DB that predates
+            // ask-many (mirrors SqliteStore::migrate). Inert plain data in every build;
+            // constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS ask_groups (
+                    parent_id    TEXT PRIMARY KEY,
+                    asker        TEXT NOT NULL,
+                    subject      TEXT,
+                    body         TEXT NOT NULL,
+                    opened_ts    INTEGER NOT NULL,
+                    target_count INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating ask_groups table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1719,11 +1766,13 @@ impl Store for LibsqlStore {
             .await?;
             let question_msg_id = self.conn.last_insert_rowid();
             let id = new_ask_id(question_msg_id);
+            // A plain `ask` is never part of a group: parent_id is NULL. Ask-many
+            // children share this insert shape with a non-NULL parent_id.
             tx.execute(
                 "INSERT INTO asks \
                     (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                     reply_to, close_note, opened_ts, updated_ts, closed_ts) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL)",
+                     reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL, NULL)",
                 params(vec![
                     id.clone().into(),
                     question_msg_id.into(),
@@ -1888,7 +1937,7 @@ impl Store for LibsqlStore {
                 .conn
                 .query(
                     "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                            reply_to, close_note, opened_ts, updated_ts, closed_ts \
+                            reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
                      FROM asks WHERE id = ?1",
                     params(vec![correlation_id.into()]),
                 )
@@ -1910,7 +1959,7 @@ impl Store for LibsqlStore {
         };
         let sql = format!(
             "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                    reply_to, close_note, opened_ts, updated_ts, closed_ts \
+                    reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
              FROM asks WHERE {where_clause} \
              ORDER BY opened_ts DESC, rowid DESC LIMIT ?2"
         );
@@ -1940,6 +1989,216 @@ impl Store for LibsqlStore {
                 Some(r) => Ok(Some(r.get::<String>(0)?)),
                 None => Ok(None),
             }
+        })
+    }
+
+    fn create_ask_many(
+        &self,
+        asker: &str,
+        peers: &[String],
+        subject: Option<&str>,
+        body: &str,
+    ) -> Result<AskManyOutcome> {
+        // OWNER-ONLY-WRITES: trap a foreign/read-only handle BEFORE any validation or
+        // insert, mirroring every other write method (the first statement).
+        self.guard_writable()?;
+        check_ident("asker", asker)?;
+        check_body(body)?;
+        if is_broadcast(asker) {
+            anyhow::bail!("the ask-many asker must be a concrete peer, not a broadcast alias.");
+        }
+        if let Some(s) = subject {
+            check_body(s)?;
+        }
+        // De-dup the requested peer list (order-preserving); this is the canonical
+        // post-dedup target_count.
+        let mut deduped: Vec<String> = Vec::new();
+        for p in peers {
+            let t = p.trim();
+            if !t.is_empty() && !deduped.iter().any(|d| d == t) {
+                deduped.push(t.to_string());
+            }
+        }
+        if deduped.is_empty() {
+            anyhow::bail!("ask-many requires at least one target peer.");
+        }
+        if deduped.len() > MAX_ASK_MANY_TARGETS {
+            anyhow::bail!(
+                "ask-many targets {} peers; max {MAX_ASK_MANY_TARGETS} per fanout.",
+                deduped.len()
+            );
+        }
+
+        let ts = now();
+        let parent_id = new_ask_many_id(ts);
+        let subject_owned = subject.map(|s| s.to_string());
+        let body_owned = body.to_string();
+        let asker_owned = asker.to_string();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            // Parent anchor first; `target_count` is the de-duped REQUESTED count so
+            // totality holds even when some children fail pre-insert.
+            tx.execute(
+                "INSERT INTO ask_groups (parent_id, asker, subject, body, opened_ts, target_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params(vec![
+                    parent_id.clone().into(),
+                    asker_owned.clone().into(),
+                    subject_owned.clone().into(),
+                    body_owned.clone().into(),
+                    ts.into(),
+                    (deduped.len() as i64).into(),
+                ]),
+            )
+            .await?;
+
+            let mut children: Vec<(String, std::result::Result<String, String>)> =
+                Vec::with_capacity(deduped.len());
+            for peer in &deduped {
+                // Best-effort per child: a rejected peer records an error and is skipped
+                // (no child ask), never aborting the whole fanout.
+                if let Err(err) = check_ident("askee", peer) {
+                    children.push((peer.clone(), Err(format!("{err}"))));
+                    continue;
+                }
+                if is_broadcast(peer) {
+                    children.push((
+                        peer.clone(),
+                        Err(
+                            "broadcast alias cannot be an ask-many target (P2 takes an explicit \
+                             peer list; a circle is P4)."
+                                .to_string(),
+                        ),
+                    ));
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
+                     VALUES (?1,?2,?3,?4,?5,NULL)",
+                    params(vec![
+                        ts.into(),
+                        asker_owned.clone().into(),
+                        peer.clone().into(),
+                        subject_owned.clone().into(),
+                        body_owned.clone().into(),
+                    ]),
+                )
+                .await?;
+                let question_msg_id = self.conn.last_insert_rowid();
+                let cid = new_ask_id(question_msg_id);
+                // Same insert shape as the plain `ask`, with the parent_id stamped.
+                tx.execute(
+                    "INSERT INTO asks \
+                        (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
+                         reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?7, NULL, ?8)",
+                    params(vec![
+                        cid.clone().into(),
+                        question_msg_id.into(),
+                        asker_owned.clone().into(),
+                        peer.clone().into(),
+                        subject_owned.clone().into(),
+                        AskState::Open.as_str().into(),
+                        ts.into(),
+                        parent_id.clone().into(),
+                    ]),
+                )
+                .await?;
+                children.push((peer.clone(), Ok(cid)));
+            }
+            tx.commit().await?;
+            Ok(AskManyOutcome {
+                parent_id: parent_id.clone(),
+                children,
+            })
+        })
+    }
+
+    fn ask_many_result(
+        &self,
+        parent_id: &str,
+        age_threshold: Option<i64>,
+    ) -> Result<Option<AskManyResult>> {
+        if !ask_many_id_valid(parent_id) {
+            anyhow::bail!("invalid ask-many parent id.");
+        }
+        self.rt.block_on(async {
+            let group: Option<AskGroup> = {
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT parent_id, asker, subject, body, opened_ts, target_count \
+                         FROM ask_groups WHERE parent_id = ?1",
+                        params(vec![parent_id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(AskGroup {
+                        parent_id: r.get::<String>(0)?,
+                        asker: r.get::<String>(1)?,
+                        subject: r.get::<Option<String>>(2)?,
+                        body: r.get::<String>(3)?,
+                        opened_ts: r.get::<i64>(4)?,
+                        target_count: r.get::<i64>(5)?,
+                    }),
+                    None => None,
+                }
+            };
+            let Some(group) = group else {
+                return Ok(None);
+            };
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, askee, state, answer_msg_id FROM asks \
+                     WHERE parent_id = ?1 ORDER BY opened_ts ASC, rowid ASC",
+                    params(vec![parent_id.into()]),
+                )
+                .await?;
+            let mut children: Vec<AskManyChildView> = Vec::new();
+            let (mut answered, mut acked, mut pending) = (0i64, 0i64, 0i64);
+            while let Some(r) = it.next().await? {
+                let cid = r.get::<String>(0)?;
+                let askee = r.get::<String>(1)?;
+                let state =
+                    AskState::from_str(&r.get::<String>(2)?).map_err(|m| anyhow::anyhow!(m))?;
+                let answer_msg_id = r.get::<Option<i64>>(3)?;
+                match state {
+                    AskState::Open => pending += 1,
+                    AskState::Answered => answered += 1,
+                    AskState::Acked => acked += 1,
+                }
+                children.push(AskManyChildView {
+                    peer: askee,
+                    correlation_id: Some(cid),
+                    state: Some(state),
+                    answer_msg_id,
+                    error: None,
+                });
+            }
+            let created = children.len() as i64;
+            let failed = (group.target_count - created).max(0);
+            let total = group.target_count;
+            let age_secs = Some(now() - group.opened_ts);
+            let state = classify_ask_many(total, pending, failed, age_secs, age_threshold);
+            Ok(Some(AskManyResult {
+                parent_id: group.parent_id,
+                asker: group.asker,
+                subject: group.subject,
+                body: group.body,
+                opened_ts: group.opened_ts,
+                target_count: group.target_count,
+                total,
+                answered,
+                acked,
+                pending,
+                failed,
+                state,
+                children,
+            }))
         })
     }
 }
@@ -2246,6 +2505,165 @@ mod tests {
             };
             let s = LibsqlStore::open(&cfg).unwrap();
             assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);
+        }
+    }
+
+    /// libsql parity (P2): `create_ask_many` opens parent + N children; aggregate
+    /// tracks the UNCHANGED P1 lifecycle; best-effort per child + caps; totality holds.
+    #[test]
+    fn ask_many_create_aggregate_and_caps_libsql() {
+        let s = mem();
+        let out = s
+            .create_ask_many("a", &["b".into(), "c".into(), "d".into()], Some("t"), "q?")
+            .unwrap();
+        assert!(crate::model::ask_many_id_valid(&out.parent_id));
+        assert_eq!(out.children.len(), 3);
+        let cids: Vec<String> = out
+            .children
+            .iter()
+            .map(|(_, r)| r.as_ref().unwrap().clone())
+            .collect();
+        for (peer, res) in &out.children {
+            let ask = s.get_ask(res.as_ref().unwrap()).unwrap().unwrap();
+            assert_eq!(ask.parent_id.as_deref(), Some(out.parent_id.as_str()));
+            assert_eq!(ask.askee, *peer);
+        }
+        s.answer("b", &cids[0], "yes").unwrap();
+        s.ack("c", &cids[1], None).unwrap();
+        let r = s.ask_many_result(&out.parent_id, None).unwrap().unwrap();
+        assert_eq!((r.answered, r.acked, r.pending, r.failed), (1, 1, 1, 0));
+        assert_eq!(r.answered + r.acked + r.pending + r.failed, r.target_count);
+        assert_eq!(r.state, crate::model::AskManyState::Pending);
+        s.ack("d", &cids[2], None).unwrap();
+        assert_eq!(
+            s.ask_many_result(&out.parent_id, None)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::model::AskManyState::Complete
+        );
+
+        // Best-effort per child + de-dup + caps.
+        let out = s
+            .create_ask_many("a", &["b".into(), "all".into(), "b".into()], None, "q")
+            .unwrap();
+        // de-dup collapses the repeated "b"; "all" is a per-child reject.
+        assert_eq!(out.children.len(), 2);
+        let r = s.ask_many_result(&out.parent_id, None).unwrap().unwrap();
+        assert_eq!(r.failed, 1);
+        assert_eq!(r.pending, 1);
+        assert!(s.create_ask_many("a", &[], None, "q").is_err());
+        let many: Vec<String> = (0..MAX_ASK_MANY_TARGETS + 1)
+            .map(|i| format!("p{i}"))
+            .collect();
+        assert!(s.create_ask_many("a", &many, None, "q").is_err());
+        assert!(s.ask_many_result("askm;rm", None).is_err());
+        assert!(s.ask_many_result("askm_1_2", None).unwrap().is_none());
+    }
+
+    /// libsql write-trap parity (P2): `create_ask_many` traps on a read-only handle
+    /// (owner-only-writes) while `ask_many_result` reads work.
+    #[test]
+    fn ask_many_write_traps_on_readonly_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-askmany-ro-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+        let parent = {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.create_ask_many("a", &["b".into()], None, "q")
+                .unwrap()
+                .parent_id
+        };
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(ro.ask_many_result(&parent, None).unwrap().is_some());
+        assert!(
+            ro.create_ask_many("a", &["c".into()], None, "intruder")
+                .is_err(),
+            "create_ask_many through a read-only handle must trap"
+        );
+    }
+
+    /// libsql parity (P2): a legacy P1-era DB whose `asks` lacks `parent_id` (and has
+    /// no `ask_groups`) upgrades in place — parent_id added NULL on the old row,
+    /// ask_groups created, a fresh fanout then works. Mirrors the sqlite test.
+    #[test]
+    fn legacy_asks_gains_parent_id_and_ask_groups_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-askmany-legacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        // Seed a P1-era store, then drop parent_id + ask_groups to simulate the older
+        // schema (recreate `asks` WITHOUT parent_id, drop ask_groups).
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let s = LibsqlStore::open(&cfg).unwrap();
+            s.send("a", "b", None, "q").unwrap();
+            s.rt
+                .block_on(async {
+                    s.conn.execute("DROP TABLE asks", ()).await?;
+                    s.conn.execute("DROP TABLE ask_groups", ()).await?;
+                    s.conn
+                        .execute(
+                            "CREATE TABLE asks (
+                                id TEXT PRIMARY KEY, question_msg_id INTEGER NOT NULL,
+                                answer_msg_id INTEGER, asker TEXT NOT NULL, askee TEXT NOT NULL,
+                                subject TEXT, state TEXT NOT NULL, reply_to TEXT, close_note TEXT,
+                                opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
+                                closed_ts INTEGER)",
+                            (),
+                        )
+                        .await?;
+                    s.conn
+                        .execute(
+                            "INSERT INTO asks (id, question_msg_id, asker, askee, state, opened_ts, updated_ts) \
+                             VALUES ('ask_1_legacy', 1, 'a', 'b', 'open', 1, 1)",
+                            (),
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .unwrap();
+        }
+        // Re-open runs the migration: parent_id (NULL) added, ask_groups recreated.
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let old = s.get_ask("ask_1_legacy").unwrap().unwrap();
+            assert_eq!(old.parent_id, None);
+            let out = s.create_ask_many("a", &["c".into()], None, "fan?").unwrap();
+            assert_eq!(
+                s.ask_many_result(&out.parent_id, None)
+                    .unwrap()
+                    .unwrap()
+                    .target_count,
+                1
+            );
         }
     }
 

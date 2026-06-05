@@ -482,6 +482,32 @@ black-box layers assert the **honest delivery verdict** vocabulary
 a queued / not-injectable ask is **not** an `isError` (hermetic ⇒ no real mux), plus the
 `weave asks` / `weave ask-get` `--json` shapes.
 
+### Ask-many fan-out + read-time aggregate (P2)
+
+`ask_many` / `ask_many_result` are tested **hermetically across both backends** the same
+way. The pure aggregate classifier `model::classify_ask_many` is locked by a proptest
+(`classify_ask_many_is_total`): for any mix of child counts the **totality**
+`answered + acked + pending + failed == target_count` holds and `state == Complete` iff
+`pending == 0` (and `Partial` only under a positive elapsed `age` threshold — there is no
+ticker). The store layer (sqlite **and** `--features libsql` `#[cfg(test)]`) asserts the
+**parent↔child** model: `create_ask_many` inserts one `ask_groups` parent + one well-formed
+P1 child ask per de-duped peer; a child answered/acked through the **unchanged** P1
+`answer`/`ack` updates the read-time aggregate; the rollup tracks mixed child states with
+totality preserved. **Best-effort per child** is asserted directly — an invalid/broadcast
+peer in the list records a per-child error and is skipped (counted `failed = target_count -
+created`) while the call still succeeds, whereas an empty or over-`MAX_ASK_MANY_TARGETS`
+(64) list is a hard whole-call error. The **legacy `parent_id` migration** is locked in both
+backends (`legacy_asks_gains_parent_id_and_ask_groups` + the `_libsql` mirror): a DB whose
+`asks` predates ask-many is seeded with an old-schema row, opened, and the old ask reads back
+with `parent_id == None` while a fresh fan-out works and re-opening is a no-op — the additive
+guarded-column template. The libSQL write-trap is asserted as the first statement of
+`create_ask_many` (`ask_many_write_traps_on_readonly_libsql`). The `McpServer` +
+`CARGO_BIN_EXE_weave` black-box layers cover the happy fan-out (parent_id + per-child cids +
+verdicts), the best-effort 1-created-1-failed path, the `complete | partial | pending`
+result rendering, and the failure paths (empty / over-cap / unknown / invalid parent →
+`isError`); `tests/security.rs` enforces the N-cap from the binary and that the result is
+bounded (child rows ≤ `target_count`) and secret-free.
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

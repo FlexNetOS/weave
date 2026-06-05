@@ -275,6 +275,142 @@ pub struct Ask {
     /// Set when the thread reaches `acked`.
     #[serde(default)]
     pub closed_ts: Option<i64>,
+    /// Parent ask-many group id (`askm_<seed>_<nonce>`) this ask is a child of, or
+    /// `None` for a standalone `ask` / a legacy P1-era row. Additive nullable column
+    /// (the `in_reply_to`/`Peer` precedent); `#[serde(default)]` keeps older JSON
+    /// payloads deserializable.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+/// Hard upper bound (in chars) on an ask-many PARENT (group) id. The id is always
+/// server-minted (`askm_<seed>_<nonce>`), so it can never legitimately be long; the
+/// cap rejects a hostile/oversized user-supplied parent id on `ask_many_result`
+/// before it is bound into a query, the `MAX_ASK_ID_LEN` analog. 80 is more than any
+/// minted id needs (`askm_` prefix + two integer tails).
+pub const MAX_ASK_MANY_ID_LEN: usize = 80;
+
+/// Validate an ask-many parent (group) id. Accepts only the minted shape:
+/// non-empty, `<= MAX_ASK_MANY_ID_LEN` chars, ASCII `[A-Za-z0-9_]` only, and the
+/// `askm_` prefix (so a plain `ask_<...>` child id can never be mistaken for a
+/// parent). The `ask_id_valid` analog for parent ids — guards every store/MCP/CLI
+/// path taking a user-supplied parent id so a metachar/oversized value is rejected
+/// before any DB bind (defense-in-depth; never reaches a shell).
+pub fn ask_many_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ASK_MANY_ID_LEN
+        && id.starts_with("askm_")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Mint an opaque parent id for a freshly-opened ask-many group: `askm_<seed>_<n>`
+/// where `<n>` is a process-local nonce derived from `now()` + the same monotonic
+/// [`ASK_NONCE`] counter `new_ask_id` uses (NO `rand`/date dependency). `seed` is the
+/// `ask_groups` insertion `now()` (or any fresh integer); the nonce widens the opaque
+/// tail. The result always satisfies [`ask_many_id_valid`] (digits + `_` only, `askm_`
+/// prefix).
+pub fn new_ask_many_id(seed: i64) -> String {
+    let n = ASK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = (now() as u64).wrapping_mul(2_654_435_761).wrapping_add(n);
+    format!("askm_{seed}_{nonce}")
+}
+
+/// The canonical question + opener of an ask-many group (the parent anchor stored in
+/// the `ask_groups` table). Holds the question text/subject/opener and the post-dedup
+/// `target_count` once, so totality (`answered+acked+pending+failed == target_count`)
+/// is checkable even when some children failed pre-insert. Pure data, no I/O.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskGroup {
+    pub parent_id: String,
+    pub asker: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub body: String,
+    pub opened_ts: i64,
+    pub target_count: i64,
+}
+
+/// One child row in an aggregated ask-many result: the target peer, the child's
+/// correlation id (`None` if the child failed to create), its lifecycle state, the
+/// answer message id (if answered), and a per-child best-effort error (the reason a
+/// child failed pre-insert). Pure data assembled by the store at read time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskManyChildView {
+    pub peer: String,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub state: Option<AskState>,
+    #[serde(default)]
+    pub answer_msg_id: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Aggregate state of an ask-many group, derived from its children at READ time (no
+/// background ticker): `Complete` when no child is pending; `Partial` when some child
+/// is still pending AND the caller-supplied age threshold has elapsed; else `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AskManyState {
+    Pending,
+    Partial,
+    Complete,
+}
+
+impl AskManyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskManyState::Pending => "pending",
+            AskManyState::Partial => "partial",
+            AskManyState::Complete => "complete",
+        }
+    }
+}
+
+/// Classify an ask-many group's aggregate state from its child rollup — PURE (no
+/// I/O), so it is the unit/proptest target. `Complete` iff no child is still pending
+/// (`pending == 0`, every child answered/acked/failed). Otherwise `Partial` only when
+/// the caller passed an `age_threshold` AND the group's age (`age_secs`) has reached
+/// it (daemon-free, opt-in timeout); else `Pending`. Totality is the caller's
+/// invariant: `answered + acked + pending + failed == total`.
+pub fn classify_ask_many(
+    _total: i64,
+    pending: i64,
+    _failed: i64,
+    age_secs: Option<i64>,
+    age_threshold: Option<i64>,
+) -> AskManyState {
+    if pending <= 0 {
+        return AskManyState::Complete;
+    }
+    if let (Some(age), Some(thr)) = (age_secs, age_threshold) {
+        if thr > 0 && age >= thr {
+            return AskManyState::Partial;
+        }
+    }
+    AskManyState::Pending
+}
+
+/// The full aggregated read-time view of an ask-many group: the parent question +
+/// opener + target count, the rollup counts, the derived [`AskManyState`], and the
+/// per-child views. Pure data returned by `Store::ask_many_result`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskManyResult {
+    pub parent_id: String,
+    pub asker: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub body: String,
+    pub opened_ts: i64,
+    pub target_count: i64,
+    pub total: i64,
+    pub answered: i64,
+    pub acked: i64,
+    pub pending: i64,
+    pub failed: i64,
+    pub state: AskManyState,
+    pub children: Vec<AskManyChildView>,
 }
 
 /// A session that has registered itself, with where (if anywhere) it can be
@@ -407,6 +543,58 @@ mod tests {
         assert!(!ask_id_valid("ask;rm")); // shell metachar
         assert!(!ask_id_valid(&"x".repeat(MAX_ASK_ID_LEN + 1))); // oversized
         assert!(ask_id_valid(&"x".repeat(MAX_ASK_ID_LEN))); // exactly the cap
+    }
+
+    #[test]
+    fn ask_many_id_validation() {
+        let id = new_ask_many_id(42);
+        assert!(id.starts_with("askm_42_"));
+        assert!(ask_many_id_valid(&id));
+        assert!(!ask_many_id_valid("")); // empty
+        assert!(!ask_many_id_valid("ask_1_2")); // a plain child id is NOT a parent
+        assert!(!ask_many_id_valid("askm 1")); // space
+        assert!(!ask_many_id_valid("askm;rm")); // shell metachar
+        assert!(!ask_many_id_valid(&format!(
+            "askm_{}",
+            "x".repeat(MAX_ASK_MANY_ID_LEN)
+        ))); // oversized
+    }
+
+    #[test]
+    fn new_ask_many_id_is_unique_per_mint() {
+        let a = new_ask_many_id(1);
+        let b = new_ask_many_id(1);
+        assert_ne!(a, b);
+    }
+
+    /// `classify_ask_many` is the pure aggregate classifier the proptest targets.
+    #[test]
+    fn classify_ask_many_states() {
+        // No pending children ⇒ complete regardless of age/threshold.
+        assert_eq!(
+            classify_ask_many(3, 0, 1, Some(100), Some(10)),
+            AskManyState::Complete
+        );
+        // Pending children, no age threshold ⇒ never auto-partial (daemon-free).
+        assert_eq!(
+            classify_ask_many(3, 2, 0, Some(9999), None),
+            AskManyState::Pending
+        );
+        // Pending children, threshold set but not yet elapsed ⇒ pending.
+        assert_eq!(
+            classify_ask_many(3, 1, 0, Some(5), Some(10)),
+            AskManyState::Pending
+        );
+        // Pending children, threshold set and elapsed ⇒ partial.
+        assert_eq!(
+            classify_ask_many(3, 1, 0, Some(15), Some(10)),
+            AskManyState::Partial
+        );
+        // A zero/negative threshold never flips to partial.
+        assert_eq!(
+            classify_ask_many(3, 1, 0, Some(15), Some(0)),
+            AskManyState::Pending
+        );
     }
 
     /// Distinct mints never collide for the same rowid (counter widens the tail).
@@ -572,6 +760,36 @@ mod tests {
             prop_assert!(ask_id_valid(&id));
             let prefix = format!("ask_{rowid}_");
             prop_assert!(id.starts_with(&prefix));
+        }
+
+        /// ASK-MANY AGGREGATE TOTALITY: for ANY child mix, `classify_ask_many` never
+        /// panics and obeys its contract — `Complete` iff `pending == 0`; a `Partial`
+        /// verdict only ever appears when a positive age threshold has elapsed and a
+        /// child is still pending; otherwise `Pending`. The caller-side totality
+        /// invariant (`answered + acked + pending + failed == total`) is honored by the
+        /// generator so the property mirrors the store's read-time rollup.
+        #[test]
+        fn classify_ask_many_is_total(
+            answered in 0i64..50,
+            acked in 0i64..50,
+            pending in 0i64..50,
+            failed in 0i64..50,
+            age in proptest::option::of(0i64..10_000),
+            thr in proptest::option::of(0i64..10_000),
+        ) {
+            let total = answered + acked + pending + failed;
+            let st = classify_ask_many(total, pending, failed, age, thr);
+            // Totality holds by construction.
+            prop_assert_eq!(answered + acked + pending + failed, total);
+            // Complete iff no child pending.
+            prop_assert_eq!(st == AskManyState::Complete, pending == 0);
+            // Partial requires a positive elapsed threshold AND a pending child.
+            if st == AskManyState::Partial {
+                prop_assert!(pending > 0);
+                let a = age.unwrap();
+                let t = thr.unwrap();
+                prop_assert!(t > 0 && a >= t);
+            }
         }
     }
 }

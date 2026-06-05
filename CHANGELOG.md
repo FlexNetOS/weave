@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased] — ask-many / ask-many-result (weave⊇repowire parity, epic 2)
+
+> **Fan one question to N peers, daemon-free.** Builds directly on the P1 `asks` table:
+> `ask_many` opens a parent anchor and creates **one normal P1 `ask` per peer**, fires
+> each child's caller-side live nudge, and returns the `parent_id` + per-child
+> correlation_ids + honest verdicts immediately (non-blocking). `ask_many_result` is a
+> **read-time aggregate** — no background ticker, no stored deadline. **Best-effort**: a
+> bad peer is a per-child error, not a whole-call failure (matching repowire). **No new
+> dependency**; no `store → inject` edge (per-child nudge fired caller-side); explicit
+> peer list only (circles compose later); local-mesh only.
+
+### Added
+- **store:** new `ask_groups` parent table + the additive nullable `asks.parent_id`
+  column (both backends, guarded idempotent migration — a legacy P1-era DB upgrades in
+  place with `parent_id = NULL` for existing asks). New `Store` methods `create_ask_many`
+  / `ask_many_result`, mirrored across `store.rs` (sqlite) and `store_libsql.rs` (libSQL,
+  with the write-trap as the first statement of `create_ask_many`). Each child is inserted
+  via the same factored ask-insert the plain `ask` uses (`parent_id = Some(group)` vs
+  `None`) — the P1 lifecycle is shared, not duplicated. Fan-out bounded by
+  `MAX_ASK_MANY_TARGETS = 64` (empty / over-cap is a hard whole-call error; the list is
+  de-duped). `ask_many_result` rolls up the children at read time with the totality
+  `answered + acked + pending + failed == target_count` and classifies
+  `complete | partial | pending`.
+- **model:** `AskGroup`, `AskManyChildView`, `AskManyResult`, `AskManyState` (+ `as_str`),
+  the **pure** classifier `classify_ask_many` (no I/O), the parent-id helpers
+  `new_ask_many_id` (`askm_<seed>_<nonce>`, no `rand`/date crate) and `ask_many_id_valid`
+  / `MAX_ASK_MANY_ID_LEN`, and an additive `Ask.parent_id` field (`#[serde(default)]`).
+- **mcp:** `weave_ask_many` / `weave_ask_many_result` tools. `weave_ask_many` fans the
+  question and fires the caller-side nudge **per created child**, attaching each child's
+  honest delivery verdict; an unknown/broadcast peer in the list is a per-child error, not
+  an `isError`. `weave_ask_many_result` renders the per-child state/answer, the pending
+  peer list, the rollup counts, and the `complete | partial | pending` summary
+  (read-only). `partial` requires an explicit `age` threshold.
+- **cli:** `weave ask-many` (`--to` repeatable, `--body`, `--subject?`, `--from?`) /
+  `weave ask-many-result` (`--parent-id`, `--age?`), both with `--json`, reusing the
+  caller-side inject-verdict seam per child.
+
 ## [Unreleased] — tracked ask/answer/ack (weave⊇repowire parity, epic 1)
 
 > **First step toward repowire capability parity — daemon-free, pure DB.** A
