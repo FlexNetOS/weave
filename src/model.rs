@@ -413,6 +413,389 @@ pub struct AskManyResult {
     pub children: Vec<AskManyChildView>,
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// P3 — Job board (poll-only, daemon-free). A durable work queue: a creator mints
+// a `queued` job, a worker CLAIMS it (minting an `attempt_id` claim token),
+// updates its lifecycle (fenced by that token), and posts a terminal result.
+// There is NO autonomous dispatch/runner here (that is P10/P11): nothing nudges,
+// nothing spawns. Pure model state machine + ids; the lifecycle lives in `store`.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Hard upper bound (in chars) on a job id. The id is always server-minted
+/// (`job_<seed>_<nonce>`), so it can never legitimately be long; the cap rejects a
+/// hostile/oversized user-supplied REFERENCE id (on show/update/result/cancel)
+/// before it is bound into a query — the `MAX_ASK_ID_LEN` analog. 80 is generous
+/// (`job_` prefix + two integer tails).
+pub const MAX_JOB_ID_LEN: usize = 80;
+
+/// Hard upper bound (in chars) on a job attempt (claim) id. Server-minted
+/// (`att_<seed>_<nonce>`); the cap rejects a hostile/oversized supplied token on
+/// `update` before any bind. 80 mirrors [`MAX_JOB_ID_LEN`].
+pub const MAX_ATTEMPT_ID_LEN: usize = 80;
+
+/// Hard upper bound (in chars) on a job's free-text fields (title, description,
+/// prompt, phase, notes, reasons, summaries). Job text is echoed into other
+/// agents' listings/contexts, so an unbounded one is a token/RAM/UI hazard — the
+/// [`crate::store::MAX_BODY`]-class cap, applied at the job text seams.
+pub const MAX_JOB_TEXT: usize = 65_536;
+
+/// Hard upper bound (in BYTES) on a stored job JSON payload (result/error/
+/// artifacts). These are peer-supplied opaque blobs persisted as TEXT; an
+/// unbounded one is a disk + token/RAM DoS once re-rendered into another agent's
+/// context. Enforced at the store write seam so CLI + MCP are both covered.
+pub const MAX_JOB_JSON: usize = 65_536;
+
+/// Validate a job id. Accepts only the minted shape: non-empty, `<= MAX_JOB_ID_LEN`
+/// chars, ASCII `[A-Za-z0-9_]` only, and the `job_` prefix (so an `att_`/`ask_` id
+/// can never be mistaken for a job id). Guards every store/MCP/CLI path taking a
+/// user-supplied job id so a metachar/oversized value is rejected before any DB
+/// bind (defense-in-depth; never reaches a shell).
+pub fn job_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_JOB_ID_LEN
+        && id.starts_with("job_")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Validate a job attempt (claim) id. Accepts only the minted shape: non-empty,
+/// `<= MAX_ATTEMPT_ID_LEN` chars, ASCII `[A-Za-z0-9_]` only, and the `att_` prefix.
+/// The `job_id_valid` analog for the fencing token.
+pub fn attempt_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ATTEMPT_ID_LEN
+        && id.starts_with("att_")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Mint an opaque job id for a freshly-inserted jobs row: `job_<seed>_<n>` where
+/// `<n>` is a nonce derived from `now()`, the process id, AND the SAME monotonic
+/// [`ASK_NONCE`] counter the ask ids use (NO `rand`/date dependency). Unlike asks
+/// (which seed from a fresh AUTOINCREMENT message rowid), a job has no pre-insert
+/// integer anchor, so the nonce MUST be unique across SEPARATE processes too — each
+/// `weave job create` is its own process whose counter resets to 0. Mixing in the
+/// PID makes two same-second, counter-0 mints in different processes diverge, so the
+/// `jobs.id` PRIMARY KEY never collides. Always satisfies [`job_id_valid`].
+pub fn new_job_id(seed: i64) -> String {
+    format!("job_{seed}_{}", mint_nonce(2_246_822_519))
+}
+
+/// Mint an opaque attempt (claim) token for a job CLAIM: `att_<seed>_<n>`, same
+/// cross-process-unique nonce scheme as [`new_job_id`]. Re-claiming a job mints a
+/// fresh token (the monotonic counter guarantees it differs within a process; the
+/// PID/clock guarantee it across processes), which is what fences out a prior
+/// worker's now-stale token in `update_job`. Always satisfies [`attempt_id_valid`].
+pub fn new_attempt_id(seed: i64) -> String {
+    format!("att_{seed}_{}", mint_nonce(3_266_489_917))
+}
+
+/// Build a digits-only nonce tail unique across processes AND within a process:
+/// mixes the wall clock, the OS process id, and the monotonic [`ASK_NONCE`] counter
+/// (NO `rand`/date crate). `mul` is a per-call-site odd multiplier so a job id and
+/// an attempt id minted in the same instant still differ.
+fn mint_nonce(mul: u64) -> u64 {
+    let n = ASK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (now() as u64)
+        .wrapping_mul(mul)
+        .wrapping_add((std::process::id() as u64).wrapping_mul(2_654_435_761))
+        .wrapping_add(n)
+}
+
+/// Lifecycle state of a board job. The 11-variant set is the FULL repowire
+/// `WorkState` vocabulary kept for forward-compat + totality (so a future
+/// autonomous-dispatch epic needs NO model migration). The P3 write paths only
+/// ever MINT the poll-only subset (`Queued` on create; `Running`/`AwaitingInput`/
+/// `Blocked`/`Completed`/`Failed`/`Cancelled`/`Expired` via claim/update/cancel);
+/// `Dispatching`/`Delivered`/`Unavailable` are runner phases — accepted on read
+/// (legacy/foreign rows) and reachable via a generic `update_job` if a caller
+/// insists, but no P3 code path produces them. Stored as TEXT and validated
+/// through this enum (the `AskState` precedent). The machine is monotonic-ish: no
+/// edge OUT of a terminal state (see [`JobState::can_transition`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    Dispatching,
+    Delivered,
+    Running,
+    AwaitingInput,
+    Completed,
+    Failed,
+    Cancelled,
+    Blocked,
+    Expired,
+    Unavailable,
+}
+
+impl JobState {
+    /// Canonical lowercase label stored in the `jobs.state` TEXT column. The only
+    /// inlined SQL "literals" for job state are derived from this (compile-time
+    /// constants, never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Dispatching => "dispatching",
+            JobState::Delivered => "delivered",
+            JobState::Running => "running",
+            JobState::AwaitingInput => "awaiting_input",
+            JobState::Completed => "completed",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::Blocked => "blocked",
+            JobState::Expired => "expired",
+            JobState::Unavailable => "unavailable",
+        }
+    }
+
+    /// Parse a stored state string back into the enum. An unknown value is a hard
+    /// error at the store mapper (never a panic, never silently coerced) so a
+    /// corrupt/foreign row surfaces loudly rather than mis-driving the machine.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "queued" => Ok(JobState::Queued),
+            "dispatching" => Ok(JobState::Dispatching),
+            "delivered" => Ok(JobState::Delivered),
+            "running" => Ok(JobState::Running),
+            "awaiting_input" => Ok(JobState::AwaitingInput),
+            "completed" => Ok(JobState::Completed),
+            "failed" => Ok(JobState::Failed),
+            "cancelled" => Ok(JobState::Cancelled),
+            "blocked" => Ok(JobState::Blocked),
+            "expired" => Ok(JobState::Expired),
+            "unavailable" => Ok(JobState::Unavailable),
+            other => Err(format!("unknown job state '{other}'")),
+        }
+    }
+
+    /// The TERMINAL set: a job in one of these states is DONE and may not change
+    /// state again (poll-only retry == create a NEW job). Frozen at
+    /// `{Completed, Failed, Cancelled, Expired, Unavailable}` — the recommended
+    /// coherent poll-only interpretation (repowire re-acquires `unavailable` only
+    /// via its runner, which P3 does not have).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobState::Completed
+                | JobState::Failed
+                | JobState::Cancelled
+                | JobState::Expired
+                | JobState::Unavailable
+        )
+    }
+
+    /// Legal forward edges of the lifecycle machine — PURE (no I/O), so it is the
+    /// unit/proptest target; the store consults it before every state UPDATE.
+    /// Rules: (1) a terminal state is FROZEN — the only allowed "edge" is the
+    /// idempotent self-noop (`self == to`); (2) cancellation/expiry may INTERRUPT
+    /// from ANY non-terminal state; (3) otherwise progress moves forward within the
+    /// active lane (a self-edge to the same non-terminal state is allowed as an
+    /// idempotent re-write). No edge ever moves OUT of a terminal state.
+    pub fn can_transition(self, to: JobState) -> bool {
+        if self.is_terminal() {
+            return self == to; // terminal frozen; same-terminal re-write is a no-op
+        }
+        if to == JobState::Cancelled || to == JobState::Expired {
+            return true; // cancel/expire interrupt any non-terminal state
+        }
+        matches!(
+            (self, to),
+            (
+                JobState::Queued,
+                JobState::Queued
+                    | JobState::Dispatching
+                    | JobState::Delivered
+                    | JobState::Running
+                    | JobState::AwaitingInput
+                    | JobState::Blocked
+                    | JobState::Completed
+                    | JobState::Failed
+                    | JobState::Unavailable
+            ) | (
+                JobState::Dispatching,
+                JobState::Dispatching
+                    | JobState::Delivered
+                    | JobState::Running
+                    | JobState::Failed
+                    | JobState::Unavailable
+            ) | (
+                JobState::Delivered,
+                JobState::Delivered
+                    | JobState::Running
+                    | JobState::AwaitingInput
+                    | JobState::Blocked
+                    | JobState::Completed
+                    | JobState::Failed
+                    | JobState::Unavailable
+            ) | (
+                JobState::Running,
+                JobState::Running
+                    | JobState::AwaitingInput
+                    | JobState::Blocked
+                    | JobState::Completed
+                    | JobState::Failed
+                    | JobState::Unavailable
+            ) | (
+                JobState::AwaitingInput,
+                JobState::AwaitingInput
+                    | JobState::Running
+                    | JobState::Blocked
+                    | JobState::Completed
+                    | JobState::Failed
+                    | JobState::Unavailable
+            ) | (
+                JobState::Blocked,
+                JobState::Blocked
+                    | JobState::Running
+                    | JobState::AwaitingInput
+                    | JobState::Completed
+                    | JobState::Failed
+                    | JobState::Unavailable
+            )
+        )
+    }
+}
+
+/// Which jobs a `list_jobs` query keeps. Each field is an optional exact-match
+/// filter (`None` == unconstrained); a populated `state` further narrows by
+/// lifecycle. Pure data (no I/O), shared by the store + the mcp/main consumers.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter {
+    pub state: Option<JobState>,
+    pub owner: Option<String>,
+    pub creator: Option<String>,
+    pub assignee: Option<String>,
+    pub circle: Option<String>,
+}
+
+/// The create-time spec for a new board job. An owned struct (not a long argv) so
+/// the store signature stays small and additive-friendly — new inert board fields
+/// can be added without churning every call site. `title` is the only required
+/// field; everything else defaults (`owner` ⇒ creator, `kind` ⇒ "general",
+/// `visibility` ⇒ "circle"). The runner-only knobs (cron/schedule/spawn-exec) are
+/// deliberately ABSENT (P10/P11).
+#[derive(Debug, Clone, Default)]
+pub struct JobSpec {
+    pub title: String,
+    pub description: Option<String>,
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    pub assignee: Option<String>,
+    pub circle: Option<String>,
+    pub prompt: Option<String>,
+    pub correlation_id: Option<String>,
+    pub source_kind: Option<String>,
+    pub source_id: Option<String>,
+    pub scope: Option<String>,
+    pub visibility: Option<String>,
+    pub deadline_at: Option<i64>,
+    pub expires_at: Option<i64>,
+}
+
+/// A mutation patch applied by `update_job`. Every field is optional — only the
+/// `Some` fields are written. `state` (when present) is guarded by
+/// [`JobState::can_transition`]; a `progress_note` is APPENDED to the append-only
+/// event log (never overwrites). Pure data, shared by store + consumers.
+#[derive(Debug, Clone, Default)]
+pub struct JobPatch {
+    pub state: Option<JobState>,
+    pub state_reason: Option<String>,
+    pub phase: Option<String>,
+    pub progress_note: Option<String>,
+    pub result_summary: Option<String>,
+    pub result_json: Option<String>,
+    pub error_json: Option<String>,
+    pub artifacts_json: Option<String>,
+}
+
+/// A board job (P3). The mutable lifecycle row of the work queue. Same
+/// `#[serde(default)]` discipline as [`Ask`] on the nullable/added fields so older
+/// JSON payloads stay deserializable. Timestamps are weave-native `i64` epoch secs
+/// ([`now`]), NOT ISO strings (the no-date-crate discipline; asks do the same).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    /// Opaque id (`job_<seed>_<nonce>`); the PK.
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: String,
+    pub state: JobState,
+    #[serde(default)]
+    pub state_reason: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub progress_note: Option<String>,
+    /// Append-only event log JSON (`[{at,note,state,phase}]`).
+    #[serde(default)]
+    pub progress_events_json: String,
+    pub creator: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Set on CLAIM (the worker that holds the active attempt).
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub circle: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub visibility: String,
+    /// Current claim token (`att_<...>`); `None` until claimed. The fencing key.
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub deadline_at: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    #[serde(default)]
+    pub result_json: String,
+    #[serde(default)]
+    pub error_json: String,
+    #[serde(default)]
+    pub artifacts_json: String,
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default)]
+    pub cancel_requested_by: Option<String>,
+    #[serde(default)]
+    pub cancel_requested_ts: Option<i64>,
+    #[serde(default)]
+    pub cancel_reason: Option<String>,
+    pub opened_ts: i64,
+    pub updated_ts: i64,
+    /// Stamped on entry to any terminal state.
+    #[serde(default)]
+    pub completed_ts: Option<i64>,
+}
+
+/// The read-time result view of a job (`job_result`). When the job is terminal it
+/// carries the terminal payload; otherwise `ready` is false and the rest is the
+/// not-ready marker (mirrors repowire `tracked_work.result()`). Pure data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobResultView {
+    pub id: String,
+    pub state: JobState,
+    pub ready: bool,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    pub result_json: String,
+    pub error_json: String,
+    pub artifacts_json: String,
+    #[serde(default)]
+    pub completed_ts: Option<i64>,
+}
+
 /// A session that has registered itself, with where (if anywhere) it can be
 /// injected into.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,5 +1174,188 @@ mod tests {
                 prop_assert!(t > 0 && a >= t);
             }
         }
+
+        /// JOB STATE-MACHINE TOTALITY: for EVERY ordered pair over the full 11-state
+        /// set, `can_transition` never panics, never moves OUT of a terminal state
+        /// (only the idempotent self-noop), and ALWAYS admits cancel/expire as an
+        /// interrupt from any non-terminal state. Deterministic. The pure invariant
+        /// the store consults before every job UPDATE.
+        #[test]
+        fn job_transition_is_total(a in 0u8..11, b in 0u8..11) {
+            let from = job_state_of(a);
+            let to = job_state_of(b);
+            let ok = from.can_transition(to);
+            prop_assert_eq!(ok, from.can_transition(to)); // determinism
+            if from.is_terminal() {
+                prop_assert_eq!(ok, from == to); // terminal frozen
+            } else {
+                if to == JobState::Cancelled || to == JobState::Expired {
+                    prop_assert!(ok); // interrupt always allowed
+                }
+                if to == JobState::Queued {
+                    prop_assert_eq!(ok, from == JobState::Queued); // no resurrection
+                }
+            }
+        }
+
+        /// JOB TERMINAL IS ABSORBING: walking an arbitrary index sequence and only
+        /// taking legal edges, once a job reaches ANY terminal state no further
+        /// state-changing edge is legal (the daemon-free "done stays done" contract).
+        #[test]
+        fn job_lifecycle_terminal_is_absorbing(steps in proptest::collection::vec(0u8..11, 0..32)) {
+            let mut cur = JobState::Queued;
+            for &s in &steps {
+                let next = job_state_of(s);
+                if cur.is_terminal() {
+                    prop_assert_eq!(cur.can_transition(next), cur == next);
+                } else if cur.can_transition(next) {
+                    cur = next;
+                }
+            }
+        }
+
+        /// ATTEMPT-ID MONOTONIC FENCING: across ANY number of (re)claims, every minted
+        /// attempt id is valid and DISTINCT from every prior mint — so only the LATEST
+        /// token can match the row and every earlier token is fenced out as stale.
+        #[test]
+        fn attempt_ids_are_unique_and_valid(n in 1usize..32) {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::new();
+            for _ in 0..n {
+                let id = new_attempt_id(42);
+                prop_assert!(attempt_id_valid(&id));
+                prop_assert!(id.starts_with("att_"));
+                prop_assert!(seen.insert(id), "attempt ids must be unique per mint");
+            }
+        }
+
+        /// JOB-ID VALIDITY TOTALITY: `job_id_valid` never panics on arbitrary input and
+        /// its verdict matches the contract (non-empty, ≤ cap, `job_` prefix, ASCII
+        /// `[A-Za-z0-9_]`); metachar/oversized/empty/wrong-prefix ids are always rejected.
+        #[test]
+        fn job_id_valid_is_total(s in ".*") {
+            let got = job_id_valid(&s);
+            let expect = !s.is_empty()
+                && s.len() <= MAX_JOB_ID_LEN
+                && s.starts_with("job_")
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            prop_assert_eq!(got, expect);
+            if s.bytes().any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b' ' | b'\n' | b'\'' | b'"')) {
+                prop_assert!(!got);
+            }
+        }
+    }
+
+    /// Map a small index onto a `JobState` so proptest can range over the full set.
+    fn job_state_of(i: u8) -> JobState {
+        match i % 11 {
+            0 => JobState::Queued,
+            1 => JobState::Dispatching,
+            2 => JobState::Delivered,
+            3 => JobState::Running,
+            4 => JobState::AwaitingInput,
+            5 => JobState::Completed,
+            6 => JobState::Failed,
+            7 => JobState::Cancelled,
+            8 => JobState::Blocked,
+            9 => JobState::Expired,
+            _ => JobState::Unavailable,
+        }
+    }
+
+    /// Every JobState label round-trips `from_str(as_str())` (the drift-guard for the
+    /// only inlined SQL state literals), and an unknown label is a clean error.
+    #[test]
+    fn job_state_str_roundtrips() {
+        use JobState::*;
+        for s in [
+            Queued,
+            Dispatching,
+            Delivered,
+            Running,
+            AwaitingInput,
+            Completed,
+            Failed,
+            Cancelled,
+            Blocked,
+            Expired,
+            Unavailable,
+        ] {
+            assert_eq!(JobState::from_str(s.as_str()), Ok(s));
+        }
+        assert!(JobState::from_str("bogus").is_err());
+    }
+
+    /// The job lifecycle machine: no edge OUT of a terminal state (only the
+    /// idempotent self-noop), cancel/expire reachable from EVERY non-terminal state,
+    /// and `can_transition` is total (never panics) over the whole 11×11 product.
+    #[test]
+    fn job_state_machine_totality() {
+        use JobState::*;
+        let all = [
+            Queued,
+            Dispatching,
+            Delivered,
+            Running,
+            AwaitingInput,
+            Completed,
+            Failed,
+            Cancelled,
+            Blocked,
+            Expired,
+            Unavailable,
+        ];
+        for &from in &all {
+            for &to in &all {
+                let ok = from.can_transition(to);
+                if from.is_terminal() {
+                    // Terminal is frozen: only the same-state self-noop is allowed.
+                    assert_eq!(ok, from == to, "terminal {from:?} -> {to:?}");
+                } else {
+                    // Cancel/expire interrupt every non-terminal state.
+                    if to == Cancelled || to == Expired {
+                        assert!(ok, "interrupt {from:?} -> {to:?} must be allowed");
+                    }
+                    // No transition ever lands on a state that then escapes terminality.
+                    if ok && to.is_terminal() {
+                        assert!(!to.can_transition(from) || to == from || from.is_terminal());
+                    }
+                }
+            }
+        }
+    }
+
+    /// A minted job id is always accepted by `job_id_valid`; an attempt id never is
+    /// (and vice-versa) — the prefixes keep the two id spaces disjoint. Hostile /
+    /// oversized / metachar values are rejected.
+    #[test]
+    fn job_and_attempt_id_validation() {
+        let jid = new_job_id(7);
+        assert!(jid.starts_with("job_7_"));
+        assert!(job_id_valid(&jid));
+        assert!(!attempt_id_valid(&jid)); // a job id is not an attempt id
+
+        let aid = new_attempt_id(7);
+        assert!(aid.starts_with("att_7_"));
+        assert!(attempt_id_valid(&aid));
+        assert!(!job_id_valid(&aid)); // an attempt id is not a job id
+
+        assert!(!job_id_valid("")); // empty
+        assert!(!job_id_valid("ask_1_2")); // wrong prefix
+        assert!(!job_id_valid("job 1")); // space
+        assert!(!job_id_valid("job;rm")); // shell metachar
+        assert!(!job_id_valid(&format!(
+            "job_{}",
+            "x".repeat(MAX_JOB_ID_LEN)
+        ))); // oversized
+        assert!(!attempt_id_valid("att;rm")); // shell metachar
+    }
+
+    /// Distinct mints never collide for the same seed (the shared monotonic nonce
+    /// widens the opaque tail) — this is what makes a re-claim fence out a stale token.
+    #[test]
+    fn job_ids_are_unique_per_mint() {
+        assert_ne!(new_job_id(1), new_job_id(1));
+        assert_ne!(new_attempt_id(1), new_attempt_id(1));
     }
 }

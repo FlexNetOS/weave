@@ -37,17 +37,19 @@
 
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
-    ask_id_valid, ask_many_id_valid, classify_ask_many, is_broadcast, new_ask_id, new_ask_many_id,
-    now, Ask, AskGroup, AskManyChildView, AskManyResult, AskRole, AskState, Intent, Message, Peer,
-    BROADCAST_SQL,
+    ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
+    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
+    AskManyChildView, AskManyResult, AskRole, AskState, Intent, Job, JobFilter, JobPatch,
+    JobResultView, JobSpec, JobState, Message, Peer, BROADCAST_SQL,
 };
 use crate::store::{
-    canonical_source, check_body, check_host, check_ident, clamp_field, clamp_limit, commit_pulled,
-    merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, sanitize_tag,
-    store_label, AskManyOutcome, Origin, PeerView, Pulled, RevocationEvent, RevocationKind,
-    SessionInfo, SessionView, Store, VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN,
-    MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS,
-    MAX_WORKTREE_LEN,
+    append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
+    clamp_field, clamp_limit, commit_pulled, job_result_view, merge_peer_views,
+    merge_session_views, remote_scheme_host, reply_subject, sanitize_tag, store_label,
+    validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
+    RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
+    MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN,
+    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -140,6 +142,45 @@ const SCHEMA: &[&str] = &[
         opened_ts    INTEGER NOT NULL,
         target_count INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS jobs (
+        id                   TEXT PRIMARY KEY,
+        title                TEXT NOT NULL DEFAULT '',
+        description          TEXT NOT NULL DEFAULT '',
+        kind                 TEXT NOT NULL DEFAULT 'general',
+        state                TEXT NOT NULL,
+        state_reason         TEXT,
+        phase                TEXT,
+        prompt               TEXT,
+        progress_note        TEXT,
+        progress_events_json TEXT NOT NULL DEFAULT '[]',
+        creator              TEXT NOT NULL,
+        owner                TEXT,
+        assignee             TEXT,
+        circle               TEXT,
+        correlation_id       TEXT,
+        source_kind          TEXT,
+        source_id            TEXT,
+        scope                TEXT,
+        visibility           TEXT NOT NULL DEFAULT 'circle',
+        attempt_id           TEXT,
+        deadline_at          INTEGER,
+        expires_at           INTEGER,
+        result_summary       TEXT,
+        result_json          TEXT NOT NULL DEFAULT '{}',
+        error_json           TEXT NOT NULL DEFAULT '{}',
+        artifacts_json       TEXT NOT NULL DEFAULT '[]',
+        cancel_requested     INTEGER NOT NULL DEFAULT 0,
+        cancel_requested_by  TEXT,
+        cancel_requested_ts  INTEGER,
+        cancel_reason        TEXT,
+        opened_ts            INTEGER NOT NULL,
+        updated_ts           INTEGER NOT NULL,
+        completed_ts         INTEGER
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated ON jobs(owner, updated_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_assignee_updated ON jobs(assignee, updated_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated ON jobs(circle, updated_ts)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -242,6 +283,58 @@ fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
         // 13th projected column (P2). Every `get_ask`/`list_asks` projection now
         // selects `parent_id` last so positional index 12 is always present.
         parent_id: r.get::<Option<String>>(12)?,
+    })
+}
+
+/// The canonical `jobs` column projection (positional), shared by every job SELECT
+/// so [`row_to_job`]'s indices stay in lock-step with the query. libsql has no
+/// by-name `Row::get`, so we pin an explicit ordered list rather than `SELECT *`.
+const JOB_COLS: &str = "id, title, description, kind, state, state_reason, phase, prompt, \
+     progress_note, progress_events_json, creator, owner, assignee, circle, correlation_id, \
+     source_kind, source_id, scope, visibility, attempt_id, deadline_at, expires_at, \
+     result_summary, result_json, error_json, artifacts_json, cancel_requested, \
+     cancel_requested_by, cancel_requested_ts, cancel_reason, opened_ts, updated_ts, completed_ts";
+
+/// Convert a `jobs` row into our owned [`Job`]. Positional column order matches
+/// [`JOB_COLS`]. `state` is parsed through [`JobState::from_str`] (a clean error on
+/// an unknown value, never a panic); `cancel_requested` is a 0/1 INTEGER.
+fn row_to_job(r: &libsql::Row) -> Result<Job> {
+    let state_str = r.get::<String>(4)?;
+    let state = JobState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+    Ok(Job {
+        id: r.get::<String>(0)?,
+        title: r.get::<String>(1)?,
+        description: r.get::<String>(2)?,
+        kind: r.get::<String>(3)?,
+        state,
+        state_reason: r.get::<Option<String>>(5)?,
+        phase: r.get::<Option<String>>(6)?,
+        prompt: r.get::<Option<String>>(7)?,
+        progress_note: r.get::<Option<String>>(8)?,
+        progress_events_json: r.get::<String>(9)?,
+        creator: r.get::<String>(10)?,
+        owner: r.get::<Option<String>>(11)?,
+        assignee: r.get::<Option<String>>(12)?,
+        circle: r.get::<Option<String>>(13)?,
+        correlation_id: r.get::<Option<String>>(14)?,
+        source_kind: r.get::<Option<String>>(15)?,
+        source_id: r.get::<Option<String>>(16)?,
+        scope: r.get::<Option<String>>(17)?,
+        visibility: r.get::<String>(18)?,
+        attempt_id: r.get::<Option<String>>(19)?,
+        deadline_at: r.get::<Option<i64>>(20)?,
+        expires_at: r.get::<Option<i64>>(21)?,
+        result_summary: r.get::<Option<String>>(22)?,
+        result_json: r.get::<String>(23)?,
+        error_json: r.get::<String>(24)?,
+        artifacts_json: r.get::<String>(25)?,
+        cancel_requested: r.get::<i64>(26)? != 0,
+        cancel_requested_by: r.get::<Option<String>>(27)?,
+        cancel_requested_ts: r.get::<Option<i64>>(28)?,
+        cancel_reason: r.get::<Option<String>>(29)?,
+        opened_ts: r.get::<i64>(30)?,
+        updated_ts: r.get::<i64>(31)?,
+        completed_ts: r.get::<Option<i64>>(32)?,
     })
 }
 
@@ -500,6 +593,60 @@ impl LibsqlStore {
             )
             .await
             .context("creating ask_groups table")?;
+            // Migration (P3): the durable poll-only job board. Created via SCHEMA
+            // above for a fresh DB; also created idempotently here for a DB that
+            // predates it (mirrors SqliteStore::migrate). Inert plain data in every
+            // build; runner-only lease/cron/spawn columns are omitted — only board
+            // metadata + the first-class `attempt_id` fencing token. Constant DDL —
+            // no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS jobs (
+                    id                   TEXT PRIMARY KEY,
+                    title                TEXT NOT NULL DEFAULT '',
+                    description          TEXT NOT NULL DEFAULT '',
+                    kind                 TEXT NOT NULL DEFAULT 'general',
+                    state                TEXT NOT NULL,
+                    state_reason         TEXT,
+                    phase                TEXT,
+                    prompt               TEXT,
+                    progress_note        TEXT,
+                    progress_events_json TEXT NOT NULL DEFAULT '[]',
+                    creator              TEXT NOT NULL,
+                    owner                TEXT,
+                    assignee             TEXT,
+                    circle               TEXT,
+                    correlation_id       TEXT,
+                    source_kind          TEXT,
+                    source_id            TEXT,
+                    scope                TEXT,
+                    visibility           TEXT NOT NULL DEFAULT 'circle',
+                    attempt_id           TEXT,
+                    deadline_at          INTEGER,
+                    expires_at           INTEGER,
+                    result_summary       TEXT,
+                    result_json          TEXT NOT NULL DEFAULT '{}',
+                    error_json           TEXT NOT NULL DEFAULT '{}',
+                    artifacts_json       TEXT NOT NULL DEFAULT '[]',
+                    cancel_requested     INTEGER NOT NULL DEFAULT 0,
+                    cancel_requested_by  TEXT,
+                    cancel_requested_ts  INTEGER,
+                    cancel_reason        TEXT,
+                    opened_ts            INTEGER NOT NULL,
+                    updated_ts           INTEGER NOT NULL,
+                    completed_ts         INTEGER
+                )",
+                (),
+            )
+            .await
+            .context("creating jobs table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated ON jobs(owner, updated_ts)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_assignee_updated ON jobs(assignee, updated_ts)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated ON jobs(circle, updated_ts)",
+            ] {
+                conn.execute(idx, ()).await.context("creating jobs index")?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -2200,6 +2347,363 @@ impl Store for LibsqlStore {
                 children,
             }))
         })
+    }
+
+    // ── P3 job board (poll-only) ──────────────────────────────────────────────
+    fn create_job(&self, creator: &str, spec: JobSpec) -> Result<Job> {
+        self.guard_writable()?;
+        validate_job_spec(creator, &spec)?;
+        let ts = now();
+        let owner = spec.owner.clone().unwrap_or_else(|| creator.to_string());
+        let kind = spec.kind.clone().unwrap_or_else(|| "general".to_string());
+        let visibility = spec
+            .visibility
+            .clone()
+            .unwrap_or_else(|| "circle".to_string());
+        let job_id = new_job_id(ts);
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO jobs (
+                        id, title, description, kind, state, prompt, progress_events_json,
+                        creator, owner, assignee, circle, correlation_id, source_kind,
+                        source_id, scope, visibility, deadline_at, expires_at,
+                        result_json, error_json, artifacts_json, cancel_requested,
+                        opened_ts, updated_ts
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                        ?15, ?16, ?17, '{}', '{}', '[]', 0, ?18, ?18
+                     )",
+                    params(vec![
+                        job_id.clone().into(),
+                        spec.title.clone().into(),
+                        spec.description.clone().unwrap_or_default().into(),
+                        kind.into(),
+                        JobState::Queued.as_str().into(),
+                        spec.prompt.clone().into(),
+                        creator.into(),
+                        owner.into(),
+                        spec.assignee.clone().into(),
+                        spec.circle.clone().into(),
+                        spec.correlation_id.clone().into(),
+                        spec.source_kind.clone().into(),
+                        spec.source_id.clone().into(),
+                        spec.scope.clone().into(),
+                        visibility.into(),
+                        spec.deadline_at.into(),
+                        spec.expires_at.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        self.get_job(&job_id)?
+            .ok_or_else(|| anyhow::anyhow!("job '{job_id}' vanished after insert."))
+    }
+
+    fn get_job(&self, id: &str) -> Result<Option<Job>> {
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        let sql = format!("SELECT {JOB_COLS} FROM jobs WHERE id = ?1");
+        self.rt.block_on(async {
+            let mut it = self.conn.query(&sql, params(vec![id.into()])).await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(row_to_job(&r)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn list_jobs(&self, filter: JobFilter, limit: i64) -> Result<Vec<Job>> {
+        let limit = clamp_limit(limit);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<Value> = Vec::new();
+        if let Some(s) = filter.state {
+            clauses.push(format!("state = ?{}", binds.len() + 1));
+            binds.push(s.as_str().into());
+        }
+        if let Some(ref v) = filter.owner {
+            clauses.push(format!("owner = ?{}", binds.len() + 1));
+            binds.push(v.clone().into());
+        }
+        if let Some(ref v) = filter.creator {
+            clauses.push(format!("creator = ?{}", binds.len() + 1));
+            binds.push(v.clone().into());
+        }
+        if let Some(ref v) = filter.assignee {
+            clauses.push(format!("assignee = ?{}", binds.len() + 1));
+            binds.push(v.clone().into());
+        }
+        if let Some(ref v) = filter.circle {
+            clauses.push(format!("circle = ?{}", binds.len() + 1));
+            binds.push(v.clone().into());
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT {JOB_COLS} FROM jobs {where_sql} \
+             ORDER BY updated_ts DESC, rowid DESC LIMIT ?{}",
+            binds.len() + 1
+        );
+        binds.push(limit.into());
+        self.rt.block_on(async {
+            let mut it = self.conn.query(&sql, params(binds)).await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_job(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn claim_job(&self, id: &str, assignee: &str) -> Result<Option<Job>> {
+        self.guard_writable()?;
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("assignee", assignee)?;
+        let ts = now();
+        let did = self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let state_str = {
+                let mut it = tx
+                    .query(
+                        "SELECT state FROM jobs WHERE id = ?1",
+                        params(vec![id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(r.get::<String>(0)?),
+                    None => None,
+                }
+            };
+            let Some(state_str) = state_str else {
+                tx.commit().await?;
+                return Ok::<bool, anyhow::Error>(false);
+            };
+            let state = JobState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+            if state.is_terminal() {
+                anyhow::bail!("job '{id}' is {} and cannot be claimed.", state.as_str());
+            }
+            let attempt_id = new_attempt_id(ts);
+            tx.execute(
+                "UPDATE jobs SET assignee = ?1, attempt_id = ?2, state = ?3, updated_ts = ?4 \
+                 WHERE id = ?5",
+                params(vec![
+                    assignee.into(),
+                    attempt_id.into(),
+                    JobState::Running.as_str().into(),
+                    ts.into(),
+                    id.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })?;
+        if did {
+            self.get_job(id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn update_job(&self, id: &str, attempt_id: Option<&str>, patch: JobPatch) -> Result<Job> {
+        self.guard_writable()?;
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        if let Some(a) = attempt_id {
+            if !attempt_id_valid(a) {
+                anyhow::bail!("invalid attempt id.");
+            }
+        }
+        validate_job_patch(&patch)?;
+        let ts = now();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let row = {
+                let mut it = tx
+                    .query(
+                        "SELECT state, attempt_id, progress_events_json, phase \
+                         FROM jobs WHERE id = ?1",
+                        params(vec![id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some((
+                        r.get::<String>(0)?,
+                        r.get::<Option<String>>(1)?,
+                        r.get::<String>(2)?,
+                        r.get::<Option<String>>(3)?,
+                    )),
+                    None => None,
+                }
+            };
+            let (state_str, cur_attempt, events_json, cur_phase) =
+                row.ok_or_else(|| anyhow::anyhow!("job '{id}' not found."))?;
+            // attempt_id FENCING: a claimed job requires the matching token.
+            if let Some(ref claimed) = cur_attempt {
+                match attempt_id {
+                    Some(a) if a == claimed => {}
+                    _ => anyhow::bail!("stale_attempt"),
+                }
+            }
+            let cur_state = JobState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+            let new_state = patch.state.unwrap_or(cur_state);
+            if patch.state.is_some() && !cur_state.can_transition(new_state) {
+                anyhow::bail!(
+                    "illegal transition {}->{} for job '{id}'.",
+                    cur_state.as_str(),
+                    new_state.as_str()
+                );
+            }
+            let events = append_progress_event(
+                &events_json,
+                ts,
+                patch.progress_note.as_deref(),
+                new_state,
+                patch.phase.as_deref().or(cur_phase.as_deref()),
+            );
+            let completed_ts: Option<i64> = if new_state.is_terminal() {
+                Some(ts)
+            } else {
+                None
+            };
+            tx.execute(
+                "UPDATE jobs SET \
+                    state = ?1, \
+                    state_reason = COALESCE(?2, state_reason), \
+                    phase = COALESCE(?3, phase), \
+                    progress_note = COALESCE(?4, progress_note), \
+                    progress_events_json = ?5, \
+                    result_summary = COALESCE(?6, result_summary), \
+                    result_json = COALESCE(?7, result_json), \
+                    error_json = COALESCE(?8, error_json), \
+                    artifacts_json = COALESCE(?9, artifacts_json), \
+                    completed_ts = COALESCE(?10, completed_ts), \
+                    updated_ts = ?11 \
+                 WHERE id = ?12",
+                params(vec![
+                    new_state.as_str().into(),
+                    patch.state_reason.clone().into(),
+                    patch.phase.clone().into(),
+                    patch.progress_note.clone().into(),
+                    events.into(),
+                    patch.result_summary.clone().into(),
+                    patch.result_json.clone().into(),
+                    patch.error_json.clone().into(),
+                    patch.artifacts_json.clone().into(),
+                    completed_ts.into(),
+                    ts.into(),
+                    id.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        self.get_job(id)?
+            .ok_or_else(|| anyhow::anyhow!("job '{id}' vanished after update."))
+    }
+
+    fn job_result(&self, id: &str) -> Result<Option<JobResultView>> {
+        match self.get_job(id)? {
+            Some(j) => Ok(Some(job_result_view(&j))),
+            None => Ok(None),
+        }
+    }
+
+    fn cancel_job(
+        &self,
+        id: &str,
+        requested_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<Job>> {
+        self.guard_writable()?;
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("requested_by", requested_by)?;
+        if let Some(r) = reason {
+            check_job_text("reason", r)?;
+        }
+        let ts = now();
+        let did = self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let state_str = {
+                let mut it = tx
+                    .query(
+                        "SELECT state FROM jobs WHERE id = ?1",
+                        params(vec![id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(r.get::<String>(0)?),
+                    None => None,
+                }
+            };
+            let Some(state_str) = state_str else {
+                tx.commit().await?;
+                return Ok::<bool, anyhow::Error>(false);
+            };
+            let state = JobState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+            if state == JobState::Queued {
+                tx.execute(
+                    "UPDATE jobs SET state = ?1, cancel_requested = 1, \
+                        cancel_requested_by = COALESCE(cancel_requested_by, ?2), \
+                        cancel_requested_ts = COALESCE(cancel_requested_ts, ?3), \
+                        cancel_reason = COALESCE(cancel_reason, ?4), \
+                        completed_ts = ?3, updated_ts = ?3 \
+                     WHERE id = ?5",
+                    params(vec![
+                        JobState::Cancelled.as_str().into(),
+                        requested_by.into(),
+                        ts.into(),
+                        reason.into(),
+                        id.into(),
+                    ]),
+                )
+                .await?;
+            } else {
+                tx.execute(
+                    "UPDATE jobs SET cancel_requested = 1, \
+                        cancel_requested_by = COALESCE(cancel_requested_by, ?1), \
+                        cancel_requested_ts = COALESCE(cancel_requested_ts, ?2), \
+                        cancel_reason = COALESCE(cancel_reason, ?3), \
+                        updated_ts = ?2 \
+                     WHERE id = ?4",
+                    params(vec![
+                        requested_by.into(),
+                        ts.into(),
+                        reason.into(),
+                        id.into(),
+                    ]),
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(true)
+        })?;
+        if did {
+            self.get_job(id)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -4065,5 +4569,253 @@ mod tests {
             let s = LibsqlStore::open(&cfg).unwrap();
             assert_eq!(s.count_revocations().unwrap(), 1, "re-open is a no-op");
         }
+    }
+
+    /// Migration on libsql (P3): a genuine LEGACY DB that predates the `jobs` table
+    /// gains it on open (mirror of the sqlite `legacy_db_gains_jobs_table`); a
+    /// pre-existing peers row survives (no data loss) and re-opening is a clean
+    /// no-op. Proves the inline migrate upgrade path, not just `IF NOT EXISTS`
+    /// re-entry on a DB that already has the table.
+    #[test]
+    fn legacy_db_gains_jobs_table_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-jobslegacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        // Build a pre-P3 DB: a peers table + one row, and NO jobs table.
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let db = Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "CREATE TABLE peers (
+                        name TEXT PRIMARY KEY, mux TEXT NOT NULL, target TEXT NOT NULL,
+                        socket TEXT NOT NULL DEFAULT '', cwd TEXT, last_seen INTEGER NOT NULL
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen)
+                     VALUES ('old', 'tmux', '%1', '', '/legacy', ?1)",
+                    params(vec![now().into()]),
+                )
+                .await
+                .unwrap();
+            });
+        }
+
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        // First open runs the inline migration: the jobs table exists and is usable,
+        // and the pre-existing peer survives.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(
+                s.list_jobs(JobFilter::default(), 100).unwrap().len(),
+                0,
+                "jobs table created, empty"
+            );
+            let j = s.create_job("alice", jspec("after-migrate")).unwrap();
+            assert!(s.get_job(&j.id).unwrap().is_some());
+            assert!(
+                s.get_peer("old").unwrap().is_some(),
+                "legacy peer survived the migration (no data loss)"
+            );
+        }
+        // Re-open: idempotent — the created job persists, no duplicate-table error.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            assert_eq!(
+                s.list_jobs(JobFilter::default(), 100).unwrap().len(),
+                1,
+                "re-open is a no-op; the created job persists"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── P3 job board store tests (libsql) — mirror the sqlite parity tests ────
+
+    fn jspec(title: &str) -> JobSpec {
+        JobSpec {
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn job_create_claim_update_result_roundtrip_libsql() {
+        let s = mem();
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        assert!(crate::model::job_id_valid(&j.id));
+        assert_eq!(j.state, JobState::Queued);
+        assert_eq!(j.owner.as_deref(), Some("alice")); // owner defaults to creator
+
+        let att = s
+            .claim_job(&j.id, "w")
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        assert!(crate::model::attempt_id_valid(&att));
+
+        let done = s
+            .update_job(
+                &j.id,
+                Some(&att),
+                JobPatch {
+                    state: Some(JobState::Completed),
+                    result_summary: Some("ok".into()),
+                    progress_note: Some("fin".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(done.state, JobState::Completed);
+        assert!(done.completed_ts.is_some());
+        assert!(done.progress_events_json.contains("fin"));
+
+        let r = s.job_result(&j.id).unwrap().unwrap();
+        assert!(r.ready);
+    }
+
+    #[test]
+    fn job_stale_attempt_is_fenced_libsql() {
+        let s = mem();
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        let old = s
+            .claim_job(&j.id, "w1")
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        let new = s
+            .claim_job(&j.id, "w2")
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        assert_ne!(old, new);
+        let err = s
+            .update_job(
+                &j.id,
+                Some(&old),
+                JobPatch {
+                    state: Some(JobState::Completed),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("stale_attempt"));
+    }
+
+    #[test]
+    fn job_illegal_transition_and_cancel_libsql() {
+        let s = mem();
+        // illegal transition: completed -> running.
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        let att = s
+            .claim_job(&j.id, "w")
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .unwrap();
+        s.update_job(
+            &j.id,
+            Some(&att),
+            JobPatch {
+                state: Some(JobState::Completed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(s
+            .update_job(
+                &j.id,
+                Some(&att),
+                JobPatch {
+                    state: Some(JobState::Running),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+
+        // cancel: queued -> terminal cancelled; running -> flag only.
+        let q = s.create_job("alice", jspec("q")).unwrap();
+        let c = s.cancel_job(&q.id, "alice", None).unwrap().unwrap();
+        assert_eq!(c.state, JobState::Cancelled);
+        let r = s.create_job("alice", jspec("r")).unwrap();
+        s.claim_job(&r.id, "w").unwrap();
+        let rc = s.cancel_job(&r.id, "alice", None).unwrap().unwrap();
+        assert_eq!(rc.state, JobState::Running);
+        assert!(rc.cancel_requested);
+    }
+
+    #[test]
+    fn job_list_filters_libsql() {
+        let s = mem();
+        let a = s.create_job("alice", jspec("a")).unwrap();
+        s.create_job("bob", jspec("b")).unwrap();
+        s.claim_job(&a.id, "alice").unwrap();
+        let running = s
+            .list_jobs(
+                JobFilter {
+                    state: Some(JobState::Running),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        let all = s.list_jobs(JobFilter::default(), i64::MAX).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn job_readonly_handle_traps_writes_libsql() {
+        // A read-only foreign handle must REFUSE every job write (owner-only-writes).
+        let s = mem();
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        drop(s);
+        // Re-open the same path read-only and assert writes trap.
+        // (mem() makes a unique dir each call, so re-derive the path is not trivial;
+        //  instead assert the guard via a fresh read-only store over a known file.)
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-jobro-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let w = LibsqlStore::open(&cfg).unwrap();
+            w.create_job("alice", jspec("seed")).unwrap();
+        }
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(ro.create_job("alice", jspec("nope")).is_err());
+        assert!(ro.claim_job(&j.id, "w").is_err());
+        assert!(ro.cancel_job(&j.id, "alice", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

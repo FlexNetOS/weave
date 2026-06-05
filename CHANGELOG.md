@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased] — poll-only job board (weave⊇repowire parity, epic 3)
+
+> **Durable, daemon-free work queue.** A persistent `jobs` board on top of the same
+> store: workers **poll and claim** jobs and report progress/results back. **Poll-only**
+> — there is **no autonomous dispatch or agent-spawn** in this release (a JobRunner that
+> *acquires and runs* a job by spawning an agent, plus the cron scheduler and
+> dispatch-lease ledger, are deferred to a later runner epic). Claim mints a fresh
+> `attempt_id` fencing token; an update with a **stale token on a claimed job is rejected**
+> (`stale_attempt`), enforced in the **store** so CLI and MCP both inherit it. Cancel is
+> **cooperative** (a worker honors the flag — no daemon needed to request it), never a hard
+> delete. **No new dependency**; no `store → inject` edge; dual-backend additive guarded
+> migration; runner-only columns excluded; local-mesh only.
+
+### Added
+- **store:** new `jobs` table (both backends, guarded idempotent migration — a legacy DB
+  upgrades in place, inert plain data in every build). Seven `Store` methods — `create_job`
+  (starts `queued`, mints the `job_<…>` id, owner defaults to creator), `get_job`,
+  `list_jobs` (filters by state/owner/creator/assignee/circle, `clamp_limit`-bounded,
+  `ORDER BY updated_ts DESC`), `claim_job` (mints `attempt_id`, → `running`, rejects
+  terminal), `update_job` (**`attempt_id` fencing** + `JobState::can_transition` legality +
+  append-only progress event + terminal `completed_ts` stamp), `job_result` (terminal
+  payload else `not_ready`), `cancel_job` (cooperative: queued → terminal `cancelled`; else
+  flag-only) — mirrored across `store.rs` (sqlite) and `store_libsql.rs` (libSQL, each WRITE
+  opening with the `guard_writable()?` write-trap). All SQL parameterized; the only inlined
+  literals are the compile-time `JobState::as_str()` constants (BROADCAST-literal discipline,
+  with a round-trip drift-guard test). **Runner-only columns excluded** (lease / runner-owner
+  / attempts-ledger / cron / schedule / spawn-exec); only the single first-class `attempt_id`
+  fencing token is promoted. No `store → inject` edge.
+- **model:** `JobState` enum — a **forward-compat 11-state superset** with a frozen terminal
+  set (`{Completed, Failed, Cancelled, Expired, Unavailable}`) and the pure monotonic
+  `can_transition` (cancel/expire interrupt any non-terminal; no edge out of a terminal,
+  idempotent self-noop excepted). `Job` / `JobSpec` / `JobFilter` / `JobPatch` /
+  `JobResultView` owned types (`#[serde(default)]` on nullable fields); the opaque id helpers
+  `new_job_id` (`job_<seed>_<nonce>`) / `new_attempt_id` (`att_<seed>_<nonce>`, no `rand` /
+  date crate) and `job_id_valid` / `attempt_id_valid` + `MAX_JOB_ID_LEN` /
+  `MAX_ATTEMPT_ID_LEN` / `MAX_JOB_TEXT` / `MAX_JOB_JSON` caps.
+- **mcp:** `weave_job_create` / `weave_job_list` / `weave_job_show` / `weave_job_status` /
+  `weave_job_claim` / `weave_job_update` / `weave_job_result` / `weave_job_cancel` tools
+  (`show` and `status` are aliases of one status view). Tested failure paths: stale
+  `attempt_id` → fenced JSON-RPC error; unknown job → not_found; illegal transition → error;
+  oversized title / JSON over the byte cap → cap error; metachar job id → validator error.
+  No injector involvement; stdout discipline preserved (only result/error frames).
+- **cli:** `weave job create / list / show / status / claim / update / result / cancel`, each
+  with `--json`, routing through the **same** seven store methods so fencing / transition /
+  caps are enforced once.
+
 ## [Unreleased] — ask-many / ask-many-result (weave⊇repowire parity, epic 2)
 
 > **Fan one question to N peers, daemon-free.** Builds directly on the P1 `asks` table:

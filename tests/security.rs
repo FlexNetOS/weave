@@ -2751,3 +2751,69 @@ fn ask_many_result_is_bounded_and_secret_free() {
     );
     assert!(!res.contains(".db"), "no db path leak: {res:?}");
 }
+
+// ---------------------------------------------------------------------------
+// P3 job board — caps, id validation, JSON size cap, bounded list, secret-free.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn job_caps_and_id_validators_reject_hostile_input() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // Oversized title rejected (MAX_JOB_TEXT-class cap, never persisted).
+    let huge = "x".repeat(70_000);
+    let (is_err, _t) = mcp.call_tool(
+        "weave_job_create",
+        serde_json::json!({"creator": "alice", "title": huge}),
+    );
+    assert!(is_err, "oversized title must be isError");
+
+    // A valid job to exercise the JSON cap + id validators.
+    let (_e, text) = mcp.call_tool(
+        "weave_job_create",
+        serde_json::json!({"creator": "alice", "title": "ok"}),
+    );
+    let id = text
+        .split_whitespace()
+        .find(|w| w.starts_with("job_"))
+        .expect("job id")
+        .to_string();
+
+    // Oversized result JSON rejected (MAX_JOB_JSON byte cap) — unclaimed job, no token needed.
+    let big_json = format!("\"{}\"", "y".repeat(70_000));
+    let (is_err, _t) = mcp.call_tool(
+        "weave_job_update",
+        serde_json::json!({"job_id": id, "result": big_json}),
+    );
+    assert!(is_err, "oversized result JSON must be isError");
+
+    // A metachar-bearing job id never reaches a bind (validator rejects first).
+    for bad in ["job;rm", "job id", "ask_1_2", "../etc"] {
+        let (is_err, _t) = mcp.call_tool("weave_job_show", serde_json::json!({"job_id": bad}));
+        assert!(is_err, "invalid job id {bad:?} must be isError");
+    }
+
+    mcp.shutdown();
+}
+
+#[test]
+fn job_list_limit_is_bounded_and_output_secret_free() {
+    let db = TestDb::new();
+    // Create a couple of jobs with a recognizable but non-secret title.
+    run_ok(
+        &db,
+        &["job", "create", "--title", "alpha", "--from", "alice"],
+    );
+    run_ok(
+        &db,
+        &["job", "create", "--title", "beta", "--from", "alice"],
+    );
+    // A huge/negative limit is clamped in the store (no panic, no unbounded scan).
+    let out = run_ok(&db, &["job", "list", "--limit", "9999999999"]);
+    assert!(out.contains("alpha") && out.contains("beta"));
+    // No db path / filesystem leak in the human listing.
+    assert!(!out.contains(".db"), "no db path leak: {out:?}");
+    let (ok, _o, _e) = run(&db, &["job", "list", "--limit=-1"]);
+    assert!(ok, "negative limit clamps rather than erroring");
+}
