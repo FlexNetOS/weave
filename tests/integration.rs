@@ -4051,6 +4051,411 @@ fn mcp_weave_scan_surfaces_remote_marker_reason_summary() {
 }
 
 // ---------------------------------------------------------------------------
+// Feature #8 — host-aware Liveness reason on peers / doctor / sessions --watch.
+//
+// Display-only, additive: the SAME #6 host-aware vocabulary (tokens
+// alive_local|alive_remote|stale, the `<remote>` marker, the
+// `alive (remote, ttl)` reason, the `N local-alive, M remote-alive, K stale`
+// summary) is now surfaced on `peers`, `doctor`, and the `sessions --watch`
+// dashboard. All hermetic & deterministic: reuse the proven forced-`HOSTNAME` +
+// `WEAVE_PEER_DBS` foreign-store fixture (a just-registered remote-host row is
+// recent ⇒ AliveRemote, never pid-probed cross-machine), and #5's bounded
+// `--iterations 1` for the dashboard (a returning call proves termination).
+//
+// CONSISTENCY MANDATE: a peers/watch row's liveness/remote/reason must be
+// BYTE-IDENTICAL to what `weave scan` emits for the SAME peer — asserted by
+// comparing a scan row to a peers row directly.
+// ---------------------------------------------------------------------------
+
+/// `peers --json` carries the additive `liveness` token + `remote` bool per peer
+/// (every pre-existing key intact), and a federated remote-host peer reads
+/// `liveness:"alive_remote"` / `remote:true`. Hermetic foreign fixture.
+#[test]
+fn peers_json_surfaces_remote_host_peer_alive_remote_additive_keys() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let out = run_ok_env(
+        &local,
+        &["peers", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("peers --json parses");
+    let arr = v.as_array().expect("peers --json is an array");
+
+    let remote = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("remotepeer"))
+        .unwrap_or_else(|| panic!("foreign remote peer surfaced via federation: {out}"));
+    assert_eq!(
+        remote["remote"].as_bool(),
+        Some(true),
+        "remotepeer host differs => remote:true: {out}"
+    );
+    assert_eq!(
+        remote["liveness"].as_str(),
+        Some("alive_remote"),
+        "a recent remote-host peer is alive_remote (TTL-judged): {out}"
+    );
+    // Pre-existing keys still present (additive change does not drop any key).
+    for k in [
+        "name",
+        "mux",
+        "target",
+        "socket",
+        "cwd",
+        "host",
+        "injectable",
+        "origin",
+        "foreign",
+        "liveness",
+        "remote",
+    ] {
+        assert!(
+            remote.get(k).is_some(),
+            "peers --json row missing key {k}: {out}"
+        );
+    }
+    // The local self row is same-host => remote:false, never alive_remote.
+    let localp = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("localpeer"))
+        .unwrap_or_else(|| panic!("local peer present: {out}"));
+    assert_eq!(localp["remote"].as_bool(), Some(false), "{out}");
+    let lv = localp["liveness"].as_str().unwrap_or("");
+    assert!(
+        lv == "alive_local" || lv == "stale",
+        "same-host peer is alive_local or stale (pid nuance), never alive_remote: {out}"
+    );
+    // Secret-free.
+    assert!(
+        !out.to_lowercase().contains("token") && !out.contains("libsql://"),
+        "peers --json must be secret-free: {out}"
+    );
+}
+
+/// CONSISTENCY: a `peers --json` row's `liveness`/`remote` are byte-identical to
+/// the `scan --json` row's for the SAME peer (the #6 vocabulary is reused, not
+/// forked). Same hermetic foreign fixture and forced host for both invocations.
+#[test]
+fn peers_json_liveness_keys_match_scan_for_same_peer() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+    let env = [
+        ("WEAVE_PEER_DBS", foreign.path_str()),
+        ("HOSTNAME", "this-machine".to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let scan_out = run_ok_env(&local, &["scan", "--json"], &env_ref);
+    let peers_out = run_ok_env(&local, &["peers", "--json"], &env_ref);
+    let scan: serde_json::Value = serde_json::from_str(&scan_out).expect("scan --json");
+    let peers: serde_json::Value = serde_json::from_str(&peers_out).expect("peers --json");
+
+    let find = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{name} present"))
+            .clone()
+    };
+    let s_remote = find(&scan, "remotepeer");
+    let p_remote = find(&peers, "remotepeer");
+    assert_eq!(
+        s_remote["liveness"], p_remote["liveness"],
+        "scan vs peers liveness token must be identical for the same peer:\nscan={scan_out}\npeers={peers_out}"
+    );
+    assert_eq!(
+        s_remote["remote"], p_remote["remote"],
+        "scan vs peers `remote` flag must be identical for the same peer"
+    );
+    assert_eq!(p_remote["liveness"].as_str(), Some("alive_remote"));
+    assert_eq!(p_remote["remote"].as_bool(), Some(true));
+}
+
+/// Human `weave peers` shows the `<remote>` marker + `[alive (remote, ttl)]`
+/// reason for the federated remote-host row — the same idiom `scan` prints.
+#[test]
+fn peers_human_shows_remote_marker_and_reason() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+    let out = run_ok_env(
+        &local,
+        &["peers"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    assert!(
+        out.contains("<remote>"),
+        "human peers shows remote marker: {out}"
+    );
+    assert!(
+        out.contains("alive (remote, ttl)"),
+        "human peers shows the remote TTL reason: {out}"
+    );
+}
+
+/// `doctor --json` carries the additive `peers_alive_local` /
+/// `peers_alive_remote` / `peers_stale` counts; with one federated remote-host
+/// row the remote count is exactly 1, and the human `doctor` shows the
+/// `N local-alive, M remote-alive, K stale` line. Pre-existing keys intact.
+#[test]
+fn doctor_json_and_human_surface_liveness_counts() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+    let foreign_path = foreign.path_str();
+    let env = [
+        ("WEAVE_PEER_DBS", foreign_path.as_str()),
+        ("HOSTNAME", "this-machine"),
+    ];
+
+    let out = run_ok_env(&local, &["doctor", "--json"], &env);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    // Additive count keys present, siblings of the pre-existing peer counts.
+    for k in [
+        "peers",
+        "peers_online",
+        "peers_alive_local",
+        "peers_alive_remote",
+        "peers_stale",
+    ] {
+        assert!(v.get(k).is_some(), "doctor --json missing key {k}: {out}");
+    }
+    // Exactly one federated remote-host row ⇒ remote-alive count is 1.
+    assert_eq!(
+        v["peers_alive_remote"].as_u64(),
+        Some(1),
+        "one recent remote-host peer => peers_alive_remote == 1: {out}"
+    );
+    // The three liveness buckets partition the peer set.
+    let total = v["peers"].as_u64().unwrap_or(0);
+    let sum = v["peers_alive_local"].as_u64().unwrap_or(0)
+        + v["peers_alive_remote"].as_u64().unwrap_or(0)
+        + v["peers_stale"].as_u64().unwrap_or(0);
+    assert_eq!(
+        total, sum,
+        "liveness buckets must sum to peers total: {out}"
+    );
+
+    // Human: the three-count summary line, exact #6 phrasing.
+    let human = run_ok_env(&local, &["doctor"], &env);
+    assert!(
+        human.contains("1 remote-alive"),
+        "human doctor shows the remote-alive count: {human}"
+    );
+    assert!(
+        human.contains("local-alive") && human.contains("stale"),
+        "human doctor lists all three liveness buckets: {human}"
+    );
+}
+
+/// `sessions --watch --iterations 1` (#5 bounded path) over a mix of a local row
+/// and a federated remote-host row shows the per-row reason marker, the
+/// `<remote>` marker for the remote row, and the three-count header — and STILL
+/// EXITS (a returning call proves the loop terminated; no hang).
+#[test]
+fn sessions_watch_shows_liveness_reasons_and_remote_marker() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &local,
+        &["register", "--name", "localpeer"],
+        &[("HOSTNAME", "this-machine")],
+    );
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["sessions", "--watch", "--iterations", "1"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+            ("WEAVE_NO_CLEAR", "1"),
+            ("NO_COLOR", "1"),
+        ],
+    );
+    assert!(
+        ok,
+        "watch --iterations 1 must exit 0 (no hang); stderr: {err}"
+    );
+    assert_eq!(frame_count(&out), 1, "exactly one frame:\n{out}");
+    // Remote row carries the marker + the remote TTL reason.
+    assert!(out.contains("remotepeer"), "remote peer present: {out}");
+    assert!(
+        out.contains("<remote>"),
+        "watch shows the remote marker: {out}"
+    );
+    assert!(
+        out.contains("[alive (remote, ttl)]"),
+        "watch shows the remote TTL reason for the remote row: {out}"
+    );
+    // Header three-count breakdown (the #6 phrasing), with the single remote row.
+    assert!(
+        out.contains("1 remote-alive"),
+        "watch header shows the remote-alive count: {out}"
+    );
+    assert!(
+        out.contains("local-alive") && out.contains("stale,"),
+        "watch header lists all three liveness buckets: {out}"
+    );
+    assert!(
+        !out.as_bytes().contains(&0x1b),
+        "plain watch frame must carry no ANSI escape: {out:?}"
+    );
+}
+
+/// CONSISTENCY: the `sessions --watch --json` snapshot's `liveness`/`remote` keys
+/// are byte-identical to the `scan --json` row's for the SAME remote peer (the
+/// watch JSON reuses the #6 vocabulary, not a forked one). Hermetic fixture.
+#[test]
+fn sessions_watch_json_liveness_matches_scan_for_same_peer() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+    let foreign_path = foreign.path_str();
+    let env = [
+        ("WEAVE_PEER_DBS", foreign_path.as_str()),
+        ("HOSTNAME", "this-machine"),
+        ("WEAVE_NO_CLEAR", "1"),
+        ("NO_COLOR", "1"),
+    ];
+    let scan_out = run_ok_env(&local, &["scan", "--json"], &env);
+    let watch_out = run_ok_env(&local, &["sessions", "--watch", "--json"], &env);
+    let scan: serde_json::Value = serde_json::from_str(&scan_out).expect("scan --json");
+    let watch: serde_json::Value = serde_json::from_str(&watch_out).expect("watch --json");
+
+    let s = scan
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str() == Some("remotepeer"))
+        .unwrap_or_else(|| panic!("scan has remotepeer: {scan_out}"))
+        .clone();
+    let w = watch
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str() == Some("remotepeer"))
+        .unwrap_or_else(|| panic!("watch json has remotepeer: {watch_out}"))
+        .clone();
+    assert_eq!(
+        s["liveness"], w["liveness"],
+        "scan vs watch liveness token identical for the same peer:\nscan={scan_out}\nwatch={watch_out}"
+    );
+    assert_eq!(
+        s["remote"], w["remote"],
+        "scan vs watch `remote` flag identical for the same peer"
+    );
+    assert_eq!(w["liveness"].as_str(), Some("alive_remote"));
+}
+
+/// MCP parity (#8): `weave_peers` shows the `<remote>` marker + reason and
+/// `weave_doctor` shows the three-count summary — mirroring the CLI, secret-free,
+/// returned as a String (stdout discipline). Hermetic foreign fixture.
+#[test]
+fn mcp_weave_peers_and_doctor_surface_liveness() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+
+    let (err, text) = mcp.call_tool("weave_peers", serde_json::json!({}));
+    assert!(!err, "weave_peers not an error: {text}");
+    assert!(
+        text.contains("remotepeer"),
+        "weave_peers lists remote peer: {text}"
+    );
+    assert!(
+        text.contains("<remote>"),
+        "weave_peers mirrors the remote marker: {text}"
+    );
+    assert!(
+        text.contains("alive (remote, ttl)"),
+        "weave_peers mirrors the remote TTL reason: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("token") && !text.contains("libsql://"),
+        "weave_peers secret-free: {text}"
+    );
+
+    let (err, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!err, "weave_doctor not an error: {dtext}");
+    assert!(
+        dtext.contains("1 remote-alive"),
+        "weave_doctor shows the remote-alive count: {dtext}"
+    );
+    assert!(
+        dtext.contains("local-alive") && dtext.contains("stale"),
+        "weave_doctor lists all three liveness buckets: {dtext}"
+    );
+    mcp.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Tier-2 v2 — LIVE remote (Turso) pull. ENV-GATED + `#[ignore]`: CI never sets
 // the env and never passes `--ignored`, so the default suite stays HERMETIC (no
 // network). Run manually against a real Turso DB only (see docs/TESTING.md):

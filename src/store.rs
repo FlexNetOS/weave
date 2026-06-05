@@ -459,16 +459,34 @@ impl Liveness {
 }
 
 /// Host-aware liveness classifier — see [`Liveness`]. Pure except for the
-/// same-host PID probe (which is gated to the `AliveLocal` arm).
+/// same-host PID probe (which is gated to the `AliveLocal` arm). Thin wrapper
+/// over [`liveness_from_fields`] reading the peer's raw fields, so a caller that
+/// only has loose fields (e.g. the `sessions --watch` dashboard render) and a
+/// caller that has a full [`Peer`] classify byte-identically.
 pub fn liveness_for(peer: &Peer, this_host: &str, now_ts: i64) -> Liveness {
+    liveness_from_fields(&peer.host, peer.pid, peer.last_seen, this_host, now_ts)
+}
+
+/// Host-aware liveness classifier over loose presence fields — the field-level
+/// seam under [`liveness_for`]. Lets a display surface that holds only
+/// `host`/`pid`/`last_seen` (the `sessions --watch` dashboard) compute the same
+/// verdict without fabricating a full [`Peer`]. Pure except for the same-host
+/// PID probe, which is gated to the local arm exactly as before.
+pub fn liveness_from_fields(
+    host: &str,
+    pid: Option<i64>,
+    last_seen: i64,
+    this_host: &str,
+    now_ts: i64,
+) -> Liveness {
     // Recency guard first: anything past the TTL window is stale regardless of host.
-    if !is_online_at(peer.last_seen, now_ts) {
+    if !is_online_at(last_seen, now_ts) {
         return Liveness::Stale;
     }
-    if peer.host == this_host {
+    if host == this_host {
         // Same host: the PID is authoritative when known; a dead local pid is
         // stale even though it is recent. A null pid falls back to the TTL window.
-        match peer.pid {
+        match pid {
             Some(pid) if !pid_alive(pid) => Liveness::Stale,
             _ => Liveness::AliveLocal,
         }

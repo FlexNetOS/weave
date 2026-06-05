@@ -672,6 +672,21 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         .iter()
         .filter(|v| !v.peer.repo.is_empty() || !v.peer.worktree_id.is_empty())
         .count();
+    // Host-aware liveness breakdown over the peer set (A2 vocabulary, display-only):
+    // one pass classifying each already-pulled row; deterministic given this_host/now,
+    // secret-free (host/liveness only). Never a cross-machine probe.
+    let this_host = config::this_host();
+    let now_ts = model::now();
+    let mut peers_alive_local = 0usize;
+    let mut peers_alive_remote = 0usize;
+    let mut peers_stale = 0usize;
+    for v in &views {
+        match store::liveness_for(&v.peer, &this_host, now_ts) {
+            store::Liveness::AliveLocal => peers_alive_local += 1,
+            store::Liveness::AliveRemote => peers_alive_remote += 1,
+            store::Liveness::Stale => peers_stale += 1,
+        }
+    }
     let (fed_ok, fed_skipped) = store::federation_status(&extra);
     // On the default sqlite build a remote source cannot be opened — surface how
     // many were skipped purely for lack of the libsql feature so the user is told.
@@ -737,6 +752,9 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "peers": total_peers,
             "peers_online": online,
             "peers_tagged": tagged,
+            "peers_alive_local": peers_alive_local,
+            "peers_alive_remote": peers_alive_remote,
+            "peers_stale": peers_stale,
             "claude_on_path": claude,
             "federation_stores": extra.len(),
             "federation_stores_ok": fed_ok,
@@ -834,6 +852,9 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         );
         println!("  messages:       {total}");
         println!("  peers:          {total_peers} ({online} online, {tagged} tagged)");
+        println!(
+            "  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
+        );
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
         // Signed-identity summary (secret-free): trust/revocation counts, the
         // strict-verify mode, and this session's OWN fingerprint (never the secret).
@@ -981,7 +1002,11 @@ const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
 /// A single session row flattened from a [`store::PeerView`] for the presence
 /// dashboard. Pure data (no store/`Peer` reference) so [`render_sessions_dashboard`]
 /// is unit-testable from hand-built snapshots with no store. Carries ONLY display
-/// tags — name/repo/branch/worktree/mux/host/alive/origin — never a token or URL.
+/// tags — name/repo/branch/worktree/mux/host plus the raw `pid`/`last_seen` presence
+/// fields the render classifies via [`store::liveness_from_fields`] — never a token
+/// or URL. Liveness is NOT precomputed here: the render computes the host-aware
+/// [`store::Liveness`] itself from `(pid, last_seen, host)` + the passed-in
+/// `this_host`/`now`, keeping the dashboard deterministic from those two inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRow {
     name: String,
@@ -990,7 +1015,10 @@ struct SessionRow {
     worktree: String,
     mux: String,
     host: String,
-    alive: bool,
+    /// Same-host PID when known — feeds the local-arm pid probe in liveness.
+    pid: Option<i64>,
+    /// Last-seen epoch seconds — feeds the TTL recency guard in liveness.
+    last_seen: i64,
     /// foreign-origin label (e.g. `messages.db`) for `(via …)`, empty when local.
     via: String,
 }
@@ -1033,7 +1061,8 @@ fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
                 worktree: p.worktree_id.clone(),
                 mux: p.mux.clone(),
                 host: p.host.clone(),
-                alive: is_alive(p),
+                pid: p.pid,
+                last_seen: p.last_seen,
                 via: if v.origin.is_foreign() {
                     v.origin.label().to_string()
                 } else {
@@ -1046,24 +1075,69 @@ fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
     rows
 }
 
+/// Host-aware liveness for a dashboard row, computed from its raw presence fields
+/// via [`store::liveness_from_fields`] (the same classifier `scan`/`peers`/`doctor`
+/// use). Deterministic given `this_host`/`now`; the only env-dependence is the
+/// same-host PID probe gated to the local arm — exactly as `scan` accepts.
+fn row_liveness(r: &SessionRow, this_host: &str, now: i64) -> store::Liveness {
+    store::liveness_from_fields(&r.host, r.pid, r.last_seen, this_host, now)
+}
+
+/// Human reason string for a dashboard row's host-aware verdict — mirrors
+/// [`scan_liveness_reason`] over the row's fields (a same-host alive row is "pid"
+/// iff its PID is known, else "ttl"). Reuses the exact A2 vocabulary.
+fn row_liveness_reason(r: &SessionRow, liveness: store::Liveness) -> &'static str {
+    match liveness {
+        store::Liveness::AliveLocal => {
+            if r.pid.is_some() {
+                "alive (local, pid)"
+            } else {
+                "alive (local, ttl)"
+            }
+        }
+        store::Liveness::AliveRemote => "alive (remote, ttl)",
+        store::Liveness::Stale => "stale",
+    }
+}
+
 /// Render one presence-dashboard frame as a `String` (the testable seam). PURE: no
-/// I/O, no clock, no sleep — `now` is passed in so frame contents are deterministic.
+/// I/O, no clock, no sleep — `now` AND `this_host` are passed in so frame contents
+/// (including the host-aware liveness via [`store::liveness_from_fields`]) are
+/// deterministic from `(now, this_host)`. The only env-dependence is liveness's
+/// same-host PID probe (gated to the local arm), mirroring `scan`.
 ///
 /// Layout: an optional ANSI clear-home prefix (when `opts.clear`), a header summary
-/// (`now`, total sessions, alive count, #repos, #branches, active filters), then one
-/// section per (repo, branch) group — in the sorted order of [`dashboard_rows`] —
-/// each listing `name·worktree·mux·host·alive` rows. A group exceeding
-/// [`DASHBOARD_GROUP_ROW_BUDGET`] renders the budgeted rows plus a `+N more` line.
-/// The empty snapshot renders a stable `no sessions` body. Output is secret-free
-/// (tags only; the `via` label is the redacted store basename, never a token/URL).
-fn render_sessions_dashboard(rows: &[SessionRow], opts: &DashboardOpts, now: i64) -> String {
+/// (`now`, total sessions, the `N local-alive, M remote-alive, K stale` breakdown,
+/// #repos, #branches, active filters), then one section per (repo, branch) group —
+/// in the sorted order of [`dashboard_rows`] — each listing
+/// `name·[reason]·worktree·mux·host` rows with a ` <remote>` marker for off-host
+/// rows (the same idiom as `scan`). A group exceeding [`DASHBOARD_GROUP_ROW_BUDGET`]
+/// renders the budgeted rows plus a `+N more` line. The empty snapshot renders a
+/// stable `no sessions` body. Output is secret-free (tags + host/liveness only; the
+/// `via` label is the redacted store basename, never a token/URL).
+fn render_sessions_dashboard(
+    rows: &[SessionRow],
+    opts: &DashboardOpts,
+    this_host: &str,
+    now: i64,
+) -> String {
     let mut out = String::new();
     if opts.clear {
         out.push_str(ANSI_CLEAR_HOME);
     }
 
     let total = rows.len();
-    let alive = rows.iter().filter(|r| r.alive).count();
+    // Host-aware liveness breakdown over the whole snapshot (A2 vocabulary).
+    let mut local_alive = 0usize;
+    let mut remote_alive = 0usize;
+    let mut stale = 0usize;
+    for r in rows {
+        match row_liveness(r, this_host, now) {
+            store::Liveness::AliveLocal => local_alive += 1,
+            store::Liveness::AliveRemote => remote_alive += 1,
+            store::Liveness::Stale => stale += 1,
+        }
+    }
     // Distinct repos / branches in first-seen (already sorted) order.
     let mut repos: Vec<&str> = Vec::new();
     let mut branches: Vec<(&str, &str)> = Vec::new();
@@ -1085,7 +1159,7 @@ fn render_sessions_dashboard(rows: &[SessionRow], opts: &DashboardOpts, now: i64
         filt.push_str(&format!(" branch={b}"));
     }
     out.push_str(&format!(
-        "weave sessions [{}] — {total} session(s), {alive} alive, {} repo(s), {} branch(es){filt}\n",
+        "weave sessions [{}] — {total} session(s), {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale, {} repo(s), {} branch(es){filt}\n",
         model::fmt_ts(now),
         repos.len(),
         branches.len(),
@@ -1114,7 +1188,10 @@ fn render_sessions_dashboard(rows: &[SessionRow], opts: &DashboardOpts, now: i64
             j += 1;
         }
         let group = &rows[i..j];
-        let g_alive = group.iter().filter(|r| r.alive).count();
+        let g_alive = group
+            .iter()
+            .filter(|r| !matches!(row_liveness(r, this_host, now), store::Liveness::Stale))
+            .count();
         out.push_str(&format!(
             "\n[{} / {}] {} session(s), {g_alive} alive\n",
             dash(repo),
@@ -1123,14 +1200,16 @@ fn render_sessions_dashboard(rows: &[SessionRow], opts: &DashboardOpts, now: i64
         ));
         let shown = group.len().min(DASHBOARD_GROUP_ROW_BUDGET);
         for r in &group[..shown] {
-            let status = if r.alive { "alive" } else { "offline" };
+            let liveness = row_liveness(r, this_host, now);
+            let reason = row_liveness_reason(r, liveness);
+            let remote_marker = if r.host != this_host { " <remote>" } else { "" };
             let via = if r.via.is_empty() {
                 String::new()
             } else {
                 format!(" (via {})", r.via)
             };
             out.push_str(&format!(
-                "  {} [{status}] worktree={} mux={} host={}{via}\n",
+                "  {}{remote_marker} [{reason}] worktree={} mux={} host={}{via}\n",
                 r.name,
                 dash(&r.worktree),
                 dash(&r.mux),
@@ -1585,11 +1664,17 @@ fn main() -> Result<()> {
             // listing tagged `local`, byte-identical to single-store behavior.
             let extra = cfg.peer_db_sources();
             let views = store::federated_peers(store, &extra)?;
+            // Host-aware liveness reason per peer (A2 vocabulary, display-only):
+            // reinterpret the already-pulled read-only rows; never a cross-machine
+            // probe. Deterministic given the captured this_host/now.
+            let this_host = config::this_host();
+            let now_ts = model::now();
             if json {
                 let arr: Vec<_> = views
                     .iter()
                     .map(|v| {
                         let p = &v.peer;
+                        let liveness = store::liveness_for(p, &this_host, now_ts);
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "socket": p.socket, "cwd": p.cwd,
@@ -1598,6 +1683,8 @@ fn main() -> Result<()> {
                             "repo": p.repo, "branch": p.branch, "worktree": p.worktree_id,
                             "online": is_alive(p),
                             "alive": is_alive(p),
+                            "liveness": liveness.token(),
+                            "remote": p.host != this_host,
                             "injectable": inject::Target::from_peer(p).injectable(),
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
@@ -1617,6 +1704,9 @@ fn main() -> Result<()> {
                         "no-inject"
                     };
                     let presence = if is_alive(p) { "online" } else { "offline" };
+                    let liveness = store::liveness_for(p, &this_host, now_ts);
+                    let reason = scan_liveness_reason(p, liveness);
+                    let remote_marker = if p.host != this_host { " <remote>" } else { "" };
                     let tgt = if p.target.is_empty() { "-" } else { &p.target };
                     let via = if v.origin.is_foreign() {
                         format!(" (via {})", v.origin.label())
@@ -1625,7 +1715,7 @@ fn main() -> Result<()> {
                     };
                     let tags = fmt_peer_tags(p);
                     println!(
-                        "{} [{presence}] [{}] {} ({inj}){tags} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}] [{}] {} ({inj}){tags} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -1685,18 +1775,26 @@ fn main() -> Result<()> {
                 Ok(dashboard_rows(&views))
             };
 
+            // Host-aware liveness reason vocabulary (A2) is computed deterministically
+            // from the captured this_host/now — never a wall-clock per row.
+            let this_host = config::this_host();
             if json {
                 // `--watch --json` ⇒ a SINGLE snapshot then exit (no clear, no loop):
                 // a stream of cleared frames is not machine-consumable. Same shape as
                 // the non-watch scan JSON (presence-focused).
+                let now_ts = model::now();
                 let rows = snapshot(store)?;
                 let arr: Vec<_> = rows
                     .iter()
                     .map(|r| {
+                        let liveness = row_liveness(r, &this_host, now_ts);
                         serde_json::json!({
                             "name": r.name, "repo": r.repo, "branch": r.branch,
                             "worktree": r.worktree, "mux": r.mux, "host": r.host,
-                            "alive": r.alive, "via": r.via,
+                            "alive": !matches!(liveness, store::Liveness::Stale),
+                            "liveness": liveness.token(),
+                            "remote": r.host != this_host,
+                            "via": r.via,
                         })
                     })
                     .collect();
@@ -1716,7 +1814,10 @@ fn main() -> Result<()> {
                 let mut n: u64 = 0;
                 loop {
                     let rows = snapshot(store)?;
-                    print!("{}", render_sessions_dashboard(&rows, &opts, model::now()));
+                    print!(
+                        "{}",
+                        render_sessions_dashboard(&rows, &opts, &this_host, model::now())
+                    );
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                     n += 1;
@@ -2423,6 +2524,21 @@ mod tests {
     /// `now` is always passed in — never `model::now()`. (2021-01-01T00:00:00Z.)
     const FIXED_NOW: i64 = 1_609_459_200;
 
+    /// The fixed `this_host` every render test passes in — never the real hostname,
+    /// so the host-aware liveness verdict is deterministic. Rows built by `row()`
+    /// share this host (`h1`), so a recent same-host null-pid row is `AliveLocal`
+    /// (ttl) and an old one is `Stale`; a remote row sets a different host.
+    const FIXED_HOST: &str = "h1";
+
+    /// Offset past the online TTL window (`store::ONLINE_TTL_SECS` = 900s) so a row
+    /// reads `Stale` regardless of host. Kept local to the tests; not load-bearing
+    /// elsewhere.
+    const STALE_OFFSET: i64 = 1_000;
+
+    /// Build a same-host (`h1`), null-pid dashboard row. `alive` maps to the TTL
+    /// recency field: alive ⇒ `last_seen == now` (recent ⇒ `AliveLocal`, ttl), dead
+    /// ⇒ far past the window (`Stale`). No PID is set, so an alive same-host row is
+    /// the "ttl" reason variant. Liveness is computed by the render, not stored.
     fn row(name: &str, repo: &str, branch: &str, alive: bool) -> SessionRow {
         SessionRow {
             name: name.to_string(),
@@ -2430,8 +2546,13 @@ mod tests {
             branch: branch.to_string(),
             worktree: "(main)".to_string(),
             mux: "tmux".to_string(),
-            host: "h1".to_string(),
-            alive,
+            host: FIXED_HOST.to_string(),
+            pid: None,
+            last_seen: if alive {
+                FIXED_NOW
+            } else {
+                FIXED_NOW - STALE_OFFSET
+            },
             via: String::new(),
         }
     }
@@ -2439,8 +2560,10 @@ mod tests {
     /// Empty snapshot ⇒ a stable header + `no sessions` body, zeroed counts.
     #[test]
     fn dashboard_empty_case() {
-        let out = render_sessions_dashboard(&[], &DashboardOpts::default(), FIXED_NOW);
-        assert!(out.contains("0 session(s), 0 alive, 0 repo(s), 0 branch(es)"));
+        let out = render_sessions_dashboard(&[], &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
+        assert!(out.contains(
+            "0 session(s), 0 local-alive, 0 remote-alive, 0 stale, 0 repo(s), 0 branch(es)"
+        ));
         assert!(out.contains("no sessions"));
         // No per-group section header (those contain " / ") is emitted when empty.
         assert!(
@@ -2449,7 +2572,8 @@ mod tests {
         );
     }
 
-    /// Header summary counts: total sessions, alive count, #repos, #branches.
+    /// Header summary counts: total sessions, the local/remote/stale liveness
+    /// breakdown, #repos, #branches.
     #[test]
     fn dashboard_header_summary_counts() {
         let rows = vec![
@@ -2457,11 +2581,63 @@ mod tests {
             row("b", "repoA", "feat", false),
             row("c", "repoB", "main", true),
         ];
-        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
-        // 3 sessions, 2 alive, 2 repos, 3 distinct (repo,branch) branches.
+        let out =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
+        // 3 sessions: 2 same-host recent (local-alive), 0 remote, 1 stale; 2 repos,
+        // 3 distinct (repo,branch) branches.
         assert!(
-            out.contains("3 session(s), 2 alive, 2 repo(s), 3 branch(es)"),
+            out.contains(
+                "3 session(s), 2 local-alive, 0 remote-alive, 1 stale, 2 repo(s), 3 branch(es)"
+            ),
             "header was: {out}"
+        );
+    }
+
+    /// Mixed local/remote/stale snapshot: each row shows the right reason marker and
+    /// the header carries the correct three-count breakdown. Remote rows force a
+    /// non-matching host so the verdict is deterministic (no PID probe on the remote
+    /// arm); same-host rows are TTL-based (null-pid) so they never depend on a live
+    /// process — fully deterministic from (`this_host`, `now`).
+    #[test]
+    fn dashboard_mixed_liveness_reasons_and_summary() {
+        // same-host recent, with a known pid ⇒ "alive (local, pid)"
+        let mut local_pid = row("withpid", "repoA", "main", true);
+        local_pid.pid = Some(std::process::id() as i64);
+        // same-host recent, null pid ⇒ "alive (local, ttl)"
+        let local_ttl = row("nopid", "repoA", "main", true);
+        // remote host, recent ⇒ "alive (remote, ttl)"
+        let mut remote = row("remote", "repoA", "main", true);
+        remote.host = "otherbox".to_string();
+        // same-host but old ⇒ "stale"
+        let stale = row("old", "repoA", "main", false);
+        let rows = dashboard_rows_sorted(vec![local_pid, local_ttl, remote, stale]);
+        let out =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
+        // The local-pid row prints "pid" iff the pid is actually alive (the running
+        // test process is): assert a stable membership instead of an exact verdict.
+        assert!(
+            out.contains("[alive (local, pid)]") || out.contains("[stale]"),
+            "missing local-pid reason: {out}"
+        );
+        assert!(
+            out.contains("[alive (local, ttl)]"),
+            "missing local-ttl: {out}"
+        );
+        assert!(
+            out.contains("[alive (remote, ttl)]"),
+            "missing remote: {out}"
+        );
+        assert!(out.contains("[stale]"), "missing stale: {out}");
+        // The remote row carries the <remote> marker; same-host rows do not.
+        assert!(
+            out.contains("remote <remote>"),
+            "remote marker missing: {out}"
+        );
+        // Header breakdown: 2 local-alive (pid+ttl, the test pid is alive), 1
+        // remote-alive, 1 stale.
+        assert!(
+            out.contains("4 session(s), 2 local-alive, 1 remote-alive, 1 stale"),
+            "header breakdown wrong: {out}"
         );
     }
 
@@ -2474,7 +2650,8 @@ mod tests {
             row("a", "repoA", "main", true),
             row("m", "repoA", "feat", false),
         ]);
-        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        let out =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
         // Section headers present.
         assert!(out.contains("[repoA / feat]"), "{out}");
         assert!(out.contains("[repoA / main]"), "{out}");
@@ -2505,12 +2682,12 @@ mod tests {
             repo: Some("repoA".to_string()),
             branch: Some("main".to_string()),
         };
-        let out = render_sessions_dashboard(&rows, &opts, FIXED_NOW);
+        let out = render_sessions_dashboard(&rows, &opts, FIXED_HOST, FIXED_NOW);
         assert!(out.contains("repo=repoA"), "{out}");
         assert!(out.contains("branch=main"), "{out}");
         assert!(out.contains("[repoA / main]"));
         // A filter that excludes everything yields the stable empty body.
-        let empty = render_sessions_dashboard(&[], &opts, FIXED_NOW);
+        let empty = render_sessions_dashboard(&[], &opts, FIXED_HOST, FIXED_NOW);
         assert!(empty.contains("no sessions"));
     }
 
@@ -2522,11 +2699,12 @@ mod tests {
             .map(|i| row(&format!("s{i:03}"), "repoA", "main", true))
             .collect();
         let rows = dashboard_rows_sorted(rows);
-        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        let out =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
         assert!(out.contains("+5 more"), "{out}");
-        // Exactly the budgeted number of session rows are printed (lines starting
-        // with two spaces and "[alive]").
-        let shown = out.matches("[alive]").count();
+        // Exactly the budgeted number of session rows are printed (each same-host
+        // recent null-pid row reads "alive (local, ttl)").
+        let shown = out.matches("[alive (local, ttl)]").count();
         assert_eq!(shown, DASHBOARD_GROUP_ROW_BUDGET);
     }
 
@@ -2538,8 +2716,10 @@ mod tests {
             row("b", "repoA", "main", false),
             row("c", "repoA", "main", true),
         ]);
-        let out = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
-        assert!(out.contains("3 session(s), 2 alive"));
+        let out =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
+        // 3 sessions: 2 same-host recent (local-alive), 1 stale.
+        assert!(out.contains("3 session(s), 2 local-alive, 0 remote-alive, 1 stale"));
         assert!(out.contains("[repoA / main] 3 session(s), 2 alive"));
     }
 
@@ -2548,13 +2728,15 @@ mod tests {
     #[test]
     fn dashboard_ansi_prefix_vs_plain() {
         let rows = vec![row("a", "repoA", "main", true)];
-        let plain = render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_NOW);
+        let plain =
+            render_sessions_dashboard(&rows, &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
         let ansi = render_sessions_dashboard(
             &rows,
             &DashboardOpts {
                 clear: true,
                 ..DashboardOpts::default()
             },
+            FIXED_HOST,
             FIXED_NOW,
         );
         // Plain output has no ESC byte.
@@ -2574,8 +2756,51 @@ mod tests {
         r.worktree = String::new();
         r.mux = String::new();
         r.host = String::new();
-        let out = render_sessions_dashboard(&[r], &DashboardOpts::default(), FIXED_NOW);
+        // host is now empty (≠ FIXED_HOST) so this row is AliveRemote — still a
+        // deterministic, recent row; the dash-rendering of the tag columns is the
+        // assertion under test, not the verdict.
+        let out = render_sessions_dashboard(&[r], &DashboardOpts::default(), FIXED_HOST, FIXED_NOW);
         assert!(out.contains("[- / -]"), "{out}");
         assert!(out.contains("worktree=- mux=- host=-"), "{out}");
+    }
+
+    /// `liveness_for` delegates to `liveness_from_fields` with byte-identical results
+    /// over a representative matrix (the #6 truth table). This pins the refactor: the
+    /// field-level seam the dashboard uses must agree with the `Peer`-level classifier
+    /// every other surface uses.
+    #[test]
+    fn liveness_for_matches_from_fields() {
+        let now = FIXED_NOW;
+        let mk = |host: &str, pid: Option<i64>, last_seen: i64| model::Peer {
+            name: "p".to_string(),
+            mux: String::new(),
+            target: String::new(),
+            socket: String::new(),
+            cwd: None,
+            last_seen,
+            pid,
+            host: host.to_string(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+        };
+        let cases: &[(&str, Option<i64>, i64)] = &[
+            ("h1", None, now),                               // same host, recent, no pid
+            ("h1", Some(std::process::id() as i64), now),    // same host, live pid
+            ("h1", Some(1), now),                            // same host, (likely) dead pid
+            ("h1", None, now - STALE_OFFSET),                // same host, stale
+            ("other", None, now),                            // remote, recent
+            ("other", Some(std::process::id() as i64), now), // remote, recent w/ pid
+            ("other", None, now - STALE_OFFSET),             // remote, stale
+            ("", None, now),                                 // empty host = remote
+        ];
+        for (host, pid, last_seen) in cases {
+            let peer = mk(host, *pid, *last_seen);
+            assert_eq!(
+                store::liveness_for(&peer, FIXED_HOST, now),
+                store::liveness_from_fields(host, *pid, *last_seen, FIXED_HOST, now),
+                "delegation mismatch for host={host:?} pid={pid:?} last_seen={last_seen}",
+            );
+        }
     }
 }
