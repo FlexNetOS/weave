@@ -409,6 +409,70 @@ CI enforces the libSQL column as a real, blocking gate: a dedicated job runs
 roadmap closed the historical "both backends green" gap — both now implement the
 full `Store` trait (reply/thread/receipts/touch_peer/`in_reply_to` + migration).
 
+### Tier-2 v2 — remote (Turso) cross-store pull: hermetic vs. live
+
+A `pull_from`/`peer_dbs` entry may now be a **remote** libSQL/Turso URL
+(`libsql://` / `https://` / `wss://` …), not just a local file path. The whole
+test surface stays **hermetic — no network in the default suite**:
+
+- **Unit (`config`):** `classify_source` (every scheme → `Remote`, paths →
+  `Local`; total/never-panics proptest), `resolve_store_sources` (trim, NUL-reject,
+  cap, first-seen order, local canonicalize+dedup, remote dedup-by-URL with
+  trailing-slash normalization), `split_source_list` (a `:`-bearing URL is NOT
+  shredded by the path-list splitter), token cap + control-char reject, and the
+  redacting `Debug` (the token is never in `{:?}`).
+- **Unit (`store_libsql`, OWNER-ONLY-WRITES proof, no network):**
+  `read_only_handle_traps_every_write_and_leaves_file_unchanged` flags a local-file
+  handle `read_only` (the identical flag `open_readonly_remote` sets) and asserts
+  **every** write method returns the `guard_writable` `bail!` error (never panics,
+  never writes) and the foreign file is byte-identical afterwards. This is the
+  unattended proof that weave never writes a foreign/remote store.
+- **Integration (default sqlite build):** a remote URL in `WEAVE_PEER_DBS` is
+  rejected **loudly** ("requires `--features libsql`") on stderr while local
+  sources still succeed; `doctor --json` reports
+  `federation_remote_stores`/`federation_remote_unsupported`; the auth token
+  (`WEAVE_PULL_TOKEN`) never appears in any output. A liveness regression test
+  confirms a foreign-`host` peer is TTL-judged, never pid-probed.
+- **Live remote (env-gated, `#[ignore]`, never in CI):**
+  `remote_live_pull_delivers_and_is_idempotent` runs **only** when you set the env
+  and pass `--ignored`, against a real Turso DB:
+
+  ```bash
+  # 1. Create a Turso DB and a READ-ONLY token (the recommended deployment contract):
+  #      turso db tokens create <db> --read-only
+  # 2. Seed its outbox out-of-band with an intent addressed to `bob`.
+  # 3. Run the gated test (built with the libsql backend):
+  WEAVE_TEST_TURSO_URL=libsql://<db>.turso.io \
+  WEAVE_TEST_TURSO_TOKEN=<read-only-token> \
+    cargo test --no-default-features --features libsql -- --ignored remote_live
+  ```
+
+  CI sets neither var and never passes `--ignored`, so the default suite stays
+  offline and deterministic. Tune the per-call network bound with
+  `WEAVE_PULL_TIMEOUT_MS` (default 5000ms; an unreachable remote is just a skip).
+
+#### Per-source pull tokens (`WEAVE_PULL_TOKEN_<LABEL>`) — resolution, not network
+
+Per-source token selection is tested as **resolution + hygiene**, hermetically; the
+cases assert which token tier wins and that no token ever leaks — never live auth:
+
+- **Unit (`config`):** `is_valid_label` (charset/bounds + a totality + uppercasing
+  proptest), `parse_labeled_source` (a `LABEL=remote-url` splits to `(Some(LABEL),
+  Remote)` uppercased; an invalid label, an empty label, or a non-remote right side
+  degrades to the verbatim entry — a proptest asserts the no-label result equals
+  `classify_source` of the verbatim entry), and `per_source_token` precedence
+  (label-env set+sane wins; set-but-over-cap/control-char **falls through** to the
+  shared token; unset → shared; neither → none). `resolve_store_sources` proves a
+  labelled and an unlabelled remote coexist (per-source vs. shared token) in one
+  resolve, and the redacting `Debug` still hides both tokens.
+- **Integration (scrubbed env, both backends):** with `WEAVE_PULL_TOKEN_<LABEL>` set
+  for labelled remotes and a shared `WEAVE_PULL_TOKEN`, `weave doctor --json`'s
+  token-free tier counts (`federation_remote_token_per_source` / `_shared` / `_none`)
+  resolve correctly and **none** of the per-source or shared token bytes appear in
+  stdout or stderr. These run on the default sqlite build (remote loud-rejected) and
+  the libsql build (unreachable host + short timeout, skipped) — resolution and the
+  secret-never-printed invariant are asserted, not a real connection.
+
 ## 7. Benchmarks (`benches/weave_bench.rs`, criterion)
 
 A `criterion` harness (`harness = false` in `Cargo.toml`) tracks the costs that

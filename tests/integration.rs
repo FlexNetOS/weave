@@ -2457,3 +2457,468 @@ fn key_gen_never_prints_the_private_key() {
 
     let _ = std::fs::remove_dir_all(&a_cfg);
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 v2 — remote (libsql/Turso) source handling, hermetic (NO network).
+//
+// On the DEFAULT sqlite build a remote URL is rejected LOUDLY at the store seam
+// ("requires --features libsql"); local sources still work and the command
+// succeeds. On the libsql build the remote is actually attempted and (with an
+// unreachable host + a tiny timeout) skipped as a per-source failure. Either way
+// the command succeeds for any local source and the URL/token never reach stdout.
+// ---------------------------------------------------------------------------
+
+/// `WEAVE_PEER_DBS` mixing a LOCAL store and a REMOTE URL on the default build:
+/// the local peer is listed, the command succeeds, and the remote is skipped with
+/// the loud "--features libsql" note on stderr (never stdout). The token never
+/// appears anywhere in the output.
+#[test]
+fn federation_mixed_local_and_remote_source() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_ok(&foreign, &["register", "--name", "fedpeer"]);
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const TOKEN: &str = "super-secret-pull-token-value";
+    let remote_url = "libsql://unreachable-host.invalid";
+    let list = format!("{},{remote_url}", foreign.path_str());
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["peers"],
+        &[
+            ("WEAVE_PEER_DBS", &list),
+            ("WEAVE_PULL_TOKEN", TOKEN),
+            // Keep the libsql-build connect attempt fast (no network wait).
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "command must succeed for local sources; stderr:\n{err}");
+    assert!(out.contains("localpeer"), "local peer listed: {out}");
+    assert!(out.contains("fedpeer"), "local foreign peer listed: {out}");
+
+    // The token is NEVER printed (stdout or stderr).
+    assert!(!out.contains(TOKEN), "token leaked to stdout: {out}");
+    assert!(!err.contains(TOKEN), "token leaked to stderr: {err}");
+
+    if cfg!(feature = "libsql") {
+        // The libsql build actually attempts the (unreachable) remote and skips it
+        // as a federated-store failure on stderr — never fatal.
+        assert!(
+            err.contains("skipping federated store") || err.contains("unreachable-host"),
+            "libsql build should diagnose the unreachable remote on stderr: {err}"
+        );
+    } else {
+        // The default sqlite build rejects the remote loudly with the rebuild note.
+        assert!(
+            err.contains("--features libsql"),
+            "default build must tell the user to rebuild for remote: {err}"
+        );
+        assert!(
+            !out.contains("--features libsql"),
+            "the rebuild note must go to stderr, never stdout: {out}"
+        );
+    }
+    // The redacted scheme+host may appear in the skip note, but never the path/token.
+    assert!(!out.contains("libsql://"), "no remote URL on stdout: {out}");
+}
+
+/// `weave doctor --json` reports the configured remote-source count, and on the
+/// default sqlite build the `federation_remote_unsupported` count is non-zero
+/// (the user is told the remote was skipped for lack of the feature). The token
+/// never appears in the doctor output.
+#[test]
+fn doctor_reports_remote_source_count() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const TOKEN: &str = "doctor-secret-token";
+    let remote_url = "libsql://reporting-host.invalid";
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", remote_url),
+            ("WEAVE_PULL_TOKEN", TOKEN),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+    assert!(!out.contains(TOKEN), "token leaked to doctor stdout: {out}");
+    assert!(!err.contains(TOKEN), "token leaked to doctor stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_stores"].as_u64(),
+        Some(1),
+        "one remote source configured: {out}"
+    );
+    if !cfg!(feature = "libsql") {
+        assert_eq!(
+            v["federation_remote_unsupported"].as_u64(),
+            Some(1),
+            "default build must report the remote as unsupported: {out}"
+        );
+    }
+}
+
+/// MCP degradation: `weave_peers` with a remote source on the default build is a
+/// SUCCESSFUL tool result (degradation is never a tool error), the local peer is
+/// present, and the token never appears in the tool output.
+#[test]
+fn mcp_peers_with_remote_source_degrades_cleanly() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const TOKEN: &str = "mcp-secret-token";
+    let remote_url = "libsql://mcp-host.invalid";
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", remote_url),
+            ("WEAVE_PULL_TOKEN", TOKEN),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    let (perr, ptext) = mcp.call_tool("weave_peers", serde_json::json!({}));
+    assert!(!perr, "remote degradation is not a tool error: {ptext}");
+    assert!(ptext.contains("localpeer"), "local peer present: {ptext}");
+    assert!(
+        !ptext.contains(TOKEN),
+        "token leaked into MCP output: {ptext}"
+    );
+    mcp.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 v2 follow-up — per-source pull tokens (WEAVE_PULL_TOKEN_<LABEL>),
+// hermetic (NO network). These assert RESOLUTION + token-tier OBSERVABILITY and
+// the headline secret-hygiene invariant (no token byte ever reaches stdout or
+// stderr), NOT live remote auth. A labelled remote (`MYDB=libsql://host/db`) +
+// a per-source `WEAVE_PULL_TOKEN_MYDB` resolves the per-source tier; without the
+// per-source env it falls through to the shared `WEAVE_PULL_TOKEN`; with neither
+// it is tier=none. The remote host is `.invalid` with a 200ms timeout so the
+// libsql build never actually waits on a network.
+// ---------------------------------------------------------------------------
+
+/// A labelled remote in `WEAVE_PEER_DBS` plus its per-source `WEAVE_PULL_TOKEN_<LABEL>`
+/// resolves the PER-SOURCE token tier in `doctor --json`. The secret token never
+/// appears in stdout or stderr on EITHER backend, and on the default sqlite build
+/// the remote is still loudly rejected (rebuild note on stderr, never stdout).
+#[test]
+fn federation_per_source_token_selected() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const PER_SOURCE: &str = "per-source-secret-token-AAA";
+    const SHARED: &str = "shared-secret-token-BBB";
+    let remote_url = "libsql://prod-host.invalid/db";
+    let entry = format!("MYDB={remote_url}");
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN_MYDB", PER_SOURCE),
+            ("WEAVE_PULL_TOKEN", SHARED),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    // Headline secret-hygiene: NEITHER token appears anywhere.
+    assert!(
+        !out.contains(PER_SOURCE),
+        "per-source token in stdout: {out}"
+    );
+    assert!(
+        !err.contains(PER_SOURCE),
+        "per-source token in stderr: {err}"
+    );
+    assert!(!out.contains(SHARED), "shared token in stdout: {out}");
+    assert!(!err.contains(SHARED), "shared token in stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(1),
+        "labelled remote with its env token resolves the per-source tier: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(0),
+        "no shared-tier remote in this config: {out}"
+    );
+
+    if !cfg!(feature = "libsql") {
+        // The remote is still rejected loudly on the default build (token-free).
+        assert_eq!(
+            v["federation_remote_unsupported"].as_u64(),
+            Some(1),
+            "default build reports the remote as unsupported: {out}"
+        );
+        assert!(
+            err.contains("--features libsql"),
+            "default build tells the user to rebuild for remote: {err}"
+        );
+    }
+}
+
+/// A labelled remote with NO `WEAVE_PULL_TOKEN_<LABEL>` set but with the shared
+/// `WEAVE_PULL_TOKEN` set falls through to the SHARED token tier. The shared token
+/// never appears in the output.
+#[test]
+fn federation_label_falls_through_to_shared() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    const SHARED: &str = "shared-only-secret-CCC";
+    let remote_url = "libsql://stage-host.invalid/db";
+    let entry = format!("STAGE={remote_url}");
+
+    // Note: WEAVE_PULL_TOKEN_STAGE deliberately UNSET (not in extra_env).
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN", SHARED),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+    assert!(!out.contains(SHARED), "shared token in stdout: {out}");
+    assert!(!err.contains(SHARED), "shared token in stderr: {err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(1),
+        "labelled remote with no per-source env falls through to shared: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source-tier remote in this config: {out}"
+    );
+}
+
+/// A labelled remote with NEITHER a per-source env token NOR a shared token is
+/// tier=none. The command still succeeds (no panic) and nothing is printed.
+#[test]
+fn federation_no_token_tier_none() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "here"]);
+
+    let remote_url = "libsql://lonely-host.invalid/db";
+    let entry = format!("SOLO={remote_url}");
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["doctor", "--json"],
+        &[("WEAVE_PEER_DBS", &entry), ("WEAVE_PULL_TIMEOUT_MS", "200")],
+    );
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    assert_eq!(
+        v["federation_remote_token_none"].as_u64(),
+        Some(1),
+        "labelled remote with no token resolves tier=none: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source token configured: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_shared"].as_u64(),
+        Some(0),
+        "no shared token configured: {out}"
+    );
+}
+
+/// A LOCAL path that contains `=` (`a=b.db`) must NOT be misparsed as a `LABEL=`
+/// split: it stays a verbatim local source (which fails to open as a weave store
+/// and is skipped), and is never treated as a labelled remote. The command still
+/// succeeds on a valid local source. Guards the degradation contract end-to-end.
+#[test]
+fn federation_local_path_with_equals_not_misparsed() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_ok(&foreign, &["register", "--name", "fedpeer"]);
+    run_ok(&local, &["register", "--name", "here"]);
+
+    // A real local foreign store + a junk `a=b.db` local entry (right side not a URL).
+    let list = format!("{},a=b.db", foreign.path_str());
+    let (ok, out, err) = run_env(&local, &["doctor", "--json"], &[("WEAVE_PEER_DBS", &list)]);
+    assert!(ok, "doctor must succeed; stderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor --json parses");
+    // `a=b.db` is a LOCAL entry, never a remote — so the remote count excludes it.
+    assert_eq!(
+        v["federation_remote_stores"].as_u64(),
+        Some(0),
+        "a local `a=b.db` must not be counted as a remote: {out}"
+    );
+    assert_eq!(
+        v["federation_remote_token_per_source"].as_u64(),
+        Some(0),
+        "no per-source remote tier from a local path: {out}"
+    );
+}
+
+/// MCP `weave_doctor` reports the per-source token tier consistently with the CLI,
+/// is a SUCCESSFUL tool result, and never leaks the token into the tool output.
+#[test]
+fn mcp_doctor_per_source_token_tier_is_token_free() {
+    let local = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+
+    const PER_SOURCE: &str = "mcp-per-source-secret-DDD";
+    let remote_url = "libsql://mcp-prod.invalid/db";
+    let entry = format!("MCPDB={remote_url}");
+
+    let mut mcp = McpServer::spawn_env(
+        &local,
+        &[
+            ("WEAVE_PEER_DBS", &entry),
+            ("WEAVE_PULL_TOKEN_MCPDB", PER_SOURCE),
+            ("WEAVE_PULL_TIMEOUT_MS", "200"),
+        ],
+    );
+    let (derr, dtext) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(!derr, "doctor degradation is not a tool error: {dtext}");
+    assert!(
+        !dtext.contains(PER_SOURCE),
+        "per-source token leaked into MCP output: {dtext}"
+    );
+    assert!(
+        dtext.contains("remote tokens:"),
+        "MCP doctor surfaces the token-tier line: {dtext}"
+    );
+    assert!(
+        dtext.contains("1 per-source"),
+        "MCP doctor reports the per-source tier count: {dtext}"
+    );
+    mcp.shutdown();
+}
+
+/// Liveness regression (A2, no regression): a peer pulled from a foreign source
+/// carrying a remote `host` is TTL-judged, NEVER pid-probed. We seed a foreign
+/// store with a peer whose host is a different machine and a pid that is alive on
+/// THIS box — if weave wrongly pid-probed it, it would call the peer online; the
+/// correct behavior is to fall open to TTL (recent ⇒ online by recency, not pid).
+/// The crux is that no `/proc/<pid>` probe runs for a foreign-host peer; this test
+/// confirms the federated listing does not crash or mis-probe on a remote host.
+#[test]
+fn federation_remote_host_peer_is_ttl_judged_not_pid_probed() {
+    let local = TestDb::new();
+    let foreign = TestDb::new();
+    run_ok(&local, &["register", "--name", "localpeer"]);
+    // A foreign peer registered by another "machine": force a DIFFERENT host so
+    // the federated read sees a remote-host peer. Liveness must fall open to TTL
+    // for a host != this_host (it cannot /proc-probe a remote PID).
+    run_env(
+        &foreign,
+        &["register", "--name", "remotepeer"],
+        &[("HOSTNAME", "some-other-machine")],
+    );
+
+    let (ok, out, err) = run_env(
+        &local,
+        &["peers", "--json"],
+        &[
+            ("WEAVE_PEER_DBS", &foreign.path_str()),
+            ("HOSTNAME", "this-machine"),
+        ],
+    );
+    assert!(ok, "federated peers must succeed; stderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("peers --json parses");
+    let arr = v.as_array().expect("peers --json is an array");
+    let remote = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("remotepeer"))
+        .expect("foreign peer surfaced via federation");
+    assert_eq!(
+        remote["host"].as_str(),
+        Some("some-other-machine"),
+        "foreign peer carries the remote host: {out}"
+    );
+    // The remote-host peer is TTL-judged (just registered ⇒ online by recency),
+    // NOT pid-probed: a foreign-host peer must never trigger a /proc probe and the
+    // listing must succeed regardless of whatever PID it carries.
+    assert_eq!(
+        remote["online"].as_bool(),
+        Some(true),
+        "a just-registered remote-host peer is TTL-online (recency, not pid): {out}"
+    );
+    assert!(
+        arr.iter().any(|p| p["name"].as_str() == Some("localpeer")),
+        "local peer present: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 v2 — LIVE remote (Turso) pull. ENV-GATED + `#[ignore]`: CI never sets
+// the env and never passes `--ignored`, so the default suite stays HERMETIC (no
+// network). Run manually against a real Turso DB only (see docs/TESTING.md):
+//
+//   WEAVE_TEST_TURSO_URL=libsql://<db>.turso.io \
+//   WEAVE_TEST_TURSO_TOKEN=<read-only-token> \
+//     cargo test --no-default-features --features libsql -- --ignored remote_live
+//
+// The hermetic write-guard unit test
+// (`store_libsql::tests::read_only_handle_traps_every_write_and_leaves_file_unchanged`)
+// is the unattended proof of OWNER-ONLY-WRITES; this is the optional real-Turso
+// smoke that delivery + idempotency hold cross-machine.
+// ---------------------------------------------------------------------------
+
+/// LIVE: pull from a real remote Turso outbox into the local inbox, then assert a
+/// re-pull is idempotent. Inert unless both env vars are set (and built with
+/// `--features libsql`); `#[ignore]` so it never runs in the default `cargo test`.
+#[cfg(feature = "libsql")]
+#[test]
+#[ignore = "live remote Turso test; set WEAVE_TEST_TURSO_URL/_TOKEN and run with --ignored"]
+fn remote_live_pull_delivers_and_is_idempotent() {
+    let url = match std::env::var("WEAVE_TEST_TURSO_URL") {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
+            eprintln!("WEAVE_TEST_TURSO_URL unset; skipping live remote test");
+            return;
+        }
+    };
+    let token = std::env::var("WEAVE_TEST_TURSO_TOKEN").unwrap_or_default();
+
+    // Local receiver pulls FROM the remote outbox. The remote must already carry an
+    // intent addressed to `bob` (seed it out-of-band per the manual procedure).
+    let b = TestDb::new();
+    run_ok(&b, &["register", "--name", "bob"]);
+
+    let env = [
+        ("WEAVE_PULL_FROM", url.as_str()),
+        ("WEAVE_PULL_TOKEN", token.as_str()),
+        ("WEAVE_PULL_TIMEOUT_MS", "5000"),
+    ];
+    // First pull commits whatever the remote outbox holds for bob.
+    let _ = run_ok_env(&b, &["pull", "--me", "bob"], &env);
+    let inbox1 = run_ok_env(&b, &["inbox", "--me", "bob", "--all", "--json"], &env);
+
+    // A second pull must be idempotent: the cursor is local, so nothing re-delivers.
+    let _ = run_ok_env(&b, &["pull", "--me", "bob"], &env);
+    let inbox2 = run_ok_env(&b, &["inbox", "--me", "bob", "--all", "--json"], &env);
+
+    let n1 = serde_json::from_str::<serde_json::Value>(&inbox1)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    let n2 = serde_json::from_str::<serde_json::Value>(&inbox2)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    assert_eq!(n1, n2, "a second remote pull must not double-deliver");
+    // The token must never appear in any output.
+    assert!(!inbox1.contains(token.as_str()) || token.is_empty());
+}

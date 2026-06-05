@@ -5,6 +5,7 @@
 //! for cross-machine sync (see `store_libsql.rs`). The on-disk SQLite format is
 //! libSQL-compatible, so the file is portable between backends.
 
+use crate::config::StoreSource;
 use crate::model::{now, Intent, Message, Peer};
 use anyhow::Result;
 
@@ -756,16 +757,58 @@ impl SqliteStore {
 /// to surface federation health without emitting the per-store stderr skip notes
 /// twice. Read-only + best-effort, like the aggregators.
 #[cfg(feature = "sqlite")]
-pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
+pub fn federation_status(extra: &[StoreSource]) -> (usize, usize) {
     let mut ok = 0usize;
     let mut skipped = 0usize;
-    for path in extra {
-        match SqliteStore::open_readonly(path).and_then(|s| s.list_peers()) {
-            Ok(_) => ok += 1,
-            Err(_) => skipped += 1,
+    for src in extra {
+        match src {
+            StoreSource::Local(path) => {
+                match SqliteStore::open_readonly(path).and_then(|s| s.list_peers()) {
+                    Ok(_) => ok += 1,
+                    Err(_) => skipped += 1,
+                }
+            }
+            // The default (sqlite) build cannot open a remote libsql URL — count it
+            // as skipped (the loud per-source note is emitted by the aggregators).
+            StoreSource::Remote { .. } => skipped += 1,
         }
     }
     (ok, skipped)
+}
+
+/// Loud, non-silent rejection of a REMOTE source on the default (sqlite) build:
+/// remote libSQL/Turso sources require a `--features libsql` build. Prints the
+/// URL **scheme + host only** (never the token, never the full URL/query) to
+/// **stderr** and is counted as a skip by the caller. The command still succeeds on
+/// any local sources.
+#[cfg(feature = "sqlite")]
+fn reject_remote_source(url: &str) {
+    eprintln!(
+        "[weave] skipping remote source '{}': remote libsql/Turso sources require \
+         building weave with --features libsql",
+        remote_scheme_host(url)
+    );
+}
+
+/// Redacted display of a remote URL for diagnostics: scheme + host only, dropping
+/// any path/query (which could carry secrets). Falls back to the scheme when no
+/// host can be parsed. Never prints the auth token.
+pub fn remote_scheme_host(url: &str) -> String {
+    // Split off scheme://rest, then take up to the first '/', '?' or '#'.
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let host: String = rest
+            .chars()
+            .take_while(|&c| c != '/' && c != '?' && c != '#')
+            .collect();
+        if host.is_empty() {
+            format!("{scheme}://")
+        } else {
+            format!("{scheme}://{host}")
+        }
+    } else {
+        // Not a recognizable URL; show only the scheme-ish prefix to avoid leaking.
+        url.chars().take_while(|&c| c != '/').collect()
+    }
 }
 
 /// Aggregate the local store's peers with those of each configured read-only
@@ -778,7 +821,7 @@ pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
 /// local listing. With `extra` empty this is exactly `local.list_peers()`
 /// tagged `Local`, i.e. identical-to-today.
 #[cfg(feature = "sqlite")]
-pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Result<Vec<PeerView>> {
+pub fn federated_peers(local: &dyn Store, extra: &[StoreSource]) -> Result<Vec<PeerView>> {
     let mut views: Vec<PeerView> = local
         .list_peers()?
         .into_iter()
@@ -787,7 +830,15 @@ pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Resul
             origin: Origin::Local,
         })
         .collect();
-    for path in extra {
+    for src in extra {
+        let path = match src {
+            StoreSource::Local(p) => p,
+            // Default sqlite build cannot open a remote URL: reject loudly + skip.
+            StoreSource::Remote { url, .. } => {
+                reject_remote_source(url);
+                continue;
+            }
+        };
         let label = store_label(path);
         match SqliteStore::open_readonly(path).and_then(|s| s.list_peers()) {
             Ok(peers) => {
@@ -811,10 +862,7 @@ pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Resul
 /// `max(last_activity)`, never summing unread — see [`merge_session_views`]).
 /// Same read-only open + per-store failure isolation as [`federated_peers`].
 #[cfg(feature = "sqlite")]
-pub fn federated_sessions(
-    local: &dyn Store,
-    extra: &[std::path::PathBuf],
-) -> Result<Vec<SessionView>> {
+pub fn federated_sessions(local: &dyn Store, extra: &[StoreSource]) -> Result<Vec<SessionView>> {
     let mut views: Vec<SessionView> = local
         .sessions()?
         .into_iter()
@@ -825,7 +873,14 @@ pub fn federated_sessions(
             origin: Origin::Local,
         })
         .collect();
-    for path in extra {
+    for src in extra {
+        let path = match src {
+            StoreSource::Local(p) => p,
+            StoreSource::Remote { url, .. } => {
+                reject_remote_source(url);
+                continue;
+            }
+        };
         let label = store_label(path);
         match SqliteStore::open_readonly(path).and_then(|s| s.sessions()) {
             Ok(sessions) => {
@@ -854,14 +909,14 @@ pub struct Pulled {
     pub committed: usize,
     /// Sources that were skipped (missing / locked / non-weave / no outbox).
     pub sources_skipped: usize,
-    /// The `allow` source paths that committed at least one intent this run, in
+    /// The `allow` sources that committed at least one intent this run, in
     /// first-seen order. The CALLER (main/mcp) uses these to gate the consent
-    /// nudge per source (`Config::inject_allowed_from`) WITHOUT `store` ever
+    /// nudge per source (`Config::inject_allowed_from_source`) WITHOUT `store` ever
     /// depending on `inject` — the inject decision is made caller-side, keeping
     /// the `store → inject` edge from forming. These are the original (un-
-    /// canonicalized) `allow` paths so the caller can canonical-compare them
-    /// against `allow_inject_from`.
-    pub committed_sources: Vec<std::path::PathBuf>,
+    /// canonicalized) `allow` sources (local path OR remote URL) so the caller can
+    /// match them against `allow_inject_from`.
+    pub committed_sources: Vec<StoreSource>,
 }
 
 /// Tier-2 cross-store delivery (receiver side). For each `allow`-listed source
@@ -896,11 +951,20 @@ pub struct Pulled {
 pub fn pull_from_store(
     local: &dyn Store,
     me: &str,
-    allow: &[std::path::PathBuf],
+    allow: &[StoreSource],
     strict: bool,
 ) -> Result<Pulled> {
     let mut out = Pulled::default();
-    for path in allow {
+    for src in allow {
+        let path = match src {
+            StoreSource::Local(p) => p,
+            // Default sqlite build cannot open a remote URL: reject loudly + skip.
+            StoreSource::Remote { url, .. } => {
+                reject_remote_source(url);
+                out.sources_skipped += 1;
+                continue;
+            }
+        };
         let source = canonical_source(path);
         let foreign = match SqliteStore::open_readonly(path) {
             Ok(s) => s,
@@ -922,7 +986,7 @@ pub fn pull_from_store(
         let n = commit_pulled(local, me, &source, strict, intents)?;
         out.committed += n;
         if n > 0 {
-            out.committed_sources.push(path.clone());
+            out.committed_sources.push(src.clone());
         }
     }
     Ok(out)
@@ -2246,7 +2310,10 @@ mod tests {
 
         // A bad path is skipped, not fatal.
         let bad = dir.join("nope.db");
-        let extra = vec![foreign_path.clone(), bad];
+        let extra = vec![
+            StoreSource::Local(foreign_path.clone()),
+            StoreSource::Local(bad),
+        ];
         let views = federated_peers(&local, &extra).unwrap();
         let names: Vec<&str> = views.iter().map(|v| v.peer.name.as_str()).collect();
         assert!(names.contains(&"me"));
@@ -2355,7 +2422,7 @@ mod tests {
             }
         }
         let b = SqliteStore::open(&b_path).unwrap();
-        let allow = vec![a_path.clone()];
+        let allow = vec![StoreSource::Local(a_path.clone())];
         let source = canonical_source(&a_path);
 
         // Normal pull commits all three; cursor now at 3.
@@ -2411,7 +2478,7 @@ mod tests {
         let before = std::fs::read(&a_path).unwrap();
 
         let b = SqliteStore::open(&b_path).unwrap();
-        let allow = vec![a_path.clone()];
+        let allow = vec![StoreSource::Local(a_path.clone())];
         let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
         assert_eq!(pulled.committed, 1);
 
@@ -2451,7 +2518,10 @@ mod tests {
                 .unwrap();
         }
         let b = SqliteStore::open(&b_path).unwrap();
-        let allow = vec![dir.join("missing.db"), a_path.clone()];
+        let allow = vec![
+            StoreSource::Local(dir.join("missing.db")),
+            StoreSource::Local(a_path.clone()),
+        ];
         let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
         assert_eq!(pulled.committed, 0);
         assert_eq!(pulled.sources_skipped, 1, "missing source skipped");
@@ -2536,18 +2606,19 @@ mod tests {
         let signer = SigningKey::from_bytes(&[42u8; 32]);
         let pubkey = to_hex(signer.verifying_key().as_bytes());
 
-        // Helper: enqueue an intent into a fresh source store, return its path.
+        // Helper: enqueue an intent into a fresh source store, return it as a
+        // Local StoreSource so it can be passed straight to `pull_from_store`.
         fn src_with(
             dir: &std::path::Path,
             tag: &str,
             from: &str,
             body: &str,
             sig: &str,
-        ) -> std::path::PathBuf {
+        ) -> StoreSource {
             let p = dir.join(format!("{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
             a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
-            p
+            StoreSource::Local(p)
         }
 
         let dir = std::env::temp_dir().join(format!("weave-sign-{}-{}", std::process::id(), now()));

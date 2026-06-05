@@ -35,12 +35,12 @@
 //! `Row`, `Value`). NOTE: `PRAGMA journal_mode=WAL` returns a row, so it is issued
 //! via `query`, not `execute` (libsql's `execute` rejects row-returning statements).
 
-use crate::config::Config;
+use crate::config::{Config, StoreSource};
 use crate::model::{is_broadcast, now, Intent, Message, Peer, BROADCAST_SQL};
 use crate::store::{
     canonical_source, check_body, check_host, check_ident, clamp_limit, commit_pulled,
-    merge_peer_views, merge_session_views, reply_subject, store_label, Origin, PeerView, Pulled,
-    SessionInfo, SessionView, Store, MAX_PULL_PER_DRAIN, MAX_SESSIONS,
+    merge_peer_views, merge_session_views, remote_scheme_host, reply_subject, store_label, Origin,
+    PeerView, Pulled, SessionInfo, SessionView, Store, MAX_PULL_PER_DRAIN, MAX_SESSIONS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -95,11 +95,38 @@ const SCHEMA: &[&str] = &[
     )",
 ];
 
+/// Default wall-clock bound (ms) for a single REMOTE network call (connect or a
+/// SELECT `block_on`). libsql 0.9.30 has NO client-side connect/request timeout
+/// knob (`busy_timeout` is a no-op for remote — proven from the vendored crate), so
+/// we wrap each remote `block_on` future in `tokio::time::timeout`. A timeout is
+/// treated as just another source skip (the existing failure-isolation contract):
+/// stderr + continue, never a panic, never a partial commit. Override with
+/// `WEAVE_PULL_TIMEOUT_MS`.
+const REMOTE_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+
+/// Resolve the remote-call timeout: `WEAVE_PULL_TIMEOUT_MS` if a positive integer,
+/// else [`REMOTE_TIMEOUT_MS_DEFAULT`]. A value of `0`/garbage falls back to the
+/// default (we never disable the bound — an unbounded remote could hang a drain).
+fn remote_timeout() -> std::time::Duration {
+    let ms = std::env::var("WEAVE_PULL_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(REMOTE_TIMEOUT_MS_DEFAULT);
+    std::time::Duration::from_millis(ms)
+}
+
 pub struct LibsqlStore {
     rt: Runtime,
     conn: Connection,
     // Keep the database alive for as long as the connection is used.
     _db: Database,
+    /// OWNER-ONLY-WRITES guard: `true` for a handle opened to read a FOREIGN store
+    /// (local read-only or remote). Every write method traps when this is set, so
+    /// weave can never mutate a store it does not own — the runtime enforcement of
+    /// the cross-machine owner-only-writes invariant. The primary RW `open` sets it
+    /// `false`; `open_readonly`/`open_readonly_remote` set it `true`.
+    read_only: bool,
 }
 
 /// Convert a libsql row column into our owned `Message`. Column order matches
@@ -280,7 +307,28 @@ impl LibsqlStore {
             Ok::<_, anyhow::Error>((db, conn))
         })?;
 
-        Ok(Self { rt, conn, _db: db })
+        Ok(Self {
+            rt,
+            conn,
+            _db: db,
+            read_only: false,
+        })
+    }
+
+    /// OWNER-ONLY-WRITES guard: bail loudly if a write is attempted on a read-only
+    /// (foreign / remote) handle. Called at the top of every write method. This is a
+    /// runtime trap converting "we promise not to write a foreign store" into an
+    /// enforced invariant that returns an `Err` (NEVER a panic) in every build, so a
+    /// caller mis-wiring degrades to the same failure-isolation skip as any other
+    /// foreign-store error rather than aborting the process. A read-only handle is
+    /// never given to a write-path in correct code, so this is a defense-in-depth
+    /// backstop; the existing read-only-handle tests assert it returns `Err` and
+    /// performs no write.
+    fn guard_writable(&self) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!("BUG: write attempted on a read-only foreign store");
+        }
+        Ok(())
     }
 
     /// Open an EXISTING local-file store **read-only** for Tier-1 federation.
@@ -314,23 +362,119 @@ impl LibsqlStore {
                 .context("setting read-only libsql busy_timeout")?;
             Ok::<_, anyhow::Error>((db, conn))
         })?;
-        Ok(Self { rt, conn, _db: db })
+        Ok(Self {
+            rt,
+            conn,
+            _db: db,
+            read_only: true,
+        })
+    }
+
+    /// Tier-2 v2: open a REMOTE libSQL/Turso store **read-only** for cross-store
+    /// federation/pull. weave NEVER writes a remote store — the owner-only-writes
+    /// invariant holds cross-machine:
+    ///
+    /// - `read_only` is set so every write method traps ([`guard_writable`]);
+    /// - NO `SCHEMA`, NO migration, NO permission hardening is run (a remote store we
+    ///   do not own is read exactly as-is). Only SELECTs touch the handle;
+    /// - libsql 0.9.30 has NO client-side read-only mode for a pure remote connection
+    ///   (read-only is a server-side Turso token-scope property — a server-enforced
+    ///   read-only token is the recommended deployment contract; see docs). Our
+    ///   client-side enforcement is the read-only flag + the SELECT-only code path;
+    /// - the connect is wrapped in [`remote_timeout`] so an unreachable remote cannot
+    ///   hang the caller — a timeout surfaces as an `Err`, which the pull/federation
+    ///   free fns treat as a per-source skip (stderr + continue).
+    ///
+    /// `Builder::new_remote` creates NO local file (the `DbType::Remote` carries no
+    /// path), so this leaves no local artifact. The `token` is a SECRET: it reaches
+    /// only the libsql client, never a shell/argv/SQL/log.
+    pub fn open_readonly_remote(url: &str, token: Option<&str>) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for read-only remote libsql store")?;
+        let url = url.to_string();
+        let token = token.unwrap_or_default().to_string();
+        let dur = remote_timeout();
+        let (db, conn) = rt.block_on(async move {
+            let build = Builder::new_remote(url, token).build();
+            // Bound the connect: an unreachable remote must not hang the drain.
+            let db = tokio::time::timeout(dur, build)
+                .await
+                .map_err(|_| anyhow::anyhow!("remote connect timed out after {dur:?}"))?
+                .context("opening read-only remote libsql database")?;
+            // `connect()` is synchronous (no network) — sets up the client handle.
+            let conn = db
+                .connect()
+                .context("connecting to read-only remote libsql database")?;
+            Ok::<_, anyhow::Error>((db, conn))
+        })?;
+        Ok(Self {
+            rt,
+            conn,
+            _db: db,
+            read_only: true,
+        })
+    }
+
+    /// Run a SELECT-bearing future on the runtime, bounded by [`remote_timeout`] when
+    /// this handle is remote/read-only. Used by the read-only foreign-handle SELECTs
+    /// ([`list_peers`]/[`sessions`]/[`list_outbox`]) so a slow/unreachable remote
+    /// surfaces as an `Err` (a source skip) rather than hanging. A local handle runs
+    /// unbounded (its `busy_timeout` already bounds local lock contention).
+    fn block_on_bounded<F, T>(&self, fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        if self.read_only {
+            let dur = remote_timeout();
+            self.rt.block_on(async move {
+                tokio::time::timeout(dur, fut)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote query timed out after {dur:?}"))?
+            })
+        } else {
+            self.rt.block_on(fut)
+        }
     }
 }
 
 /// Diagnostic mirror of `store::federation_status`: of the configured `extra`
 /// read-only stores, how many open + list cleanly vs. are skipped this run. Used
 /// by `doctor` to surface federation health. Read-only + best-effort.
-pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
+pub fn federation_status(extra: &[StoreSource]) -> (usize, usize) {
     let mut ok = 0usize;
     let mut skipped = 0usize;
-    for path in extra {
-        match LibsqlStore::open_readonly(path).and_then(|s| s.list_peers()) {
+    for src in extra {
+        match open_source_readonly(src).and_then(|s| s.list_peers()) {
             Ok(_) => ok += 1,
             Err(_) => skipped += 1,
         }
     }
     (ok, skipped)
+}
+
+/// Open a [`StoreSource`] **read-only** (the ONLY foreign touch): a `Local` path via
+/// [`LibsqlStore::open_readonly`], a `Remote` URL via
+/// [`LibsqlStore::open_readonly_remote`]. Both set the `read_only` write-guard flag;
+/// the remote open is timeout-bounded. weave never opens a foreign source writable.
+fn open_source_readonly(src: &StoreSource) -> Result<LibsqlStore> {
+    match src {
+        StoreSource::Local(path) => LibsqlStore::open_readonly(path),
+        StoreSource::Remote { url, token } => {
+            LibsqlStore::open_readonly_remote(url, token.as_deref())
+        }
+    }
+}
+
+/// Short display label for a federated source's origin tag: a local store's basename
+/// or a remote URL's redacted scheme+host (NEVER the token). Used to tag `Foreign`
+/// rows and in skip diagnostics.
+fn source_label(src: &StoreSource) -> String {
+    match src {
+        StoreSource::Local(path) => store_label(path),
+        StoreSource::Remote { url, .. } => remote_scheme_host(url),
+    }
 }
 
 /// Aggregate the local store's peers with those of each configured read-only
@@ -341,7 +485,7 @@ pub fn federation_status(extra: &[std::path::PathBuf]) -> (usize, usize) {
 /// locked / missing / non-weave extra store is logged to **stderr** and skipped —
 /// it never breaks the local listing. With `extra` empty this is exactly
 /// `local.list_peers()` tagged `Local`.
-pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Result<Vec<PeerView>> {
+pub fn federated_peers(local: &dyn Store, extra: &[StoreSource]) -> Result<Vec<PeerView>> {
     let mut views: Vec<PeerView> = local
         .list_peers()?
         .into_iter()
@@ -350,9 +494,9 @@ pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Resul
             origin: Origin::Local,
         })
         .collect();
-    for path in extra {
-        let label = store_label(path);
-        match LibsqlStore::open_readonly(path).and_then(|s| s.list_peers()) {
+    for src in extra {
+        let label = source_label(src);
+        match open_source_readonly(src).and_then(|s| s.list_peers()) {
             Ok(peers) => {
                 for peer in peers {
                     views.push(PeerView {
@@ -362,7 +506,7 @@ pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Resul
                 }
             }
             Err(e) => {
-                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+                eprintln!("[weave] skipping federated store '{label}': {e}");
             }
         }
     }
@@ -373,10 +517,7 @@ pub fn federated_peers(local: &dyn Store, extra: &[std::path::PathBuf]) -> Resul
 /// extra store (Tier-1 federation). Mirrors `store::federated_sessions`: merges
 /// by name keeping `max(last_activity)` and never summing unread, with the same
 /// read-only open + per-store failure isolation as [`federated_peers`].
-pub fn federated_sessions(
-    local: &dyn Store,
-    extra: &[std::path::PathBuf],
-) -> Result<Vec<SessionView>> {
+pub fn federated_sessions(local: &dyn Store, extra: &[StoreSource]) -> Result<Vec<SessionView>> {
     let mut views: Vec<SessionView> = local
         .sessions()?
         .into_iter()
@@ -387,9 +528,9 @@ pub fn federated_sessions(
             origin: Origin::Local,
         })
         .collect();
-    for path in extra {
-        let label = store_label(path);
-        match LibsqlStore::open_readonly(path).and_then(|s| s.sessions()) {
+    for src in extra {
+        let label = source_label(src);
+        match open_source_readonly(src).and_then(|s| s.sessions()) {
             Ok(sessions) => {
                 for (name, unread, last_activity) in sessions {
                     views.push(SessionView {
@@ -401,7 +542,7 @@ pub fn federated_sessions(
                 }
             }
             Err(e) => {
-                eprintln!("[weave] skipping federated store '{}': {e}", path.display());
+                eprintln!("[weave] skipping federated store '{label}': {e}");
             }
         }
     }
@@ -424,16 +565,20 @@ pub fn federated_sessions(
 pub fn pull_from_store(
     local: &dyn Store,
     me: &str,
-    allow: &[std::path::PathBuf],
+    allow: &[StoreSource],
     strict: bool,
 ) -> Result<Pulled> {
     let mut out = Pulled::default();
-    for path in allow {
-        let source = canonical_source(path);
-        let foreign = match LibsqlStore::open_readonly(path) {
+    for src in allow {
+        // Per-source pull_cursor key: a Local path canonicalizes (so `./a.db` and
+        // its absolute form share one cursor); a Remote URL is keyed by the exact
+        // (trailing-slash-normalized) URL string — a URL is never canonicalized.
+        let source = source_cursor_key(src);
+        let label = source_label(src);
+        let foreign = match open_source_readonly(src) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                eprintln!("[weave] skipping pull source '{label}': {e}");
                 out.sources_skipped += 1;
                 continue;
             }
@@ -442,7 +587,7 @@ pub fn pull_from_store(
         let intents = match foreign.list_outbox(me, since, MAX_PULL_PER_DRAIN) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[weave] skipping pull source '{}': {e}", path.display());
+                eprintln!("[weave] skipping pull source '{label}': {e}");
                 out.sources_skipped += 1;
                 continue;
             }
@@ -450,10 +595,21 @@ pub fn pull_from_store(
         let n = commit_pulled(local, me, &source, strict, intents)?;
         out.committed += n;
         if n > 0 {
-            out.committed_sources.push(path.clone());
+            out.committed_sources.push(src.clone());
         }
     }
     Ok(out)
+}
+
+/// The `pull_cursor.source` key for a [`StoreSource`]: a Local path canonicalized
+/// (matching the federation dedup discipline), or a Remote URL trailing-slash-
+/// normalized (NEVER `std::fs::canonicalize`'d). Stable across runs for a stable
+/// configured URL, so the idempotent high-water cursor holds cross-machine.
+fn source_cursor_key(src: &StoreSource) -> String {
+    match src {
+        StoreSource::Local(path) => canonical_source(path),
+        StoreSource::Remote { url, .. } => url.strip_suffix('/').unwrap_or(url).to_string(),
+    }
 }
 
 /// Build a positional parameter vector for a libsql query. `Value` already has
@@ -474,6 +630,7 @@ impl Store for LibsqlStore {
         subject: Option<&str>,
         body: &str,
     ) -> Result<i64> {
+        self.guard_writable()?;
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
         check_body(body)?;
@@ -502,6 +659,11 @@ impl Store for LibsqlStore {
         mark_read: bool,
         limit: i64,
     ) -> Result<(Vec<Message>, i64)> {
+        // `inbox` is a local-inbox op (never called on a foreign handle); only the
+        // read-marking branch writes, so guard only when it would.
+        if mark_read {
+            self.guard_writable()?;
+        }
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = if include_read {
@@ -615,7 +777,8 @@ impl Store for LibsqlStore {
     }
 
     fn sessions(&self) -> Result<Vec<SessionInfo>> {
-        self.rt.block_on(async {
+        // SELECT-only (N+1 unread/last-activity); bounded on a read-only/remote handle.
+        self.block_on_bounded(async {
             let mut names: Vec<String> = Vec::new();
             {
                 let mut it = self
@@ -671,6 +834,7 @@ impl Store for LibsqlStore {
     }
 
     fn clear_inbox(&self, me: &str) -> Result<usize> {
+        self.guard_writable()?;
         // Reuse `inbox` (which has its own runtime entry) to fetch the unread
         // set, then mark each read — same approach and semantics as SqliteStore.
         let (rows, _) = self.inbox(me, false, false, i64::MAX)?;
@@ -691,6 +855,7 @@ impl Store for LibsqlStore {
     }
 
     fn clear_all(&self) -> Result<i64> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             // Both deletes in ONE transaction so a crash can't orphan `reads`.
             let tx = self
@@ -712,6 +877,7 @@ impl Store for LibsqlStore {
     }
 
     fn gc(&self, older_than_secs: i64) -> Result<i64> {
+        self.guard_writable()?;
         let cutoff = now().saturating_sub(older_than_secs.max(0));
         self.rt.block_on(async {
             // COUNT + both DELETEs in ONE IMMEDIATE transaction: accurate count and
@@ -773,6 +939,7 @@ impl Store for LibsqlStore {
     }
 
     fn set_in_reply_to(&self, message_id: i64, in_reply_to: i64) -> Result<()> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             self.conn
                 .execute(
@@ -789,6 +956,7 @@ impl Store for LibsqlStore {
         // set_in_reply_to() in two round-trips): resolve the parent and INSERT a
         // single row carrying in_reply_to, all inside ONE IMMEDIATE transaction
         // so the parent cannot vanish mid-reply. Mirrors SqliteStore::reply.
+        self.guard_writable()?;
         check_ident("sender", sender)?;
         check_body(body)?;
         self.rt.block_on(async {
@@ -882,6 +1050,7 @@ impl Store for LibsqlStore {
     }
 
     fn touch_peer(&self, name: &str) -> Result<()> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             self.conn
                 .execute(
@@ -903,6 +1072,7 @@ impl Store for LibsqlStore {
         pid: Option<i64>,
         host: &str,
     ) -> Result<()> {
+        self.guard_writable()?;
         check_ident("peer name", name)?;
         self.rt.block_on(async {
             self.conn
@@ -943,7 +1113,8 @@ impl Store for LibsqlStore {
     }
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
-        self.rt.block_on(async {
+        // SELECT-only; bounded by the remote timeout on a read-only/remote handle.
+        self.block_on_bounded(async {
             let mut it = self
                 .conn
                 .query(
@@ -968,6 +1139,7 @@ impl Store for LibsqlStore {
         body: &str,
         sig: &str,
     ) -> Result<i64> {
+        self.guard_writable()?;
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
@@ -994,7 +1166,9 @@ impl Store for LibsqlStore {
 
     fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
-        self.rt.block_on(async {
+        // SELECT-only; bounded by the remote timeout on a read-only/remote handle
+        // (this is the call the pull path makes against the foreign source).
+        self.block_on_bounded(async {
             let mut it = self
                 .conn
                 .query(
@@ -1047,6 +1221,7 @@ impl Store for LibsqlStore {
     }
 
     fn pull_cursor_set(&self, source: &str, last_id: i64) -> Result<()> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             self.conn
                 .execute(
@@ -1060,6 +1235,7 @@ impl Store for LibsqlStore {
     }
 
     fn register_key(&self, identity: &str, pubkey: &str) -> Result<()> {
+        self.guard_writable()?;
         check_ident("identity", identity)?;
         self.rt.block_on(async {
             self.conn
@@ -1714,6 +1890,94 @@ mod tests {
         );
     }
 
+    /// OWNER-ONLY-WRITES (the Tier-2 v2 crux), hermetic / NO network: a `read_only`-
+    /// flagged `LibsqlStore` (the same flag set on every remote/foreign open) makes
+    /// EVERY write method return the `guard_writable` `bail!` error — never a panic,
+    /// never a write — and the foreign DATA file is byte-identical afterwards. We use
+    /// a LOCAL-file read-only handle (`open_readonly`, which sets `read_only = true`,
+    /// the identical flag `open_readonly_remote` sets) so the proof needs no live
+    /// Turso. This is the remote analogue of the sqlite "foreign store byte-unchanged"
+    /// assertion, proving the guard without a network connection.
+    #[test]
+    fn read_only_handle_traps_every_write_and_leaves_file_unchanged() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-guard-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foreign.db");
+
+        // Seed a foreign store, then drop the writer so all WAL is flushed.
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.register_peer_full("seed", "tmux", "%1", "", Some("/w"), Some(7), "boxA")
+                .unwrap();
+            rw.send("seed", "seed", None, "hi").unwrap();
+        }
+        let before = std::fs::read(&path).expect("read foreign DB bytes (before)");
+
+        // The read-only-flagged handle (the exact flag a remote open sets).
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(
+            ro.read_only,
+            "open_readonly must set the read-only guard flag"
+        );
+
+        // Every write method must return the guard error (NOT panic, NOT write).
+        let guarded = "BUG: write attempted on a read-only foreign store";
+        let assert_trapped = |what: &str, r: Result<()>| {
+            let e = r.expect_err(&format!("{what} must be trapped on a read-only handle"));
+            assert!(
+                e.to_string().contains(guarded),
+                "{what} returned the wrong error: {e}"
+            );
+        };
+
+        assert_trapped("send", ro.send("a", "b", None, "x").map(|_| ()));
+        assert_trapped(
+            "inbox(mark_read)",
+            ro.inbox("seed", false, true, 10).map(|_| ()),
+        );
+        assert_trapped("clear_inbox", ro.clear_inbox("seed").map(|_| ()));
+        assert_trapped("clear_all", ro.clear_all().map(|_| ()));
+        assert_trapped("gc", ro.gc(0).map(|_| ()));
+        assert_trapped("set_in_reply_to", ro.set_in_reply_to(1, 1));
+        assert_trapped("reply", ro.reply("a", 1, "x").map(|_| ()));
+        assert_trapped("touch_peer", ro.touch_peer("seed"));
+        assert_trapped(
+            "register_peer_full",
+            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA"),
+        );
+        assert_trapped(
+            "enqueue_intent",
+            ro.enqueue_intent("to", "boxB", "from", None, "body", "")
+                .map(|_| ()),
+        );
+        assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
+        assert_trapped("register_key", ro.register_key("id", "pubkey"));
+
+        // A read still works (the failed writes were no-ops).
+        assert_eq!(ro.list_peers().unwrap().len(), 1);
+        drop(ro);
+
+        // The foreign DATA file is byte-identical; the WAL committed nothing.
+        let after = std::fs::read(&path).expect("read foreign DB bytes (after)");
+        assert_eq!(
+            before, after,
+            "a read-only foreign handle must leave the source DB byte-unchanged"
+        );
+        let wal_len = std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal_len, 0, "no write may be committed to the foreign WAL");
+    }
+
     /// `federated_peers` (libsql) unions the local peers with a foreign read-only
     /// store, origin-tagging foreign rows; an unreadable extra store is skipped (the
     /// local listing still returns) — mirrors the sqlite federation aggregation test.
@@ -1753,7 +2017,10 @@ mod tests {
 
         // A bad path is skipped, not fatal.
         let bad = dir.join("nope.db");
-        let extra = vec![foreign_path.clone(), bad];
+        let extra = vec![
+            StoreSource::Local(foreign_path.clone()),
+            StoreSource::Local(bad),
+        ];
         let views = federated_peers(&local, &extra).unwrap();
         let names: Vec<&str> = views.iter().map(|v| v.peer.name.as_str()).collect();
         assert!(names.contains(&"me"));
@@ -1871,7 +2138,7 @@ mod tests {
             };
             LibsqlStore::open(&cfg).unwrap()
         };
-        let allow = vec![a_path.clone()];
+        let allow = vec![StoreSource::Local(a_path.clone())];
         let pulled = pull_from_store(&b, "bob", &allow, false).unwrap();
         assert_eq!(pulled.committed, 1);
 
