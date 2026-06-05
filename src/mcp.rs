@@ -341,6 +341,8 @@ fn call_tool(
         "weave_ack" => tool_ack(store, me_default, args),
         "weave_asks" => tool_asks(store, me_default, args),
         "weave_ask_get" => tool_ask_get(store, args),
+        "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args),
+        "weave_ask_many_result" => tool_ask_many_result(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1566,6 +1568,129 @@ fn tool_ask_get(store: &dyn Store, args: &Value) -> Result<String, String> {
     ))
 }
 
+/// `weave_ask_many`: fan ONE question to N explicit peers. Opens a parent group +
+/// one normal P1 child ask per (de-duped, valid, non-broadcast) peer, then fires the
+/// per-child live nudge CALLER-SIDE for each created child (the `ask_delivery_verdict`
+/// seam — NO `store → inject` edge). Best-effort: an invalid/broadcast peer in the
+/// list carries a per-child error and the call still succeeds; an empty / over-cap
+/// list is a hard whole-call error. Non-blocking — returns the parent id + per-child
+/// correlation ids/verdicts immediately (no quorum, no retry).
+fn tool_ask_many(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    // `to` must be a non-empty JSON array of strings.
+    let to_arr = args
+        .get("to")
+        .and_then(|v| v.as_array())
+        .ok_or("'to' is required (a JSON array of peer session names).")?;
+    if to_arr.is_empty() {
+        return Err("'to' must list at least one peer.".to_string());
+    }
+    if to_arr.len() > store::MAX_ASK_MANY_TARGETS {
+        return Err(format!(
+            "'to' lists {} peers; max {} per ask-many.",
+            to_arr.len(),
+            store::MAX_ASK_MANY_TARGETS
+        ));
+    }
+    // Bound each entry to a trimmed identity (over-length / non-string is a hard
+    // whole-call error; a metachar-but-valid-length id is left to the per-child
+    // best-effort path in the store). A broadcast entry stays in the list and is
+    // rejected PER-CHILD by the store (best-effort), matching repowire.
+    let mut peers: Vec<String> = Vec::with_capacity(to_arr.len());
+    for (i, v) in to_arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("'to[{i}]' must be a string."))?;
+        peers.push(bound_ident("to", s)?);
+    }
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required (the question).")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let outcome = store
+        .create_ask_many(&from, &peers, subject.as_deref(), body)
+        .map_err(e)?;
+    // Per-child caller-side nudge for each CREATED child (no store→inject edge).
+    let mut created = 0usize;
+    let mut failed = 0usize;
+    let mut lines = String::new();
+    for (peer, res) in &outcome.children {
+        match res {
+            Ok(cid) => {
+                created += 1;
+                let verdict = ask_delivery_verdict(store, nudge_template, &from, peer, body);
+                lines.push_str(&format!("  {peer}: {cid} — {verdict}\n"));
+            }
+            Err(err) => {
+                failed += 1;
+                lines.push_str(&format!("  {peer}: FAILED — {err}\n"));
+            }
+        }
+    }
+    Ok(format!(
+        "Opened ask-many {} from '{from}' to {} peer(s): {created} created, {failed} failed.\n{lines}",
+        outcome.parent_id,
+        outcome.children.len()
+    ))
+}
+
+/// `weave_ask_many_result`: aggregate an ask-many group at READ time. Renders the
+/// rollup counts, the derived state (`complete|partial|pending`), the pending peer
+/// list, and per-child state/answer ids. Read-only, no nudge. An unknown/invalid
+/// parent id is a clean error.
+fn tool_ask_many_result(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let parent_id = args
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'parent_id' is required (the ask-many id).")?;
+    if !model::ask_many_id_valid(parent_id) {
+        return Err("'parent_id' is not a valid ask-many id.".to_string());
+    }
+    let age = args.get("age").and_then(|v| v.as_i64());
+    let r = store
+        .ask_many_result(parent_id, age)
+        .map_err(e)?
+        .ok_or_else(|| format!("No ask-many '{parent_id}'."))?;
+    let mut out = format!(
+        "ask-many {} [{}] from '{}' — {}/{} answered, {} acked, {} pending, {} failed (opened {}).\n",
+        r.parent_id,
+        r.state.as_str(),
+        r.asker,
+        r.answered,
+        r.target_count,
+        r.acked,
+        r.pending,
+        r.failed,
+        fmt_ts(r.opened_ts)
+    );
+    let mut pending_peers: Vec<&str> = Vec::new();
+    for c in &r.children {
+        let state = c.state.map(|s| s.as_str()).unwrap_or("failed");
+        if c.state == Some(model::AskState::Open) {
+            pending_peers.push(&c.peer);
+        }
+        let cid = c.correlation_id.as_deref().unwrap_or("-");
+        let ans = c
+            .answer_msg_id
+            .map(|m| format!(" answer=#{m}"))
+            .unwrap_or_default();
+        out.push_str(&format!("  {} [{state}] {cid}{ans}\n", c.peer));
+    }
+    if !pending_peers.is_empty() {
+        out.push_str(&format!("pending: {}\n", pending_peers.join(", ")));
+    }
+    Ok(out)
+}
+
 /// Resolve the correlation id `weave_answer` targets: prefer an explicit
 /// `correlation_id`, else map an `in_reply_to` message id to its owning ask via a
 /// `get_ask`-free lookup walking `list_asks` is too coarse, so we resolve through
@@ -1765,6 +1890,24 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "id":{"type":"string","description":"The correlation_id."}
             },"required":["id"]}
+        },
+        {
+            "name": "weave_ask_many",
+            "description": "Fan ONE question to N explicit peers in parallel and return a parent_id + per-child correlation_ids immediately (NON-blocking, best-effort — no quorum, no retry). Opens a parent ask-many group and one normal tracked child ask per peer; each child is delivered like a normal message (live nudge if injectable, else next-turn) and reports its honest delivery verdict. An invalid/broadcast peer in the list is a per-child error, NOT a whole-call failure; an empty or over-cap list IS an error. Children answer/ack exactly like any weave_ask. Use weave_ask_many_result to aggregate. Explicit peer LIST only (no broadcast/circle).",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "to":{"type":"array","items":{"type":"string"},"description":"The peer session names to ask (1..=64, de-duplicated)."},
+                "body":{"type":"string","description":"The question (delivered to every target)."},
+                "subject":{"type":"string"}
+            },"required":["to","body"]}
+        },
+        {
+            "name": "weave_ask_many_result",
+            "description": "Aggregate an ask-many group at READ time (no background ticker): the per-child state/answer, the pending peer list, the rollup counts, and the derived state (complete = no child pending; partial = some pending AND past the optional age threshold; pending otherwise). Read-only. Errors on an unknown or invalid parent_id.",
+            "inputSchema": {"type":"object","properties":{
+                "parent_id":{"type":"string","description":"The ask-many parent id."},
+                "age":{"type":"integer","description":"Optional age (seconds): a still-pending group older than this reads as 'partial' (daemon-free, opt-in)."}
+            },"required":["parent_id"]}
         }
     ])
 }

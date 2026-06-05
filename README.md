@@ -66,6 +66,12 @@ weave answer --id ask_42_17 --body "confirmed, ship it" --from envctl   # or: --
 weave ack --id ask_42_17 --from envctl --message "thanks"               # close the thread (acked)
 weave asks --me envctl --role askee  # list tracked asks (role: asker|askee|any); --json
 weave ask-get --id ask_42_17         # inspect one ask (state + answer presence); --json
+
+# Ask-many: fan ONE question to N peers, collect replies (best-effort, non-blocking)
+weave ask-many --from desktop --to envctl --to ci --body "ready to ship?" --subject "release"
+weave ask-many-result --parent-id askm_7_31   # aggregate: per-child state + pending list + complete|partial|pending; --json
+weave ask-many-result --parent-id askm_7_31 --age 600   # treat still-open children past 600s as partial
+
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
 
@@ -208,6 +214,7 @@ is pulled in.
 · `weave_peers` · `weave_scan` · `weave_reply` · `weave_thread` · `weave_receipts` · `weave_doctor` · `weave_whoami`
 · `weave_attach` · `weave_connect`
 · `weave_ask` · `weave_answer` · `weave_ack` · `weave_asks` · `weave_ask_get`
+· `weave_ask_many` · `weave_ask_many_result`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
@@ -270,6 +277,34 @@ nudge) and local-mesh only — cross-store ask is future work.
 but not live; delivered on the recipient's next drain), or `recipient_not_injectable` (no
 injectable pane). The verdict is **advisory, never an error**: a queued or not-injectable
 ask still succeeds and arrives on the next drain.
+
+## Ask-many (fan one question to N peers)
+
+`ask` is point-to-point; `ask_many` fans **one question to an explicit list of peers** and
+lets you collect their replies — still **daemon-free** and built directly on the `asks`
+table (each child is a normal `ask`, answered/acked exactly like P1). No quorum, no retry,
+no background ticker — best-effort, just like repowire's `ask_many`.
+
+- **`weave ask-many` / `weave_ask_many`** `{ from?, to:[peer,…], body, subject? }` — opens a
+  parent ask-many (`askm_<id>`), creates **one child `ask` per peer**, fires each child's
+  live nudge caller-side, and **returns immediately** with the `parent_id`, every child's
+  `correlation_id`, and every child's honest delivery verdict (`transport_delivered` /
+  `queued_next_turn` / `recipient_not_injectable`). **Best-effort per child:** an
+  unknown/unreachable/broadcast peer in the list yields a per-child error but does **not**
+  fail the whole call. `to` is an **explicit peer list** (circles compose in a later epic),
+  capped at **64** targets (an empty or over-cap list is a hard error); the list is de-duped.
+- **`weave ask-many-result` / `weave_ask_many_result`** `{ parent_id, age? }` — **read-only**
+  aggregate of the children at read time: each child's state (`open`/`answered`/`acked`),
+  the answers collected, the still-pending peers, the rollup counts, and a
+  `complete | partial | pending` summary. `complete` once no child is pending; `partial`
+  only when you pass `age` and an open child has been waiting at least that many seconds
+  (there is no stored deadline); otherwise `pending`. Totality always holds:
+  `answered + acked + pending + failed == target_count`.
+
+Children answer and ack through the **unchanged** `weave answer` / `weave ack` path, so
+`weave thread`, receipts, and the hook drain all work for an ask-many child with no new
+machinery. Local-mesh only (each child must be an explicit, valid, non-broadcast peer in
+your own store); cross-store fan-out is future work.
 
 ## Native injector
 

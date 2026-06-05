@@ -6339,3 +6339,181 @@ fn mcp_ask_verdict_is_success_not_error() {
     );
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P2 ask-many / ask-many-result — black-box (CLI + MCP)
+// ---------------------------------------------------------------------------
+
+/// Pull the minted `askm_<seed>_<nonce>` parent id out of a CLI/MCP line.
+fn extract_parent_id(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| w.trim_end_matches([':', '.', ',']))
+        .find(|w| w.starts_with("askm_"))
+        .unwrap_or_else(|| panic!("no ask-many parent id in: {text:?}"))
+        .to_string()
+}
+
+/// CLI end-to-end: `weave ask-many --to a --to b` opens a parent + two children
+/// (both pending), `ask-many-result` shows both pending, answering one child flips
+/// the rollup to 1 answered + 1 pending (still `pending`), answering the second
+/// reaches `complete`. The children answer through the UNCHANGED P1 `answer` path.
+#[test]
+fn cli_ask_many_partial_to_complete() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &[
+            "ask-many",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--to",
+            "carol",
+            "--subject",
+            "sync",
+            "--body",
+            "standup?",
+        ],
+    );
+    assert!(
+        opened.contains("opened ask-many"),
+        "ask-many line: {opened:?}"
+    );
+    assert!(
+        opened.contains("2 created, 0 failed"),
+        "two children created: {opened:?}"
+    );
+    let parent = extract_parent_id(&opened);
+
+    // Both questions landed in the askees' inboxes.
+    assert!(run_ok(&db, &["inbox", "--me", "bob"]).contains("standup?"));
+    assert!(run_ok(&db, &["inbox", "--me", "carol"]).contains("standup?"));
+
+    // Result: both pending, state pending.
+    let res = run_ok(&db, &["ask-many-result", "--parent-id", &parent]);
+    assert!(res.contains("[pending]"), "state pending: {res:?}");
+    assert!(
+        res.contains("2 pending") || res.contains("0/2 answered"),
+        "rollup: {res:?}"
+    );
+
+    // The result --json lists the child correlation ids; answer the bob child.
+    let res_json = run_ok(&db, &["ask-many-result", "--parent-id", &parent, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&res_json).expect("result --json valid");
+    let children = v["result"]["children"].as_array().expect("children array");
+    assert_eq!(children.len(), 2);
+    let bob_cid = children
+        .iter()
+        .find(|c| c["peer"] == "bob")
+        .and_then(|c| c["correlation_id"].as_str())
+        .expect("bob child cid")
+        .to_string();
+
+    run_ok(
+        &db,
+        &["answer", "--from", "bob", "--id", &bob_cid, "--body", "yes"],
+    );
+    let res = run_ok(&db, &["ask-many-result", "--parent-id", &parent]);
+    assert!(res.contains("1/2 answered"), "one answered: {res:?}");
+    assert!(res.contains("[pending]"), "still pending: {res:?}");
+
+    // Answer carol's child too → complete.
+    let carol_cid = children
+        .iter()
+        .find(|c| c["peer"] == "carol")
+        .and_then(|c| c["correlation_id"].as_str())
+        .expect("carol child cid")
+        .to_string();
+    run_ok(
+        &db,
+        &[
+            "answer", "--from", "carol", "--id", &carol_cid, "--body", "yes",
+        ],
+    );
+    let res = run_ok(&db, &["ask-many-result", "--parent-id", &parent]);
+    assert!(res.contains("[complete]"), "complete: {res:?}");
+
+    // Unknown parent id is a clean error.
+    let (ok, _o, _e) = run(&db, &["ask-many-result", "--parent-id", "askm_404_1"]);
+    assert!(!ok, "unknown parent id errors");
+}
+
+/// MCP black-box: tools/list gains weave_ask_many + weave_ask_many_result; a happy
+/// fanout returns the parent id + per-child verdicts (HONEST success, not isError
+/// even when not injectable); an unknown peer in the list is a per-child failure
+/// (call still succeeds, best-effort); empty/over-cap lists are clean isError;
+/// ask_many_result of an unknown/invalid parent is isError.
+#[test]
+fn mcp_ask_many_lifecycle_and_failures() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect();
+    for expected in ["weave_ask_many", "weave_ask_many_result"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing {expected}: {names:?}"
+        );
+    }
+
+    // Happy fanout: bob (valid, not-injectable) + "all" (broadcast → per-child fail).
+    let (is_err, text) = mcp.call_tool(
+        "weave_ask_many",
+        serde_json::json!({"from": "alice", "to": ["bob", "all"], "body": "ping?"}),
+    );
+    assert!(
+        !is_err,
+        "ask-many to a non-injectable peer is honest success: {text}"
+    );
+    assert!(text.contains("Opened ask-many"), "ask-many text: {text:?}");
+    assert!(
+        text.contains("1 created, 1 failed"),
+        "best-effort per child: {text:?}"
+    );
+    let parent = extract_parent_id(&text);
+
+    // Result aggregate: read-only, shows 1 pending + 1 failed.
+    let (is_err, res) = mcp.call_tool(
+        "weave_ask_many_result",
+        serde_json::json!({"parent_id": parent}),
+    );
+    assert!(!is_err, "result: {res}");
+    assert!(res.contains("1 pending"), "rollup pending: {res:?}");
+    assert!(res.contains("1 failed"), "rollup failed: {res:?}");
+
+    // FAILURE: empty list → isError.
+    let (is_err, _t) = mcp.call_tool(
+        "weave_ask_many",
+        serde_json::json!({"from": "alice", "to": [], "body": "q"}),
+    );
+    assert!(is_err, "empty to list must be isError");
+
+    // FAILURE: over-cap list → isError.
+    let big: Vec<String> = (0..70).map(|i| format!("p{i}")).collect();
+    let (is_err, _t) = mcp.call_tool(
+        "weave_ask_many",
+        serde_json::json!({"from": "alice", "to": big, "body": "q"}),
+    );
+    assert!(is_err, "over-cap to list must be isError");
+
+    // FAILURE: unknown parent / invalid parent → isError.
+    let (is_err, _t) = mcp.call_tool(
+        "weave_ask_many_result",
+        serde_json::json!({"parent_id": "askm_404_9"}),
+    );
+    assert!(is_err, "unknown parent must be isError");
+    let (is_err, _t) = mcp.call_tool(
+        "weave_ask_many_result",
+        serde_json::json!({"parent_id": "ask;rm"}),
+    );
+    assert!(is_err, "invalid parent id must be isError");
+
+    mcp.shutdown();
+}

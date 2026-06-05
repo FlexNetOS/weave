@@ -2667,3 +2667,87 @@ fn mcp_ask_stdout_is_pure_jsonrpc_no_body_leak() {
     );
     mcp.shutdown();
 }
+
+/// P2 N-cap enforced from the COMPILED binary: an `ask-many` whose `--to` list
+/// exceeds the fanout cap (64) is rejected as a whole-call error (no parent opened,
+/// no child storm), never a panic. A within-cap list with a metachar/control-char
+/// peer is best-effort per child (that child fails, the call still succeeds), and
+/// the question body of a created child never reaches a shell (argv-only).
+#[test]
+fn ask_many_cap_enforced_and_per_peer_validated() {
+    let db = TestDb::new();
+    // Build an over-cap (>64) --to argv. Each peer is a distinct valid id so only the
+    // COUNT triggers the reject (not per-peer validation).
+    let peers: Vec<String> = (0..70).map(|i| format!("peer{i}")).collect();
+    let mut args: Vec<&str> = vec!["ask-many", "--from", "a", "--body", "q"];
+    for p in &peers {
+        args.push("--to");
+        args.push(p);
+    }
+    let (ok, _o, _e) = run(&db, &args);
+    assert!(!ok, "an over-cap ask-many fanout must be rejected");
+
+    // Within cap, a control-char peer is a per-child failure, not a whole-call error.
+    let (ok, out, _e) = run(
+        &db,
+        &[
+            "ask-many",
+            "--from",
+            "a",
+            "--to",
+            "good",
+            "--to",
+            "bad\nid",
+            "--body",
+            "q;rm -rf /",
+        ],
+    );
+    assert!(
+        ok,
+        "best-effort per child: a bad peer does not fail the call"
+    );
+    assert!(
+        out.contains("1 created, 1 failed"),
+        "per-child verdict: {out:?}"
+    );
+    // The metachar body never reached a shell: nothing was deleted, the good child
+    // exists and its question is in the inbox verbatim.
+    assert!(run_ok(&db, &["inbox", "--me", "good"]).contains("q;rm -rf /"));
+}
+
+/// P2 result is BOUNDED + secret-free from the binary: the aggregated `ask-many-result`
+/// emits at most `target_count` (≤ cap) child rows and leaks no DB path / key
+/// material, even when the question body contains secret-looking text.
+#[test]
+fn ask_many_result_is_bounded_and_secret_free() {
+    let db = TestDb::new();
+    let secret = "TOPSECRET-PW-7733";
+    let opened = run_ok(
+        &db,
+        &[
+            "ask-many", "--from", "a", "--to", "b", "--to", "c", "--body", secret,
+        ],
+    );
+    let parent = opened
+        .split_whitespace()
+        .map(|w| w.trim_end_matches([':', '.', ',']))
+        .find(|w| w.starts_with("askm_"))
+        .expect("parent id")
+        .to_string();
+    let res = run_ok(&db, &["ask-many-result", "--parent-id", &parent]);
+    // Bounded: exactly two child rows (≤ target_count ≤ cap).
+    let child_rows = res
+        .lines()
+        .filter(|l| l.trim_start().starts_with('b') || l.trim_start().starts_with('c'))
+        .count();
+    assert!(
+        child_rows <= 2,
+        "child rows bounded by target_count: {res:?}"
+    );
+    // Secret-free: the human result surfaces state/cids, not the question body or db path.
+    assert!(
+        !res.contains(secret),
+        "question body must not ride the result: {res:?}"
+    );
+    assert!(!res.contains(".db"), "no db path leak: {res:?}");
+}

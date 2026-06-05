@@ -374,6 +374,36 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Fan ONE question to N peers (P2 ask-many). Opens a parent group + one tracked
+    /// child ask per --to peer, fires each child's live nudge, and prints the parent
+    /// id + per-child verdicts immediately (non-blocking, best-effort).
+    AskMany {
+        /// a target peer (repeat --to for each peer; 1..=64, de-duplicated)
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Aggregate an ask-many group at read time: per-child state/answer, pending peers,
+    /// rollup counts, and the derived state (complete|partial|pending).
+    AskManyResult {
+        /// the ask-many parent id
+        #[arg(long = "parent-id")]
+        parent_id: String,
+        /// optional age (seconds): a still-pending group older than this reads 'partial'
+        #[arg(long)]
+        age: Option<i64>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Configuration helpers.
     Config {
         #[command(subcommand)]
@@ -1870,6 +1900,111 @@ fn main() -> Result<()> {
                                 .unwrap_or_default(),
                             answered
                         );
+                    }
+                }
+            }
+        }
+
+        Cmd::AskMany {
+            to,
+            body,
+            subject,
+            from,
+            json,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let outcome = store.create_ask_many(&from, &to, subject.as_deref(), &body)?;
+            // Honest per-child delivery verdict via the caller-side nudge (no
+            // store->inject edge), one per CREATED child.
+            let mut child_json = Vec::new();
+            let mut created = 0usize;
+            let mut failed = 0usize;
+            for (peer, res) in &outcome.children {
+                match res {
+                    Ok(cid) => {
+                        created += 1;
+                        let verdict = ask_inject_verdict(store, &cfg, &from, peer, &body);
+                        if json {
+                            child_json.push(serde_json::json!({
+                                "peer": peer, "correlation_id": cid, "verdict": verdict
+                            }));
+                        } else {
+                            println!("  {peer}: {cid} ({verdict})");
+                        }
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        if json {
+                            child_json.push(serde_json::json!({
+                                "peer": peer, "error": err
+                            }));
+                        } else {
+                            println!("  {peer}: FAILED ({err})");
+                        }
+                    }
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "parent_id": outcome.parent_id,
+                        "created": created,
+                        "failed": failed,
+                        "children": child_json,
+                    }))?
+                );
+            } else {
+                println!(
+                    "opened ask-many {}: {created} created, {failed} failed",
+                    outcome.parent_id
+                );
+            }
+        }
+
+        Cmd::AskManyResult {
+            parent_id,
+            age,
+            json,
+        } => {
+            let r = store.ask_many_result(&parent_id, age)?;
+            match r {
+                None => {
+                    if json {
+                        println!("{}", serde_json::json!({ "result": null }));
+                    } else {
+                        anyhow::bail!("no ask-many '{parent_id}'");
+                    }
+                }
+                Some(r) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({ "result": r }))?
+                        );
+                    } else {
+                        println!(
+                            "ask-many {} [{}] from {}: {}/{} answered, {} acked, {} pending, {} failed ({})",
+                            r.parent_id,
+                            r.state.as_str(),
+                            r.asker,
+                            r.answered,
+                            r.target_count,
+                            r.acked,
+                            r.pending,
+                            r.failed,
+                            model::fmt_ts(r.opened_ts)
+                        );
+                        for c in &r.children {
+                            let state = c.state.map(|s| s.as_str()).unwrap_or("failed");
+                            let cid = c.correlation_id.as_deref().unwrap_or("-");
+                            let ans = c
+                                .answer_msg_id
+                                .map(|m| format!(" answer=#{m}"))
+                                .unwrap_or_default();
+                            println!("  {} [{state}] {cid}{ans}", c.peer);
+                        }
                     }
                 }
             }

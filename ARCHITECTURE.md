@@ -432,7 +432,10 @@ reads       (message_id INTEGER, reader TEXT, ts INTEGER, PRIMARY KEY(message_id
 asks        (id TEXT PRIMARY KEY, question_msg_id INTEGER NOT NULL, answer_msg_id INTEGER NULL,
              asker TEXT NOT NULL, askee TEXT NOT NULL, subject TEXT NULL,
              state TEXT NOT NULL, reply_to TEXT NULL, close_note TEXT NULL,
-             opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, closed_ts INTEGER NULL)
+             opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, closed_ts INTEGER NULL,
+             parent_id TEXT NULL)                                  -- ask-many child link (P2, additive)
+ask_groups  (parent_id TEXT PRIMARY KEY, asker TEXT NOT NULL, subject TEXT NULL,
+             body TEXT NOT NULL, opened_ts INTEGER NOT NULL, target_count INTEGER NOT NULL)
 peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
              last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '',
              repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
@@ -474,6 +477,28 @@ revocations   (id INTEGER PK AUTOINCREMENT, ts INTEGER NOT NULL, fp TEXT NOT NUL
   edge** and **no new dependency**. Always-present plain data; point-to-point only
   (broadcast/cross-store ask are out of P1). Created on every open in **both** backends
   via an additive, guarded, idempotent migration (the `reads`/`revocations` precedent).
+- **`ask_groups`** + **`asks.parent_id`** — the **ask-many** parent↔child link (P2, the
+  second weave⊇repowire parity epic). `ask_many` fans **one question to an explicit list
+  of peers**: it inserts one `ask_groups` parent anchor (`askm_<id>`, validated by
+  `model::ask_many_id_valid`) holding the canonical question `body`/`subject`/`asker` and
+  the de-duped `target_count`, then creates **one normal P1 `ask` per peer** carrying the
+  parent's id in the additive nullable `asks.parent_id` column (NULL for every plain ask
+  and every legacy P1-era row). A child **is** a P1 ask — it answers/acks through the
+  unchanged `open → answered → acked` lifecycle, no duplicated state machine. `ask_many` is
+  **best-effort**: an invalid/unreachable/broadcast peer is skipped with a per-child error
+  rather than failing the whole call (it never gets a child row and counts as `failed` at
+  read time, so `target_count` keeps the totality `answered + acked + pending + failed ==
+  target_count` checkable). The per-child live nudge is fired **caller-side** in `mcp`/`main`
+  (the same honest-verdict seam as P1) — still **no `store → inject` edge**. `ask_many_result`
+  is a **read-time aggregate**: it enumerates the children `WHERE parent_id = ?1`, rolls up
+  their states, lists the pending peers, and classifies `complete | partial | pending` via the
+  pure `model::classify_ask_many` — **no background ticker, no stored deadline**. `partial`
+  appears only when the caller passes an `age` threshold and an open child has waited at least
+  that long. The fan-out is bounded by `MAX_ASK_MANY_TARGETS = 64` (explicit peer list only;
+  circles compose in a later epic). Both `ask_groups` and `asks.parent_id` ship as **additive,
+  guarded, idempotent migrations in both backends** — a legacy P1-era DB upgrades in place
+  (`ADD COLUMN parent_id` defaults NULL; `CREATE TABLE IF NOT EXISTS ask_groups`) with **no
+  new dependency**.
 - **`peers`** — the injection registry: where each named session can be reached,
   plus `last_seen`, `pid`, and `host` for presence, and the descriptive session
   tags `repo` / `branch` / `worktree_id`. The `pid`/`host` and the
@@ -760,6 +785,7 @@ keep what worked and drop the operational weight.
 | Paste-safe submission | n/a | partial (had cancel bug) | ✅ per-mux idiom |
 | MCP-native | ✅ | ✅ | ✅ |
 | Tracked ask/answer/ack | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure DB** |
+| Ask-many (fan to N peers) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, read-time aggregate** |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
 | Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
 
@@ -787,6 +813,17 @@ keep what worked and drop the operational weight.
   lifecycle on the existing append-only `messages` + the caller-side injector, with
   an honest delivery verdict and **no new dependency**. It is local-mesh
   point-to-point in P1; broadcast and cross-store ask are future epics.
+- **weave⊇repowire parity (P2 — ask-many).** repowire could also fan one question
+  to many peers and collect the replies; weave now matches that **daemon-free** with
+  `ask_many` / `ask_many_result` (§6): a small `ask_groups` parent anchor plus the
+  additive `asks.parent_id` column turn each target into a normal P1 `ask`, and the
+  parent view is computed as a **read-time aggregate** (no background ticker, no stored
+  deadline) — `complete | partial | pending` with the totality `answered + acked +
+  pending + failed == target_count`. It is **best-effort** (one bad peer is a per-child
+  error, not a whole-call failure, matching repowire), **no `store → inject` edge** (the
+  per-child nudge is fired caller-side), bounded by `MAX_ASK_MANY_TARGETS = 64`, and
+  ships with a **dual-backend additive migration** and **no new dependency**. Explicit
+  peer list only (circles compose in a later epic); cross-store fan-out remains future work.
 
 ---
 
