@@ -50,6 +50,21 @@ fastest layer and carry most of the injector and store coverage.
   columns migrates in place; the `is_alive` matrix (local-dead-PID ⇒ offline,
   remote-host / NULL-pid ⇒ fail-open alive, stale `last_seen` ⇒ offline) and
   `pid_alive` (own PID alive, absurd PID dead on Linux, cfg-degrade otherwise);
+
+  **Host-aware liveness (`liveness_for`).** The pure A2 classifier is exercised by
+  a `#[cfg(test)]` matrix that passes a **fixed `this_host` + `now_ts`** — never the
+  real hostname or wall clock — so every regime is deterministic: same-host +
+  live-pid ⇒ `AliveLocal`; same-host + null-pid + recent ⇒ `AliveLocal`; same-host
+  + dead-pid + recent ⇒ `Stale` (Linux-gated, pid authoritative beats recency);
+  remote-host + recent + absurd-pid ⇒ `AliveRemote` (proving the remote arm is
+  **never pid-probed**); empty-host + recent ⇒ `AliveRemote` (fail open); the TTL
+  boundary (`now_ts - ONLINE_TTL_SECS` inclusive-alive vs `-1` stale, matching
+  `is_online_at`'s `<=`); and `token()`'s `alive_local`/`alive_remote`/`stale`
+  strings. **remote-stale is covered here** at the pure layer (a backdated
+  `now_ts`), so the integration layer needs no wall-clock backdate hack. A
+  **delegation regression-lock** asserts `liveness_for(p, &this_host(), now()) !=
+  Stale` equals `is_alive(p)` over every regime peer, proving the truth table is
+  unchanged.
   and the federation surface — `open_readonly` reads but cannot write (and never
   creates a missing file), `federated_peers` unions local + foreign and isolates a
   bad store, plus the pure `merge_peer_views` / `merge_session_views`
@@ -202,6 +217,17 @@ Coverage:
   `not injectable (mux=none)` verdict strings and **exits 0** for a queued
   (non-injectable) peer, non-zero for a non-existent one.
 
+- **Scan remote-host surfacing.** Extending the proven foreign-store fixture
+  (forced `HOSTNAME` + `WEAVE_PEER_DBS`), a federated peer registered on a
+  *different* host with a recent `last_seen` surfaces in `weave scan --json` with
+  `remote:true` and `liveness:"alive_remote"` (and `alive:true`) — proving the
+  remote row is TTL-judged, never pid-probed across hosts — while the human output
+  carries the ` <remote>` marker, the `[alive (remote, ttl)]` reason, and the
+  trailing `summary: N local-alive, M remote-alive, K stale` count line matches the
+  rows. Because the forced foreign `HOSTNAME` differs from this host, the
+  remote-alive case needs **no backdate / wall-clock** seam (remote-stale is locked
+  at the pure `liveness_for` layer above, with a fixed `now_ts`).
+
 - **Read-only federation.** With `WEAVE_PEER_DBS` set to a second store, a foreign
   peer/session surfaces in `peers`/`sessions --json` with `origin`=<store label>
   and `foreign:true` (local rows `origin:"local"`/`foreign:false`, pre-Tier-1 keys
@@ -340,6 +366,13 @@ suite is hermetic in CI.
   emoji, scripts) and long (200–400 char) bodies survive
   `send → store → inbox --json` byte-for-byte — JSON decoding handles escaping,
   so any mismatch is real corruption.
+
+- **Property 4 — `liveness_for` totality + determinism.** For any
+  `(host, this_host, pid, last_seen, now_ts)`, `liveness_for` never panics and is
+  **deterministic** (called twice with the same inputs it returns the same
+  variant). It is exercised purely (no real hostname/clock, no `/proc`-dependent
+  pid in the generator), guarding the A2 classifier's totality and locking that a
+  remote arm decision never depends on a probe.
 
 ### What proptest caught: the leading-hyphen bug
 
@@ -501,7 +534,10 @@ Where a store change must be proven *structurally* per backend, the libSQL modul
 (`src/store_libsql.rs`, `#[cfg(test)]`) carries the **mirror** of the sqlite
 store-unit tests: `register_peer_full` round-trips `pid`/`host`, the legacy
 `pid`/`host` migration runs in place, the `is_alive` matrix (incl. the remote-host
-fail-open / Turso shared-DB case), and the `open_readonly` read-only proof (a write
+fail-open / Turso shared-DB case), the `liveness_for` host-aware matrix against
+**real libSQL rows** (the same fixed-`this_host` + fixed-`now_ts` regimes, with the
+stale paths seeded via the `backdate_peer` helper, plus the `is_alive` delegation
+regression-lock), and the `open_readonly` read-only proof (a write
 through the RO handle is engine-rejected and the foreign DB file stays
 byte-identical). So both the sqlite count and the libSQL count grow together when
 a mirrored store layer is added — the backends differ only in the count of their

@@ -847,17 +847,36 @@ fn tool_scan(
     if views.is_empty() {
         return Ok("No peers match the scan.".into());
     }
+    // Host-aware liveness reason per row (pure A2 reinterpretation of the
+    // read-only federated rows; never a cross-machine probe). Mirrors `weave scan`.
+    let this_host = crate::config::this_host();
+    let now_ts = crate::model::now();
     let mut out = format!("Scan ({} peer(s)):", views.len());
+    let mut local_alive = 0usize;
+    let mut remote_alive = 0usize;
+    let mut stale = 0usize;
     for v in views {
         let p = &v.peer;
-        let alive = if is_alive(p) { "alive" } else { "offline" };
+        let liveness = store::liveness_for(p, &this_host, now_ts);
+        let reason = match liveness {
+            store::Liveness::AliveLocal if p.pid.is_some() => "alive (local, pid)",
+            store::Liveness::AliveLocal => "alive (local, ttl)",
+            store::Liveness::AliveRemote => "alive (remote, ttl)",
+            store::Liveness::Stale => "stale",
+        };
+        match liveness {
+            store::Liveness::AliveLocal => local_alive += 1,
+            store::Liveness::AliveRemote => remote_alive += 1,
+            store::Liveness::Stale => stale += 1,
+        }
+        let remote_marker = if p.host != this_host { " <remote>" } else { "" };
         let via = if v.origin.is_foreign() {
             format!(" (via {})", v.origin.label())
         } else {
             String::new()
         };
         out.push_str(&format!(
-            "\n  • {} [{alive}] repo={} branch={} worktree={} mux={} pane={} host={}{via}",
+            "\n  • {}{remote_marker} [{reason}] repo={} branch={} worktree={} mux={} pane={} host={}{via}",
             p.name,
             if p.repo.is_empty() { "-" } else { &p.repo },
             if p.branch.is_empty() { "-" } else { &p.branch },
@@ -871,6 +890,9 @@ fn tool_scan(
             if p.host.is_empty() { "-" } else { &p.host },
         ));
     }
+    out.push_str(&format!(
+        "\nsummary: {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale"
+    ));
     Ok(out)
 }
 

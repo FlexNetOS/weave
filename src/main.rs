@@ -878,6 +878,24 @@ fn git_tags_for(cwd: Option<&str>) -> git::WorktreeTags {
     git::capture_worktree_tags(&path)
 }
 
+/// Human reason string for a peer's host-aware liveness verdict, used by `scan`.
+/// Pure formatting over the already-computed [`store::Liveness`]; surfaces the
+/// pid-confirmed-vs-TTL-presumed nuance that the 3-variant enum deliberately
+/// folds away (a same-host alive row is "pid" iff its PID is known, else "ttl").
+fn scan_liveness_reason(p: &model::Peer, liveness: store::Liveness) -> String {
+    match liveness {
+        store::Liveness::AliveLocal => {
+            if p.pid.is_some() {
+                "alive (local, pid)".to_string()
+            } else {
+                "alive (local, ttl)".to_string()
+            }
+        }
+        store::Liveness::AliveRemote => "alive (remote, ttl)".to_string(),
+        store::Liveness::Stale => "stale".to_string(),
+    }
+}
+
 /// Build a `name -> Peer` map of the LOCAL store's peers for a display-layer tag
 /// join (e.g. attaching repo/branch/worktree to `sessions`, which is message-derived
 /// and carries no peer/git data). Best-effort: a read failure yields an empty map
@@ -1769,11 +1787,16 @@ fn main() -> Result<()> {
             if let Some(b) = branch.as_deref() {
                 views.retain(|v| v.peer.branch == b);
             }
+            // Host-aware liveness reason per row (pure A2 reinterpretation of the
+            // already-pulled read-only rows; never a cross-machine probe).
+            let this_host = config::this_host();
+            let now_ts = model::now();
             if json {
                 let arr: Vec<_> = views
                     .iter()
                     .map(|v| {
                         let p = &v.peer;
+                        let liveness = store::liveness_for(p, &this_host, now_ts);
                         serde_json::json!({
                             "name": p.name,
                             "repo": p.repo,
@@ -1783,6 +1806,8 @@ fn main() -> Result<()> {
                             "pane": p.target,
                             "host": p.host,
                             "alive": is_alive(p),
+                            "liveness": liveness.token(),
+                            "remote": p.host != this_host,
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -1793,9 +1818,19 @@ fn main() -> Result<()> {
                 if views.is_empty() {
                     println!("no peers match the scan");
                 }
+                let mut local_alive = 0usize;
+                let mut remote_alive = 0usize;
+                let mut stale = 0usize;
                 for v in &views {
                     let p = &v.peer;
-                    let alive = if is_alive(p) { "alive" } else { "offline" };
+                    let liveness = store::liveness_for(p, &this_host, now_ts);
+                    let reason = scan_liveness_reason(p, liveness);
+                    match liveness {
+                        store::Liveness::AliveLocal => local_alive += 1,
+                        store::Liveness::AliveRemote => remote_alive += 1,
+                        store::Liveness::Stale => stale += 1,
+                    }
+                    let remote_marker = if p.host != this_host { " <remote>" } else { "" };
                     let repo = if p.repo.is_empty() { "-" } else { &p.repo };
                     let branch = if p.branch.is_empty() { "-" } else { &p.branch };
                     let wt = if p.worktree_id.is_empty() {
@@ -1811,8 +1846,13 @@ fn main() -> Result<()> {
                         String::new()
                     };
                     println!(
-                        "{} [{alive}] repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{via}",
+                        "{}{remote_marker} [{reason}] repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{via}",
                         p.name, p.mux
+                    );
+                }
+                if !views.is_empty() {
+                    println!(
+                        "summary: {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale"
                     );
                 }
             }

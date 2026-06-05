@@ -81,10 +81,45 @@ can't be live-nudged: its messages still arrive via the store on its next drain.
 `weave scan` is the "who's around, and where?" view. It first re-captures **your
 own** session's git tags and presence (owner-only — it never re-registers a
 foreign row), then lists every (federated) peer joined with liveness and its
-**repo / branch / worktree** tags. `--repo <name>` / `--branch <name>` narrow the
-set by exact tag match; `--json` emits an array of
-`{name, repo, branch, worktree, mux, pane, host, alive, origin, foreign}`. The
-same repo/branch/worktree tags now also appear in `weave peers`, `weave sessions`
+**repo / branch / worktree** tags. It now also **distinguishes remote-host
+sessions** and shows a per-row liveness *reason* (pid-confirmed-local vs
+TTL-presumed-remote vs stale). `--repo <name>` / `--branch <name>` narrow the set
+by exact tag match.
+
+`--json` emits an array of
+`{name, repo, branch, worktree, mux, pane, host, alive, liveness, remote, origin, foreign}`.
+The two new keys are additive:
+
+- **`liveness`** — a stable machine token, one of `"alive_local"` (same host,
+  online, pid-confirmed or null-pid TTL fallback), `"alive_remote"` (a different
+  host, online by TTL only — never pid-probed), or `"stale"` (past the TTL window,
+  or a same-host known-dead pid).
+- **`remote`** — a bool, `true` when the row's `host` differs from this machine's
+  host.
+
+The human (non-`--json`) output marks a remote row with a ` <remote>` tag and
+prints the reason in brackets per row:
+
+```
+<name>[ <remote>] [<reason>] repo=… branch=… worktree=… mux=… pane=… host=…[ (via <store>)]
+```
+
+where `<reason>` is one of `alive (local, pid)` (same host, PID confirmed),
+`alive (local, ttl)` (same host, null PID, presumed alive by TTL),
+`alive (remote, ttl)` (another host, presumed alive by TTL), or `stale`. When at
+least one row is listed, a trailing summary line counts the regimes:
+
+```
+summary: N local-alive, M remote-alive, K stale
+```
+
+**Cross-machine liveness is TTL-only.** A remote-host peer is presumed alive when
+its `last_seen` is within the presence TTL (`ONLINE_TTL_SECS`, 900 s) — it is
+**never pid-probed across hosts** (weave can only probe a process on the machine it
+runs on; see ARCHITECTURE "A2 — fail-open by host"). The same TTL window is
+inherited cross-machine, so a peer seen within 15 minutes reads online.
+
+The same repo/branch/worktree tags also appear in `weave peers`, `weave sessions`
 (via a local-only display join), and the `weave doctor` `peers_tagged` count.
 
 **Session tags** (repo, branch, worktree id) are captured **best-effort** from

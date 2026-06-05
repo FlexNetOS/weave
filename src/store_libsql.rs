@@ -1403,7 +1403,8 @@ impl LibsqlStore {
 mod tests {
     use super::*;
     use crate::store::{
-        clamp_limit, is_alive, is_online, pid_alive, MAX_IDENT, MAX_LIMIT, ONLINE_TTL_SECS,
+        clamp_limit, is_alive, is_online, liveness_for, pid_alive, Liveness, MAX_IDENT, MAX_LIMIT,
+        ONLINE_TTL_SECS,
     };
 
     /// A local-file libsql store backed by a unique temp DB. This exercises the
@@ -1993,6 +1994,115 @@ mod tests {
             !is_alive(&stale),
             "stale last_seen is offline even with a live pid (libsql)"
         );
+    }
+
+    /// Host-aware `liveness_for` classifier against real libSQL rows (mirror of
+    /// the sqlite `liveness_for_matrix_*` unit test). FIXED `this_host` + `now_ts`
+    /// (no real hostname/clock) except the same-host pid probe.
+    #[test]
+    fn liveness_for_matrix_against_libsql_rows() {
+        let s = mem();
+        let this = crate::config::this_host();
+        let now_ts = crate::model::now();
+
+        // same-host + our OWN live pid => AliveLocal.
+        s.register_peer_full(
+            "local",
+            "tmux",
+            "%1",
+            "",
+            None,
+            Some(std::process::id() as i64),
+            &this,
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let local = s.get_peer("local").unwrap().unwrap();
+        assert_eq!(liveness_for(&local, &this, now_ts), Liveness::AliveLocal);
+
+        // same-host + null pid + recent => AliveLocal (TTL fallback).
+        s.register_peer_full("nullpid", "tmux", "%2", "", None, None, &this, "", "", "")
+            .unwrap();
+        let nullpid = s.get_peer("nullpid").unwrap().unwrap();
+        assert_eq!(liveness_for(&nullpid, &this, now_ts), Liveness::AliveLocal);
+
+        // remote host + recent + absurd pid => AliveRemote (NEVER probed).
+        let remote_host = format!("{this}-remote");
+        s.register_peer_full(
+            "remote",
+            "tmux",
+            "%3",
+            "",
+            None,
+            Some(999_999_999),
+            &remote_host,
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let remote = s.get_peer("remote").unwrap().unwrap();
+        assert_eq!(liveness_for(&remote, &this, now_ts), Liveness::AliveRemote);
+
+        // empty host + recent => AliveRemote (fail-open).
+        s.register_peer_full(
+            "empty",
+            "tmux",
+            "%4",
+            "",
+            None,
+            Some(999_999_999),
+            "",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let empty = s.get_peer("empty").unwrap().unwrap();
+        assert_eq!(liveness_for(&empty, &this, now_ts), Liveness::AliveRemote);
+
+        // remote host backdated past the TTL => Stale.
+        s.backdate_peer("remote", ONLINE_TTL_SECS + 1).unwrap();
+        let remote_stale = s.get_peer("remote").unwrap().unwrap();
+        assert_eq!(
+            liveness_for(&remote_stale, &this, crate::model::now()),
+            Liveness::Stale
+        );
+
+        // same-host dead pid + recent => Stale on Linux (real /proc probe).
+        s.register_peer_full(
+            "dead",
+            "tmux",
+            "%5",
+            "",
+            None,
+            Some(999_999_999),
+            &this,
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        let dead = s.get_peer("dead").unwrap().unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                liveness_for(&dead, &this, crate::model::now()),
+                Liveness::Stale
+            );
+        }
+
+        // Delegation regression-lock: (liveness_for != Stale) == is_alive.
+        for name in ["local", "nullpid", "empty", "dead"] {
+            let p = s.get_peer(name).unwrap().unwrap();
+            assert_eq!(
+                liveness_for(&p, &crate::config::this_host(), crate::model::now())
+                    != Liveness::Stale,
+                is_alive(&p),
+                "is_alive must equal (liveness_for != Stale) for {name}"
+            );
+        }
     }
 
     /// `pid_alive` (shared pure helper) behaves the same when exercised from the
