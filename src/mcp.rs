@@ -343,6 +343,14 @@ fn call_tool(
         "weave_ask_get" => tool_ask_get(store, args),
         "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args),
         "weave_ask_many_result" => tool_ask_many_result(store, args),
+        "weave_job_create" => tool_job_create(store, me_default, args),
+        "weave_job_list" => tool_job_list(store, args),
+        // `show` is the canonical detail view; `status` is its alias (repowire parity).
+        "weave_job_show" | "weave_job_status" => tool_job_status(store, args),
+        "weave_job_claim" => tool_job_claim(store, me_default, args),
+        "weave_job_update" => tool_job_update(store, args),
+        "weave_job_result" => tool_job_result(store, args),
+        "weave_job_cancel" => tool_job_cancel(store, me_default, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1720,6 +1728,287 @@ fn resolve_correlation_id(store: &dyn Store, args: &Value) -> Result<String, Str
     Err("provide either 'correlation_id' or 'in_reply_to'.".to_string())
 }
 
+// ---- P3 job board (poll-only) -------------------------------------------
+// Seven tools mirroring repowire 1:1 under weave's `weave_` prefix. NO injector
+// involvement — jobs do not nudge in P3. All caps + id validation + attempt_id
+// fencing + state-machine enforcement live in the STORE, so these tools inherit
+// them; the failure paths (stale_attempt / unknown job / illegal transition /
+// oversized JSON / bad id) surface as JSON-RPC errors via `map_err(e)`.
+
+/// Render a [`model::Job`] as a one-line human summary for the tools.
+fn job_line(j: &model::Job) -> String {
+    let assignee = j.assignee.as_deref().unwrap_or("-");
+    format!(
+        "{} [{}] {} (creator={}, assignee={}, updated {})",
+        j.id,
+        j.state.as_str(),
+        j.title,
+        j.creator,
+        assignee,
+        fmt_ts(j.updated_ts)
+    )
+}
+
+/// `weave_job_create`: mint a new `queued` board job. creator = me. Returns the
+/// minted job_id + state. No nudge.
+fn tool_job_create(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let creator = ident(args, "creator", def)?;
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'title' is required.")?;
+    let str_arg = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let spec = model::JobSpec {
+        title: title.to_string(),
+        description: str_arg("description"),
+        kind: str_arg("kind"),
+        owner: str_arg("owner"),
+        assignee: str_arg("assignee"),
+        circle: str_arg("circle"),
+        prompt: str_arg("prompt"),
+        correlation_id: str_arg("correlation_id"),
+        source_kind: str_arg("source_kind"),
+        source_id: str_arg("source_id"),
+        scope: str_arg("scope"),
+        visibility: str_arg("visibility"),
+        deadline_at: args.get("deadline_at").and_then(|v| v.as_i64()),
+        expires_at: args.get("expires_at").and_then(|v| v.as_i64()),
+    };
+    let job = store.create_job(&creator, spec).map_err(e)?;
+    Ok(format!(
+        "Created job {} [{}] '{}' (creator={}).",
+        job.id,
+        job.state.as_str(),
+        job.title,
+        job.creator
+    ))
+}
+
+/// `weave_job_list`: list board jobs filtered by state/owner/creator/assignee/circle.
+/// Read-only, bounded by clamp_limit in the store.
+fn tool_job_list(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let str_arg = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let state = match args.get("state").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => Some(model::JobState::from_str(s.trim())?),
+        _ => None,
+    };
+    let filter = model::JobFilter {
+        state,
+        owner: str_arg("owner"),
+        creator: str_arg("creator"),
+        assignee: str_arg("assignee"),
+        circle: str_arg("circle"),
+    };
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
+    let jobs = store.list_jobs(filter, limit).map_err(e)?;
+    if jobs.is_empty() {
+        return Ok("No jobs.".to_string());
+    }
+    let mut out = format!("{} job(s):\n", jobs.len());
+    for j in &jobs {
+        out.push_str(&job_line(j));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `weave_job_show` / `weave_job_status`: fetch one job by id (the canonical detail
+/// view; the two names are aliases, repowire parity). Unknown id is a clean error.
+fn tool_job_status(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'job_id' is required.")?;
+    if !model::job_id_valid(id) {
+        return Err("'job_id' is not a valid job id.".to_string());
+    }
+    let job = store
+        .get_job(id)
+        .map_err(e)?
+        .ok_or_else(|| format!("No job '{id}'."))?;
+    let mut out = job_line(&job);
+    if let Some(ref p) = job.phase {
+        out.push_str(&format!("\nphase: {p}"));
+    }
+    if let Some(ref n) = job.progress_note {
+        out.push_str(&format!("\nnote: {n}"));
+    }
+    if job.cancel_requested {
+        out.push_str("\ncancel_requested: true");
+    }
+    Ok(out)
+}
+
+/// `weave_job_claim`: CLAIM a job — mint an attempt_id, set assignee, transition to
+/// running. Returns the attempt_id (the worker captures it to fence its updates). A
+/// terminal job cannot be claimed.
+fn tool_job_claim(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'job_id' is required.")?;
+    if !model::job_id_valid(id) {
+        return Err("'job_id' is not a valid job id.".to_string());
+    }
+    let assignee = ident(args, "assignee", def)?;
+    let job = store
+        .claim_job(id, &assignee)
+        .map_err(e)?
+        .ok_or_else(|| format!("No job '{id}'."))?;
+    let attempt = job.attempt_id.as_deref().unwrap_or("-");
+    Ok(format!(
+        "Claimed job {} as '{}'; attempt_id={} state={}.",
+        job.id,
+        assignee,
+        attempt,
+        job.state.as_str()
+    ))
+}
+
+/// `weave_job_update`: apply a lifecycle/result patch, fenced by attempt_id and the
+/// state machine (BOTH enforced in the store). Failure paths surface as JSON-RPC
+/// errors: stale attempt → "stale_attempt"; unknown job → not found; illegal
+/// transition → error; oversized JSON → cap error.
+fn tool_job_update(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'job_id' is required.")?;
+    if !model::job_id_valid(id) {
+        return Err("'job_id' is not a valid job id.".to_string());
+    }
+    let attempt_id = args
+        .get("attempt_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let str_arg = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let state = match args.get("state").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => Some(model::JobState::from_str(s.trim())?),
+        _ => None,
+    };
+    // result/error/artifacts accept either a JSON object/array or a JSON string; we
+    // store the serialized text either way (the store size-caps it).
+    let json_arg = |k: &str| -> Option<String> {
+        args.get(k).and_then(|v| match v {
+            Value::Null => None,
+            Value::String(s) if s.is_empty() => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+    };
+    let patch = model::JobPatch {
+        state,
+        state_reason: str_arg("state_reason"),
+        phase: str_arg("phase"),
+        progress_note: str_arg("progress_note"),
+        result_summary: str_arg("result_summary"),
+        result_json: json_arg("result"),
+        error_json: json_arg("error"),
+        artifacts_json: json_arg("artifacts"),
+    };
+    let job = store.update_job(id, attempt_id, patch).map_err(e)?;
+    Ok(format!("Updated job {} [{}].", job.id, job.state.as_str()))
+}
+
+/// `weave_job_result`: the read-time result view. Terminal → payload; else a
+/// not_ready marker. Read-only.
+fn tool_job_result(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'job_id' is required.")?;
+    if !model::job_id_valid(id) {
+        return Err("'job_id' is not a valid job id.".to_string());
+    }
+    let r = store
+        .job_result(id)
+        .map_err(e)?
+        .ok_or_else(|| format!("No job '{id}'."))?;
+    if !r.ready {
+        return Ok(format!(
+            "job {} [{}] not_ready (no terminal result yet).",
+            r.id,
+            r.state.as_str()
+        ));
+    }
+    let summary = r.result_summary.as_deref().unwrap_or("-");
+    Ok(format!(
+        "job {} [{}] summary={} result={} error={} artifacts={}",
+        r.id,
+        r.state.as_str(),
+        summary,
+        r.result_json,
+        r.error_json,
+        r.artifacts_json
+    ))
+}
+
+/// `weave_job_cancel`: COOPERATIVE cancel (never a hard delete) — no confirm gate.
+/// requested_by = me. A queued job terminal-cancels; a claimed/running job just gets
+/// the cancel_requested flag (worker honors it on its next poll).
+fn tool_job_cancel(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let id = args
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'job_id' is required.")?;
+    if !model::job_id_valid(id) {
+        return Err("'job_id' is not a valid job id.".to_string());
+    }
+    let me = ident(args, "from", def)?;
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let job = store
+        .cancel_job(id, &me, reason)
+        .map_err(e)?
+        .ok_or_else(|| format!("No job '{id}'."))?;
+    Ok(format!(
+        "Cancel requested for job {} (state {}, cancel_requested={}).",
+        job.id,
+        job.state.as_str(),
+        job.cancel_requested
+    ))
+}
+
 // ---- helpers ------------------------------------------------------------
 
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -1908,6 +2197,89 @@ fn tools() -> Value {
                 "parent_id":{"type":"string","description":"The ask-many parent id."},
                 "age":{"type":"integer","description":"Optional age (seconds): a still-pending group older than this reads as 'partial' (daemon-free, opt-in)."}
             },"required":["parent_id"]}
+        },
+        {
+            "name": "weave_job_create",
+            "description": "Create a durable board job in the 'queued' state and return its server-minted job_id (P3 poll-only work queue — NO autonomous dispatch/runner; nothing nudges or spawns). The creator is you; owner defaults to the creator. A worker later CLAIMs the job to work it. Title required; other fields are inert board metadata (kind/circle/prompt/visibility/deadline_at/expires_at as epoch seconds, etc.).",
+            "inputSchema": {"type":"object","properties":{
+                "creator":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "title":{"type":"string","description":"Short job title (required)."},
+                "description":{"type":"string","description":"The work request / details."},
+                "kind":{"type":"string","description":"Job kind label (default 'general')."},
+                "owner":{"type":"string","description":"Owning peer (default: creator)."},
+                "assignee":{"type":"string","description":"Pre-assigned worker (optional)."},
+                "circle":{"type":"string","description":"Board circle/scope label (optional)."},
+                "prompt":{"type":"string","description":"Board metadata prompt (NOT runner exec config)."},
+                "deadline_at":{"type":"integer","description":"Optional deadline (epoch seconds)."},
+                "expires_at":{"type":"integer","description":"Optional expiry (epoch seconds)."},
+                "visibility":{"type":"string","description":"Visibility label (default 'circle')."}
+            },"required":["title"]}
+        },
+        {
+            "name": "weave_job_list",
+            "description": "List board jobs, filtered by any of state/owner/creator/assignee/circle (exact match; omit to leave unconstrained), newest-first by update time and bounded. Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "state":{"type":"string","description":"queued|dispatching|delivered|running|awaiting_input|completed|failed|cancelled|blocked|expired|unavailable"},
+                "owner":{"type":"string"},
+                "creator":{"type":"string"},
+                "assignee":{"type":"string"},
+                "circle":{"type":"string"},
+                "limit":{"type":"integer"}
+            },"required":[]}
+        },
+        {
+            "name": "weave_job_show",
+            "description": "Show a single board job's full status by job_id (state, parties, phase, latest note, cancel flag). Read-only. Alias of weave_job_status.",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id."}
+            },"required":["job_id"]}
+        },
+        {
+            "name": "weave_job_status",
+            "description": "Show a single board job's status by job_id (the canonical detail view; alias of weave_job_show). Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id."}
+            },"required":["job_id"]}
+        },
+        {
+            "name": "weave_job_claim",
+            "description": "CLAIM a board job to work it: mints a fresh attempt_id (claim token), sets you as the assignee, and transitions the job to 'running'. Returns the attempt_id — capture it and pass it to weave_job_update so your updates are FENCED (a re-claim by another worker mints a new token and invalidates yours). A terminal job cannot be claimed.",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id to claim."},
+                "assignee":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["job_id"]}
+        },
+        {
+            "name": "weave_job_update",
+            "description": "Update a board job's lifecycle/result. If the job is CLAIMED you MUST pass the matching attempt_id or the update is rejected ('stale_attempt') — this fences out a stale worker. The state transition is validated (an illegal one errors). progress_note is appended to an append-only event log; entering a terminal state (completed/failed/cancelled/expired/unavailable) stamps completion. result/error/artifacts accept a JSON object/array (size-capped).",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id."},
+                "attempt_id":{"type":"string","description":"Your claim token (required to update a claimed job)."},
+                "state":{"type":"string","description":"New lifecycle state (validated)."},
+                "state_reason":{"type":"string"},
+                "phase":{"type":"string","description":"Free-form worker phase label."},
+                "progress_note":{"type":"string","description":"Appended to the progress log."},
+                "result_summary":{"type":"string"},
+                "result":{"description":"Terminal result payload (JSON object/array or string)."},
+                "error":{"description":"Error payload (JSON object/array or string)."},
+                "artifacts":{"description":"Artifacts payload (JSON array or string)."}
+            },"required":["job_id"]}
+        },
+        {
+            "name": "weave_job_result",
+            "description": "Read a board job's result. A terminal job returns its summary/result/error/artifacts payload; a non-terminal job returns a 'not_ready' marker. Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id."}
+            },"required":["job_id"]}
+        },
+        {
+            "name": "weave_job_cancel",
+            "description": "COOPERATIVELY cancel a board job (never a hard delete — no confirm needed). A 'queued' job transitions straight to 'cancelled'; a claimed/running job only gets a cancel_requested flag that its worker honors on its next poll (the daemon-free contract); a terminal job just records the request. Cancel requested-by is you.",
+            "inputSchema": {"type":"object","properties":{
+                "job_id":{"type":"string","description":"The job id."},
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "reason":{"type":"string","description":"Optional cancellation reason."}
+            },"required":["job_id"]}
         }
     ])
 }

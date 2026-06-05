@@ -508,6 +508,41 @@ result rendering, and the failure paths (empty / over-cap / unknown / invalid pa
 `isError`); `tests/security.rs` enforces the N-cap from the binary and that the result is
 bounded (child rows ≤ `target_count`) and secret-free.
 
+### Poll-only job board (P3)
+
+The durable job board is tested **hermetically across both backends** and end-to-end.
+The pure `model::JobState::can_transition` machine is locked by proptests
+(`job_state_machine_totality`, `job_lifecycle_terminal_is_absorbing`): for all
+`(from, to)` pairs the check never panics and is deterministic, **no edge leaves a
+terminal state** (`{Completed, Failed, Cancelled, Expired, Unavailable}` is absorbing,
+idempotent self-noop excepted), and cancel/expire are reachable from every non-terminal
+state; a companion property asserts the **`attempt_id` fencing uniqueness** — across a
+sequence of claims, only the latest minted token validates and every prior one is
+rejected. The store layer (`src/store.rs` / `src/store_libsql.rs` `#[cfg(test)]`, run
+under default sqlite **and** `--no-default-features --features libsql`) covers the full
+`create → claim → update → complete → result` lifecycle: `create_job` opens a `queued`
+row + a valid `job_id_valid` id with owner defaulting to creator; `claim_job` mints the
+`attempt_id`, assigns, and moves to `running`; `update_job` with the matching token
+advances state, appends the progress event, stamps `completed_ts` on terminal entry, and
+stores the result. The **`attempt_id` fencing is asserted at the store level**
+(`job_update_stale_attempt_is_fenced` / `job_stale_attempt_is_fenced_libsql`): a re-claim
+mints a new token and an update carrying the **stale** token is rejected
+(`stale_attempt`), while an unclaimed (NULL-token) job accepts a tokenless update.
+**Illegal transitions** (e.g. `completed → running`) and **cooperative cancel** (queued →
+terminal `cancelled`; in-flight → `cancel_requested` flag only, never a hard delete) are
+asserted as clean errors / flag-sets, never panics. **Legacy-migration idempotency** is
+locked in both backends (`job_migration_is_idempotent` + the libSQL re-open path): a DB
+with no `jobs` table gains it on `migrate`, a second run is a no-op, and a fresh DB already
+has it; `row_to_job` hard-errors on an unknown stored state. The libSQL write-trap is
+asserted as the first statement of every job WRITE. The `McpServer` +
+`CARGO_BIN_EXE_weave` black-box layers cover the happy `create/list/status/result` JSON
+shapes and the full CLI roundtrip (capture id → claim → capture `attempt_id` → update →
+complete → result), plus the failure paths (stale attempt → fenced error, unknown job →
+not_found, illegal transition, oversized title/JSON → cap error, bad assignee/job id →
+validator error); `tests/security.rs` enforces the text/JSON byte caps, the id validators
+(a metachar id never reaches a bind), the `clamp_limit`-bounded list, and secret-free
+output.
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

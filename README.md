@@ -72,6 +72,17 @@ weave ask-many --from desktop --to envctl --to ci --body "ready to ship?" --subj
 weave ask-many-result --parent-id askm_7_31   # aggregate: per-child state + pending list + complete|partial|pending; --json
 weave ask-many-result --parent-id askm_7_31 --age 600   # treat still-open children past 600s as partial
 
+# Job board (poll-only, daemon-free durable work queue)
+weave job create --title "build the release" --desc "cut v0.2" --assignee ci --kind build
+weave job list --state queued --owner desktop --limit 20   # filter by state/owner/creator/assignee/circle; --json
+weave job show <job_id>              # full row (status is the canonical; show is an alias)
+weave job status <job_id>            # same as show
+weave job claim <job_id> --as ci     # mint a fresh attempt_id (the fencing token) + assign; prints it
+weave job update <job_id> --attempt <att_id> --state running --note "compiling"  # fenced by attempt_id
+weave job update <job_id> --attempt <att_id> --state completed --result '{"ok":true}'  # JSON result/error/artifacts
+weave job result <job_id>            # terminal payload (summary/result/error/artifacts) or not_ready
+weave job cancel <job_id> --reason "superseded"   # cooperative cancel request (worker honors it)
+
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
 
@@ -215,6 +226,8 @@ is pulled in.
 · `weave_attach` · `weave_connect`
 · `weave_ask` · `weave_answer` · `weave_ack` · `weave_asks` · `weave_ask_get`
 · `weave_ask_many` · `weave_ask_many_result`
+· `weave_job_create` · `weave_job_list` · `weave_job_show` · `weave_job_status` · `weave_job_claim`
+· `weave_job_update` · `weave_job_result` · `weave_job_cancel`
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
@@ -305,6 +318,56 @@ Children answer and ack through the **unchanged** `weave answer` / `weave ack` p
 `weave thread`, receipts, and the hook drain all work for an ask-many child with no new
 machinery. Local-mesh only (each child must be an explicit, valid, non-broadcast peer in
 your own store); cross-store fan-out is future work.
+
+## Job board (poll-only, daemon-free)
+
+A **durable work queue** on top of the same store — the third step toward
+repowire capability parity. A job is a persistent row with a lifecycle; workers
+**poll and claim** jobs and report progress/results back. It is **poll-only**:
+there is **no autonomous dispatch or agent-spawn** in this release (a worker is
+whatever process polls the board — a runner that *acquires and runs* a job by
+spawning an agent is deferred to a later epic). Still **daemon-free**, **no new
+dependency**, and **local-mesh** only.
+
+**The board model.**
+
+- **Create** a durable job (`weave job create` / `weave_job_create`) — it starts
+  `queued`, the server mints its `job_<…>` id, and the creator becomes the owner.
+  Carries title/description/kind plus optional assignee/owner/circle and
+  caller-supplied `deadline_at`/`expires_at`.
+- **List / show / status** (`weave job list|show|status`) are read-only. `list`
+  filters by state/owner/creator/assignee/circle and is bounded; `show` and
+  `status` are aliases for the same single-job view.
+- **Claim** (`weave job claim` / `weave_job_claim`) is how a worker takes a job:
+  it **mints a fresh `attempt_id`** (the fencing token), assigns the job to the
+  worker, and moves it to `running`. The worker captures the printed `attempt_id`.
+- **Update** (`weave job update` / `weave_job_update`) drives the lifecycle
+  forward — state, phase, an append-only progress note, and the terminal
+  `result` / `error` / `artifacts` (all **TEXT JSON**). Once a job is claimed,
+  an update **must carry the matching `attempt_id`** or it is rejected
+  (`stale_attempt`); an unclaimed job accepts a tokenless update (pre-claim
+  parking).
+- **Result** (`weave job result` / `weave_job_result`) returns the terminal
+  payload (summary/result/error/artifacts) once the job is in a terminal state,
+  otherwise a `not_ready` marker.
+- **Cancel** (`weave job cancel` / `weave_job_cancel`) is **cooperative, never a
+  hard delete**: a still-`queued` job transitions straight to terminal
+  `cancelled`; an in-flight (claimed/running) job only gets a `cancel_requested`
+  flag set, which the worker observes on its next poll and honors. No daemon is
+  needed to *request* a cancel — the worker does the honoring.
+
+**`attempt_id` fencing.** The claim→token→update fencing is enforced **in the
+store**, so the CLI and the MCP tools inherit it identically. Re-claiming an
+in-flight job mints a **new** token that fences out the prior worker: any update
+carrying the now-stale token is rejected. A worker that wants to retry a failed
+job creates a new one (terminal states — `completed` / `failed` / `cancelled` /
+`expired` / `unavailable` — are frozen).
+
+The job board adds only an additive `jobs` table (both backends, guarded
+idempotent migration — a legacy DB upgrades in place) and routes every CLI and
+MCP path through one set of store methods. There is **no `store → inject` edge**
+(jobs don't nudge in this release) and the autonomous JobRunner / scheduler /
+spawn machinery is explicitly out of scope here.
 
 ## Native injector
 

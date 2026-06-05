@@ -450,6 +450,22 @@ identity_keys (identity TEXT NOT NULL, pubkey TEXT NOT NULL, added_ts INTEGER NO
 revocations   (id INTEGER PK AUTOINCREMENT, ts INTEGER NOT NULL, fp TEXT NOT NULL,
                identity TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
                kind TEXT NOT NULL DEFAULT 'enforced')             -- observed-revocation audit log (#11)
+-- Poll-only durable job board (P3, §8):
+jobs        (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+             kind TEXT NOT NULL DEFAULT 'general', state TEXT NOT NULL, state_reason TEXT NULL,
+             phase TEXT NULL, prompt TEXT NULL, progress_note TEXT NULL,
+             progress_events_json TEXT NOT NULL DEFAULT '[]',     -- append-only [{at,note,state,phase}]
+             creator TEXT NOT NULL, owner TEXT NULL, assignee TEXT NULL, circle TEXT NULL,
+             correlation_id TEXT NULL, source_kind TEXT NULL, source_id TEXT NULL, scope TEXT NULL,
+             visibility TEXT NOT NULL DEFAULT 'circle',
+             attempt_id TEXT NULL,                                -- current claim/fencing token (att_<…>)
+             deadline_at INTEGER NULL, expires_at INTEGER NULL,
+             result_summary TEXT NULL, result_json TEXT NOT NULL DEFAULT '{}',
+             error_json TEXT NOT NULL DEFAULT '{}', artifacts_json TEXT NOT NULL DEFAULT '[]',
+             cancel_requested INTEGER NOT NULL DEFAULT 0, cancel_requested_by TEXT NULL,
+             cancel_requested_ts INTEGER NULL, cancel_reason TEXT NULL,
+             opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, completed_ts INTEGER NULL)
+            -- + indexes: state, (owner,updated_ts), (assignee,updated_ts), (circle,updated_ts)
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
@@ -543,9 +559,59 @@ revocations   (id INTEGER PK AUTOINCREMENT, ts INTEGER NOT NULL, fp TEXT NOT NUL
   fingerprints (`SHA256:<64-hex>`, derived from public keys), public identities,
   source labels, and a `kind`. Surfaced read-only by `weave audit revocations` and
   the (count-only) `doctor` / `weave_doctor` verify summary.
+- **`jobs`** — the **poll-only durable job board** (P3, the third weave⊇repowire
+  parity epic — see §8). One row per durable unit of work, keyed by an opaque
+  `job_<rowid>_<nonce>` id (minted server-side, validated by `model::job_id_valid`
+  before any bind). A job carries a **`JobState` lifecycle**, descriptive metadata
+  (title/description/kind/owner/assignee/circle/visibility, plus inert nullable
+  `correlation_id`/`source_kind`/`source_id`/`scope` for board filtering), an
+  **append-only** `progress_events_json` audit log, the terminal `result_summary` /
+  `result_json` / `error_json` / `artifacts_json` (all **TEXT JSON**, byte-capped),
+  and the cooperative-cancel flags. Timestamps are weave-native `i64` epoch seconds
+  (`model::now()`), never ISO strings — `deadline_at` / `expires_at` are
+  caller-supplied i64.
+  - **`JobState` — the state machine.** The enum is a **forward-compat 11-state
+    superset** (`Queued, Dispatching, Delivered, Running, AwaitingInput, Completed,
+    Failed, Cancelled, Blocked, Expired, Unavailable`) so a later runner epic needs
+    no model migration; **P3's write paths only ever mint the poll-only subset**
+    (`queued` on create; claim → `running`; update/cancel produce the rest), while
+    `dispatching` / `delivered` / `unavailable` are accepted-on-read and reachable
+    only via a generic update. The **terminal set is frozen** —
+    `{Completed, Failed, Cancelled, Expired, Unavailable}` — no edge leaves a
+    terminal state (idempotent self-noop excepted), and `cancel`/`expire` may
+    **interrupt** from any non-terminal state; otherwise transitions are forward
+    progress within the active lane. The legality check is the pure
+    `model::JobState::can_transition`, run **before any UPDATE** — an illegal edge is
+    a clean error, never a panic; the enum-label↔string round-trip is locked by a
+    drift-guard test (the BROADCAST-literal discipline).
+  - **`attempt_id` fencing (claim → token → stale-rejection).** A worker **claims**
+    a job via `claim_job`, which **mints a fresh `attempt_id`** token, assigns the
+    job, and moves it to `running` (claim is the *only* path that sets `attempt_id`).
+    `update_job` then enforces fencing **in the store** (so CLI and MCP inherit it
+    identically): if the row is claimed (non-NULL `attempt_id`), the supplied token
+    **must equal** the row's current one, else `Err("stale_attempt")`; an unclaimed
+    (NULL) job accepts a tokenless update (pre-claim parking). A **re-claim mints a
+    new token**, fencing out the prior worker — the proptest asserts only the latest
+    token ever validates.
+  - **Cooperative cancel — never a hard delete.** `cancel_job` mirrors repowire: a
+    still-`queued` row transitions straight to terminal `cancelled`; an in-flight
+    (claimed/running) row only gets the `cancel_requested` flag set, which the worker
+    observes on its next poll and honors — no daemon is needed to *request* a cancel.
+    P3 has no hard-delete path.
+  - **No `store → inject` edge, no new dependency.** P3 is pure DB — `jobs` adds no
+    injector call and no crate (`serde_json`, already a dep, carries the JSON TEXT
+    columns); the module DAG (`model` ← `store`) is unchanged (the state machine in
+    `model`, the lifecycle in `store`). **Runner-only columns are excluded** — the
+    lease/runner-owner/attempts-ledger and the cron/schedule/spawn-exec config that
+    drive repowire's autonomous JobRunner are **not** carried (deferred to a later
+    runner epic); only the single first-class `attempt_id` fencing token is promoted.
+    Created on every open in **both** backends via an additive, guarded, idempotent
+    migration (the `reads`/`revocations` precedent), so a legacy DB upgrades in place
+    and the table is inert plain data in every build.
 - The Tier-2 tables are whole **new** tables created on every open in **both**
   backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER;
-  `identity_keys` additionally absorbs the legacy `keys` rows on first open.
+  `identity_keys` additionally absorbs the legacy `keys` rows on first open. The
+  `jobs` table follows the same whole-new-table pattern.
 
 ### Presence: `liveness_for` / `is_alive` vs `is_online`
 
@@ -786,6 +852,8 @@ keep what worked and drop the operational weight.
 | MCP-native | ✅ | ✅ | ✅ |
 | Tracked ask/answer/ack | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure DB** |
 | Ask-many (fan to N peers) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, read-time aggregate** |
+| Durable job board (poll/claim) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, poll-only** |
+| Autonomous dispatch / agent-spawn | ❌ | ✅ (JobRunner daemon) | ⏳ deferred (later runner epic) |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
 | Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
 
@@ -824,6 +892,20 @@ keep what worked and drop the operational weight.
   per-child nudge is fired caller-side), bounded by `MAX_ASK_MANY_TARGETS = 64`, and
   ships with a **dual-backend additive migration** and **no new dependency**. Explicit
   peer list only (circles compose in a later epic); cross-store fan-out remains future work.
+- **weave⊇repowire parity (P3 — job board, poll-only).** repowire's other
+  daemon-mediated capability was a **durable job board** (`tracked_work`): persistent
+  work rows with a lifecycle, claimed and reported on by workers. weave now matches the
+  **poll-only** half **daemon-free** with the additive `jobs` table (§6): durable rows
+  driven by the pure `JobState` machine (frozen terminal set; cancel/expire interrupt),
+  **claim-by-update with `attempt_id` fencing enforced in the store** (a re-claim fences
+  out a stale worker), and **cooperative cancel** (a worker honors the flag on its next
+  poll — no daemon needed to request it). Result/error/artifacts are TEXT JSON. It ships
+  with a **dual-backend additive migration**, **no new dependency**, and **no `store →
+  inject` edge**; the **runner-only columns are excluded** (lease/cron/spawn-exec).
+  **Autonomous dispatch is explicitly deferred** — a JobRunner that *acquires and runs* a
+  job by spawning an agent, the cron scheduler, and the dispatch-lease ledger belong to a
+  later runner epic (Tier B). P3 is **local-mesh poll-only**: workers poll and claim; there
+  is no auto-dispatch yet.
 
 ---
 

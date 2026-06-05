@@ -404,6 +404,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Durable poll-only job board (P3): create/list/show/status/claim/update/
+    /// result/cancel. No autonomous dispatch/runner — nothing nudges or spawns.
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
     /// Configuration helpers.
     Config {
         #[command(subcommand)]
@@ -533,6 +539,120 @@ enum ConfigCmd {
     /// Scaffold a commented ~/.config/weave/config.toml. Never overwrites an
     /// existing file, so it is safe to run repeatedly.
     Init,
+}
+
+/// `weave job` subcommands — the P3 poll-only board: create/list/show/status/claim/
+/// update/result/cancel. NO autonomous dispatch/runner (that is P10/P11): nothing
+/// nudges or spawns. attempt_id fencing + the state machine are enforced in the
+/// store, so both CLI and MCP inherit them.
+#[derive(Subcommand)]
+enum JobCmd {
+    /// Create a durable board job (state 'queued') and print its minted job_id.
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long, allow_hyphen_values = true)]
+        desc: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long)]
+        circle: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// optional deadline (epoch seconds)
+        #[arg(long)]
+        deadline: Option<i64>,
+        /// your session name (creator); defaults to config/$WEAVE_SESSION/cwd
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List board jobs filtered by state/owner/creator/assignee/circle.
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        creator: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long)]
+        circle: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a single job's status by id.
+    Show {
+        job_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a single job's status by id (alias of show).
+    Status {
+        job_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim a job to work it: mints an attempt_id, sets you as assignee, -> running.
+    Claim {
+        job_id: String,
+        /// the assignee (defaults to you)
+        #[arg(long = "as")]
+        as_who: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update a job's lifecycle/result. Pass --attempt to fence a claimed job.
+    Update {
+        job_id: String,
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "state-reason", allow_hyphen_values = true)]
+        state_reason: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        phase: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        note: Option<String>,
+        #[arg(long = "result-summary", allow_hyphen_values = true)]
+        result_summary: Option<String>,
+        /// result payload as a JSON string
+        #[arg(long, allow_hyphen_values = true)]
+        result: Option<String>,
+        /// error payload as a JSON string
+        #[arg(long, allow_hyphen_values = true)]
+        error: Option<String>,
+        /// artifacts payload as a JSON string
+        #[arg(long, allow_hyphen_values = true)]
+        artifacts: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a job's result (terminal payload, or 'not_ready').
+    Result {
+        job_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cooperatively cancel a job (never a hard delete).
+    Cancel {
+        job_id: String,
+        #[arg(long, allow_hyphen_values = true)]
+        reason: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Shells we can emit completion scripts for. Kept as a local enum (rather than
@@ -2010,6 +2130,8 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Job { cmd } => dispatch_job(store, &cfg, cmd)?,
+
         Cmd::Thread { root, limit, json } => {
             let rows = store.thread(root, limit)?;
             if json {
@@ -2617,6 +2739,236 @@ fn main() -> Result<()> {
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
     Ok(())
+}
+
+/// `weave job` handler (P3 poll-only board). Routes the 8 subcommands through the
+/// SAME 7 Store methods the MCP tools use, so attempt_id fencing, the state machine,
+/// and input caps are enforced once, in the store. NO injector involvement (jobs do
+/// not nudge in P3). Each subcommand supports `--json` for machine-readable output.
+fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
+    match cmd {
+        JobCmd::Create {
+            title,
+            desc,
+            kind,
+            owner,
+            assignee,
+            circle,
+            prompt,
+            deadline,
+            from,
+            json,
+        } => {
+            let (creator, explicit) = resolve_me_explicit(from, None, cfg);
+            refresh_presence(store, &creator, explicit);
+            let spec = model::JobSpec {
+                title,
+                description: desc,
+                kind,
+                owner,
+                assignee,
+                circle,
+                prompt,
+                deadline_at: deadline,
+                ..Default::default()
+            };
+            let job = store.create_job(&creator, spec)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "job": job }))?
+                );
+            } else {
+                println!(
+                    "created job {} [{}] '{}' (creator={})",
+                    job.id,
+                    job.state.as_str(),
+                    job.title,
+                    job.creator
+                );
+            }
+        }
+        JobCmd::List {
+            state,
+            owner,
+            creator,
+            assignee,
+            circle,
+            limit,
+            json,
+        } => {
+            let state = match state {
+                Some(s) if !s.trim().is_empty() => {
+                    Some(model::JobState::from_str(s.trim()).map_err(|m| anyhow::anyhow!(m))?)
+                }
+                _ => None,
+            };
+            let filter = model::JobFilter {
+                state,
+                owner,
+                creator,
+                assignee,
+                circle,
+            };
+            let jobs = store.list_jobs(filter, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "jobs": jobs }))?
+                );
+            } else if jobs.is_empty() {
+                println!("no jobs");
+            } else {
+                for j in &jobs {
+                    print_job_line(j);
+                }
+            }
+        }
+        JobCmd::Show { job_id, json } | JobCmd::Status { job_id, json } => {
+            let job = store.get_job(&job_id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "job": job }))?
+                );
+            } else {
+                match job {
+                    None => println!("no job '{job_id}'"),
+                    Some(j) => print_job_line(&j),
+                }
+            }
+        }
+        JobCmd::Claim {
+            job_id,
+            as_who,
+            json,
+        } => {
+            let (me, explicit) = resolve_me_explicit(as_who, None, cfg);
+            refresh_presence(store, &me, explicit);
+            let job = store
+                .claim_job(&job_id, &me)?
+                .ok_or_else(|| anyhow::anyhow!("no job '{job_id}'"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "job": job }))?
+                );
+            } else {
+                println!(
+                    "claimed job {} as '{}'; attempt_id={} state={}",
+                    job.id,
+                    me,
+                    job.attempt_id.as_deref().unwrap_or("-"),
+                    job.state.as_str()
+                );
+            }
+        }
+        JobCmd::Update {
+            job_id,
+            attempt,
+            state,
+            state_reason,
+            phase,
+            note,
+            result_summary,
+            result,
+            error,
+            artifacts,
+            json,
+        } => {
+            let state = match state {
+                Some(s) if !s.trim().is_empty() => {
+                    Some(model::JobState::from_str(s.trim()).map_err(|m| anyhow::anyhow!(m))?)
+                }
+                _ => None,
+            };
+            let patch = model::JobPatch {
+                state,
+                state_reason,
+                phase,
+                progress_note: note,
+                result_summary,
+                result_json: result,
+                error_json: error,
+                artifacts_json: artifacts,
+            };
+            let job = store.update_job(&job_id, attempt.as_deref(), patch)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "job": job }))?
+                );
+            } else {
+                println!("updated job {} [{}]", job.id, job.state.as_str());
+            }
+        }
+        JobCmd::Result { job_id, json } => {
+            let r = store.job_result(&job_id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "result": r }))?
+                );
+            } else {
+                match r {
+                    None => println!("no job '{job_id}'"),
+                    Some(r) if !r.ready => {
+                        println!("job {} [{}] not_ready", r.id, r.state.as_str())
+                    }
+                    Some(r) => {
+                        println!(
+                            "job {} [{}] summary={} result={} error={} artifacts={}",
+                            r.id,
+                            r.state.as_str(),
+                            r.result_summary.as_deref().unwrap_or("-"),
+                            r.result_json,
+                            r.error_json,
+                            r.artifacts_json
+                        );
+                    }
+                }
+            }
+        }
+        JobCmd::Cancel {
+            job_id,
+            reason,
+            from,
+            json,
+        } => {
+            let (me, explicit) = resolve_me_explicit(from, None, cfg);
+            refresh_presence(store, &me, explicit);
+            let job = store
+                .cancel_job(&job_id, &me, reason.as_deref())?
+                .ok_or_else(|| anyhow::anyhow!("no job '{job_id}'"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "job": job }))?
+                );
+            } else {
+                println!(
+                    "cancel requested for job {} (state {}, cancel_requested={})",
+                    job.id,
+                    job.state.as_str(),
+                    job.cancel_requested
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-line human summary of a [`model::Job`] for the CLI listings/show.
+fn print_job_line(j: &model::Job) {
+    println!(
+        "{} [{}] {} (creator={}, assignee={}, updated {})",
+        j.id,
+        j.state.as_str(),
+        j.title,
+        j.creator,
+        j.assignee.as_deref().unwrap_or("-"),
+        model::fmt_ts(j.updated_ts)
+    );
 }
 
 /// `weave key` handler (only built with `--features sign`). Generates/shows this

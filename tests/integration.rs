@@ -6517,3 +6517,217 @@ fn mcp_ask_many_lifecycle_and_failures() {
 
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P3 job board (poll-only) — CLI roundtrip + MCP failure paths
+// ---------------------------------------------------------------------------
+
+/// Full CLI lifecycle: create -> claim -> update(running, note) -> update(completed,
+/// result, fenced by attempt) -> result shows the payload. Plus a cancel path.
+#[test]
+fn cli_job_board_roundtrip() {
+    let db = TestDb::new();
+
+    // create (capture id from --json)
+    let out = run_ok(
+        &db,
+        &[
+            "job",
+            "create",
+            "--title",
+            "build the thing",
+            "--from",
+            "alice",
+            "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("job create --json parses");
+    let id = v["job"]["id"].as_str().expect("job id present").to_string();
+    assert_eq!(v["job"]["state"].as_str(), Some("queued"));
+    assert_eq!(v["job"]["creator"].as_str(), Some("alice"));
+
+    // claim (capture attempt_id)
+    let out = run_ok(&db, &["job", "claim", &id, "--as", "worker", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("job claim --json parses");
+    assert_eq!(v["job"]["state"].as_str(), Some("running"));
+    let att = v["job"]["attempt_id"]
+        .as_str()
+        .expect("attempt_id present")
+        .to_string();
+
+    // update running with a note (still fenced by attempt)
+    run_ok(
+        &db,
+        &[
+            "job",
+            "update",
+            &id,
+            "--attempt",
+            &att,
+            "--note",
+            "halfway",
+            "--json",
+        ],
+    );
+
+    // complete with a result, fenced by the matching attempt
+    run_ok(
+        &db,
+        &[
+            "job",
+            "update",
+            &id,
+            "--attempt",
+            &att,
+            "--state",
+            "completed",
+            "--result-summary",
+            "shipped",
+            "--result",
+            r#"{"ok":true}"#,
+            "--json",
+        ],
+    );
+
+    // result shows the terminal payload
+    let out = run_ok(&db, &["job", "result", &id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("job result --json parses");
+    assert_eq!(v["result"]["ready"].as_bool(), Some(true));
+    assert_eq!(v["result"]["state"].as_str(), Some("completed"));
+    assert!(v["result"]["result_json"]
+        .as_str()
+        .unwrap()
+        .contains("true"));
+
+    // A STALE update with NO attempt on a claimed job is fenced.
+    let (ok, _o, err) = run(&db, &["job", "update", &id, "--state", "running"]);
+    assert!(!ok, "update without the claim token must fail");
+    let _ = err;
+
+    // cancel path: a fresh queued job cancels straight to terminal.
+    let out = run_ok(
+        &db,
+        &[
+            "job", "create", "--title", "todo", "--from", "alice", "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let id2 = v["job"]["id"].as_str().unwrap().to_string();
+    let out = run_ok(
+        &db,
+        &[
+            "job", "cancel", &id2, "--reason", "obsolete", "--from", "alice", "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["job"]["state"].as_str(), Some("cancelled"));
+    assert_eq!(v["job"]["cancel_requested"].as_bool(), Some(true));
+}
+
+/// MCP happy path + every documented failure path for the job tools.
+#[test]
+fn mcp_job_tools_happy_and_failure_paths() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // tools/list advertises all 8 job tool names.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect();
+    for n in [
+        "weave_job_create",
+        "weave_job_list",
+        "weave_job_show",
+        "weave_job_status",
+        "weave_job_claim",
+        "weave_job_update",
+        "weave_job_result",
+        "weave_job_cancel",
+    ] {
+        assert!(names.iter().any(|x| x == n), "tools/list missing {n}");
+    }
+
+    // create (happy)
+    let (is_err, text) = mcp.call_tool(
+        "weave_job_create",
+        serde_json::json!({"creator": "alice", "title": "do work"}),
+    );
+    assert!(!is_err, "create should succeed: {text}");
+    // The created id is embedded in the text ("Created job job_<...> ...").
+    let id = text
+        .split_whitespace()
+        .find(|w| w.starts_with("job_"))
+        .expect("created job id in text")
+        .to_string();
+
+    // status happy
+    let (is_err, _t) = mcp.call_tool("weave_job_status", serde_json::json!({"job_id": id}));
+    assert!(!is_err);
+
+    // claim happy (capture attempt_id from text "attempt_id=att_<...>")
+    let (is_err, text) = mcp.call_tool(
+        "weave_job_claim",
+        serde_json::json!({"job_id": id, "assignee": "worker"}),
+    );
+    assert!(!is_err, "claim should succeed: {text}");
+    let att = text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("attempt_id="))
+        .expect("attempt_id in claim text")
+        .to_string();
+
+    // FAILURE: update with a STALE/empty token on a claimed job → stale_attempt error.
+    let (is_err, text) = mcp.call_tool(
+        "weave_job_update",
+        serde_json::json!({"job_id": id, "state": "completed"}),
+    );
+    assert!(
+        is_err,
+        "claimed-job update without the token must be isError"
+    );
+    assert!(
+        text.contains("stale_attempt"),
+        "fenced error surfaced: {text}"
+    );
+
+    // FAILURE: unknown job → not found.
+    let (is_err, _t) = mcp.call_tool(
+        "weave_job_update",
+        serde_json::json!({"job_id": "job_404_9", "state": "running"}),
+    );
+    assert!(is_err, "unknown job must be isError");
+
+    // FAILURE: illegal transition (complete first, then try to run).
+    let (is_err, _t) = mcp.call_tool(
+        "weave_job_update",
+        serde_json::json!({"job_id": id, "attempt_id": att, "state": "completed"}),
+    );
+    assert!(!is_err, "completing a claimed job succeeds");
+    let (is_err, text) = mcp.call_tool(
+        "weave_job_update",
+        serde_json::json!({"job_id": id, "attempt_id": att, "state": "running"}),
+    );
+    assert!(is_err, "completed->running must be isError");
+    assert!(
+        text.contains("illegal transition"),
+        "transition error: {text}"
+    );
+
+    // FAILURE: bad job id never reaches a bind.
+    let (is_err, _t) = mcp.call_tool("weave_job_show", serde_json::json!({"job_id": "job;rm"}));
+    assert!(is_err, "metachar job id must be isError");
+
+    // result happy (now terminal)
+    let (is_err, text) = mcp.call_tool("weave_job_result", serde_json::json!({"job_id": id}));
+    assert!(!is_err);
+    assert!(
+        text.contains("completed"),
+        "result shows terminal state: {text}"
+    );
+
+    mcp.shutdown();
+}
