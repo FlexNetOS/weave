@@ -694,6 +694,38 @@ hermetically — never a real network bound:
   `cfg!(feature="libsql")`. No token byte appears in any timeout output (the security
   redaction test configures a token + a per-source timeout together).
 
+#### `weave doctor` federation-health rollup (both source kinds)
+
+The federation-health rollup that surfaces the `pull_from` token/timeout tiers at
+parity with `peer_db` is tested **hermetically** — env-guard-serialized, `.invalid`
+hosts only, **no live network**:
+
+- **Unit (`config`):** `pull_from_remote_token_tiers` resolves per-source / shared /
+  none over `pull_from`, locals omitted, and yields the identical tier multiset as the
+  same list under `peer_dbs` (proving the symmetric accessor shares one resolver); its
+  `Debug` carries no token. `federation_health()` aggregation is asserted over a mixed
+  `.invalid` set (a labelled remote with a per-source token + per-source timeout, an
+  unlabelled remote on the shared token + global timeout, and a local) — symmetric
+  `peer_db == pull_from` rollup, all `total`/`local`/`remote` counts and token/timeout
+  tiers, and the `ms_min`/`ms_max` range; plus the empty / local-only edge (defaulted
+  zeros, `ms_min`/`ms_max == None`, no misleading `0-0`) and the no-token/no-timeout
+  default tier (`token_none`, `timeout_default`, ms == `REMOTE_TIMEOUT_MS_DEFAULT`).
+- **Integration (scrubbed env, both backends):** with a mixed `WEAVE_PULL_FROM` (one
+  local + one labelled `.invalid` remote carrying `WEAVE_PULL_TOKEN_<LABEL>` +
+  `WEAVE_PULL_TIMEOUT_MS_<LABEL>`) alongside `WEAVE_PEER_DBS`, `weave doctor --json`
+  carries the additive `federation_pull_*` keys (`federation_pull_sources`,
+  `_local`/`_remote`, `_token_{per_source,shared,none}`,
+  `_timeout_{per_source,global,default}`, `_timeout_ms_{min,max}`) with correct
+  counts/tiers, and every existing `federation_*` key is unchanged. A local-only case
+  asserts the pull-side block (and its keys) is **absent** (additive-when-configured).
+  Resolution is backend-agnostic, so the tiers hold on the default sqlite build (remote
+  loud-rejected at the store seam) and the libsql build.
+- **Security / redaction:** with a per-source token configured, **no** token substring
+  appears anywhere across the new pull-side surface — `doctor --json`, the human
+  `doctor` block, OR the `weave_doctor` MCP result (tier counts only).
+
+These run under BOTH the default sqlite and the `--features libsql` backends.
+
 ## 7. Benchmarks (`benches/weave_bench.rs`, criterion)
 
 A `criterion` harness (`harness = false` in `Cargo.toml`) tracks the costs that

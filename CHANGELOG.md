@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased] — `weave doctor` federation-health rollup (token/timeout parity)
+
+> **Observability-only.** No new dependency, no schema/migration, no `Store`-trait,
+> SQL, or apply-path change. Closes the surfaced-parity gap from Tier-2 v2: the
+> per-source token (`WEAVE_PULL_TOKEN_<LABEL>`) and timeout
+> (`WEAVE_PULL_TIMEOUT_MS_<LABEL>`) knobs were already **resolved** and **applied**
+> for `pull_from`, but `doctor` only **surfaced** them for `peer_db`. The rollup now
+> reports both source kinds symmetrically. Secret-free (tier counts + an ms range
+> only, never a token); both backends gain only the new aggregation/integration tests.
+
+### Added
+- **config:** `Config::federation_health() -> FederationHealth` — a single secret-free
+  rollup holding a `FederationKindHealth` per source kind (`peer_db`, `pull_from`):
+  source counts (`total`/`local`/`remote`), per-source token tiers, per-source timeout
+  tiers, and the effective-ms range (`ms_min`/`ms_max`, `None` over zero remotes). Plus
+  the symmetric `Config::pull_from_remote_token_tiers()` accessor that was missing (the
+  sibling of `peer_db_remote_token_tiers`). Read-only aggregation over the same
+  `resolve_store_sources_with_tiers` the apply path uses — **no** new network probe.
+- **cli:** `weave doctor` now reports the `pull_from` delivery side at parity with
+  `peer_db` — a `pull sources:` / `pull tokens:` / `pull timeout:` human block and the
+  additive `--json` keys `federation_pull_sources`, `federation_pull_local`,
+  `federation_pull_remote`, `federation_pull_token_{per_source,shared,none}`,
+  `federation_pull_timeout_{per_source,global,default}`, and
+  `federation_pull_timeout_ms_{min,max}`. Emitted only when `pull_from` is configured,
+  so a local-only config is byte-unchanged; the ms keys only when a remote pull source
+  exists.
+- **mcp:** `weave_doctor` mirrors the same three `pull_from` human lines via
+  `Config::load().federation_health()` (stdout discipline preserved — JSON-RPC frames
+  only). Counts/tiers only; never a token byte.
+
 ## [Unreleased] — host-aware liveness on `peers` / `doctor` / `sessions --watch`
 
 > Pure observability/consistency upgrade: **no new dependency, no schema/migration,

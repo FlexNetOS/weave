@@ -268,6 +268,55 @@ pub struct RemoteTiers {
     pub timeout: PullTimeoutTier,
 }
 
+/// Token-FREE per-source-kind federation rollup for `doctor` observability. Carries
+/// ONLY counts and a plain effective-ms range for ONE source kind (`peer_db` OR
+/// `pull_from`) — NEVER a token byte, NEVER a label↔token pairing. Used to render the
+/// secret-free "federation health" block in both `weave doctor` (CLI) and the
+/// `weave_doctor` MCP tool. `ms_min`/`ms_max` are `None` when the kind has no remote
+/// source (so an empty set never renders a misleading `0-0`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FederationKindHealth {
+    /// Total resolved sources for this kind (local + remote).
+    pub total: usize,
+    /// Local-file sources.
+    pub local: usize,
+    /// Remote-URL sources (the set the token/timeout tiers are counted over).
+    pub remote: usize,
+    /// Remote sources whose token resolved per-source (`WEAVE_PULL_TOKEN_<LABEL>`).
+    pub token_per_source: usize,
+    /// Remote sources that fell back to the shared `pull_token`.
+    pub token_shared: usize,
+    /// Remote sources with no token applied.
+    pub token_none: usize,
+    /// Remote sources whose timeout resolved per-source (`WEAVE_PULL_TIMEOUT_MS_<LABEL>`).
+    pub timeout_per_source: usize,
+    /// Remote sources that fell back to the global `WEAVE_PULL_TIMEOUT_MS`.
+    pub timeout_global: usize,
+    /// Remote sources using the hardcoded [`REMOTE_TIMEOUT_MS_DEFAULT`].
+    pub timeout_default: usize,
+    /// Minimum effective remote-call timeout (ms) over the remote sources; `None`
+    /// when there is no remote source for this kind.
+    pub ms_min: Option<u64>,
+    /// Maximum effective remote-call timeout (ms) over the remote sources; `None`
+    /// when there is no remote source for this kind.
+    pub ms_max: Option<u64>,
+}
+
+/// Secret-free federation-health rollup for `doctor`, aggregating BOTH source kinds
+/// symmetrically: `peer_db` (Tier-1 federation) and `pull_from` (Tier-2 delivery).
+/// Carries ONLY counts + an effective-ms range per kind — NEVER a token. Built by
+/// [`Config::federation_health`] so the CLI `weave doctor` and the `weave_doctor`
+/// MCP tool consume ONE method and cannot drift. Reachability for the `peer_db` set
+/// is NOT recomputed here (no new probe): `doctor` derives ok/skipped from the
+/// already-computed [`crate::store::federation_status`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FederationHealth {
+    /// Rollup over the `peer_db` (Tier-1 federation) source set.
+    pub peer_db: FederationKindHealth,
+    /// Rollup over the `pull_from` (Tier-2 delivery) source set.
+    pub pull_from: FederationKindHealth,
+}
+
 /// Parse + clamp a remote-call timeout env value: parse as `u64`, require `> 0`, and
 /// clamp into `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`. Returns `None` on an empty /
 /// unparsable / `0` value so the caller FALLS THROUGH to the next precedence tier
@@ -1128,6 +1177,33 @@ impl Config {
         .collect()
     }
 
+    /// `pull_from` analogue of [`peer_db_remote_token_tiers`]: the symmetric token-FREE
+    /// per-source token-tier observability over the Tier-2 **delivery** set
+    /// (`pull_from`). The two source kinds share ONE label namespace + resolver
+    /// ([`resolve_store_sources_with_tiers`]), so a labelled remote selects its
+    /// `WEAVE_PULL_TOKEN_<LABEL>` whether it appears in `peer_dbs` or `pull_from`; this
+    /// just aggregates the tier over the delivery list instead of the federation list.
+    /// Locals are omitted (they carry no token). NEVER returns or logs any token byte
+    /// nor the label↔token pairing — only the tier classification.
+    ///
+    /// `doctor` aggregates the `pull_from` side through
+    /// [`federation_health`](Self::federation_health) (one method for both kinds), so
+    /// this symmetric accessor is exercised by config unit/integration tests — the
+    /// `allow(dead_code)` marks that intentional retention (mirrors the sibling
+    /// [`pull_from_remote_timeout_tiers`](Self::pull_from_remote_timeout_tiers)).
+    #[allow(dead_code)]
+    pub fn pull_from_remote_token_tiers(&self) -> Vec<PullTokenTier> {
+        self.resolve_store_sources_with_tiers(
+            self.pull_from.as_deref(),
+            MAX_PULL_FROM,
+            "WEAVE_PULL_FROM",
+        )
+        .into_iter()
+        .filter(|(src, _)| src.is_remote())
+        .map(|(_, tiers)| tiers.token)
+        .collect()
+    }
+
     /// Token-FREE per-source TIMEOUT observability for `doctor` over the `peer_dbs`
     /// Tier-1 federation set (the SAME set [`peer_db_remote_token_tiers`] reports
     /// over). Returns, for every REMOTE source, its EFFECTIVE timeout (ms) paired with
@@ -1170,6 +1246,71 @@ impl Config {
                 StoreSource::Local(_) => None,
             })
             .collect()
+    }
+
+    /// Token-FREE per-source-kind rollup behind [`federation_health`](Self::federation_health):
+    /// resolves `raw` ONCE through [`resolve_store_sources_with_tiers`] (the SAME
+    /// resolver the apply path uses) and tallies counts + tier classifications +
+    /// effective-ms range. NEVER reads or returns a token byte — only the tiers/counts.
+    /// Used symmetrically for both `peer_db` and `pull_from`, so the rollup cannot
+    /// diverge between the two kinds.
+    fn federation_kind_health(
+        &self,
+        raw: Option<&[String]>,
+        cap: usize,
+        list_label: &str,
+    ) -> FederationKindHealth {
+        let resolved = self.resolve_store_sources_with_tiers(raw, cap, list_label);
+        let mut h = FederationKindHealth {
+            total: resolved.len(),
+            ..FederationKindHealth::default()
+        };
+        for (src, tiers) in &resolved {
+            match src {
+                StoreSource::Local(_) => h.local += 1,
+                StoreSource::Remote { timeout_ms, .. } => {
+                    h.remote += 1;
+                    match tiers.token {
+                        PullTokenTier::PerSourceLabel => h.token_per_source += 1,
+                        PullTokenTier::Shared => h.token_shared += 1,
+                        PullTokenTier::None => h.token_none += 1,
+                    }
+                    match tiers.timeout {
+                        PullTimeoutTier::PerSourceLabel => h.timeout_per_source += 1,
+                        PullTimeoutTier::Global => h.timeout_global += 1,
+                        PullTimeoutTier::Default => h.timeout_default += 1,
+                    }
+                    let ms = timeout_ms.unwrap_or(REMOTE_TIMEOUT_MS_DEFAULT);
+                    h.ms_min = Some(h.ms_min.map_or(ms, |m| m.min(ms)));
+                    h.ms_max = Some(h.ms_max.map_or(ms, |m| m.max(ms)));
+                }
+            }
+        }
+        h
+    }
+
+    /// Secret-free federation-health rollup for `doctor` (CLI + MCP). Aggregates BOTH
+    /// source kinds symmetrically — `peer_db` Tier-1 federation and `pull_from` Tier-2
+    /// delivery — through the SAME [`resolve_store_sources_with_tiers`] the apply path
+    /// uses, so resolved/applied/surfaced cannot drift. Carries ONLY counts plus an
+    /// effective-ms range per kind (see [`FederationKindHealth`]); NEVER a token byte
+    /// nor a label↔token pairing. No network probe: this reads config/env only, while
+    /// reachability is layered in by `doctor` from the already-computed
+    /// [`crate::store::federation_status`], never recomputed here. Backend-agnostic —
+    /// identical on the default sqlite and `--features libsql` builds.
+    pub fn federation_health(&self) -> FederationHealth {
+        FederationHealth {
+            peer_db: self.federation_kind_health(
+                self.peer_dbs.as_deref(),
+                MAX_PEER_DBS,
+                "WEAVE_PEER_DBS",
+            ),
+            pull_from: self.federation_kind_health(
+                self.pull_from.as_deref(),
+                MAX_PULL_FROM,
+                "WEAVE_PULL_FROM",
+            ),
+        }
     }
 
     /// Tier-2 v2 inject-gate over a [`StoreSource`] (the [`StoreSource`] analogue of
@@ -2598,6 +2739,164 @@ mod tests {
         );
     }
 
+    /// `pull_from_remote_token_tiers` resolves the per-source / shared / none token
+    /// tier for each REMOTE `pull_from` source SYMMETRICALLY to
+    /// `peer_db_remote_token_tiers` (same resolver, one label namespace). Locals are
+    /// omitted. NEVER carries a token byte (asserted via the redacting Debug).
+    #[test]
+    fn pull_from_remote_token_tiers_resolves_symmetrically() {
+        let _g = ENV_GUARD.lock().unwrap();
+        let var = "WEAVE_PULL_TOKEN_PROD";
+        std::env::set_var(var, "prod-only-jwt");
+
+        let cfg = Config {
+            pull_token: Some("shared-jwt".to_string()),
+            pull_from: Some(vec![
+                "PROD=libsql://prod.turso.io".to_string(), // per-source label
+                "libsql://shared.turso.io".to_string(),    // shared token
+                "/tmp/weave-local.db".to_string(),         // local: omitted (no token)
+            ]),
+            ..Config::default()
+        };
+        // pull_from view counts one per-source + one shared, omits the local.
+        let pull = cfg.pull_from_remote_token_tiers();
+        assert_eq!(pull.len(), 2, "locals omitted; two remotes counted");
+        assert_eq!(
+            pull.iter()
+                .filter(|t| **t == PullTokenTier::PerSourceLabel)
+                .count(),
+            1
+        );
+        assert_eq!(
+            pull.iter().filter(|t| **t == PullTokenTier::Shared).count(),
+            1
+        );
+        assert_eq!(
+            pull.iter().filter(|t| **t == PullTokenTier::None).count(),
+            0
+        );
+
+        // Symmetry: the SAME list as peer_dbs yields the identical tier multiset.
+        let cfg_peer = Config {
+            peer_dbs: cfg.pull_from.clone(),
+            pull_from: None,
+            ..cfg.clone()
+        };
+        let peer = cfg_peer.peer_db_remote_token_tiers();
+        assert_eq!(peer, pull, "pull_from and peer_db token tiers must match");
+
+        // No token byte leaks through the tier surface.
+        let dbg = format!("{pull:?}");
+        assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
+        assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
+
+        std::env::remove_var(var);
+    }
+
+    /// `federation_health` aggregates correct symmetric counts/tiers for a configured
+    /// mix across BOTH source kinds: a labelled remote (per-source token + per-source
+    /// timeout), an unlabelled remote (shared token + global timeout), and a local
+    /// file (no token, no remote timeout). `.invalid` hosts only — NO live network
+    /// (pure config/env resolution). NEVER carries a token byte.
+    #[test]
+    fn federation_health_aggregates_mixed_set() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::set_var("WEAVE_PULL_TOKEN_PROD", "prod-only-jwt");
+        std::env::set_var("WEAVE_PULL_TIMEOUT_MS_PROD", "250");
+        std::env::set_var("WEAVE_PULL_TIMEOUT_MS", "1000");
+
+        let mix = vec![
+            "PROD=libsql://prod.invalid".to_string(), // per-source token + per-source timeout
+            "libsql://shared.invalid".to_string(),    // shared token + global timeout
+            "/tmp/weave-fed-health-local.db".to_string(), // local
+        ];
+        let cfg = Config {
+            pull_token: Some("shared-jwt".to_string()),
+            peer_dbs: Some(mix.clone()),
+            pull_from: Some(mix.clone()),
+            ..Config::default()
+        };
+
+        let health = cfg.federation_health();
+        // Both kinds resolve the SAME list ⇒ identical rollups (parity).
+        assert_eq!(
+            health.peer_db, health.pull_from,
+            "symmetric rollup for an identical source list"
+        );
+
+        for kind in [&health.peer_db, &health.pull_from] {
+            assert_eq!(kind.total, 3);
+            assert_eq!(kind.local, 1);
+            assert_eq!(kind.remote, 2);
+            // token tiers: one per-source, one shared, none "none".
+            assert_eq!(kind.token_per_source, 1);
+            assert_eq!(kind.token_shared, 1);
+            assert_eq!(kind.token_none, 0);
+            // timeout tiers: one per-source (250), one global (1000), none default.
+            assert_eq!(kind.timeout_per_source, 1);
+            assert_eq!(kind.timeout_global, 1);
+            assert_eq!(kind.timeout_default, 0);
+            assert_eq!(kind.ms_min, Some(250));
+            assert_eq!(kind.ms_max, Some(1000));
+        }
+
+        // No token byte leaks through the rollup's Debug.
+        let dbg = format!("{health:?}");
+        assert!(!dbg.contains("prod-only-jwt"), "leaked per-source: {dbg}");
+        assert!(!dbg.contains("shared-jwt"), "leaked shared: {dbg}");
+
+        std::env::remove_var("WEAVE_PULL_TOKEN_PROD");
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_PROD");
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+    }
+
+    /// `federation_health` over an empty / local-only config yields zeroed counts and
+    /// `None` ms bounds for both kinds — so `doctor` renders no pull-side block and no
+    /// misleading `0-0` ms range.
+    #[test]
+    fn federation_health_empty_and_local_only() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+
+        // Fully empty.
+        let empty = Config::default().federation_health();
+        assert_eq!(empty.peer_db, FederationKindHealth::default());
+        assert_eq!(empty.pull_from, FederationKindHealth::default());
+
+        // Local-only pull_from: a count but no remote tiers / ms range.
+        let cfg = Config {
+            pull_from: Some(vec!["/tmp/weave-fed-health-localonly.db".to_string()]),
+            ..Config::default()
+        };
+        let h = cfg.federation_health();
+        assert_eq!(h.pull_from.total, 1);
+        assert_eq!(h.pull_from.local, 1);
+        assert_eq!(h.pull_from.remote, 0);
+        assert_eq!(h.pull_from.ms_min, None);
+        assert_eq!(h.pull_from.ms_max, None);
+        assert_eq!(h.peer_db, FederationKindHealth::default());
+    }
+
+    /// `federation_health` classifies the DEFAULT timeout tier (no per-source, no
+    /// global env) and reports `REMOTE_TIMEOUT_MS_DEFAULT` as the effective ms bound.
+    #[test]
+    fn federation_health_default_timeout_tier() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+        std::env::remove_var("WEAVE_PULL_TIMEOUT_MS_DFLT");
+
+        let cfg = Config {
+            pull_from: Some(vec!["DFLT=libsql://d.invalid".to_string()]),
+            ..Config::default()
+        };
+        let ph = cfg.federation_health().pull_from;
+        assert_eq!(ph.remote, 1);
+        assert_eq!(ph.token_none, 1, "no token configured");
+        assert_eq!(ph.timeout_default, 1);
+        assert_eq!(ph.ms_min, Some(REMOTE_TIMEOUT_MS_DEFAULT));
+        assert_eq!(ph.ms_max, Some(REMOTE_TIMEOUT_MS_DEFAULT));
+    }
+
     /// The template documents `WEAVE_PULL_TIMEOUT_MS[_<LABEL>]`, the precedence, the
     /// clamp bounds, and that the LABEL namespace covers BOTH pull_from and peer_dbs.
     #[test]
@@ -2705,6 +3004,17 @@ mod tests {
         fn resolve_store_sources_remote_dedup_is_stable(
             hosts in proptest::collection::vec("[a-z0-9-]{1,12}", 0..8)
         ) {
+            // `pull_from_sources` resolves a per-source timeout from the AMBIENT
+            // `WEAVE_PULL_TIMEOUT_MS` (a global env read), so hold the shared env
+            // guard and clear that global for this test's duration. Otherwise a
+            // concurrent env-mutating test (e.g. `federation_health_*`, which sets
+            // `WEAVE_PULL_TIMEOUT_MS`) can change the value BETWEEN the two
+            // resolutions below — or mid-resolution across entries — making the
+            // `first == second` stability assertion flaky under load. The dedup
+            // property under test is independent of the timeout value.
+            let _g = ENV_GUARD.lock().unwrap();
+            std::env::remove_var("WEAVE_PULL_TIMEOUT_MS");
+            std::env::remove_var("WEAVE_PULL_TOKEN");
             // Build a list with each host twice (plain + trailing slash) to force
             // dedup; first-seen order must be the de-duplicated host order.
             let mut raw: Vec<String> = Vec::new();

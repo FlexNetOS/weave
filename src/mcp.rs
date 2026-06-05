@@ -1136,6 +1136,30 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             }
         }
     }
+    // Additive secret-free "federation health" rollup for the `pull_from` delivery
+    // set — parity with the CLI `weave doctor` (the side never surfaced before).
+    // Counts/tiers only; never a token byte. Reads config/env via the same
+    // `Config::load()` pattern the peer_db tiers above use (the full Config isn't
+    // plumbed into the MCP server). The whole string is the JSON-RPC RESULT (stdout
+    // frame); no skip/timeout note is emitted here, so stdout discipline holds.
+    let ph = crate::config::Config::load().federation_health().pull_from;
+    if ph.total > 0 {
+        out.push_str(&format!(
+            "\n  pull sources:   {} configured ({} local, {} remote)",
+            ph.total, ph.local, ph.remote
+        ));
+        if ph.remote > 0 {
+            out.push_str(&format!(
+                "\n  pull tokens:    {} per-source, {} shared, {} none",
+                ph.token_per_source, ph.token_shared, ph.token_none
+            ));
+            let (pmin, pmax) = (ph.ms_min.unwrap_or(0), ph.ms_max.unwrap_or(0));
+            out.push_str(&format!(
+                "\n  pull timeout:   {} per-source, {} global, {} default (effective {pmin}-{pmax} ms)",
+                ph.timeout_per_source, ph.timeout_global, ph.timeout_default
+            ));
+        }
+    }
     out.push_str("\n  (db/config paths: run `weave doctor` on the CLI)");
     // FR6: warn when the resolved store is NOT the well-known XDG default — the most
     // common "why can't I see the other session's peers" cause is a mismatched
