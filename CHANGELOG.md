@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — observed-revocation audit log + `weave_doctor` verify-summary parity (`sign`)
+
+> **Observability + parity only — `sign`-gated.** R1 revocation is **unchanged**: it
+> stays absolute and config-driven (`WEAVE_REVOKED` / `revoked`), and the verifier
+> never reads the new table, so the audit log can never weaken or diverge from the
+> decision. No new dependency; the default and `libsql`-no-`sign` builds are
+> unaffected (the table is inert plain data there). Secret-free throughout —
+> fingerprints (`SHA256:<64-hex>`), public identities, source labels, and counts only;
+> never a private key, peer pubkey, or token.
+
+### Added
+- **store:** additive `revocations` audit table (both backends, guarded idempotent
+  migration) — an **observed-revocation log**, write-on-enforce / read-only to the
+  decision. A `declared` event is recorded when an operator runs `weave key revoke`;
+  an `enforced` event is recorded (best-effort) when the absolute R1 predicate rejects
+  a pulled signed intent in `verify_pulled_intent`. An audit-write failure is logged to
+  stderr and swallowed — it can never change the rejection.
+- **cli:** `weave audit revocations` (human + `--json`, `--limit`) lists the audit log
+  most-recent-first, secret-free. `weave doctor` gains `sign_registered_keys_revoked`
+  and `sign_revocation_events` (count of registered keys currently revoked + recorded
+  revocation events).
+- **mcp:** `weave_doctor` gains a `sign`-gated verify summary at **parity** with
+  `weave doctor` (strict mode, trusted/revoked counts, registered-key count,
+  registered-revoked count, revocation-event count, own fingerprint), closing the
+  prior CLI/MCP asymmetry. Counts + the local fingerprint only; appended to the
+  JSON-RPC result frame (stdout discipline preserved).
+
 ## [Unreleased] — unify the test `WEAVE_*` env guard (`crate::testenv`)
 
 > **Test-only.** No runtime/behavior change, no new dependency (std-only), nothing

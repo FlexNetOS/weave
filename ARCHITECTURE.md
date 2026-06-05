@@ -440,6 +440,9 @@ pull_cursor   (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)
 keys          (identity TEXT PRIMARY KEY, pubkey TEXT NOT NULL)   -- DEPRECATED shadow (#7)
 identity_keys (identity TEXT NOT NULL, pubkey TEXT NOT NULL, added_ts INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (identity, pubkey))                    -- multi-key registry (#7)
+revocations   (id INTEGER PK AUTOINCREMENT, ts INTEGER NOT NULL, fp TEXT NOT NULL,
+               identity TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+               kind TEXT NOT NULL DEFAULT 'enforced')             -- observed-revocation audit log (#11)
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
@@ -477,6 +480,20 @@ identity_keys (identity TEXT NOT NULL, pubkey TEXT NOT NULL, added_ts INTEGER NO
 - **`keys`** — the **deprecated** legacy single-key table (`identity PRIMARY KEY`),
   RETAINED as a shadow (no DROP) for crash-safety and old-binary coexistence. Nothing
   reads it anymore; new writes go ONLY to `identity_keys`.
+- **`revocations`** — the **observed-revocation audit log** (#11): an append-only
+  record of *when* revocation was exercised, for operator visibility only. A
+  `declared` row is written when an operator runs `weave key revoke`; an `enforced`
+  row is written (best-effort) when the R1 predicate rejects a pulled signed intent
+  that verified only against a revoked key. **Write-on-enforce, never read by the
+  verifier** — `verify_pulled_intent` never touches this table, so R1 stays the
+  single, absolute, config-driven decision source and the log can never weaken or
+  drift from it. An audit-write failure is logged to stderr and swallowed; it cannot
+  change the rejection. Always-present plain data; every read/write call site is
+  `sign`-gated. Created on every open in **both** backends via an additive, guarded,
+  idempotent migration (mirroring `identity_keys`). Secret-free: it stores only full
+  fingerprints (`SHA256:<64-hex>`, derived from public keys), public identities,
+  source labels, and a `kind`. Surfaced read-only by `weave audit revocations` and
+  the (count-only) `doctor` / `weave_doctor` verify summary.
 - The Tier-2 tables are whole **new** tables created on every open in **both**
   backends, so a legacy (pre-Tier-2) DB upgrades in place with no per-column ALTER;
   `identity_keys` additionally absorbs the legacy `keys` rows on first open.
@@ -1076,8 +1093,17 @@ registered set; ambiguous/no match errors). `weave key revoke <fp>` validates th
 value and echoes the `WEAVE_REVOKED=` / `revoked = [...]` line to add (it does not
 rewrite a managed config); revocation is unconditional (R1). The emitted rotate/revoke
 values are the **full** `SHA256:<64-hex>` form so they are actually accepted by
-trust/revoke matching. `doctor` reports secret-free per-identity key counts
-(`sign_key_identities`, `sign_registered_keys`, `sign_identities_multi_key`).
+trust/revoke matching. `weave key revoke` additionally writes a best-effort
+`declared` row to the `revocations` audit log (provenance only; never a decision
+input — see the `revocations` table above). `doctor` reports secret-free per-identity
+key counts (`sign_key_identities`, `sign_registered_keys`, `sign_identities_multi_key`),
+plus the count of registered keys currently revoked (`sign_registered_keys_revoked`)
+and the recorded revocation-event count (`sign_revocation_events`). The MCP
+`weave_doctor` tool emits the same sign-gated verify summary at **parity** (strict
+mode, trusted/revoked counts, registered-key count, registered-revoked count,
+revocation-event count, own fingerprint) — counts + the local fingerprint only,
+appended to the JSON-RPC result frame (stdout discipline intact). `weave audit
+revocations` lists the log read-only.
 
 `sign` is a low module (`model ← config ← sign`); `store` depends down on it for
 verify-on-commit; `main`/`mcp` depend down on both. `VerifyPolicy` lives in `store`

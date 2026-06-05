@@ -332,8 +332,33 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeyCmd,
     },
+    /// Inspect signed-identity audit logs (Tier-2, only built with `--features sign`).
+    /// Currently surfaces the observed-revocation log: enforced rejections (a signed
+    /// intent was dropped because its key is revoked) and operator `declared` revokes.
+    #[cfg(feature = "sign")]
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCmd,
+    },
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
+}
+
+/// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
+/// secret-free views over the local audit logs.
+#[cfg(feature = "sign")]
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// List recorded revocation events, most-recent-first. `enforced` rows are R1
+    /// rejections actually observed; `declared` rows record an operator running
+    /// `weave key revoke`. Secret-free: fingerprints + public identities/labels only.
+    Revocations {
+        #[arg(long)]
+        json: bool,
+        /// maximum rows to show (clamped to a sane cap)
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
 }
 
 /// `weave key` subcommands (only compiled with `--features sign`, so the default
@@ -799,6 +824,19 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 obj.insert("sign_registered_keys".into(), pairs.len().into());
                 let multi = per_ident.values().filter(|&&c| c > 1).count();
                 obj.insert("sign_identities_multi_key".into(), multi.into());
+                // How many REGISTERED keys' fingerprints are currently in the
+                // revoked set (per-registered-key revoked breakdown). Reuses the same
+                // FULL-digest `fingerprint_matches` idiom as `key list`. Secret-free.
+                let hit = pairs
+                    .iter()
+                    .filter(|(_, pk)| revoked.iter().any(|e| sign::fingerprint_matches(e, pk)))
+                    .count();
+                obj.insert("sign_registered_keys_revoked".into(), hit.into());
+            }
+            // Observed-revocation audit count (#11): how many enforcement/declared
+            // events are recorded. Read-only rollup; never feeds the decision.
+            if let Ok(n) = store.count_revocations() {
+                obj.insert("sign_revocation_events".into(), n.into());
             }
             obj.insert(
                 "sign_strict_verify".into(),
@@ -917,9 +955,26 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
                 .flatten()
                 .and_then(|pk| sign::fingerprint(&pk))
                 .unwrap_or_else(|| "none".to_string());
+            // Per-registered-key revoked breakdown + observed-revocation event count
+            // (#11), both secret-free. `hit` is how many REGISTERED keys are currently
+            // in the revoked set; `events` is the audit-log size.
+            let hit = store
+                .list_keys()
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter(|(_, pk)| revoked.iter().any(|e| sign::fingerprint_matches(e, pk)))
+                        .count()
+                })
+                .unwrap_or(0);
+            let events = store.count_revocations().unwrap_or(0);
             println!(
                 "  signed id:      strict={mode}, trusted={}, revoked={}",
                 trust.len(),
+                revoked.len()
+            );
+            println!(
+                "  revoked keys:   {} in policy, {hit} registered key(s) hit, {events} event(s) logged",
                 revoked.len()
             );
             println!("  my fingerprint: {local_fp}");
@@ -2206,6 +2261,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "sign")]
         Cmd::Key { cmd } => handle_key(store, &cfg, cmd)?,
 
+        #[cfg(feature = "sign")]
+        Cmd::Audit { cmd } => handle_audit(store, cmd)?,
+
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
     Ok(())
@@ -2363,6 +2421,24 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
                     None => entry.to_string(),
                 }
             };
+            // Record a `Declared` provenance event in the local audit log so
+            // `weave audit revocations` shows operator intent (which fp was marked
+            // revoked, when, from this host) even before any enforcement fires. The
+            // config predicate remains the SOLE decision source — this row is never
+            // read by the verifier. BEST-EFFORT: a write failure prints a stderr note
+            // and does NOT fail the command (the printed config guidance is what
+            // actually revokes the key).
+            let ev = store::RevocationEvent {
+                id: 0,
+                ts: model::now(),
+                fp: normalized.clone(),
+                identity: String::new(),
+                source: String::new(),
+                kind: store::RevocationKind::Declared,
+            };
+            if let Err(e) = store.record_revocation(&ev) {
+                eprintln!("[weave] note: failed to record declared-revocation audit event: {e}");
+            }
             println!("to revoke this key, add its fingerprint to your revocation list:");
             println!("  WEAVE_REVOKED={normalized}");
             println!("or in ~/.config/weave/config.toml:");
@@ -2465,6 +2541,61 @@ fn handle_key(store: &dyn Store, cfg: &Config, cmd: KeyCmd) -> Result<()> {
                     };
                     println!("  {identity}  {fp}{suffix}");
                     println!("    {pubkey}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave audit` handler (only built with `--features sign`). Read-only, secret-free
+/// views over the local audit logs. The observed-revocation log surfaces enforced
+/// rejections + operator declared revokes; it is NEVER consulted by the verifier (the
+/// config `revoked` predicate stays the single decision source), so reading it has no
+/// bearing on R1. Output carries fingerprints + public identities/labels only.
+#[cfg(feature = "sign")]
+fn handle_audit(store: &dyn Store, cmd: AuditCmd) -> Result<()> {
+    match cmd {
+        AuditCmd::Revocations { json, limit } => {
+            let rows = store.list_revocations(limit)?;
+            if json {
+                let arr: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "ts": r.ts,
+                            "fp": r.fp,
+                            "identity": r.identity,
+                            "source": r.source,
+                            "kind": r.kind.as_str(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "revocations": arr,
+                        "count": rows.len(),
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!("0 revocation event(s)");
+            } else {
+                println!("{} revocation event(s):", rows.len());
+                for r in &rows {
+                    let id = if r.identity.is_empty() {
+                        "-"
+                    } else {
+                        &r.identity
+                    };
+                    let src = if r.source.is_empty() { "-" } else { &r.source };
+                    println!(
+                        "  {} [{}] identity={id} source={src} fp={}",
+                        model::fmt_ts(r.ts),
+                        r.kind.as_str(),
+                        r.fp
+                    );
                 }
             }
         }

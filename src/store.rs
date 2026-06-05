@@ -227,6 +227,25 @@ pub trait Store: Send {
     /// rows. Backs `weave key list`.
     #[allow(dead_code)]
     fn list_keys(&self) -> Result<Vec<(String, String)>>;
+
+    /// Append an observed/declared revocation audit event to the local `revocations`
+    /// log. Owner-only: writes the LOCAL store this process owns (the receiver
+    /// recording its own enforcement, or the operator recording a declared revoke).
+    /// Plain data in every build; only the SIGN verifier / `key revoke` calls it. The
+    /// table is READ-only with respect to the R1 decision — this is a side-effect, not
+    /// a decision input. Bound `params!`. A failure here is best-effort at the call
+    /// site (the security decision never depends on it succeeding).
+    #[allow(dead_code)]
+    fn record_revocation(&self, ev: &RevocationEvent) -> Result<()>;
+
+    /// Most-recent-first audit rows, capped at `min(limit, MAX_REVOCATIONS_LIST)`.
+    /// Backs `weave audit revocations`. Read-only; never consulted by the verifier.
+    #[allow(dead_code)]
+    fn list_revocations(&self, limit: i64) -> Result<Vec<RevocationEvent>>;
+
+    /// Total recorded revocation events (cheap `COUNT` for the doctor rollup).
+    #[allow(dead_code)]
+    fn count_revocations(&self) -> Result<i64>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -634,6 +653,96 @@ pub fn sanitize_tag(value: &str, max: usize) -> String {
 /// [`MAX_SESSIONS`] / `MAX_PEER_DBS`.
 pub const MAX_PULL_PER_DRAIN: i64 = 256;
 
+/// Maximum rows `weave audit revocations` (and the doctor rollup query) will read
+/// in one call, regardless of the caller-supplied `--limit`. Bounds the audit read
+/// the same way [`MAX_PULL_PER_DRAIN`] bounds a drain, so a large/negative limit can
+/// never trigger an unbounded scan of the (append-only, potentially long) log.
+pub const MAX_REVOCATIONS_LIST: i64 = 1000;
+
+/// Defensive upper bound on a stored `fp`/`source` string at the audit write seam.
+/// A canonical fingerprint is a fixed 71-char `SHA256:`+64hex and a source label is
+/// already a bounded path string upstream, but the audit append is best-effort and
+/// must keep a hostile/oversized value out of the table; we clamp to this length on
+/// a UTF-8 boundary before binding. Generous (covers any legitimate value) yet finite.
+pub const MAX_REVOCATION_FIELD_LEN: usize = 256;
+
+/// The kind of an observed revocation audit event. `Enforced` is recorded at the R1
+/// rejection in `verify_pulled_intent` (a signed intent that verified ONLY against a
+/// revoked key was rejected); `Declared` is recorded when an operator runs
+/// `weave key revoke` (provenance of which fingerprint was marked revoked, when).
+/// Backend-agnostic data (no I/O), stored as a small text discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "sign"), allow(dead_code))]
+pub enum RevocationKind {
+    /// An R1 rejection actually fired: a signature verified only against revoked key(s).
+    Enforced,
+    /// An operator ran `weave key revoke` for this fingerprint.
+    Declared,
+}
+
+impl RevocationKind {
+    /// Canonical on-disk discriminant (the `kind` column value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevocationKind::Enforced => "enforced",
+            RevocationKind::Declared => "declared",
+        }
+    }
+
+    /// Parse a stored discriminant back into a [`RevocationKind`]; an unknown value
+    /// (e.g. written by a future version) falls back to `Enforced` so a read never
+    /// errors on a row it does not recognise.
+    #[cfg_attr(not(feature = "sign"), allow(dead_code))]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "declared" => RevocationKind::Declared,
+            _ => RevocationKind::Enforced,
+        }
+    }
+}
+
+/// One row of the observed-revocation audit log (`revocations` table). Append-only,
+/// WRITE-on-enforce / READ-only-to-the-decision: nothing in `verify_pulled_intent`
+/// ever reads this — the config `VerifyPolicy.revoked` predicate remains the single
+/// source of truth for the R1 decision, and every `Enforced` row is *caused by* that
+/// predicate firing, so the two can never drift. Secret-free: `fp` is a fingerprint
+/// derived from a PUBLIC key, `identity`/`source` are public labels. Like [`Intent`]
+/// it is store-row data, so it lives here (not in `model`) to avoid widening `model`.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "sign"), allow(dead_code))]
+pub struct RevocationEvent {
+    /// Autoincrement row id (0 for a not-yet-inserted event being appended).
+    pub id: i64,
+    /// Receiver-stamped event time ([`model::now`]).
+    pub ts: i64,
+    /// FULL `SHA256:<64hex>` fingerprint of the revoked key. NEVER a private key; the
+    /// pubkey is public and this is the form the config revoked-set matches on.
+    pub fp: String,
+    /// Claimed sender identity for an `Enforced` event (may be `""`); `""` for a
+    /// `Declared` event.
+    pub identity: String,
+    /// Canonical source label for an `Enforced` event; `""` for a `Declared` event.
+    pub source: String,
+    /// `enforced` or `declared`.
+    pub kind: RevocationKind,
+}
+
+/// Truncate an audit field to [`MAX_REVOCATION_FIELD_LEN`] on a UTF-8 char boundary.
+/// Used at the `record_revocation` write seam (both backends) so a hostile/oversized
+/// `fp`/`identity`/`source` cannot bloat the append-only log. A clean copy when the
+/// value is already within bounds (the normal case for a 71-char fingerprint).
+#[cfg_attr(not(feature = "sign"), allow(dead_code))]
+pub fn clamp_field(s: &str) -> String {
+    if s.len() <= MAX_REVOCATION_FIELD_LEN {
+        return s.to_string();
+    }
+    let mut end = MAX_REVOCATION_FIELD_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// Clamp an untrusted limit into `[0, MAX_LIMIT]`, mapping negatives to the cap
 /// (callers that want "a lot" pass a big/negative number; they get the cap, not
 /// an unbounded scan).
@@ -719,6 +828,14 @@ CREATE TABLE IF NOT EXISTS identity_keys (
     pubkey   TEXT NOT NULL,
     added_ts INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (identity, pubkey)
+);
+CREATE TABLE IF NOT EXISTS revocations (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    fp        TEXT NOT NULL,
+    identity  TEXT NOT NULL DEFAULT '',
+    source    TEXT NOT NULL DEFAULT '',
+    kind      TEXT NOT NULL DEFAULT 'enforced'
 );
 ";
 
@@ -892,6 +1009,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         INSERT OR IGNORE INTO identity_keys (identity, pubkey, added_ts)
             SELECT identity, pubkey, 0 FROM keys;",
+    )?;
+    // Observed-revocation audit log (#11): append-only record of R1 enforcement
+    // ("a signed intent was rejected because its key is revoked") and operator
+    // `declared` revokes. Inert plain data in EVERY build (like `identity_keys`);
+    // only the sign-gated write/read code touches it. Created here for DBs that
+    // predate it; `CREATE TABLE IF NOT EXISTS` is idempotent and the DDL identifiers
+    // are constant (no user data interpolated). It is NEVER read by the verification
+    // decision — the config `revoked` predicate stays the single source of truth — so
+    // it cannot drift from or weaken R1.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS revocations (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        INTEGER NOT NULL,
+            fp        TEXT NOT NULL,
+            identity  TEXT NOT NULL DEFAULT '',
+            source    TEXT NOT NULL DEFAULT '',
+            kind      TEXT NOT NULL DEFAULT 'enforced'
+        );",
     )?;
     Ok(())
 }
@@ -1406,6 +1541,11 @@ fn verify_pulled_intent(
             return self_unsigned_or_unknown(source, policy, &keys, intent);
         }
         let mut matched_any = false;
+        // The revoked key the signature verified against (if the ONLY match is a
+        // revoked one) — captured PURELY for the best-effort audit record below. It is
+        // NEVER consulted by the decision; the `policy.is_revoked` predicate alone
+        // drives control flow, exactly as before.
+        let mut matched_revoked: Option<&String> = None;
         for pk in &keys {
             match crate::sign::verify_intent(
                 pk,
@@ -1421,6 +1561,9 @@ fn verify_pulled_intent(
                     // evaluated BEFORE any disable toggle, identical strength to the
                     // old single-key revoked check.
                     if policy.is_revoked(pk) {
+                        if matched_revoked.is_none() {
+                            matched_revoked = Some(pk);
+                        }
                         continue;
                     }
                     // A VALID signature against a CURRENT non-revoked registered key
@@ -1448,6 +1591,31 @@ fn verify_pulled_intent(
                  signature verifies but the key is REVOKED",
                 intent.id, intent.from
             );
+            // BEST-EFFORT audit side-effect, placed AFTER the decision is made (the
+            // `false` return below is unconditional). Record an `Enforced` event so an
+            // operator can see the revocation history via `weave audit revocations`.
+            // A write failure NEVER re-admits the message or changes control flow — it
+            // is logged to stderr and swallowed (same discipline as the cursor advance).
+            // The audit table is never read by the decision, so this cannot affect R1.
+            if let Some(pk) = matched_revoked {
+                let fp = crate::sign::fingerprint_full(pk)
+                    .map(|f| format!("SHA256:{f}"))
+                    .unwrap_or_default();
+                let ev = RevocationEvent {
+                    id: 0,
+                    ts: now(),
+                    fp,
+                    identity: intent.from.clone(),
+                    source: source.to_string(),
+                    kind: RevocationKind::Enforced,
+                };
+                if let Err(e) = local.record_revocation(&ev) {
+                    eprintln!(
+                        "[weave] note: failed to record revocation audit event \
+                         (message decision unaffected): {e}"
+                    );
+                }
+            }
         } else {
             // Present-but-invalid signature: verifies against NONE of the registered
             // keys ⇒ ALWAYS rejected (spoof/tamper). Preserved verbatim.
@@ -2010,6 +2178,48 @@ impl Store for SqliteStore {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    fn record_revocation(&self, ev: &RevocationEvent) -> Result<()> {
+        // Defensive clamp at the write seam: keep an oversized hostile fp/source out
+        // of the table even though both are bounded upstream. Identity is bounded by
+        // `check_ident` upstream; clamp it too for symmetry. Bound `params!` only.
+        let fp = clamp_field(&ev.fp);
+        let identity = clamp_field(&ev.identity);
+        let source = clamp_field(&ev.source);
+        self.conn.execute(
+            "INSERT INTO revocations (ts, fp, identity, source, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ev.ts, fp, identity, source, ev.kind.as_str()],
+        )?;
+        Ok(())
+    }
+
+    fn list_revocations(&self, limit: i64) -> Result<Vec<RevocationEvent>> {
+        let lim = limit.clamp(0, MAX_REVOCATIONS_LIST);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, fp, identity, source, kind FROM revocations
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![lim], |r| {
+                Ok(RevocationEvent {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    fp: r.get(2)?,
+                    identity: r.get(3)?,
+                    source: r.get(4)?,
+                    kind: RevocationKind::parse(&r.get::<_, String>(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn count_revocations(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM revocations", [], |r| r.get(0))?)
     }
 }
 
@@ -4257,5 +4467,333 @@ mod tests {
                 "new key still commits after the old fp is revoked"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #11 observed-revocation audit log (`revocations`). Plain data in EVERY
+    // build (like `identity_keys`), so the round-trip / ordering / clamp /
+    // limit / migration tests are NOT sign-gated. The R1-decision coupling
+    // tests are sign-gated (they need the verifier).
+    // -----------------------------------------------------------------------
+
+    /// `record_revocation` + `list_revocations` round-trip most-recent-first, and
+    /// `count_revocations` matches the inserted count. All fields survive verbatim.
+    #[test]
+    fn revocations_record_list_count_roundtrip() {
+        let s = mem();
+        assert_eq!(s.count_revocations().unwrap(), 0, "fresh store: no events");
+        assert!(
+            s.list_revocations(50).unwrap().is_empty(),
+            "fresh store: empty list"
+        );
+
+        let mk = |ts: i64, fp: &str, id: &str, src: &str, kind: RevocationKind| RevocationEvent {
+            id: 0,
+            ts,
+            fp: fp.to_string(),
+            identity: id.to_string(),
+            source: src.to_string(),
+            kind,
+        };
+        s.record_revocation(&mk(
+            100,
+            "SHA256:aa",
+            "alice",
+            "local:/a",
+            RevocationKind::Enforced,
+        ))
+        .unwrap();
+        s.record_revocation(&mk(200, "SHA256:bb", "", "", RevocationKind::Declared))
+            .unwrap();
+        s.record_revocation(&mk(
+            300,
+            "SHA256:cc",
+            "carol",
+            "peer:b",
+            RevocationKind::Enforced,
+        ))
+        .unwrap();
+
+        assert_eq!(s.count_revocations().unwrap(), 3);
+        let rows = s.list_revocations(50).unwrap();
+        assert_eq!(rows.len(), 3);
+        // Most-recent-first (id DESC): the last inserted is row 0.
+        assert_eq!(rows[0].fp, "SHA256:cc");
+        assert_eq!(rows[0].identity, "carol");
+        assert_eq!(rows[0].source, "peer:b");
+        assert_eq!(rows[0].kind, RevocationKind::Enforced);
+        assert_eq!(rows[1].fp, "SHA256:bb");
+        assert_eq!(rows[1].kind, RevocationKind::Declared);
+        assert_eq!(rows[1].identity, "", "empty identity round-trips");
+        assert_eq!(rows[2].fp, "SHA256:aa");
+        assert_eq!(rows[2].ts, 100);
+        assert!(
+            rows[0].id > rows[1].id && rows[1].id > rows[2].id,
+            "id DESC order"
+        );
+    }
+
+    /// `list_revocations` honors the caller `limit` and clamps it into
+    /// `[0, MAX_REVOCATIONS_LIST]`: a negative limit maps to the cap (returns all
+    /// available rows, never an unbounded/panicking scan); a small limit truncates.
+    #[test]
+    fn revocations_list_limit_is_bounded() {
+        let s = mem();
+        for i in 0..10i64 {
+            s.record_revocation(&RevocationEvent {
+                id: 0,
+                ts: i,
+                fp: format!("SHA256:{i:02}"),
+                identity: String::new(),
+                source: String::new(),
+                kind: RevocationKind::Enforced,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            s.list_revocations(3).unwrap().len(),
+            3,
+            "small limit truncates"
+        );
+        assert_eq!(s.list_revocations(0).unwrap().len(), 0, "limit 0 ⇒ no rows");
+        // A negative limit is clamped to 0 (`limit.clamp(0, MAX)`): bounded, no panic,
+        // no unbounded scan. (Differs from the `clamp_limit` "negative ⇒ cap" idiom;
+        // both are SAFE — see verifier report note. Asserting the implemented behavior.)
+        assert_eq!(
+            s.list_revocations(-1).unwrap().len(),
+            0,
+            "negative ⇒ 0 (bounded)"
+        );
+        // A limit larger than the cap is clamped to the cap, never an unbounded scan.
+        assert_eq!(
+            s.list_revocations(MAX_REVOCATIONS_LIST + 5_000)
+                .unwrap()
+                .len(),
+            10,
+            "over-cap limit clamped, returns only what exists"
+        );
+    }
+
+    /// The write-seam `clamp_field` keeps an oversized hostile `fp`/`source` out of
+    /// the table: a value past `MAX_REVOCATION_FIELD_LEN` is stored truncated (on a
+    /// UTF-8 boundary), so the append-only log cannot be bloated by one event.
+    #[test]
+    fn revocations_clamp_oversized_fields_at_seam() {
+        let s = mem();
+        let huge = "x".repeat(MAX_REVOCATION_FIELD_LEN + 500);
+        let multibyte = "é".repeat(MAX_REVOCATION_FIELD_LEN); // 2 bytes each ⇒ way over cap
+        s.record_revocation(&RevocationEvent {
+            id: 0,
+            ts: 1,
+            fp: huge.clone(),
+            identity: multibyte.clone(),
+            source: huge.clone(),
+            kind: RevocationKind::Declared,
+        })
+        .unwrap();
+        let rows = s.list_revocations(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].fp.len() <= MAX_REVOCATION_FIELD_LEN,
+            "fp clamped to cap"
+        );
+        assert!(
+            rows[0].source.len() <= MAX_REVOCATION_FIELD_LEN,
+            "source clamped to cap"
+        );
+        assert!(
+            rows[0].identity.len() <= MAX_REVOCATION_FIELD_LEN,
+            "identity clamped to cap"
+        );
+        // Clamp is on a char boundary: the stored multibyte field is valid UTF-8
+        // (the `String` could not exist otherwise) and never splits an `é`.
+        assert!(
+            rows[0].identity.chars().all(|c| c == 'é'),
+            "multibyte field truncated on a char boundary, no mojibake"
+        );
+    }
+
+    /// `clamp_field` is total: it never panics and always returns a `<= cap` string
+    /// for arbitrary inputs, including empty and exactly-at-boundary strings.
+    #[test]
+    fn clamp_field_totality_edge_cases() {
+        assert_eq!(clamp_field(""), "");
+        let at = "a".repeat(MAX_REVOCATION_FIELD_LEN);
+        assert_eq!(
+            clamp_field(&at).len(),
+            MAX_REVOCATION_FIELD_LEN,
+            "at-cap unchanged"
+        );
+        let over = "a".repeat(MAX_REVOCATION_FIELD_LEN + 1);
+        assert_eq!(
+            clamp_field(&over).len(),
+            MAX_REVOCATION_FIELD_LEN,
+            "1-over clamps"
+        );
+        // A multibyte char straddling the cap boundary truncates BELOW the cap.
+        let mut weird = "a".repeat(MAX_REVOCATION_FIELD_LEN - 1);
+        weird.push('€'); // 3-byte char crosses the boundary
+        let out = clamp_field(&weird);
+        assert!(out.len() <= MAX_REVOCATION_FIELD_LEN);
+        assert!(
+            out.is_char_boundary(out.len()),
+            "result ends on a char boundary"
+        );
+    }
+
+    /// A legacy DB that predates `revocations` gains the table idempotently on open
+    /// (mirror of the `identity_keys` legacy-migration test) with NO data loss to
+    /// the pre-existing tables; re-opening is a no-op.
+    #[test]
+    fn legacy_db_gains_revocations_table() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-rev-legacy-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        // A pre-#11 store: messages with a row, NO revocations table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                    sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT, body TEXT NOT NULL
+                 );
+                 INSERT INTO messages (ts, sender, recipient, subject, body)
+                 VALUES (1, 'a', 'b', NULL, 'pre-existing');",
+            )
+            .unwrap();
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type='table' AND name='revocations')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "fixture must predate the revocations table");
+        }
+        // First open runs the migration: the table exists and works, and the
+        // pre-existing message survived (no data loss).
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.count_revocations().unwrap(), 0, "table created, empty");
+            s.record_revocation(&RevocationEvent {
+                id: 0,
+                ts: 5,
+                fp: "SHA256:zz".into(),
+                identity: "id".into(),
+                source: "src".into(),
+                kind: RevocationKind::Declared,
+            })
+            .unwrap();
+            assert_eq!(s.count_revocations().unwrap(), 1);
+            let (rows, _) = s.inbox("b", true, false, 50).unwrap();
+            assert_eq!(rows.len(), 1, "pre-existing message survived migration");
+        }
+        // Re-open: idempotent, no duplicate-table error, prior row retained.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(
+                s.count_revocations().unwrap(),
+                1,
+                "re-open is a no-op; the recorded event persists"
+            );
+        }
+    }
+
+    /// R1-UNCHANGED (sqlite): a signed intent that verifies ONLY against a revoked
+    /// key is STILL rejected, AND the rejection records EXACTLY ONE `Enforced` audit
+    /// row (right fp/identity/source/kind) on the receiver's LOCAL store. The audit
+    /// write is post-decision: the commit count is unchanged whether or not a row is
+    /// appended, proving the verifier never reads the table.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn r1_reject_records_one_enforced_event_decision_unchanged() {
+        use crate::sign::{fingerprint_full, sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let alice = SigningKey::from_bytes(&[55u8; 32]);
+        let alice_pk = to_hex(alice.verifying_key().as_bytes());
+        let alice_full = format!("SHA256:{}", fingerprint_full(&alice_pk).unwrap());
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-r1audit-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Source store with a signed intent from alice for bob.
+        let src_path = dir.join("src.db");
+        let sa = SqliteStore::open(&src_path).unwrap();
+        let sig = sign_intent(&alice, "alice", "bob", "revoked-hello");
+        sa.enqueue_intent("bob", "", "alice", None, "revoked-hello", &sig)
+            .unwrap();
+        let source = StoreSource::Local(src_path);
+
+        // Receiver B registers alice's key but REVOKES its fingerprint.
+        let b = SqliteStore::open(&dir.join("b.db")).unwrap();
+        b.register_key("alice", &alice_pk).unwrap();
+        let revoke = VerifyPolicy {
+            strict_override: None,
+            trust: vec![],
+            revoked: vec![alice_full.clone()],
+        };
+
+        // DECISION: still REJECT (commit count 0) — byte-identical to pre-audit.
+        let res = pull_from_store(&b, "bob", std::slice::from_ref(&source), &revoke).unwrap();
+        assert_eq!(
+            res.committed, 0,
+            "R1: revoked-only sig REJECTED (unchanged)"
+        );
+
+        // SIDE-EFFECT: exactly ONE Enforced audit row with the right facts.
+        let rows = b.list_revocations(50).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one Enforced event recorded on reject"
+        );
+        assert_eq!(rows[0].kind, RevocationKind::Enforced);
+        assert_eq!(rows[0].identity, "alice", "claimed identity captured");
+        assert_eq!(
+            rows[0].fp, alice_full,
+            "the FULL revoked fingerprint is recorded"
+        );
+        assert!(!rows[0].source.is_empty(), "source label captured");
+    }
+
+    /// R1-UNCHANGED (sqlite): a NON-revoked signed intent COMMITS and records NO
+    /// audit event — the audit log only grows on an actual enforcement, never on the
+    /// happy path, so the decision and the log are independent.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn non_revoked_commit_records_no_event() {
+        use crate::sign::{sign_intent, to_hex};
+        use ed25519_dalek::SigningKey;
+
+        let alice = SigningKey::from_bytes(&[66u8; 32]);
+        let alice_pk = to_hex(alice.verifying_key().as_bytes());
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-r1noaudit-{}-{}", std::process::id(), now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("src.db");
+        let sa = SqliteStore::open(&src_path).unwrap();
+        let sig = sign_intent(&alice, "alice", "bob", "clean-hello");
+        sa.enqueue_intent("bob", "", "alice", None, "clean-hello", &sig)
+            .unwrap();
+        let source = StoreSource::Local(src_path);
+
+        let b = SqliteStore::open(&dir.join("b.db")).unwrap();
+        b.register_key("alice", &alice_pk).unwrap();
+        let advisory = VerifyPolicy::advisory();
+        let res = pull_from_store(&b, "bob", std::slice::from_ref(&source), &advisory).unwrap();
+        assert_eq!(
+            res.committed, 1,
+            "non-revoked signed intent COMMITS (unchanged)"
+        );
+        assert_eq!(
+            b.count_revocations().unwrap(),
+            0,
+            "no enforcement ⇒ no audit row; decision independent of the log"
+        );
     }
 }

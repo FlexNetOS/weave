@@ -108,6 +108,15 @@ fastest layer and carry most of the injector and store coverage.
   forged⇒reject / revoked-good⇒reject is byte-identical to the #3 single-key model.
   Both seed keys from **fixed bytes** (`SigningKey::from_bytes(&[seed; 32])`, never
   `OsRng`), and ed25519 verify is RNG-free, so they are bit-stable across repeat runs.
+  The **observed-revocation audit log** (#11) adds a `record/list/count_revocations`
+  roundtrip (most-recent-first ordering, `--limit` clamp, declared/enforced kinds), an
+  idempotent-migration case (a pre-#11 DB without `revocations` gains the table on
+  open, a second open is a no-op — mirroring the `identity_keys` legacy migration), and
+  the **R1-independence** assertion: the revoked-key REJECT decision is unchanged and
+  exactly one `enforced` row is recorded on the rejection, proving the best-effort
+  audit write never feeds back into `verify_pulled_intent`. The libSQL backend mirrors
+  the roundtrip/migration and proves `record_revocation` **traps on a read-only handle**
+  (owner-only-writes).
   Because the store-internals
   tests touch backend internals (`s.conn.execute`, the concrete `SqliteStore`),
   that module is gated to the `sqlite` feature — see the dual-backend note below
@@ -407,8 +416,13 @@ between semi-trusted agent sessions:
   still cannot verify (R1 holds even when other registered keys exist for the same
   identity), and no private-key bytes appear in any `key list` / `key remove` /
   `doctor` output (only pubkeys, fingerprints, and per-identity counts are surfaced).
-  The `--features "libsql sign"` column proves the same security parity on the alt
-  backend.
+  For the #11 revocation audit log: `weave audit revocations` (and `--json`) output is
+  **secret-free** (no private-key hex, no full peer pubkey — only `SHA256:` fingerprints,
+  public identities/source labels, kinds, and counts) and **bounded** (`--limit` past
+  the cap returns ≤ cap rows; an oversized fp/source is clamped at the write seam), and
+  the `weave_doctor` / `weave doctor` verify summary surfaces counts + the own
+  fingerprint only. The `--features "libsql sign"` column proves the same security
+  parity on the alt backend.
 
 ## 4. Property-based tests (`tests/prop.rs`)
 

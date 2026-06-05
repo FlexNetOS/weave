@@ -5764,3 +5764,253 @@ fn key_add_appends_and_remove_prunes_one_through_binary() {
     let _ = std::fs::remove_dir_all(&gb_cfg);
     let _ = std::fs::remove_dir_all(&b_cfg);
 }
+
+// ---------------------------------------------------------------------------
+// #11 observed-revocation audit log (A) + doctor/MCP verify-summary (B/C).
+// All `--features sign`, hermetic (scrubbed env, temp WEAVE_DB, isolated
+// XDG_CONFIG_HOME), driving the COMPILED binary through the CLI / MCP seams.
+// ---------------------------------------------------------------------------
+
+/// `weave audit revocations` on a fresh store: human says "0 revocation event(s)"
+/// and `--json` is well-formed with `count:0` and an empty array.
+#[cfg(feature = "sign")]
+#[test]
+fn audit_revocations_empty_store_human_and_json() {
+    let db = TestDb::new();
+    let human = run_ok(&db, &["audit", "revocations"]);
+    assert!(
+        human.contains("0 revocation event(s)"),
+        "empty audit human output: {human}"
+    );
+    let json = run_ok(&db, &["audit", "revocations", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("audit --json parses");
+    assert_eq!(v["count"], 0, "empty store: count 0");
+    assert!(
+        v["revocations"].as_array().unwrap().is_empty(),
+        "empty store: empty array"
+    );
+}
+
+/// `weave key revoke <pubkey>` records a `declared` audit event that
+/// `weave audit revocations` then surfaces (fp == the normalized full digest the
+/// command echoes), secret-free, in both human and `--json` form.
+#[cfg(feature = "sign")]
+#[test]
+fn key_revoke_records_declared_event_visible_in_audit() {
+    let gen = TestDb::new();
+    let cfg = sign_config_home_it();
+    let cfg_s = cfg.to_string_lossy().into_owned();
+
+    let pubkey = pubkey_from_gen(&run_ok_env(
+        &gen,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &cfg_s)],
+    ));
+    let secret = std::fs::read_to_string(cfg.join("weave").join("ed25519.key")).expect("key file");
+    let secret = secret.trim().to_string();
+
+    // Revoke records a `declared` event into THIS db's audit log + echoes the full fp.
+    let revoke = run_ok_env(
+        &gen,
+        &["key", "revoke", &pubkey],
+        &[("XDG_CONFIG_HOME", &cfg_s)],
+    );
+    let full_fp = revoke
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("WEAVE_REVOKED="))
+        .map(|s| s.trim().to_string())
+        .expect("revoke echoes the full fingerprint");
+
+    let json = run_ok(&gen, &["audit", "revocations", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("audit --json parses");
+    assert_eq!(v["count"], 1, "one declared event recorded: {json}");
+    let row = &v["revocations"][0];
+    assert_eq!(row["kind"], "declared");
+    assert_eq!(
+        row["fp"], full_fp,
+        "the declared fp matches the echoed full digest"
+    );
+    assert_eq!(row["identity"], "", "declared event has empty identity");
+
+    // Secret-free: the private key never appears in audit output.
+    assert!(
+        !json.contains(&secret),
+        "the private key must never appear in `audit revocations --json`"
+    );
+    let human = run_ok(&gen, &["audit", "revocations"]);
+    assert!(
+        human.contains("[declared]"),
+        "human shows the declared event: {human}"
+    );
+    assert!(
+        !human.contains(&secret),
+        "the private key must never appear in `audit revocations`"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+/// CLI `weave doctor` (sign build) surfaces the revoked-registered + revocation-event
+/// breakdown, in both human and `--json`. After registering a key and declaring its
+/// revocation, the count is reflected; output stays secret-free.
+#[cfg(feature = "sign")]
+#[test]
+fn doctor_shows_revoked_and_revocation_event_breakdown() {
+    let gen = TestDb::new();
+    let b = TestDb::new();
+    let gen_cfg = sign_config_home_it();
+    let b_cfg = sign_config_home_it();
+    let gen_cfg_s = gen_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    let pubkey = pubkey_from_gen(&run_ok_env(
+        &gen,
+        &["key", "gen", "--me", "alice"],
+        &[("XDG_CONFIG_HOME", &gen_cfg_s)],
+    ));
+    // B registers alice's key, then declares it revoked (records a declared event).
+    run_ok_env(
+        &b,
+        &["key", "add", "alice", &pubkey],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let full_fp = full_fp_of_registered(&b, &b_cfg_s, &pubkey);
+
+    // doctor --json carries the new sign fields; with the fp revoked, the registered
+    // key is counted as hit, and one declared event was logged.
+    let json = run_ok_env(
+        &b,
+        &["doctor", "--json"],
+        &[("WEAVE_REVOKED", &full_fp), ("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).expect("doctor --json parses");
+    assert_eq!(
+        v["sign_registered_keys_revoked"], 1,
+        "the registered key whose fp is revoked is counted: {json}"
+    );
+    assert!(
+        v["sign_revocation_events"].as_i64().unwrap() >= 1,
+        "the declared event is reflected in the rollup: {json}"
+    );
+
+    // doctor human shows the `revoked keys:` line.
+    let human = run_ok_env(
+        &b,
+        &["doctor"],
+        &[("WEAVE_REVOKED", &full_fp), ("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert!(
+        human.contains("revoked keys:") && human.contains("event(s) logged"),
+        "doctor human surfaces the revoked/event breakdown: {human}"
+    );
+
+    let _ = std::fs::remove_dir_all(&gen_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+/// MCP `weave_doctor` (sign build) emits the verify-summary section (mirrors the CLI
+/// human fields) as part of the tool RESULT — never an error, no panic — and is
+/// SECRET-FREE. Also covers the edge path: a store with ZERO registered keys returns
+/// a well-formed summary (counts 0) rather than failing.
+#[cfg(feature = "sign")]
+#[test]
+fn mcp_weave_doctor_emits_secret_free_sign_summary() {
+    // Edge path first: zero keys, no trust config — summary still well-formed.
+    {
+        let db = TestDb::new();
+        let mut mcp = McpServer::spawn(&db);
+        let (is_err, text) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+        assert!(
+            !is_err,
+            "weave_doctor must not be an error on an empty store: {text}"
+        );
+        assert!(
+            text.contains("signed id:"),
+            "the sign verify-summary section is present: {text}"
+        );
+        assert!(
+            text.contains("revocation log:"),
+            "the revocation-log rollup line is present: {text}"
+        );
+        assert!(
+            text.contains("revocation log: 0 event"),
+            "zero events on a fresh store: {text}"
+        );
+        assert!(
+            text.contains("my fingerprint:"),
+            "the own-fingerprint line is present: {text}"
+        );
+        mcp.shutdown();
+    }
+
+    // With a generated key + a declared revoke, the summary reflects state and stays
+    // secret-free (the private key bytes must never appear in the RESULT frame).
+    {
+        let db = TestDb::new();
+        let cfg = sign_config_home_it();
+        let cfg_s = cfg.to_string_lossy().into_owned();
+        let pubkey = pubkey_from_gen(&run_ok_env(
+            &db,
+            &["key", "gen", "--me", "alice"],
+            &[("XDG_CONFIG_HOME", &cfg_s)],
+        ));
+        let secret =
+            std::fs::read_to_string(cfg.join("weave").join("ed25519.key")).expect("key file");
+        let secret = secret.trim().to_string();
+        // Register a peer key + declare a revoke so registry/log counts are non-trivial.
+        run_ok_env(
+            &db,
+            &["key", "add", "alice", &pubkey],
+            &[("XDG_CONFIG_HOME", &cfg_s)],
+        );
+        run_ok_env(
+            &db,
+            &["key", "revoke", &pubkey],
+            &[("XDG_CONFIG_HOME", &cfg_s)],
+        );
+
+        let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", &cfg_s)]);
+        let (is_err, text) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+        assert!(!is_err, "weave_doctor not an error: {text}");
+        assert!(text.contains("signed id:"), "sign summary present: {text}");
+        assert!(
+            text.contains("key registry:"),
+            "registry line present: {text}"
+        );
+        assert!(
+            text.contains("revocation log:"),
+            "revocation log line present: {text}"
+        );
+        // SECRET-FREE: the private key must never appear in the MCP RESULT frame.
+        assert!(
+            !text.contains(&secret),
+            "the private key must never appear in the weave_doctor RESULT"
+        );
+        mcp.shutdown();
+        let _ = std::fs::remove_dir_all(&cfg);
+    }
+}
+
+/// MCP stdout discipline (sign build): with the sign verify-summary active, the
+/// `weave_doctor` exchange still emits ONLY well-formed JSON-RPC frames on stdout —
+/// every line parses as JSON and carries the matching response id (no stray
+/// diagnostics leaked from the new summary block).
+#[cfg(feature = "sign")]
+#[test]
+fn mcp_weave_doctor_stdout_is_pure_jsonrpc() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    // call_tool already asserts: a single response line that parses as JSON with the
+    // matching id and no `error` (see McpServer::request). A diagnostic written to
+    // stdout would either fail JSON parse or break the id match, panicking the test.
+    let (is_err, text) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+    assert!(
+        !is_err,
+        "weave_doctor result is a clean JSON-RPC frame: {text}"
+    );
+    assert!(
+        text.contains("signed id:"),
+        "summary rode the RESULT frame: {text}"
+    );
+    mcp.shutdown();
+}
