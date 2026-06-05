@@ -64,7 +64,11 @@ fastest layer and carry most of the injector and store coverage.
   `now_ts`), so the integration layer needs no wall-clock backdate hack. A
   **delegation regression-lock** asserts `liveness_for(p, &this_host(), now()) !=
   Stale` equals `is_alive(p)` over every regime peer, proving the truth table is
-  unchanged.
+  unchanged. A second delegation lock asserts
+  `liveness_for(p, this_host, now_ts) == liveness_from_fields(&p.host, p.pid,
+  p.last_seen, this_host, now_ts)` over the same fixed-host/now matrix, proving the
+  field-level seam the dashboard render uses is byte-identical to the full-`Peer`
+  path.
   and the federation surface — `open_readonly` reads but cannot write (and never
   creates a missing file), `federated_peers` unions local + foreign and isolates a
   bad store, plus the pure `merge_peer_views` / `merge_session_views`
@@ -241,7 +245,14 @@ Coverage:
   trailing `summary: N local-alive, M remote-alive, K stale` count line matches the
   rows. Because the forced foreign `HOSTNAME` differs from this host, the
   remote-alive case needs **no backdate / wall-clock** seam (remote-stale is locked
-  at the pure `liveness_for` layer above, with a fixed `now_ts`).
+  at the pure `liveness_for` layer above, with a fixed `now_ts`). The **same**
+  forced-`HOSTNAME` foreign-store fixture drives the parallel surfacing on the
+  other three surfaces: `peers --json` carries the additive `liveness` (token) +
+  `remote` (bool) keys (and the human row its ` <remote>` marker + `[reason]`);
+  `doctor --json` carries `peers_alive_local` / `peers_alive_remote` /
+  `peers_stale` (and the human `liveness:` three-count line); and `sessions --watch
+  --iterations 1` prints the per-row `[reason]` + the three-count header — one
+  liveness vocabulary asserted identically across all four surfaces.
 
 - **Read-only federation.** With `WEAVE_PEER_DBS` set to a second store, a foreign
   peer/session surfaces in `peers`/`sessions --json` with `origin`=<store label>
@@ -477,21 +488,33 @@ render** and a **bounded** driver — every timing-bounded test is bounded by
 **iteration count, never a wall-clock assertion**:
 
 - **Pure render unit tests (in `src/main.rs` `#[cfg(test)]`):**
-  `render_sessions_dashboard(rows, opts, now)` is a pure function, so the frame is
-  asserted from hand-built `SessionRow`s against a **fixed `now`** (never
-  `model::now()` / the wall clock), making output byte-deterministic. Cases cover
-  grouping by `(repo, branch)`, the header summary counts (sessions / alive /
-  #repos / #branches), per-group alive/total, the `--repo`/`--branch` filter echo,
-  `+N more` truncation past the row budget, the empty-snapshot `no sessions` body,
-  the empty-tag `-` rendering, and ANSI-on vs. plain (the only byte difference is
-  the `\x1b[2J\x1b[H` clear-home prefix).
+  `render_sessions_dashboard(rows, opts, this_host, now)` is a pure function, so
+  the frame is asserted from hand-built `SessionRow`s against a **fixed `now` + a
+  fixed `this_host`** (never `model::now()` / the real hostname / the wall clock),
+  making output byte-deterministic — the dashboard classifies each row's liveness
+  itself via `liveness_from_fields`, so the host-aware verdict is fully determined
+  by the two pinned inputs. Cases cover grouping by `(repo, branch)`, the header
+  three-count breakdown (`N local-alive, M remote-alive, K stale` + #repos /
+  #branches), per-group alive/total, the `--repo`/`--branch` filter echo, `+N more`
+  truncation past the row budget, the empty-snapshot `no sessions` body, the
+  empty-tag `-` rendering, and ANSI-on vs. plain (the only byte difference is the
+  `\x1b[2J\x1b[H` clear-home prefix). A dedicated mixed-liveness case forces
+  `this_host` to a non-matching host so a row whose `host` differs reads
+  `alive (remote, ttl)` + the ` <remote>` marker deterministically (a same-host
+  pid-bearing row asserts the membership set `pid|stale` since it probes the live
+  test pid — never an exact same-host verdict), and asserts the three-count header.
 - **Bounded integration path (`tests/integration.rs`, via `CARGO_BIN_EXE_weave` +
   scrubbed env + temp `WEAVE_DB`):** `weave sessions --watch --iterations 1` (and
   `--iterations N` for multi-frame) renders exactly N frames and **exits 0** — the
   harness `run_ok` *returning at all* proves there is no hang, with **no `sleep`
   to "wait for" a frame** and no elapsed-time assertion. The frame is asserted to
-  carry both peer names and a group header; `--watch --repo`/`--branch` narrows
-  it; `--watch --json` emits a single snapshot with **no clear prefix**.
+  carry both peer names, a group header, the per-row `[<reason>]` marker, and the
+  `N local-alive, M remote-alive, K stale` three-count header; a remote-host row
+  (and its ` <remote>` marker + `[alive (remote, ttl)]` reason) is driven by the
+  same forced-`HOSTNAME` + `WEAVE_PEER_DBS` foreign-store fixture the `scan`
+  remote-surfacing test uses, so the remote verdict needs no wall-clock backdate.
+  `--watch --repo`/`--branch` narrows it; `--watch --json` emits a single snapshot
+  with **no clear prefix**.
 - **Read-only proof:** capture the `WEAVE_DB` file bytes before and after
   `weave sessions --watch --iterations 3` with **no explicit identity** (so even
   the one pre-loop self-refresh is skipped) and assert the store is byte-unchanged

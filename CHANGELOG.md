@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased] — host-aware liveness on `peers` / `doctor` / `sessions --watch`
+
+> Pure observability/consistency upgrade: **no new dependency, no schema/migration,
+> no `Store`-trait or SQL change**, and the `is_alive` truth table is **unchanged**.
+> Extends #6's host-aware liveness vocabulary (the `<remote>` marker, the
+> `alive (local, pid)` / `alive (local, ttl)` / `alive (remote, ttl)` / `stale`
+> reasons, and the `N local-alive, M remote-alive, K stale` breakdown) from
+> `weave scan` to the three remaining presence surfaces, so all four speak one
+> language. Display-only; both backends gain only the pure delegation unit test.
+
+### Added
+- **cli:** `weave peers` now marks a remote-host row with a ` <remote>` marker and
+  prints its host-aware liveness reason in `[…]` (consistent with `weave scan`);
+  `--json` gains two additive keys — `liveness` (the stable token
+  `alive_local`/`alive_remote`/`stale`) and `remote` (bool, `host != this_host`).
+- **cli:** `weave doctor` gains a `liveness:` line —
+  `N local-alive, M remote-alive, K stale` — and three additive `--json` counts,
+  `peers_alive_local` / `peers_alive_remote` / `peers_stale` (siblings of the
+  existing `peers` / `peers_online` / `peers_tagged`).
+- **cli:** the `weave sessions --watch` dashboard shows the per-row liveness reason
+  + ` <remote>` marker on each row, and its header now carries the same
+  three-count `N local-alive, M remote-alive, K stale` breakdown.
+- **mcp:** `weave_peers` and `weave_doctor` mirror the same markers, reason
+  strings, and three-count summary in their text results (stdout discipline
+  preserved — JSON-RPC frames only; diagnostics to stderr).
+- **store:** pure `liveness_from_fields(host, pid, last_seen, this_host, now_ts)`
+  field-level seam under `liveness_for` (which now delegates to it, byte-identical),
+  letting the pure dashboard render classify a `SessionRow` from its loose fields
+  without fabricating a `Peer`. No `Store`-trait/SQL/schema change; lives once in
+  `store.rs` and is shared by both backends.
+
 ## [Unreleased] — multi-key-per-identity registry (true rotation overlap)
 
 > **No new dependency.** Additive, guarded, idempotent schema migration in **both**

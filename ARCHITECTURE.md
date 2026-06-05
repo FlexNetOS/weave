@@ -549,13 +549,37 @@ real `this_host()`/`now()`, so every existing bool call site (`peers`,
 truth table is unchanged; the enum only adds an observability dimension
 (local-vs-remote + reason) on top of the same alive/stale boundary.
 
-#### Scan surfaces the liveness reason
+#### The liveness reason is surfaced uniformly across all four presence surfaces
 
 `weave scan` (and the `weave_scan` MCP tool) consume `liveness_for` per row to
 distinguish remote-host sessions and show *why* a peer is alive — a `<remote>`
 marker, a per-row reason string, additive `--json` keys, and a `summary` count
 line (see README). Cross-machine liveness inherits the same `ONLINE_TTL_SECS` =
 900 s freshness window: a remote peer seen within 15 minutes is presumed alive.
+
+That **same** vocabulary is now surfaced UNIFORMLY across the other three
+presence surfaces — `weave peers`, `weave doctor`, and the `sessions --watch`
+dashboard (plus the `weave_peers` / `weave_doctor` MCP mirrors) — so all four
+read the one classifier and speak one language. This is **display-only**: the
+`is_alive` truth table is unchanged (each surface's alive count is still
+`!matches!(liveness, Stale)`); no schema, SQL, or `Store`-trait change.
+
+- **`peers`** prints the ` <remote>` marker + `[<reason>]` per row and adds the
+  `"liveness"` (token) / `"remote"` (bool) keys to `--json`.
+- **`doctor`** computes the three counts in one pass over `views` via
+  `liveness_for` and emits a `liveness:` line plus the `--json` keys
+  `peers_alive_local` / `peers_alive_remote` / `peers_stale`.
+- **`sessions --watch`** classifies each row inside the **pure** render.
+
+Because the dashboard render holds only loose `SessionRow` fields (not a full
+`Peer`), `liveness_for` is now a thin wrapper over a field-level seam,
+`liveness_from_fields(host, pid, last_seen, this_host, now_ts) -> Liveness`. The
+render delegates to it, so the dashboard classifies a `SessionRow`
+**deterministically from `(now, this_host)`** with byte-identical results to a
+full-`Peer` `liveness_for` call — no behavior change to either path. The render
+takes `this_host` (and `now`) as parameters, keeping the pure-render seam intact
+(the only env-dependence is the same-host PID probe, gated to the local arm,
+exactly as `scan`).
 
 Read paths keep `last_seen` warm: `weave peers` and a long-lived `weave watch`
 each refresh presence (heartbeat-on-read, explicit-identity only) so a session
@@ -569,11 +593,14 @@ grouped by `(repo, branch)` — on a fixed interval. The design keeps weave
 dependency-light and the loop testable:
 
 - **Pure render seam.** A single pure function
-  `render_sessions_dashboard(snapshot, opts, now) -> String` does all formatting:
-  no I/O, no clock (the `now` is passed in), no sleep. The impure watch loop only
-  re-reads a snapshot, calls the pure renderer, prints, and sleeps. This mirrors
-  the `commands_for` purity discipline — the renderer is unit-testable from
-  hand-built rows against a fixed `now`, with no store and no terminal.
+  `render_sessions_dashboard(rows, opts, this_host, now) -> String` does all
+  formatting: no I/O, no clock (the `now` is passed in), no sleep. The impure
+  watch loop only re-reads a snapshot, calls the pure renderer, prints, and
+  sleeps. This mirrors the `commands_for` purity discipline — the renderer is
+  unit-testable from hand-built rows against a **fixed `now` + fixed `this_host`**,
+  with no store and no terminal. Each `SessionRow` carries `pid` / `last_seen`
+  (not a precomputed `alive` bool) so the render classifies liveness itself via
+  `liveness_from_fields`, deterministically from `(now, this_host)`.
 - **Std-only loop, no new dependency.** The loop is `std::thread::sleep` between
   frames; the in-place redraw is a plain ANSI clear-home literal
   (`\x1b[2J\x1b[H`) gated by `std::io::IsTerminal` on stdout **and** `NO_COLOR` /

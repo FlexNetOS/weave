@@ -51,7 +51,7 @@ messages into the agent's context on its next turn (auto-delivery without a mult
 ```bash
 weave register --name desktop        # register this session (captures pane from $TMUX_PANE/$ZELLIJ_SESSION_NAME)
 weave attach --name desktop          # adopt a *running* session into the store WITHOUT restarting (re-capture pane)
-weave peers                          # list peers + whether each is alive + injectable (now with repo/branch/worktree tags)
+weave peers                          # list peers + host-aware liveness reason + remote marker + injectable + tags
 weave scan                           # refresh your own git tags, then list every (federated) peer + liveness + tags
 weave scan --repo weave --branch feat/x --json   # filter by exact repo/branch tag; machine-readable output
 weave sessions --watch               # live read-only presence dashboard, grouped by repo then branch (Ctrl-C to stop)
@@ -122,6 +122,28 @@ inherited cross-machine, so a peer seen within 15 minutes reads online.
 The same repo/branch/worktree tags also appear in `weave peers`, `weave sessions`
 (via a local-only display join), and the `weave doctor` `peers_tagged` count.
 
+**One liveness language across `scan` / `peers` / `doctor` / `sessions --watch`.**
+The exact same host-aware vocabulary `scan` uses — the machine tokens
+`"alive_local"` / `"alive_remote"` / `"stale"`, the human reasons
+`alive (local, pid)` / `alive (local, ttl)` / `alive (remote, ttl)` / `stale`,
+the ` <remote>` marker, and the `N local-alive, M remote-alive, K stale`
+breakdown — is now surfaced **uniformly** on the other three presence surfaces:
+
+- **`weave peers`** marks a remote row with ` <remote>` and prints its liveness
+  reason in brackets (between the `[online|offline]` presence token and the
+  existing `[target]` token); `--json` gains the two additive keys
+  `"liveness"` (the stable token) and `"remote"` (bool, `host != this_host`).
+- **`weave doctor`** prints a `liveness:` line —
+  `N local-alive, M remote-alive, K stale` — and `--json` gains the three sibling
+  counts `"peers_alive_local"` / `"peers_alive_remote"` / `"peers_stale"`
+  (alongside the existing `"peers"` / `"peers_online"` / `"peers_tagged"`).
+- **`weave sessions --watch`** shows the per-row reason marker + ` <remote>` on
+  each dashboard row and the three-count breakdown in its header (see below).
+
+This is display-only — the `is_alive` truth table is unchanged; every surface
+reads the same pure classifier (`store::liveness_for`), so all four speak one
+consistent liveness language.
+
 **Session tags** (repo, branch, worktree id) are captured **best-effort** from
 the session's cwd at registration and refreshed on `scan`: the worktree id comes
 from the cwd's `.git` (the `.git/worktrees/<name>` segment for a linked worktree,
@@ -153,14 +175,18 @@ identity is explicit), so observing presence never perturbs it.
 | `--json` | off | with `--watch`, emit a **single** JSON snapshot (no loop, no clear-screen) and exit |
 
 The frame is a **header summary** —
-`weave sessions [<ts>] — N session(s), A alive, R repo(s), B branch(es)` (with any
-active `repo=…`/`branch=…` filters echoed) — followed by one section per
-`(repo, branch)` group in sorted order. Each section header reads
+`weave sessions [<ts>] — N session(s), A local-alive, B remote-alive, C stale, R repo(s), D branch(es)`
+(with any active `repo=…`/`branch=…` filters echoed) — i.e. the **same**
+three-count liveness breakdown `weave scan` / `weave doctor` print, followed by
+one section per `(repo, branch)` group in sorted order. Each section header reads
 `[<repo> / <branch>] G session(s), GA alive` (an empty tag renders as `-`), and
-each row is `  <name> [alive|offline] worktree=… mux=… host=…`, plus ` (via <store>)`
-for a federated peer from another store. A group exceeding the per-section row
-budget (20) prints the first 20 rows then a `  +N more` line. An empty snapshot
-renders the zeroed header plus `no sessions`.
+each row is `  <name>[ <remote>] [<reason>] worktree=… mux=… host=…`, plus
+` (via <store>)` for a federated peer from another store. The per-row `<reason>`
+is the same vocabulary as `scan` — `alive (local, pid)` / `alive (local, ttl)` /
+`alive (remote, ttl)` / `stale` — and a remote-host row carries the ` <remote>`
+marker. A group exceeding the per-section row budget (20) prints the first 20
+rows then a `  +N more` line. An empty snapshot renders the zeroed header plus
+`no sessions`.
 
 The dashboard is **dependency-light** (std-only): the loop is
 `std::thread::sleep` between frames, and the in-place redraw uses a plain ANSI

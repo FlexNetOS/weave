@@ -734,6 +734,10 @@ fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, St
     if views.is_empty() {
         return Ok("No peers registered yet. Sessions register via `weave hook session`.".into());
     }
+    // Host-aware liveness reason per peer (A2 vocabulary, display-only); mirrors
+    // `weave scan` / `weave_scan`. Never a cross-machine probe; secret-free.
+    let this_host = crate::config::this_host();
+    let now_ts = crate::model::now();
     let mut out = format!("Registered peers ({}):", views.len());
     for v in views {
         let p = &v.peer;
@@ -743,6 +747,14 @@ fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, St
             "no-inject"
         };
         let presence = if is_alive(p) { "online" } else { "offline" };
+        let liveness = store::liveness_for(p, &this_host, now_ts);
+        let reason = match liveness {
+            store::Liveness::AliveLocal if p.pid.is_some() => "alive (local, pid)",
+            store::Liveness::AliveLocal => "alive (local, ttl)",
+            store::Liveness::AliveRemote => "alive (remote, ttl)",
+            store::Liveness::Stale => "stale",
+        };
+        let remote_marker = if p.host != this_host { " <remote>" } else { "" };
         let via = if v.origin.is_foreign() {
             format!(" (via {})", v.origin.label())
         } else {
@@ -750,7 +762,7 @@ fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, St
         };
         let tags = fmt_peer_tags(p);
         out.push_str(&format!(
-            "\n  • {} [{presence}] [{}] {} ({inj}){tags} seen {}{via}",
+            "\n  • {}{remote_marker} [{presence}] [{reason}] [{}] {} ({inj}){tags} seen {}{via}",
             p.name,
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
@@ -1024,6 +1036,20 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     let views = store::federated_peers(store, extra_dbs).map_err(e)?;
     let total_peers = views.len();
     let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    // Host-aware liveness breakdown over the peer set (A2 vocabulary, display-only),
+    // mirroring `weave doctor`. Deterministic given this_host/now; secret-free.
+    let this_host = crate::config::this_host();
+    let now_ts = crate::model::now();
+    let mut peers_alive_local = 0usize;
+    let mut peers_alive_remote = 0usize;
+    let mut peers_stale = 0usize;
+    for v in &views {
+        match store::liveness_for(&v.peer, &this_host, now_ts) {
+            store::Liveness::AliveLocal => peers_alive_local += 1,
+            store::Liveness::AliveRemote => peers_alive_remote += 1,
+            store::Liveness::Stale => peers_stale += 1,
+        }
+    }
     let (fed_ok, fed_skipped) = store::federation_status(extra_dbs);
     let total = store.total_messages().map_err(e)?;
     let claude = inject::have("claude");
@@ -1047,6 +1073,9 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     out.push_str(&format!("\n  messages:       {total}"));
     out.push_str(&format!(
         "\n  peers:          {total_peers} ({online} online)"
+    ));
+    out.push_str(&format!(
+        "\n  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
     ));
     out.push_str(&format!(
         "\n  claude on PATH: {}",
