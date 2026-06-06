@@ -228,6 +228,13 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// only show peers in this circle (default: your own circle; an
+        /// orchestrator defaults to mesh-wide)
+        #[arg(long)]
+        circle: Option<String>,
+        /// show peers in every circle (mesh-wide)
+        #[arg(long)]
+        all_circles: bool,
     },
     /// List known sessions with unread counts. With `--watch`, render a read-only
     /// presence dashboard (grouped by repo then branch) that re-renders every
@@ -252,6 +259,13 @@ enum Cmd {
         /// only show sessions whose branch tag equals this value
         #[arg(long)]
         branch: Option<String>,
+        /// only show sessions in this circle (default: your own circle; an
+        /// orchestrator defaults to mesh-wide)
+        #[arg(long)]
+        circle: Option<String>,
+        /// show sessions in every circle (mesh-wide)
+        #[arg(long)]
+        all_circles: bool,
     },
     /// Scan, identify, and tag running sessions: refresh your own row's git tags,
     /// then list every (federated) peer joined with liveness and its
@@ -266,6 +280,13 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// only show peers in this circle (default: your own circle; an
+        /// orchestrator defaults to mesh-wide)
+        #[arg(long)]
+        circle: Option<String>,
+        /// show peers in every circle (mesh-wide)
+        #[arg(long)]
+        all_circles: bool,
     },
     /// Delete messages older than the given age (retention / disk guard).
     Gc {
@@ -410,6 +431,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: JobCmd,
     },
+    /// Per-circle orchestrator role (P4): claim the single coordinator slot for a
+    /// circle, or report who currently holds it.
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: OrchestratorCmd,
+    },
     /// Configuration helpers.
     Config {
         #[command(subcommand)]
@@ -539,6 +566,33 @@ enum ConfigCmd {
     /// Scaffold a commented ~/.config/weave/config.toml. Never overwrites an
     /// existing file, so it is safe to run repeatedly.
     Init,
+}
+
+/// `weave orchestrator` subcommands (P4). The per-circle coordinator slot is a
+/// pure DB role bit; `claim` promotes the caller (refused if a LIVE holder
+/// exists unless `--force` steals it), `status` reports the live holder.
+#[derive(Subcommand)]
+enum OrchestratorCmd {
+    /// Claim the orchestrator role for a circle. Refused if a DIFFERENT live
+    /// orchestrator already holds it, unless `--force` steals the role (a
+    /// non-destructive role-bit flip; the demoted peer can re-claim).
+    Claim {
+        /// circle to claim (defaults to your own circle)
+        #[arg(long)]
+        circle: Option<String>,
+        /// steal the role even from a live orchestrator
+        #[arg(long)]
+        force: bool,
+        /// claim under this identity (defaults to config/$WEAVE_SESSION/cwd)
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Report the live orchestrator of a circle (or that none is present).
+    Status {
+        /// circle to query (defaults to your own circle)
+        #[arg(long)]
+        circle: Option<String>,
+    },
 }
 
 /// `weave job` subcommands — the P3 poll-only board: create/list/show/status/claim/
@@ -744,6 +798,47 @@ fn resolve_me_explicit(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> 
         .map(|s| s.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     (name, false)
+}
+
+/// Resolve the effective circle for a `peers`/`sessions`/`scan` listing (P4),
+/// returning `None` for "no filter" (mesh-wide). Precedence (repowire's
+/// list_peers scoping, ported daemon-free):
+///
+/// 1. an explicit `--circle <name>` (`"*"` ⇒ mesh-wide) wins;
+/// 2. `--all-circles` ⇒ mesh-wide;
+/// 3. else if the caller's OWN peer row is `role='orchestrator'` ⇒ mesh-wide
+///    (an orchestrator has cross-circle visibility);
+/// 4. else the caller's own circle (`cfg.circle()`).
+///
+/// Backward-compat: with everyone in `"default"`, no flag, and a non-orchestrator
+/// caller, this returns `Some("default")` which keeps every default-circle row ⇒
+/// byte-identical to pre-P4.
+fn resolve_list_circle(
+    store: &dyn Store,
+    cfg: &Config,
+    me: &str,
+    circle: Option<&str>,
+    all_circles: bool,
+) -> Option<String> {
+    if let Some(c) = circle.filter(|s| !s.trim().is_empty()) {
+        let c = c.trim();
+        if c == "*" {
+            return None;
+        }
+        return Some(model::circle_or_default(c).to_string());
+    }
+    if all_circles {
+        return None;
+    }
+    // An orchestrator caller defaults to mesh-wide. One indexed lookup on the hot
+    // path (comparable to refresh_presence's touch); a read failure falls back to
+    // the caller's own circle (never widens visibility on error).
+    if let Ok(Some(p)) = store.get_peer(me) {
+        if model::PeerRole::from_str(&p.role) == Ok(model::PeerRole::Orchestrator) {
+            return None;
+        }
+    }
+    Some(cfg.circle())
 }
 
 /// Refresh this session's presence (heartbeat) at the start of a command, but
@@ -2132,6 +2227,8 @@ fn main() -> Result<()> {
 
         Cmd::Job { cmd } => dispatch_job(store, &cfg, cmd)?,
 
+        Cmd::Orchestrator { cmd } => dispatch_orchestrator(store, &cfg, cmd)?,
+
         Cmd::Thread { root, limit, json } => {
             let rows = store.thread(root, limit)?;
             if json {
@@ -2246,19 +2343,33 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Peers { json } => {
+        Cmd::Peers {
+            json,
+            circle,
+            all_circles,
+        } => {
             // A1 heartbeat-on-read: listing peers is a cheap, frequently-hit path,
             // so use it to keep our own `last_seen` warm. Best-effort and explicit-
             // identity-only (refresh_presence guards both): a heartbeat write failure
             // must never abort the read.
             let (me, explicit) = resolve_me_explicit(None, None, &cfg);
             refresh_presence(store, &me, explicit);
+            // P4 circle scope: resolve the effective circle (explicit flag wins,
+            // then --all-circles, then an orchestrator caller goes mesh-wide, else
+            // the caller's own circle). `None` ⇒ no filter (mesh-wide).
+            let effective = resolve_list_circle(store, &cfg, &me, circle.as_deref(), all_circles);
             // Tier-1 federation: union the local peers with any configured
             // read-only extra stores, origin-tagged. Default (no WEAVE_PEER_DBS /
             // [federation] peer_dbs) ⇒ `extra` is empty ⇒ output is the local
             // listing tagged `local`, byte-identical to single-store behavior.
             let extra = cfg.peer_db_sources();
-            let views = store::federated_peers(store, &extra)?;
+            let mut views = store::federated_peers(store, &extra)?;
+            // Caller-side circle filter over the merged views (federation
+            // composes). With everyone in "default" and no flag, this keeps every
+            // row ⇒ byte-identical to pre-P4.
+            if let Some(target) = effective.as_deref() {
+                views.retain(|v| model::circle_or_default(&v.peer.circle) == target);
+            }
             // Host-aware liveness reason per peer (A2 vocabulary, display-only):
             // reinterpret the already-pulled read-only rows; never a cross-machine
             // probe. Deterministic given the captured this_host/now.
@@ -2276,6 +2387,8 @@ fn main() -> Result<()> {
                             "last_seen": p.last_seen,
                             "pid": p.pid, "host": p.host,
                             "repo": p.repo, "branch": p.branch, "worktree": p.worktree_id,
+                            "circle": model::circle_or_default(&p.circle),
+                            "role": p.role,
                             "online": is_alive(p),
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
@@ -2327,6 +2440,8 @@ fn main() -> Result<()> {
             iterations,
             repo,
             branch,
+            circle,
+            all_circles,
         } if watch => {
             // Presence dashboard (read-only). Groups federated PEER rows (which carry
             // repo/branch/worktree + liveness, unlike SessionView) by repo→branch.
@@ -2350,11 +2465,14 @@ fn main() -> Result<()> {
                     &tags.repo,
                     &tags.branch,
                     &tags.worktree_id,
+                    &cfg.circle(),
                 ) {
                     eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
                 }
             }
             let extra = cfg.peer_db_sources();
+            // P4 circle scope (resolved once; the snapshot closure applies it).
+            let effective = resolve_list_circle(store, &cfg, &me, circle.as_deref(), all_circles);
 
             // Build one snapshot (read-only) from federated peers, applying the same
             // exact-match repo/branch filters as `scan`. Closure so the loop re-reads
@@ -2366,6 +2484,9 @@ fn main() -> Result<()> {
                 }
                 if let Some(b) = branch.as_deref() {
                     views.retain(|v| v.peer.branch == b);
+                }
+                if let Some(target) = effective.as_deref() {
+                    views.retain(|v| model::circle_or_default(&v.peer.circle) == target);
                 }
                 Ok(dashboard_rows(&views))
             };
@@ -2424,18 +2545,38 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Sessions { json, .. } => {
+        Cmd::Sessions {
+            json,
+            circle,
+            all_circles,
+            ..
+        } => {
             // Tier-1 federation: union local sessions with read-only extra stores,
             // origin-tagged. Foreign sessions are kept distinct (no unread summing —
             // Tier 1 has no cross-store inbox). Default ⇒ identical-to-today.
             let extra = cfg.peer_db_sources();
-            let views = store::federated_sessions(store, &extra)?;
+            let mut views = store::federated_sessions(store, &extra)?;
             // Display-layer tag join (purely additive, no schema/trait/federation
             // change): SessionView is message-derived and carries no git tags, so we
             // look up the LOCAL peer by session name and attach repo/branch/worktree
             // for display only. Only the local store's peers are consulted (never
             // foreign rows), and a session without a registered peer shows `-`/empty.
             let local_peers = local_peer_tag_map(store);
+            // P4 circle scope: a session's circle is its registered local peer's
+            // circle (a session with no peer row classifies as "default" via
+            // circle_or_default). With everyone in "default" and no flag this keeps
+            // every row ⇒ byte-identical to pre-P4.
+            let (me, _) = resolve_me_explicit(None, None, &cfg);
+            let effective = resolve_list_circle(store, &cfg, &me, circle.as_deref(), all_circles);
+            if let Some(target) = effective.as_deref() {
+                views.retain(|v| {
+                    let c = local_peers
+                        .get(&v.name)
+                        .map(|p| p.circle.as_str())
+                        .unwrap_or("");
+                    model::circle_or_default(c) == target
+                });
+            }
             if json {
                 let arr: Vec<_> = views
                     .iter()
@@ -2444,9 +2585,19 @@ fn main() -> Result<()> {
                             .get(&v.name)
                             .map(|p| (p.repo.clone(), p.branch.clone(), p.worktree_id.clone()))
                             .unwrap_or_default();
+                        let (circle, role) = local_peers
+                            .get(&v.name)
+                            .map(|p| {
+                                (
+                                    model::circle_or_default(&p.circle).to_string(),
+                                    p.role.clone(),
+                                )
+                            })
+                            .unwrap_or_else(|| (model::DEFAULT_CIRCLE.to_string(), String::new()));
                         serde_json::json!({
                             "name": v.name, "unread": v.unread, "last_activity": v.last_activity,
                             "repo": repo, "branch": branch, "worktree": worktree,
+                            "circle": circle, "role": role,
                             "origin": v.origin.label(), "foreign": v.origin.is_foreign(),
                         })
                     })
@@ -2476,7 +2627,13 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Scan { repo, branch, json } => {
+        Cmd::Scan {
+            repo,
+            branch,
+            json,
+            circle,
+            all_circles,
+        } => {
             // Owner-only-writes: refresh ONLY the caller's own row (re-capture this
             // session's git tags + presence and upsert under our own identity),
             // exactly like attach. We never re-register a foreign/federated row.
@@ -2499,6 +2656,7 @@ fn main() -> Result<()> {
                     &tags.repo,
                     &tags.branch,
                     &tags.worktree_id,
+                    &cfg.circle(),
                 ) {
                     eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
                 }
@@ -2512,6 +2670,12 @@ fn main() -> Result<()> {
             }
             if let Some(b) = branch.as_deref() {
                 views.retain(|v| v.peer.branch == b);
+            }
+            // P4 circle scope (caller-side filter; federation composes). With
+            // everyone in "default" and no flag this keeps every row.
+            let effective = resolve_list_circle(store, &cfg, &me, circle.as_deref(), all_circles);
+            if let Some(target) = effective.as_deref() {
+                views.retain(|v| model::circle_or_default(&v.peer.circle) == target);
             }
             // Host-aware liveness reason per row (pure A2 reinterpretation of the
             // already-pulled read-only rows; never a cross-machine probe).
@@ -2531,6 +2695,8 @@ fn main() -> Result<()> {
                             "mux": p.mux,
                             "pane": p.target,
                             "host": p.host,
+                            "circle": model::circle_or_default(&p.circle),
+                            "role": p.role,
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
@@ -2617,6 +2783,7 @@ fn main() -> Result<()> {
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
+                &cfg.circle(),
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -2665,6 +2832,7 @@ fn main() -> Result<()> {
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
+                &cfg.circle(),
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -2737,6 +2905,52 @@ fn main() -> Result<()> {
         Cmd::Audit { cmd } => handle_audit(store, cmd)?,
 
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
+    }
+    Ok(())
+}
+
+/// `weave orchestrator` handler (P4). Routes claim/status through the SAME store
+/// methods the MCP tools use, so the force-demote transaction and the
+/// `is_alive`-reuse liveness verdict are enforced once, in the store. No injector
+/// involvement (a role is a pure DB bit; nothing is nudged or spawned).
+fn dispatch_orchestrator(store: &dyn Store, cfg: &Config, cmd: OrchestratorCmd) -> Result<()> {
+    match cmd {
+        OrchestratorCmd::Claim {
+            circle,
+            force,
+            from,
+        } => {
+            let me = resolve_me(from, None, cfg);
+            store::check_ident("name", &me)?;
+            match store.claim_orchestrator_role(&me, circle.as_deref(), force)? {
+                model::ClaimOutcome::Claimed { circle, demoted } => {
+                    println!("claimed role=orchestrator for '{me}' in circle '{circle}'");
+                    if !demoted.is_empty() {
+                        println!("demoted: {}", demoted.join(", "));
+                    }
+                }
+                model::ClaimOutcome::Refused { circle, holder } => {
+                    println!(
+                        "refused: '{holder}' is the live orchestrator in circle '{circle}' (pass --force to steal)"
+                    );
+                }
+            }
+        }
+        OrchestratorCmd::Status { circle } => {
+            // Default the status query to the caller's own circle when no circle is
+            // given (so `weave orchestrator status` reports YOUR circle).
+            let effective = circle.or_else(|| Some(cfg.circle()));
+            let st = store.orchestrator_status(effective.as_deref())?;
+            match st.holder {
+                Some(h) if st.present => {
+                    println!(
+                        "orchestrator present in circle '{}': '{}' (online)",
+                        st.circle, h.name
+                    );
+                }
+                _ => println!("no live orchestrator in circle '{}'", st.circle),
+            }
+        }
     }
     Ok(())
 }
@@ -3355,6 +3569,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
+                &cfg.circle(),
             )?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must
@@ -3684,6 +3899,8 @@ mod tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
+            circle: model::DEFAULT_CIRCLE.to_string(),
+            role: model::PeerRole::Peer.as_str().to_string(),
         };
         let cases: &[(&str, Option<i64>, i64)] = &[
             ("h1", None, now),                               // same host, recent, no pid

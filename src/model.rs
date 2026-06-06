@@ -796,6 +796,120 @@ pub struct JobResultView {
     pub completed_ts: Option<i64>,
 }
 
+/// Hard upper bound (in chars) on a circle label. A circle is a small grouping
+/// tag (a visibility-scoping label), never a path or shell token, so 64 is more
+/// than enough; the cap exists to reject a hostile/oversized value before it is
+/// bound into a query or stored (the `MAX_IDENT`/`MAX_ASK_ID_LEN` analog).
+pub const MAX_CIRCLE_LEN: usize = 64;
+
+/// The semantic default circle. Legacy rows, empty values, and any peer that
+/// never set `WEAVE_CIRCLE`/`config.circle` classify here, so a single-circle
+/// (pre-P4) deployment behaves byte-identically.
+pub const DEFAULT_CIRCLE: &str = "default";
+
+/// Validate a circle label. Accepts a non-empty, `<= MAX_CIRCLE_LEN` string of
+/// ASCII `[A-Za-z0-9_-]` only — a grouping label, never a path/shell token. This
+/// is the `ask_id_valid` analog (it additionally allows `-`); it guards every
+/// store/MCP/CLI surface that takes a user-supplied circle so a metachar-bearing
+/// or oversized value is rejected before any DB bind (defense-in-depth even
+/// though all SQL is parameterized; a circle never reaches a shell).
+pub fn circle_valid(c: &str) -> bool {
+    !c.is_empty()
+        && c.len() <= MAX_CIRCLE_LEN
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Normalize a stored/legacy circle value: an empty string (a pre-P4 row, or a
+/// stray blank) materializes the [`DEFAULT_CIRCLE`]. Defense-in-depth — the
+/// column default is already `'default'`, but reads coalesce so even a blank
+/// value classifies into the default circle.
+pub fn circle_or_default(c: &str) -> &str {
+    if c.is_empty() {
+        DEFAULT_CIRCLE
+    } else {
+        c
+    }
+}
+
+/// The coordination role of a peer within its circle. A deliberately
+/// two-variant enum stored as TEXT in `peers.role` (the [`AskState`]/`JobState`
+/// precedent): `Peer` (the default; a plain participant scoped to its own
+/// circle) and `Orchestrator` (the single per-circle coordinator with mesh-wide
+/// default visibility). Stored through `as_str`/`from_str` so a future epic can
+/// ADD variants with no schema migration. `role` is an ENUM, never free text —
+/// the only path to `Orchestrator` is `claim_orchestrator_role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerRole {
+    /// A plain participant, scoped to its own circle. The default for every
+    /// fresh registration.
+    #[default]
+    Peer,
+    /// The single coordinator of a circle; gets mesh-wide default visibility.
+    Orchestrator,
+}
+
+impl PeerRole {
+    /// Canonical lowercase label stored in the `peers.role` TEXT column. The only
+    /// inlined SQL "literals" for role are derived from this (compile-time
+    /// constants, never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerRole::Peer => "peer",
+            PeerRole::Orchestrator => "orchestrator",
+        }
+    }
+
+    /// Parse a stored role string back into the enum. An empty value (a legacy
+    /// pre-P4 row) coalesces to the default `Peer`; any other unknown value is a
+    /// hard error at the store mapper (never a panic, never silently coerced) so
+    /// a corrupt/foreign row surfaces loudly.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "" | "peer" => Ok(PeerRole::Peer),
+            "orchestrator" => Ok(PeerRole::Orchestrator),
+            other => Err(format!("unknown peer role '{other}'")),
+        }
+    }
+}
+
+/// serde default for [`Peer::circle`] so older JSON payloads (which omit the
+/// field) deserialize to the [`DEFAULT_CIRCLE`].
+fn default_circle() -> String {
+    DEFAULT_CIRCLE.to_string()
+}
+
+/// The outcome of a [`claim_orchestrator_role`](crate::store::Store::claim_orchestrator_role)
+/// call, rendered by the MCP/CLI surface. A `Refused` is a clean, expected verdict
+/// (a live holder blocks an unforced claim), NOT an error. Pure data (no I/O).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "lowercase")]
+pub enum ClaimOutcome {
+    /// The caller now holds the orchestrator role for `circle`. `demoted` lists
+    /// any prior orchestrators that were demoted to `peer` in the same claim
+    /// (empty on a no-contest or idempotent re-claim).
+    Claimed {
+        circle: String,
+        demoted: Vec<String>,
+    },
+    /// A different LIVE orchestrator already holds the circle and `force` was not
+    /// set; the claim was refused without any write. `holder` is the live holder.
+    Refused { circle: String, holder: String },
+}
+
+/// The result of an [`orchestrator_status`](crate::store::Store::orchestrator_status)
+/// query for a circle. `present` is true iff a LIVE (`role='orchestrator'` AND
+/// `is_alive`) holder exists; `holder` is the most-recently-seen live one. Pure
+/// data (no I/O), shared by the store + the mcp/main consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorStatus {
+    pub circle: String,
+    pub present: bool,
+    #[serde(default)]
+    pub holder: Option<Peer>,
+}
+
 /// A session that has registered itself, with where (if anywhere) it can be
 /// injected into.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,6 +966,24 @@ pub struct Peer {
     /// `git worktree list`'s path column). Additive + backward-compatible.
     #[serde(default)]
     pub worktree_id: String,
+    /// Visibility-scoping circle this session belongs to (P4). Captured at
+    /// registration from `WEAVE_CIRCLE`/`config.circle`; defaults to
+    /// [`DEFAULT_CIRCLE`]. Reads normalize empty/legacy values through
+    /// [`circle_or_default`]. Additive + backward-compatible: DBs created before
+    /// the `circle` column migration read back as `"default"` (the column
+    /// default), and `#[serde(default = "default_circle")]` keeps older JSON
+    /// payloads (which omit the field) deserializable into the default circle.
+    #[serde(default = "default_circle")]
+    pub circle: String,
+    /// Coordination role label within the circle (P4): `"peer"` (default) or
+    /// `"orchestrator"`. Stored as the TEXT label and mapped through [`PeerRole`]
+    /// at the store-read seam (the `Job.visibility`-is-a-plain-`String`
+    /// precedent). NEVER set at registration — only `claim_orchestrator_role`
+    /// promotes a row to `"orchestrator"`. Additive + backward-compatible: legacy
+    /// rows read back as `"peer"`. `#[serde(default)]` (an empty string ⇒
+    /// `PeerRole::Peer`) keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub role: String,
 }
 
 #[cfg(test)]
@@ -1035,6 +1167,44 @@ mod tests {
         assert_eq!(AskRole::parse("ASKEE"), AskRole::Askee);
         assert_eq!(AskRole::parse(""), AskRole::Any);
         assert_eq!(AskRole::parse("garbage"), AskRole::Any);
+    }
+
+    // ---- P4: PeerRole + circle validators ----
+
+    #[test]
+    fn peer_role_round_trips_and_unknown_is_err() {
+        for r in [PeerRole::Peer, PeerRole::Orchestrator] {
+            assert_eq!(PeerRole::from_str(r.as_str()), Ok(r));
+        }
+        // A legacy empty value coalesces to the default `Peer`.
+        assert_eq!(PeerRole::from_str(""), Ok(PeerRole::Peer));
+        // Any other unknown value is a hard error (never silently coerced).
+        assert!(PeerRole::from_str("admin").is_err());
+        assert!(PeerRole::from_str("Orchestrator").is_err());
+        assert_eq!(PeerRole::default(), PeerRole::Peer);
+    }
+
+    #[test]
+    fn circle_valid_accepts_good_rejects_bad() {
+        assert!(circle_valid("default"));
+        assert!(circle_valid("team-a"));
+        assert!(circle_valid("ops_1"));
+        assert!(circle_valid(&"x".repeat(MAX_CIRCLE_LEN)));
+        // empty / oversized / metachar are rejected.
+        assert!(!circle_valid(""));
+        assert!(!circle_valid(&"x".repeat(MAX_CIRCLE_LEN + 1)));
+        for bad in [
+            "a b", "a/b", "a;b", "a$b", "a`b", "a\nb", "a'b", "a\"b", "a|b",
+        ] {
+            assert!(!circle_valid(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn circle_or_default_maps_empty_to_default() {
+        assert_eq!(circle_or_default(""), DEFAULT_CIRCLE);
+        assert_eq!(circle_or_default("team"), "team");
+        assert_eq!(DEFAULT_CIRCLE, "default");
     }
 
     // ---- proptest: lifecycle monotonicity + correlation-id validity totality ----
@@ -1241,6 +1411,22 @@ mod tests {
                 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
             prop_assert_eq!(got, expect);
             if s.bytes().any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b' ' | b'\n' | b'\'' | b'"')) {
+                prop_assert!(!got);
+            }
+        }
+
+        /// CIRCLE-VALIDITY TOTALITY (P4): `circle_valid` never panics on arbitrary
+        /// input and its verdict matches the contract (non-empty, ≤ cap, ASCII
+        /// `[A-Za-z0-9_-]`); a metachar/oversized/empty circle is always rejected —
+        /// the `ask_id_valid_is_total`/`job_id_valid_is_total` precedent.
+        #[test]
+        fn circle_valid_is_total(s in ".*") {
+            let got = circle_valid(&s);
+            let expect = !s.is_empty()
+                && s.len() <= MAX_CIRCLE_LEN
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            prop_assert_eq!(got, expect);
+            if s.bytes().any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b' ' | b'\n' | b'\'' | b'"' | b'/')) {
                 prop_assert!(!got);
             }
         }

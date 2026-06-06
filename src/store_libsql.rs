@@ -39,12 +39,12 @@ use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
-    AskManyChildView, AskManyResult, AskRole, AskState, Intent, Job, JobFilter, JobPatch,
-    JobResultView, JobSpec, JobState, Message, Peer, BROADCAST_SQL,
+    AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, Intent, Job, JobFilter,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, BROADCAST_SQL,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
-    clamp_field, clamp_limit, commit_pulled, job_result_view, merge_peer_views,
+    clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view, merge_peer_views,
     merge_session_views, remote_scheme_host, reply_subject, sanitize_tag, store_label,
     validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
     RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
@@ -85,7 +85,9 @@ const SCHEMA: &[&str] = &[
         host        TEXT NOT NULL DEFAULT '',
         repo        TEXT NOT NULL DEFAULT '',
         branch      TEXT NOT NULL DEFAULT '',
-        worktree_id TEXT NOT NULL DEFAULT ''
+        worktree_id TEXT NOT NULL DEFAULT '',
+        circle      TEXT NOT NULL DEFAULT 'default',
+        role        TEXT NOT NULL DEFAULT 'peer'
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -339,7 +341,7 @@ fn row_to_job(r: &libsql::Row) -> Result<Job> {
 }
 
 /// Column order: name, mux, target, socket, cwd, last_seen, pid, host, repo,
-/// branch, worktree_id.
+/// branch, worktree_id, circle, role.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
     Ok(Peer {
         name: r.get::<String>(0)?,
@@ -353,6 +355,8 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         repo: r.get::<String>(8)?,
         branch: r.get::<String>(9)?,
         worktree_id: r.get::<String>(10)?,
+        circle: r.get::<String>(11)?,
+        role: r.get::<String>(12)?,
     })
 }
 
@@ -484,6 +488,25 @@ impl LibsqlStore {
                 if it.next().await?.is_none() {
                     let ddl =
                         format!("ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''");
+                    conn.execute(&ddl, ())
+                        .await
+                        .with_context(|| format!("adding {col} column"))?;
+                }
+            }
+            // Migration (P4): a DB created before circles + orchestrator role lacks
+            // the `peers.circle` / `peers.role` columns. Add each idempotently
+            // (mirrors SqliteStore::migrate). `circle` defaults to the non-empty
+            // literal 'default' (legacy rows classify into the default circle with
+            // no runtime coalesce); `role` defaults to 'peer' (legacy rows are plain
+            // participants). The col names and the default literals are constant DDL
+            // (no user data interpolated).
+            for (col, default) in [("circle", "default"), ("role", "peer")] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('peers') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    let ddl = format!(
+                        "ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}'"
+                    );
                     conn.execute(&ddl, ())
                         .await
                         .with_context(|| format!("adding {col} column"))?;
@@ -1446,6 +1469,7 @@ impl Store for LibsqlStore {
         repo: &str,
         branch: &str,
         worktree_id: &str,
+        circle: &str,
     ) -> Result<()> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
@@ -1454,12 +1478,22 @@ impl Store for LibsqlStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // Re-validate the circle at the store seam (defense-in-depth, mirroring
+        // the sqlite backend): an invalid value falls back to the default circle.
+        let circle = if crate::model::circle_valid(circle) {
+            circle.to_string()
+        } else {
+            crate::model::DEFAULT_CIRCLE.to_string()
+        };
         self.rt.block_on(async {
+            // `role` is INTENTIONALLY omitted from both the column list and the
+            // ON CONFLICT SET: a NEW row gets the table default ('peer'); an upsert
+            // leaves `role` untouched so a re-register never demotes an orchestrator.
             self.conn
                 .execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11",
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11, circle=?12",
                     params(vec![
                         name.into(),
                         mux.into(),
@@ -1472,6 +1506,7 @@ impl Store for LibsqlStore {
                         repo.into(),
                         branch.into(),
                         worktree_id.into(),
+                        circle.into(),
                     ]),
                 )
                 .await?;
@@ -1484,7 +1519,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -1501,7 +1536,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -1510,6 +1545,138 @@ impl Store for LibsqlStore {
                 out.push(row_to_peer(&r)?);
             }
             Ok(out)
+        })
+    }
+
+    fn claim_orchestrator_role(
+        &self,
+        me: &str,
+        circle: Option<&str>,
+        force: bool,
+    ) -> Result<ClaimOutcome> {
+        self.guard_writable()?;
+        check_ident("peer name", me)?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            // The caller must already be registered.
+            let my_circle: Option<String> = {
+                let mut it = tx
+                    .query(
+                        "SELECT circle FROM peers WHERE name=?1",
+                        params(vec![me.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(r.get::<String>(0)?),
+                    None => None,
+                }
+            };
+            let my_circle = match my_circle {
+                Some(c) => c,
+                None => anyhow::bail!("peer '{me}' is not registered"),
+            };
+            let target = match circle {
+                Some(c) => crate::model::circle_or_default(c).to_string(),
+                None => crate::model::circle_or_default(&my_circle).to_string(),
+            };
+            // Current orchestrators in the circle.
+            let holders: Vec<Peer> = {
+                let mut it = tx
+                    .query(
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+                        (),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(r) = it.next().await? {
+                    let p = row_to_peer(&r)?;
+                    if crate::model::circle_or_default(&p.circle) == target {
+                        out.push(p);
+                    }
+                }
+                out
+            };
+            // A DIFFERENT live holder blocks an unforced claim.
+            if !force {
+                if let Some(live) = holders
+                    .iter()
+                    .filter(|p| p.name != me && is_alive(p))
+                    .max_by_key(|p| p.last_seen)
+                {
+                    return Ok(ClaimOutcome::Refused {
+                        circle: target,
+                        holder: live.name.clone(),
+                    });
+                }
+            }
+            // Demote every OTHER orchestrator in the circle, then promote the caller.
+            let mut demoted = Vec::new();
+            for p in &holders {
+                if p.name != me {
+                    tx.execute(
+                        "UPDATE peers SET role=?1 WHERE name=?2",
+                        params(vec![
+                            crate::model::PeerRole::Peer.as_str().into(),
+                            p.name.clone().into(),
+                        ]),
+                    )
+                    .await?;
+                    demoted.push(p.name.clone());
+                }
+            }
+            tx.execute(
+                "UPDATE peers SET role=?1, circle=?2 WHERE name=?3",
+                params(vec![
+                    crate::model::PeerRole::Orchestrator.as_str().into(),
+                    target.clone().into(),
+                    me.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            demoted.sort();
+            Ok(ClaimOutcome::Claimed {
+                circle: target,
+                demoted,
+            })
+        })
+    }
+
+    fn orchestrator_status(&self, circle: Option<&str>) -> Result<OrchestratorStatus> {
+        let target = circle
+            .map(crate::model::circle_or_default)
+            .unwrap_or(crate::model::DEFAULT_CIRCLE)
+            .to_string();
+        // SELECT-only; bounded on a remote handle.
+        self.block_on_bounded(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+                    (),
+                )
+                .await?;
+            let mut holder: Option<Peer> = None;
+            while let Some(r) = it.next().await? {
+                let p = row_to_peer(&r)?;
+                if crate::model::circle_or_default(&p.circle) == target
+                    && is_alive(&p)
+                    && holder
+                        .as_ref()
+                        .map(|h| p.last_seen > h.last_seen)
+                        .unwrap_or(true)
+                {
+                    holder = Some(p);
+                }
+            }
+            Ok(OrchestratorStatus {
+                circle: target,
+                present: holder.is_some(),
+                holder,
+            })
         })
     }
 
@@ -3433,6 +3600,7 @@ mod tests {
             "weave",
             "main",
             "(main)",
+            "default",
         )
         .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -3445,8 +3613,20 @@ mod tests {
         assert_eq!(lp.pid, Some(4321));
         assert_eq!(lp.host, "boxA");
         // Upsert overwrites pid/host (and a None pid clears it).
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB", "", "", "")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%3",
+            "",
+            Some("/w"),
+            None,
+            "boxB",
+            "",
+            "",
+            "",
+            "default",
+        )
+        .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p2.pid, None);
         assert_eq!(p2.host, "boxB");
@@ -3519,11 +3699,145 @@ mod tests {
         assert_eq!(p.host, "", "legacy row reads host:'' after migration");
         // Re-opening is idempotent and a fresh full register works on the upgrade.
         let s2 = LibsqlStore::open(&cfg).unwrap();
-        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h", "", "", "")
-            .unwrap();
+        s2.register_peer_full(
+            "new",
+            "tmux",
+            "%2",
+            "",
+            None,
+            Some(7),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+        )
+        .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
         assert_eq!(nrow.pid, Some(7));
         assert_eq!(nrow.host, "h");
+    }
+
+    /// P4 (libSQL mirror): a pre-P4 peers table (no circle/role) migrates in place;
+    /// a legacy row reads circle='default'/role='peer'; re-open is a no-op.
+    #[test]
+    fn legacy_db_without_circle_role_migrates_in_place() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-circle-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-circle.db");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Builder::new_local(&path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            // A post-tags but pre-P4 peers table.
+            conn.execute(
+                "CREATE TABLE peers (
+                    name        TEXT PRIMARY KEY,
+                    mux         TEXT NOT NULL,
+                    target      TEXT NOT NULL,
+                    socket      TEXT NOT NULL DEFAULT '',
+                    cwd         TEXT,
+                    last_seen   INTEGER NOT NULL,
+                    pid         INTEGER,
+                    host        TEXT NOT NULL DEFAULT '',
+                    repo        TEXT NOT NULL DEFAULT '',
+                    branch      TEXT NOT NULL DEFAULT '',
+                    worktree_id TEXT NOT NULL DEFAULT ''
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1, 42, 'h', '', '', '')",
+                params(vec![now().into()]),
+            )
+            .await
+            .unwrap();
+        });
+        drop(rt);
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let old = s.get_peer("old").unwrap().unwrap();
+        assert_eq!(old.circle, "default");
+        assert_eq!(old.role, "peer");
+        // Re-open is idempotent.
+        let s2 = LibsqlStore::open(&cfg).unwrap();
+        assert!(s2.get_peer("old").unwrap().is_some());
+    }
+
+    /// P4 (libSQL mirror): register round-trips the circle and a re-register
+    /// preserves an orchestrator role.
+    #[test]
+    fn register_roundtrips_circle_and_preserves_role() {
+        let s = mem();
+        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+            .unwrap();
+        assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
+        s.claim_orchestrator_role("p", None, false).unwrap();
+        assert_eq!(s.get_peer("p").unwrap().unwrap().role, "orchestrator");
+        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+            .unwrap();
+        assert_eq!(
+            s.get_peer("p").unwrap().unwrap().role,
+            "orchestrator",
+            "a re-register must not demote an orchestrator"
+        );
+    }
+
+    /// P4 (libSQL mirror): claim refuses a non-force claim while a LIVE holder
+    /// exists, and force steals (demoting the prior holder).
+    #[test]
+    fn claim_refuses_live_holder_then_force_steals() {
+        let s = mem();
+        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        assert!(matches!(
+            s.claim_orchestrator_role("a", None, false).unwrap(),
+            crate::model::ClaimOutcome::Claimed { .. }
+        ));
+        match s.claim_orchestrator_role("b", None, false).unwrap() {
+            crate::model::ClaimOutcome::Refused { holder, .. } => assert_eq!(holder, "a"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        match s.claim_orchestrator_role("b", None, true).unwrap() {
+            crate::model::ClaimOutcome::Claimed { demoted, .. } => {
+                assert_eq!(demoted, vec!["a".to_string()])
+            }
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+        assert_eq!(s.get_peer("a").unwrap().unwrap().role, "peer");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "orchestrator");
+        assert!(s.claim_orchestrator_role("ghost", None, false).is_err());
+    }
+
+    /// P4 (libSQL mirror): `orchestrator_status` reuses `is_alive` — a fresh holder
+    /// reads present; an empty circle reads absent.
+    #[test]
+    fn orchestrator_status_present_and_absent() {
+        let s = mem();
+        s.register_peer_full("o", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        s.claim_orchestrator_role("o", None, false).unwrap();
+        let st = s.orchestrator_status(Some("c1")).unwrap();
+        assert!(st.present);
+        assert_eq!(st.holder.unwrap().name, "o");
+        let st2 = s.orchestrator_status(Some("empty")).unwrap();
+        assert!(!st2.present);
     }
 
     /// A libSQL DB whose `peers` table predates the session-tag columns (no `repo`,
@@ -3610,6 +3924,7 @@ mod tests {
             "weave",
             "feat/x",
             "wt-9",
+            "default",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -3662,6 +3977,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -3681,6 +3997,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -3702,6 +4019,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -3722,6 +4040,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -3762,14 +4081,17 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let local = s.get_peer("local").unwrap().unwrap();
         assert_eq!(liveness_for(&local, &this, now_ts), Liveness::AliveLocal);
 
         // same-host + null pid + recent => AliveLocal (TTL fallback).
-        s.register_peer_full("nullpid", "tmux", "%2", "", None, None, &this, "", "", "")
-            .unwrap();
+        s.register_peer_full(
+            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default",
+        )
+        .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
         assert_eq!(liveness_for(&nullpid, &this, now_ts), Liveness::AliveLocal);
 
@@ -3786,6 +4108,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -3803,6 +4126,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let empty = s.get_peer("empty").unwrap().unwrap();
@@ -3828,6 +4152,7 @@ mod tests {
             "",
             "",
             "",
+            "default",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -3905,6 +4230,7 @@ mod tests {
                 "",
                 "",
                 "",
+                "default",
             )
             .unwrap();
         }
@@ -3922,8 +4248,9 @@ mod tests {
         assert_eq!(peers[0].name, "seed");
 
         // But ANY write is rejected by the engine, not by convention.
-        let wr =
-            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", "");
+        let wr = ro.register_peer_full(
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+        );
         assert!(
             wr.is_err(),
             "a write through a libsql read-only handle must error"
@@ -3998,6 +4325,7 @@ mod tests {
                 "",
                 "",
                 "",
+                "default",
             )
             .unwrap();
             rw.send("seed", "seed", None, "hi").unwrap();
@@ -4034,7 +4362,9 @@ mod tests {
         assert_trapped("touch_peer", ro.touch_peer("seed"));
         assert_trapped(
             "register_peer_full",
-            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", ""),
+            ro.register_peer_full(
+                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+            ),
         );
         assert_trapped(
             "enqueue_intent",
@@ -4083,7 +4413,9 @@ mod tests {
             LibsqlStore::open(&cfg).unwrap()
         };
         local
-            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA", "", "", "")
+            .register_peer_full(
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default",
+            )
             .unwrap();
         {
             let cfg = Config {
@@ -4093,7 +4425,9 @@ mod tests {
             };
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
-                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA", "", "", "")
+                .register_peer_full(
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+                )
                 .unwrap();
         }
 

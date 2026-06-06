@@ -543,6 +543,48 @@ validator error); `tests/security.rs` enforces the text/JSON byte caps, the id v
 (a metachar id never reaches a bind), the `clamp_limit`-bounded list, and secret-free
 output.
 
+### Circles + orchestrator role (P4)
+
+Circles and roles are tested **across both backends** and end-to-end. The pure
+`model` layer locks the validators: `peer_role_round_trips_and_unknown_is_err`
+(every `PeerRole` round-trips `from_str(as_str())`, an empty legacy value coalesces
+to `Peer`, any other unknown is a hard `Err`), `circle_valid_accepts_good_rejects_bad`
+/ `circle_or_default_maps_empty_to_default`, and a **proptest** `circle_valid_is_total`
+(never panics on arbitrary input, the verdict matches the contract, a metachar is
+always rejected — the `ask_id_valid`/`job_id_valid` totality precedent). The config
+layer asserts `Config::circle()` resolves `"default"` when unset/blank, passes a
+valid value through, and **sanitizes** a metachar/oversized value back to `"default"`
+(`circle_resolves_default_passthrough_and_sanitize`). The store layer
+(`src/store.rs` / `src/store_libsql.rs` `#[cfg(test)]`, run under sqlite **and**
+`--features libsql`) covers: **circle/role migration idempotency on a legacy peers
+table** (`legacy_db_without_circle_role_migrates_in_place` in both backends — a
+pre-P4 `peers` gains the two columns, a legacy row reads `circle='default'`/
+`role='peer'`, re-open is a no-op); `register_roundtrips_circle_and_preserves_role`
+(register round-trips the circle and a re-register does **not** demote an
+orchestrator — the role-preserving upsert); `claim_refuses_live_holder_then_force_steals`
+(a non-force claim while a LIVE holder exists ⇒ `Refused` with no write; `force` ⇒
+`Claimed` and the prior holder demoted to `peer`; an unregistered caller ⇒ `Err`);
+`list_peers_in_circle_scopes` (`None`/`'*'` ⇒ all); and `orchestrator_status`
+**liveness reuse of `is_alive`** (a fresh holder ⇒ present; a holder backdated past
+the TTL window ⇒ absent — no new probe). The `McpServer` + `CARGO_BIN_EXE_weave`
+black-box layers cover the happy claim/status/whoami path **and the failure paths**
+(claim-without-force-when-a-live-holder-exists ⇒ a refusal *result* string, not a
+protocol error; `orchestrator_status` of an empty circle ⇒ "no live orchestrator";
+`weave_whoami` echoes circle + role), the CLI circle scoping (`--circle`/
+`--all-circles`), and the **load-bearing backward-compat regression**
+(`cli_peers_default_circle_human_output_unchanged`: with everyone in `"default"`
+and no flag the human `peers` line carries no `circle=`/`role=` token — byte-identical
+to pre-P4). `tests/security.rs` enforces the circle caps and enum discipline:
+`invalid_weave_circle_is_sanitized_to_default` (a metachar/oversized/control
+`WEAVE_CIRCLE` is sanitized, never stored raw, never crashes),
+`role_is_never_free_text` (the only path to `orchestrator` is `claim`; a fresh
+register is always `peer`), and `orchestrator_output_is_secret_free`. **Liveness
+fixture note:** the orchestrator-status integration tests register under a forced
+foreign `HOSTNAME` and query without it, so a row's stored host differs from the
+query-time `this_host` ⇒ liveness fails OPEN (TTL recency-online) rather than
+pid-probing a one-shot CLI process's already-dead PID — the same remote-host fixture
+the scan/peers liveness tests use.
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

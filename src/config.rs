@@ -607,6 +607,15 @@ pub struct Config {
     /// Inert on the default sqlite build (remote sources are rejected loudly there).
     #[serde(default)]
     pub pull_token: Option<String>,
+    /// Visibility-scoping circle this session belongs to (P4): a grouping label
+    /// (NOT a secret, NOT a path). `peers`/`sessions`/`scan` default to the
+    /// caller's circle; `--all-circles`/`circle='*'` go mesh-wide. `None`/empty ⇒
+    /// the [`crate::model::DEFAULT_CIRCLE`] (`"default"`), so a single-circle
+    /// deployment is identical to today. Overlaid by `WEAVE_CIRCLE`. Resolved (and
+    /// validated) by [`Config::circle`]. `#[serde(default)]` keeps configs that
+    /// omit the key loading unchanged.
+    #[serde(default)]
+    pub circle: Option<String>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -635,6 +644,7 @@ impl std::fmt::Debug for Config {
                 "pull_token",
                 &self.pull_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("circle", &self.circle)
             .finish()
     }
 }
@@ -817,7 +827,33 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_PULL_TOKEN") {
             cfg.pull_token = Some(v);
         }
+        // P4 circle: WEAVE_CIRCLE overrides the config `circle`. Stored raw here;
+        // validated/sanitized at the `Config::circle()` resolve seam (the
+        // session/host discipline — overlay then validate, never store-side trust).
+        if let Some(v) = nonempty("WEAVE_CIRCLE") {
+            cfg.circle = Some(v);
+        }
         cfg
+    }
+
+    /// Resolve this session's visibility-scoping circle (P4). The config/env value
+    /// if it passes [`crate::model::circle_valid`]; otherwise the
+    /// [`crate::model::DEFAULT_CIRCLE`] (with a one-line stderr note for an invalid
+    /// value, the `sanitize_token`/`this_host` discipline — sanitize at the seam,
+    /// never store/inject a raw untrusted token). `None`/empty ⇒ `"default"`, so a
+    /// single-circle deployment is byte-identical to today.
+    pub fn circle(&self) -> String {
+        match self.circle.as_deref().filter(|s| !s.is_empty()) {
+            Some(c) if crate::model::circle_valid(c) => c.to_string(),
+            Some(c) => {
+                eprintln!(
+                    "[weave] ignoring invalid circle {c:?}; falling back to '{}'",
+                    crate::model::DEFAULT_CIRCLE
+                );
+                crate::model::DEFAULT_CIRCLE.to_string()
+            }
+            None => crate::model::DEFAULT_CIRCLE.to_string(),
+        }
     }
 
     /// Resolve the validated, deduplicated list of **read-only** extra store paths
@@ -1569,6 +1605,14 @@ pub const CONFIG_TEMPLATE: &str = "\
 # UNCONDITIONALLY — even when strict_verify = false. Same entry forms as `trust`.
 # Empty (the default) ⇒ nothing revoked. Overridable via WEAVE_REVOKED. Capped at 64.
 # revoked = [\"SHA256:dead...\"]
+
+# CIRCLE (P4): the visibility-scoping group this session belongs to. `weave peers`/
+# `sessions`/`scan` default to YOUR circle; pass --all-circles (or circle='*') to go
+# mesh-wide. An orchestrator (see `weave orchestrator claim`) defaults to mesh-wide
+# visibility. A circle is a label (ASCII [A-Za-z0-9_-], <=64), NOT a secret or path.
+# Default (unset) ⇒ \"default\", so a single-circle deployment behaves as before.
+# Overridable via WEAVE_CIRCLE.
+# circle = \"default\"
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -1644,6 +1688,7 @@ mod tests {
         assert!(cfg.trust.is_none());
         assert!(cfg.revoked.is_none());
         assert!(cfg.pull_token.is_none());
+        assert!(cfg.circle.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -1674,12 +1719,32 @@ mod tests {
             "trust",
             "revoked",
             "pull_token",
+            "circle",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
                 "template is missing config key {key:?}"
             );
         }
+    }
+
+    /// `Config::circle()` (P4): unset ⇒ "default"; a valid value passes through; an
+    /// invalid (metachar/oversized) value falls back to "default" (sanitize at the
+    /// seam, never store/return a raw untrusted token).
+    #[test]
+    fn circle_resolves_default_passthrough_and_sanitize() {
+        let with_circle = |c: Option<String>| Config {
+            circle: c,
+            ..Config::default()
+        };
+        assert_eq!(Config::default().circle(), "default");
+        assert_eq!(with_circle(Some("team-a".to_string())).circle(), "team-a");
+        assert_eq!(with_circle(Some(String::new())).circle(), "default");
+        assert_eq!(with_circle(Some("a/b; rm".to_string())).circle(), "default");
+        assert_eq!(
+            with_circle(Some("x".repeat(crate::model::MAX_CIRCLE_LEN + 1))).circle(),
+            "default"
+        );
     }
 
     /// `retention()` resolves to the 30-day default when unset, honors an explicit

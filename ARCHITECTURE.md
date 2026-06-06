@@ -439,7 +439,9 @@ ask_groups  (parent_id TEXT PRIMARY KEY, asker TEXT NOT NULL, subject TEXT NULL,
 peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
              last_seen INTEGER, pid INTEGER NULL, host TEXT NOT NULL DEFAULT '',
              repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
-             worktree_id TEXT NOT NULL DEFAULT '')
+             worktree_id TEXT NOT NULL DEFAULT '',
+             circle TEXT NOT NULL DEFAULT 'default',                -- visibility-scoping group (P4, additive)
+             role TEXT NOT NULL DEFAULT 'peer')                     -- peer | orchestrator (P4, PeerRole enum)
 -- Tier-2 cross-store delivery (§10):
 outbox      (id INTEGER PK AUTOINCREMENT, ts INTEGER, to_peer TEXT, to_host TEXT NOT NULL DEFAULT '',
              from_peer TEXT, subject TEXT NULL, body TEXT, sig TEXT NOT NULL DEFAULT '')
@@ -524,7 +526,31 @@ jobs        (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TE
   empty tags. The three tag columns are `TEXT NOT NULL DEFAULT ''` (nullable in
   spirit — empty means "unknown/non-git"), appended after `host` at fixed positions
   8/9/10 so the column order is identical across backends. They are **descriptive
-  tags only**, never injection targets.
+  tags only**, never injection targets. The P4 `circle` / `role` columns are
+  appended LAST (positions 11/12) by the same additive idempotent migration in both
+  backends; `circle` defaults to the non-empty literal `'default'` (so a legacy row
+  classifies into the default circle with no runtime coalesce) and `role` defaults
+  to `'peer'`. **circle** is a visibility-scoping group (a label, validated by
+  `circle_valid` + `MAX_CIRCLE_LEN=64`, captured at registration from
+  `WEAVE_CIRCLE`/config like identity is captured from `WEAVE_SESSION`). **role** is
+  a two-variant enum `PeerRole::{Peer, Orchestrator}` stored as TEXT (the
+  `AskState`/`JobState` precedent — an enum, never free text). **Orchestrator
+  policy:** `role='orchestrator'` is the single per-circle coordinator. It is
+  **claimed, never self-asserted** — a registration always inserts `role='peer'` and
+  an upsert **omits `role`** so a re-register preserves an existing orchestrator.
+  `claim_orchestrator_role(circle?, force?)` runs in ONE transaction: a non-force
+  claim while a **different LIVE** holder exists (`role='orchestrator'` AND
+  `is_alive`) is **refused** (a clean `ClaimOutcome::Refused`, not an error); `force`
+  demotes every other orchestrator in the circle to `peer` and sets the caller. The
+  forced demote is the **only cross-row peer write** P4 adds — a single-row UPDATE in
+  the caller's **own** local store (never a foreign store, the owner-only-writes
+  contract is about cross-STORE writes), and **non-destructive** (a role bit; the
+  demoted peer can re-claim) ⇒ **not** confirm-gated. The "live" verdict REUSES
+  `is_alive` (no new probe — weave's daemon-free analog of repowire's heartbeat).
+  `peers`/`sessions`/`scan` filter by circle caller-side over the merged views
+  (federation composes); the default is the caller's circle, an orchestrator caller
+  defaults to mesh-wide, `--all-circles`/`circle='*'` is mesh-wide. There is **no
+  `store → inject` edge** for circles/roles.
 - **`outbox`** — Tier-2 pending intents the owner queued for recipients in *other*
   stores (§10). Append-only; `id` is the monotonic dedup key the receiver tracks.
   `sig` is empty unless `--features sign` signed the intent.
@@ -853,6 +879,8 @@ keep what worked and drop the operational weight.
 | Tracked ask/answer/ack | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure DB** |
 | Ask-many (fan to N peers) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, read-time aggregate** |
 | Durable job board (poll/claim) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, poll-only** |
+| Circles (visibility scoping) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure-DB column + caller-side filter** |
+| Orchestrator role (per-circle coordinator) | ❌ | ✅ (daemon registry) | ✅ **daemon-free, claim + `is_alive` verdict** |
 | Autonomous dispatch / agent-spawn | ❌ | ✅ (JobRunner daemon) | ⏳ deferred (later runner epic) |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
 | Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
