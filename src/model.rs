@@ -1238,6 +1238,167 @@ pub struct DeliveryTrace {
     pub ts: i64,
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// P7 — Review queue (poll-only, daemon-free). A reviewer records "I reviewed PR
+// <url> at SHA <sha>"; a later `review queue` read best-effort fetches the PR's
+// CURRENT head SHA + state (via the `gh` CLI, an external trusted binary — see
+// `gh.rs`) and derives a per-row `my_action` PURELY in `compute_my_action`. No
+// HTTP client is linked; gh absent/offline ⇒ `unknown` (graceful, never sinks).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Hard upper bound (in chars) on a PR url. A PR url is a bounded GitHub URL,
+/// never a path/shell token; the cap rejects a hostile/oversized value before it
+/// is bound into a query OR passed as a `gh` argv element. 512 is far more than any
+/// real `https://github.com/owner/repo/pull/N` needs.
+pub const MAX_PR_URL_LEN: usize = 512;
+
+/// Hard upper bound (in chars) on a commit SHA. Accepts a short (7) through full
+/// SHA-1 (40) and forward-compat SHA-256 (64); the cap rejects an oversized value.
+pub const MAX_SHA_LEN: usize = 64;
+
+/// Hard upper bound on the number of rows a single `list_reviews` read returns.
+/// Bounds the per-row best-effort `gh` fan-out so a pathological reviewer can never
+/// trigger an unbounded number of subprocesses — the [`MAX_DELIVERY_ROWS`] precedent.
+pub const MAX_REVIEW_ROWS: i64 = 500;
+
+/// Validate a PR url before it is bound into a query OR passed to `gh` as an argv
+/// element. Accepts only a bounded `http(s)://...` GitHub-shaped URL with NO ASCII
+/// whitespace or control characters (so a metachar-bearing value can never be an
+/// option-smuggling argv element — defense-in-depth even though `gh` is spawned via
+/// an explicit argv vector and never a shell). The empty string is rejected (a url
+/// is always required). Pure + total (the `circle_valid`/`ask_id_valid` analog).
+pub fn pr_url_valid(url: &str) -> bool {
+    if url.is_empty() || url.len() > MAX_PR_URL_LEN {
+        return false;
+    }
+    // Must be an http(s) URL (gh `pr view` accepts a PR URL directly).
+    let rest = match url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // No whitespace / control chars / leading-dash option smuggling: every byte is a
+    // printable non-space ASCII char. This keeps the value a single inert argv token.
+    url.bytes()
+        .all(|b| b.is_ascii_graphic() && b != b' ')
+        // The contained "/pull/" path segment is what makes it a PR url (cheap shape
+        // check; gh does the authoritative validation — a bad url just yields unknown).
+        && rest.contains("/pull/")
+}
+
+/// Validate a NON-EMPTY commit SHA. The empty string is the legitimate "unfilled"
+/// sentinel (→ every read is `re-review-suggested`) and is handled by the caller, so
+/// this validator is only applied to a provided non-empty sha: it accepts 7..=64
+/// lowercase/uppercase hex digits only. Pure + total — a metachar/oversized value is
+/// rejected before any DB bind (defense-in-depth; never reaches a shell).
+pub fn sha_valid(sha: &str) -> bool {
+    (7..=MAX_SHA_LEN).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The lifecycle state of a reviewed PR as reported by `gh` (or `Unknown` when gh is
+/// absent/offline/errored). A deliberately small enum (the [`AskState`]/`JobState`
+/// precedent) — `Unknown` is the total fallback that drives `my_action=unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+    Unknown,
+}
+
+impl PrState {
+    /// Canonical lowercase label (the wire/CLI/JSON vocabulary; compile-time const).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+            PrState::Unknown => "unknown",
+        }
+    }
+}
+
+/// The action weave suggests for a reviewer given a recorded review vs. the PR's
+/// current state — the EXACT 5-value vocabulary ported from repowire's
+/// `_derive_action` (`none-needed` · `re-review-suggested` · `merged-since-review` ·
+/// `closed-since-review` · `unknown`). Stored nowhere — derived at READ time by the
+/// pure [`compute_my_action`]; surfaced over CLI/MCP via [`MyAction::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MyAction {
+    NoneNeeded,
+    ReReviewSuggested,
+    MergedSinceReview,
+    ClosedSinceReview,
+    Unknown,
+}
+
+impl MyAction {
+    /// Canonical kebab-case label (the wire/CLI/JSON vocabulary; compile-time const).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MyAction::NoneNeeded => "none-needed",
+            MyAction::ReReviewSuggested => "re-review-suggested",
+            MyAction::MergedSinceReview => "merged-since-review",
+            MyAction::ClosedSinceReview => "closed-since-review",
+            MyAction::Unknown => "unknown",
+        }
+    }
+}
+
+/// PURE, TOTAL my_action computation — a verbatim port of repowire's `_derive_action`.
+/// Given the reviewer's recorded `reviewed_sha` (`""` == unfilled), the PR's current
+/// head `current_sha` (`None` when gh could not report one), and its [`PrState`]:
+///   * `Open` → `NoneNeeded` iff BOTH SHAs are present (non-empty) and EQUAL, else
+///     `ReReviewSuggested` (the head moved, or we have no anchor).
+///   * `Merged`  → `MergedSinceReview`.
+///   * `Closed`  → `ClosedSinceReview`.
+///   * `Unknown` → `Unknown` (gh absent/offline/errored — the graceful fallback).
+///
+/// No I/O, no subprocess, no panic for any input — the unit/proptest target.
+pub fn compute_my_action(
+    reviewed_sha: &str,
+    current_sha: Option<&str>,
+    state: PrState,
+) -> MyAction {
+    match state {
+        PrState::Open => {
+            let head = current_sha.unwrap_or("");
+            if !reviewed_sha.is_empty() && !head.is_empty() && reviewed_sha == head {
+                MyAction::NoneNeeded
+            } else {
+                MyAction::ReReviewSuggested
+            }
+        }
+        PrState::Merged => MyAction::MergedSinceReview,
+        PrState::Closed => MyAction::ClosedSinceReview,
+        PrState::Unknown => MyAction::Unknown,
+    }
+}
+
+/// One recorded review row (P7). METADATA ONLY — `(reviewer, pr_url, reviewed_sha,
+/// repo, title, reviewed_ts)`; NEVER a gh token (gh manages its own auth, weave never
+/// reads or stores it). Pure data assembled by the store at read time; the live
+/// `current_head_sha`/`state`/`my_action` are computed caller-side (mcp/main), never
+/// stored. `#[serde(default)]` on the optional metadata keeps older payloads readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewRow {
+    pub reviewer: String,
+    pub pr_url: String,
+    pub reviewed_sha: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub title: String,
+    pub reviewed_ts: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1914,5 +2075,151 @@ mod tests {
     fn job_ids_are_unique_per_mint() {
         assert_ne!(new_job_id(1), new_job_id(1));
         assert_ne!(new_attempt_id(1), new_attempt_id(1));
+    }
+
+    /// `compute_my_action` drives the FULL 5-value vocabulary purely (zero
+    /// subprocess), exactly as repowire's `_derive_action`.
+    #[test]
+    fn compute_my_action_vocabulary() {
+        // Open + same sha (both present, equal) ⇒ none-needed.
+        assert_eq!(
+            compute_my_action("abc123", Some("abc123"), PrState::Open),
+            MyAction::NoneNeeded
+        );
+        // Open + diff sha ⇒ re-review-suggested (the head moved).
+        assert_eq!(
+            compute_my_action("abc123", Some("def456"), PrState::Open),
+            MyAction::ReReviewSuggested
+        );
+        // Open + empty reviewed sha (unfilled) ⇒ re-review-suggested (no anchor).
+        assert_eq!(
+            compute_my_action("", Some("def456"), PrState::Open),
+            MyAction::ReReviewSuggested
+        );
+        // Open + no current head (gh gave no headRefOid) ⇒ re-review-suggested.
+        assert_eq!(
+            compute_my_action("abc123", None, PrState::Open),
+            MyAction::ReReviewSuggested
+        );
+        // Merged / closed are state-determined regardless of sha.
+        assert_eq!(
+            compute_my_action("abc123", Some("abc123"), PrState::Merged),
+            MyAction::MergedSinceReview
+        );
+        assert_eq!(
+            compute_my_action("abc123", Some("abc123"), PrState::Closed),
+            MyAction::ClosedSinceReview
+        );
+        // Unknown state (gh absent/offline/errored) ⇒ unknown (the graceful fallback).
+        assert_eq!(
+            compute_my_action("abc123", None, PrState::Unknown),
+            MyAction::Unknown
+        );
+    }
+
+    /// `MyAction`/`PrState` labels are the exact wire vocabulary (locks the tokens
+    /// the CLI/MCP/JSON surfaces emit).
+    #[test]
+    fn my_action_and_pr_state_labels() {
+        assert_eq!(MyAction::NoneNeeded.as_str(), "none-needed");
+        assert_eq!(MyAction::ReReviewSuggested.as_str(), "re-review-suggested");
+        assert_eq!(MyAction::MergedSinceReview.as_str(), "merged-since-review");
+        assert_eq!(MyAction::ClosedSinceReview.as_str(), "closed-since-review");
+        assert_eq!(MyAction::Unknown.as_str(), "unknown");
+        assert_eq!(PrState::Open.as_str(), "open");
+        assert_eq!(PrState::Merged.as_str(), "merged");
+        assert_eq!(PrState::Closed.as_str(), "closed");
+        assert_eq!(PrState::Unknown.as_str(), "unknown");
+    }
+
+    /// `pr_url_valid` accepts only a bounded http(s) GitHub PR-shaped url and rejects
+    /// blanks, oversized, non-http, whitespace/metachar, and non-PR urls.
+    #[test]
+    fn pr_url_validation() {
+        assert!(pr_url_valid("https://github.com/owner/repo/pull/42"));
+        assert!(pr_url_valid("http://github.com/o/r/pull/1"));
+        assert!(!pr_url_valid("")); // empty
+        assert!(!pr_url_valid("github.com/o/r/pull/1")); // no scheme
+        assert!(!pr_url_valid("https://github.com/owner/repo")); // not a /pull/ url
+        assert!(!pr_url_valid("https://github.com/o/r/pull/1; rm -rf")); // space + metachar
+        assert!(!pr_url_valid("https://github.com/o/r/pull/1\n")); // control char
+        assert!(!pr_url_valid(&format!(
+            "https://github.com/o/r/pull/{}",
+            "1".repeat(MAX_PR_URL_LEN)
+        ))); // oversized
+    }
+
+    /// `sha_valid` accepts 7..=64 hex; rejects too-short, oversized, and non-hex.
+    #[test]
+    fn sha_validation() {
+        assert!(sha_valid("abc1234")); // 7 hex (short)
+        assert!(sha_valid("a".repeat(40).as_str())); // full SHA-1
+        assert!(sha_valid("a".repeat(64).as_str())); // SHA-256
+        assert!(!sha_valid("abc12")); // too short (<7)
+        assert!(!sha_valid(&"a".repeat(65))); // oversized
+        assert!(!sha_valid("abc123g")); // non-hex
+        assert!(!sha_valid("abc 123")); // space
+    }
+
+    // ---- proptest: P7 pure-fn totality (never panic over arbitrary input) ----
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// `compute_my_action` is TOTAL — never panics for any (sha, head, state)
+        /// triple — and obeys its state-determined contract: merged/closed/unknown
+        /// are fixed; open is none-needed IFF both shas present + equal.
+        #[test]
+        fn compute_my_action_is_total(
+            reviewed in ".*",
+            head in proptest::option::of(".*"),
+            si in 0u8..4,
+        ) {
+            let state = match si {
+                0 => PrState::Open,
+                1 => PrState::Merged,
+                2 => PrState::Closed,
+                _ => PrState::Unknown,
+            };
+            let got = compute_my_action(&reviewed, head.as_deref(), state);
+            match state {
+                PrState::Merged => prop_assert_eq!(got, MyAction::MergedSinceReview),
+                PrState::Closed => prop_assert_eq!(got, MyAction::ClosedSinceReview),
+                PrState::Unknown => prop_assert_eq!(got, MyAction::Unknown),
+                PrState::Open => {
+                    let h = head.as_deref().unwrap_or("");
+                    let none_needed = !reviewed.is_empty() && !h.is_empty() && reviewed == h;
+                    let want = if none_needed {
+                        MyAction::NoneNeeded
+                    } else {
+                        MyAction::ReReviewSuggested
+                    };
+                    prop_assert_eq!(got, want);
+                }
+            }
+        }
+
+        /// `pr_url_valid` / `sha_valid` are TOTAL: never panic over arbitrary input,
+        /// and any accepted value satisfies the documented shape (bounded, http(s)
+        /// /pull/ url; 7..=64 hex). A `valid` verdict never accepts whitespace.
+        #[test]
+        fn url_and_sha_validators_are_total(s in ".*") {
+            let url_ok = pr_url_valid(&s);
+            if url_ok {
+                prop_assert!(s.len() <= MAX_PR_URL_LEN);
+                prop_assert!(s.starts_with("https://") || s.starts_with("http://"));
+                prop_assert!(s.contains("/pull/"));
+                prop_assert!(!s.bytes().any(|b| b == b' '));
+            }
+            let sha_ok = sha_valid(&s);
+            if sha_ok {
+                prop_assert!(s.len() >= 7 && s.len() <= MAX_SHA_LEN);
+                prop_assert!(s.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+        }
     }
 }

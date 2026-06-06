@@ -7521,3 +7521,165 @@ fn mcp_notify_and_delivery_lifecycle_and_failures() {
 
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P7 — Review queue (HERMETIC: no network, no real gh)
+// ---------------------------------------------------------------------------
+
+/// Create a temp dir containing an executable `gh` shell script. When invoked it
+/// appends its full argv to `log_path` and (optionally) prints `json_out` to stdout.
+/// An empty `json_out` makes the fake `gh` exit non-zero (simulating gh failure ⇒
+/// my_action=unknown). This NEVER touches the network — it only echoes a fixture.
+fn make_fake_gh(log_path: &Path, json_out: &str) -> std::path::PathBuf {
+    let dir = common::unique_db().with_extension("ghbin");
+    std::fs::create_dir_all(&dir).expect("create fake-gh bin dir");
+    let script = dir.join("gh");
+    let body = if json_out.is_empty() {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+            log_path.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s' '{}'\nexit 0\n",
+            log_path.display(),
+            json_out
+        )
+    };
+    std::fs::write(&script, body).expect("write fake gh script");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat fake gh")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake gh");
+    dir
+}
+
+/// HERMETIC end-to-end: `weave review mark` then `weave review queue`. With a fake
+/// `gh` echoing an OPEN PR at the SAME head SHA, my_action is `none-needed`; with
+/// `--offline` (gh skipped) it is `unknown`. No network, no real gh.
+#[test]
+fn review_mark_then_queue_with_fake_gh() {
+    let db = TestDb::new();
+    let sha = "abc1234def5678";
+    let url = "https://github.com/owner/repo/pull/42";
+    let json = format!(r#"{{"headRefOid":"{sha}","state":"OPEN"}}"#);
+    let log = common::unique_db().with_extension("ghlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_gh(&log, &json);
+    let fake_str = fake_dir.display().to_string();
+
+    // Mark a review at an explicit sha (no gh needed for the mark).
+    let out = run_ok_env(
+        &db,
+        &["review", "mark", url, sha, "--me", "rev"],
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+    );
+    assert!(out.contains("recorded review"), "mark output: {out}");
+
+    // Queue WITH the fake gh: head == reviewed sha ⇒ none-needed.
+    let q = run_ok_env(
+        &db,
+        &["review", "queue", "--json", "--me", "rev"],
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+    );
+    let v: serde_json::Value = serde_json::from_str(&q).expect("queue --json parses");
+    let row = &v["reviews"][0];
+    assert_eq!(row["pr_url"], url);
+    assert_eq!(
+        row["my_action"], "none-needed",
+        "same sha ⇒ none-needed: {q}"
+    );
+    assert_eq!(row["state"], "open");
+
+    // Queue --offline: gh skipped ⇒ unknown, listing still renders.
+    let q2 = run_ok_env(
+        &db,
+        &["review", "queue", "--offline", "--json", "--me", "rev"],
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+    );
+    let v2: serde_json::Value = serde_json::from_str(&q2).expect("offline queue --json parses");
+    assert_eq!(
+        v2["reviews"][0]["my_action"], "unknown",
+        "offline ⇒ unknown"
+    );
+    assert_eq!(v2["reviews"][0]["state"], "unknown");
+}
+
+/// HERMETIC: when gh FAILS (non-zero / unparseable), the review queue degrades
+/// gracefully to my_action=unknown rather than erroring. No network.
+#[test]
+fn review_queue_gh_failure_yields_unknown() {
+    let db = TestDb::new();
+    let url = "https://github.com/owner/repo/pull/7";
+    let log = common::unique_db().with_extension("ghlog");
+    let _ = std::fs::remove_file(&log);
+    // Empty json ⇒ the fake gh exits non-zero (gh unauth/offline simulation).
+    let fake_dir = make_fake_gh(&log, "");
+    let fake_str = fake_dir.display().to_string();
+
+    run_ok_env(
+        &db,
+        &["review", "mark", url, "feedface", "--me", "rev"],
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+    );
+    let q = run_ok_env(
+        &db,
+        &["review", "queue", "--json", "--me", "rev"],
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+    );
+    let v: serde_json::Value = serde_json::from_str(&q).expect("queue --json parses");
+    assert_eq!(
+        v["reviews"][0]["my_action"], "unknown",
+        "gh failure ⇒ unknown (graceful, not an error): {q}"
+    );
+}
+
+/// MCP parity: weave_mark_reviewed happy path + failure paths (bad pr_url, non-hex
+/// sha) and weave_review_queue with gh absent ⇒ rows my_action=unknown. HERMETIC.
+#[test]
+fn mcp_review_tools_happy_and_failure_paths() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // Happy path: mark a review with an explicit sha (no gh fill needed).
+    let (err, t) = mcp.call_tool(
+        "weave_mark_reviewed",
+        serde_json::json!({
+            "me": "rev",
+            "pr_url": "https://github.com/owner/repo/pull/1",
+            "sha": "abc1234"
+        }),
+    );
+    assert!(!err, "mark_reviewed happy path must succeed: {t}");
+    assert!(t.contains("Recorded review"), "mark output: {t}");
+
+    // FAILURE: bad pr_url ⇒ isError (validation before any DB bind).
+    let (err, t) = mcp.call_tool(
+        "weave_mark_reviewed",
+        serde_json::json!({"me": "rev", "pr_url": "not a url"}),
+    );
+    assert!(err, "bad pr_url must be isError: {t}");
+
+    // FAILURE: non-hex sha ⇒ isError.
+    let (err, t) = mcp.call_tool(
+        "weave_mark_reviewed",
+        serde_json::json!({
+            "me": "rev",
+            "pr_url": "https://github.com/owner/repo/pull/2",
+            "sha": "zzzzzzz"
+        }),
+    );
+    assert!(err, "non-hex sha must be isError: {t}");
+
+    // weave_review_queue with gh absent (no WEAVE_MUX_DIR fake; offline forces it
+    // regardless of any system gh) ⇒ rows my_action=unknown, NOT an error.
+    let (err, t) = mcp.call_tool(
+        "weave_review_queue",
+        serde_json::json!({"me": "rev", "offline": true}),
+    );
+    assert!(!err, "review_queue must not error: {t}");
+    assert!(t.contains("unknown"), "offline rows ⇒ unknown: {t}");
+
+    mcp.shutdown();
+}

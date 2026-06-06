@@ -357,6 +357,8 @@ fn call_tool(
         "weave_job_cancel" => tool_job_cancel(store, me_default, args),
         "weave_claim_orchestrator" => tool_claim_orchestrator(store, me_default, args),
         "weave_orchestrator_status" => tool_orchestrator_status(store, args),
+        "weave_mark_reviewed" => tool_mark_reviewed(store, me_default, args),
+        "weave_review_queue" => tool_review_queue(store, me_default, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1253,6 +1255,129 @@ fn tool_orchestrator_status(store: &dyn Store, args: &Value) -> Result<String, S
         )),
         _ => Ok(format!("no live orchestrator in circle '{}'", st.circle)),
     }
+}
+
+/// P7: record (OWNER-ONLY) the CALLER's review of a PR. The reviewer is the caller
+/// (`me`/$WEAVE_SESSION), never a free param — a reviewer records ONLY its own review.
+/// Validates `pr_url` (shape + bound) and, when provided, `sha` (hex + bound) BEFORE
+/// any DB bind. When `sha` is omitted, best-effort fills the current head via `gh`
+/// (repowire parity); gh absent ⇒ records `''` (NOT an error). SECRET-FREE: only
+/// url/sha/repo/title metadata is stored — never a gh token.
+fn tool_mark_reviewed(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let reviewer = ident(args, "me", def)?;
+    let pr_url = args
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'pr_url' is required (the PR url you reviewed).")?;
+    if !model::pr_url_valid(pr_url) {
+        return Err(format!(
+            "'pr_url' is not a valid PR url (expected an http(s) GitHub /pull/ URL, \
+             max {} chars).",
+            model::MAX_PR_URL_LEN
+        ));
+    }
+    // sha is optional; when present it must be hex + bounded (reject BEFORE any bind).
+    let provided_sha = args
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let sha = match provided_sha {
+        Some(s) => {
+            if !model::sha_valid(s) {
+                return Err(format!(
+                    "'sha' is not a valid commit SHA (7..={} hex digits).",
+                    model::MAX_SHA_LEN
+                ));
+            }
+            s.to_string()
+        }
+        // sha omitted: best-effort fill the PR's current head via gh (repowire
+        // parity). gh absent/offline ⇒ '' (every future read => re-review-suggested).
+        None => crate::gh::gh_pr_info(pr_url)
+            .head_sha
+            .filter(|s| model::sha_valid(s))
+            .unwrap_or_default(),
+    };
+    let repo = args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    store
+        .mark_reviewed(&reviewer, pr_url, &sha, repo, title)
+        .map_err(e)?;
+    let sha_note = if sha.is_empty() {
+        " (no sha recorded — re-review will be suggested until you mark a sha)".to_string()
+    } else {
+        format!(" at {sha}")
+    };
+    Ok(format!(
+        "Recorded review of {pr_url}{sha_note} as '{reviewer}'."
+    ))
+}
+
+/// P7: list the CALLER's recorded reviews and, best-effort per row (unless
+/// `offline`), fetch the PR's CURRENT head SHA + state via `gh` and derive
+/// `my_action` PURELY (`compute_my_action`). gh absent/offline ⇒ every row
+/// `my_action=unknown` (NOT an error); a single gh row failure ⇒ that row `unknown`,
+/// the rest unaffected. Read-only, metadata-only.
+fn tool_review_queue(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let offline = args
+        .get("offline")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(model::MAX_REVIEW_ROWS);
+    let rows = store.list_reviews(&me, limit).map_err(e)?;
+    if rows.is_empty() {
+        return Ok(format!("No recorded reviews for '{me}'."));
+    }
+    let mut out = format!("{} recorded review(s) for '{me}':", rows.len());
+    for r in &rows {
+        // Best-effort live state (skipped entirely when offline). gh failure ⇒ unknown.
+        let info = if offline {
+            crate::gh::GhPrInfo {
+                head_sha: None,
+                state: model::PrState::Unknown,
+            }
+        } else {
+            crate::gh::gh_pr_info(&r.pr_url)
+        };
+        let action =
+            model::compute_my_action(&r.reviewed_sha, info.head_sha.as_deref(), info.state);
+        let head = info.head_sha.as_deref().unwrap_or("-");
+        let reviewed = if r.reviewed_sha.is_empty() {
+            "-"
+        } else {
+            &r.reviewed_sha
+        };
+        out.push_str(&format!(
+            "\n  • {} [reviewed {reviewed} / head {head} / {} ] => {}",
+            r.pr_url,
+            info.state.as_str(),
+            action.as_str()
+        ));
+    }
+    Ok(out)
 }
 
 /// Reply to an existing message. The recipient is derived by the store from the
@@ -2773,6 +2898,26 @@ fn tools() -> Value {
             "description": "Report the live orchestrator of a circle (or that none is present). 'live' reuses weave's daemon-free liveness verdict (no new probe).",
             "inputSchema": {"type":"object","properties":{
                 "circle":{"type":"string","description":"Circle to query (defaults to your own circle)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_mark_reviewed",
+            "description": "Record (OWNER-ONLY) that YOU reviewed a PR at a given commit SHA. The reviewer is you (your session) — never a free param. If 'sha' is omitted, weave best-effort fills the PR's current head via the local 'gh' CLI (an external trusted binary; gh absent => no sha recorded, which makes every future read suggest a re-review). SECRET-FREE: only url/sha/repo/title metadata is stored, never a gh token (gh manages its own auth). Re-marking the same PR updates the recorded sha/metadata in place.",
+            "inputSchema": {"type":"object","properties":{
+                "pr_url":{"type":"string","description":"The PR url you reviewed (http(s) GitHub /pull/ URL)."},
+                "sha":{"type":"string","description":"The commit SHA you reviewed (7..=64 hex). Omit to best-effort fill the PR's current head via gh."},
+                "repo":{"type":"string","description":"Optional owner/repo metadata."},
+                "title":{"type":"string","description":"Optional PR title metadata."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["pr_url"]}
+        },
+        {
+            "name": "weave_review_queue",
+            "description": "List YOUR recorded reviews and, best-effort per row, compute a 'my_action' from the PR's CURRENT head SHA + state (fetched via the local 'gh' CLI). my_action is one of: none-needed | re-review-suggested | merged-since-review | closed-since-review | unknown. gh absent/offline (or offline=true) => every row reports my_action=unknown (NOT an error); the listing always renders. Read-only and metadata-only.",
+            "inputSchema": {"type":"object","properties":{
+                "offline":{"type":"boolean","description":"Skip the gh calls entirely (all rows report my_action=unknown)."},
+                "limit":{"type":"integer","description":"Max reviews to list (bounded by the server)."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
             },"required":[]}
         }
     ])

@@ -41,7 +41,7 @@ use crate::model::{
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
     AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job,
     JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
-    BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    ReviewRow, BROADCAST_SQL, MAX_DELIVERY_ROWS, MAX_REVIEW_ROWS,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
@@ -200,6 +200,18 @@ const SCHEMA: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
+    // reviews (P7): the review-queue durable state. SECRET-FREE — only (reviewer,
+    // pr_url, reviewed_sha, repo, title, reviewed_ts); never a gh token.
+    "CREATE TABLE IF NOT EXISTS reviews (
+        reviewer     TEXT NOT NULL,
+        pr_url       TEXT NOT NULL,
+        reviewed_sha TEXT NOT NULL DEFAULT '',
+        repo         TEXT NOT NULL DEFAULT '',
+        title        TEXT NOT NULL DEFAULT '',
+        reviewed_ts  INTEGER NOT NULL,
+        PRIMARY KEY (reviewer, pr_url)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_reviewer ON reviews(reviewer, reviewed_ts)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -747,6 +759,31 @@ impl LibsqlStore {
                     .await
                     .context("creating delivery_log index")?;
             }
+            // Migration (P7): the review-queue durable state. Created via SCHEMA above
+            // for a fresh DB; also created idempotently here for a DB that predates it
+            // (mirrors SqliteStore::migrate). SECRET-FREE — only (reviewer, pr_url,
+            // reviewed_sha, repo, title, reviewed_ts); never a gh token. Constant DDL —
+            // no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reviews (
+                    reviewer     TEXT NOT NULL,
+                    pr_url       TEXT NOT NULL,
+                    reviewed_sha TEXT NOT NULL DEFAULT '',
+                    repo         TEXT NOT NULL DEFAULT '',
+                    title        TEXT NOT NULL DEFAULT '',
+                    reviewed_ts  INTEGER NOT NULL,
+                    PRIMARY KEY (reviewer, pr_url)
+                )",
+                (),
+            )
+            .await
+            .context("creating reviews table")?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reviews_reviewer ON reviews(reviewer, reviewed_ts)",
+                (),
+            )
+            .await
+            .context("creating reviews index")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -3073,6 +3110,73 @@ impl Store for LibsqlStore {
             Ok(out)
         })
     }
+
+    fn mark_reviewed(
+        &self,
+        reviewer: &str,
+        pr_url: &str,
+        sha: &str,
+        repo: &str,
+        title: &str,
+    ) -> Result<()> {
+        // OWNER-ONLY-WRITES: trap on a read_only handle FIRST (write-trap parity).
+        self.guard_writable()?;
+        // OWNER-ONLY upsert keyed on (reviewer, pr_url). SECRET-FREE — only these
+        // metadata fields are bound; never a gh token. All values bound via params().
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO reviews (reviewer, pr_url, reviewed_sha, repo, title, reviewed_ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(reviewer, pr_url) DO UPDATE SET
+                         reviewed_sha = excluded.reviewed_sha,
+                         repo         = excluded.repo,
+                         title        = excluded.title,
+                         reviewed_ts  = excluded.reviewed_ts",
+                    params(vec![
+                        reviewer.into(),
+                        pr_url.into(),
+                        sha.into(),
+                        repo.into(),
+                        title.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    fn list_reviews(&self, reviewer: &str, limit: i64) -> Result<Vec<ReviewRow>> {
+        // BOUNDED: never return more than MAX_REVIEW_ROWS regardless of `limit`.
+        // OWNER-SCOPED: only this reviewer's rows.
+        let lim = limit.clamp(1, MAX_REVIEW_ROWS);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT reviewer, pr_url, reviewed_sha, repo, title, reviewed_ts
+                     FROM reviews WHERE reviewer = ?1
+                     ORDER BY reviewed_ts DESC, pr_url ASC LIMIT ?2",
+                    params(vec![reviewer.into(), lim.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(ReviewRow {
+                    reviewer: r.get::<String>(0)?,
+                    pr_url: r.get::<String>(1)?,
+                    reviewed_sha: r.get::<String>(2)?,
+                    repo: r.get::<String>(3)?,
+                    title: r.get::<String>(4)?,
+                    reviewed_ts: r.get::<i64>(5)?,
+                });
+            }
+            Ok(out)
+        })
+    }
 }
 
 /// Count unread messages for `me` against any connection (the live connection or
@@ -3883,6 +3987,85 @@ mod tests {
         );
         // Reads still work on the RO handle.
         assert_eq!(ro.list_delivery(1, 50).unwrap().len(), 1);
+    }
+
+    /// P7 (libsql parity): mark_reviewed is an owner-keyed upsert (re-mark updates in
+    /// place, no dup) and list_reviews is owner-scoped + bounded.
+    #[test]
+    fn reviews_upsert_owner_scoped_and_bounded_libsql() {
+        let s = mem();
+        let url = "https://github.com/o/r/pull/1";
+        s.mark_reviewed("alice", url, "aaaaaaa", "o/r", "t1")
+            .unwrap();
+        s.mark_reviewed("alice", url, "bbbbbbb", "o/r", "t2")
+            .unwrap();
+        let rows = s.list_reviews("alice", 50).unwrap();
+        assert_eq!(rows.len(), 1, "re-mark must not duplicate");
+        assert_eq!(rows[0].reviewed_sha, "bbbbbbb");
+        // Owner-scoped: bob's row is invisible to alice.
+        s.mark_reviewed("bob", url, "ccccccc", "o/r", "tb").unwrap();
+        let alice = s.list_reviews("alice", 50).unwrap();
+        assert_eq!(alice.len(), 1);
+        assert!(alice.iter().all(|r| r.reviewer == "alice"));
+        // Bounded.
+        for i in 0..(MAX_REVIEW_ROWS + 5) {
+            let u = format!("https://github.com/o/r/pull/{i}");
+            s.mark_reviewed("carol", &u, "", "", "").unwrap();
+        }
+        assert_eq!(
+            s.list_reviews("carol", i64::MAX).unwrap().len() as i64,
+            MAX_REVIEW_ROWS
+        );
+    }
+
+    /// P7 (libsql OWNER-ONLY-WRITES): mark_reviewed traps on a read-only handle FIRST
+    /// (write-trap parity); reads still work. Mirrors record_delivery's trap test.
+    #[test]
+    fn mark_reviewed_traps_on_readonly_handle_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-reviewguard-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foreign.db");
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.mark_reviewed(
+                "alice",
+                "https://github.com/o/r/pull/1",
+                "abc1234",
+                "o/r",
+                "t",
+            )
+            .unwrap();
+        }
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(ro.read_only, "open_readonly sets the guard flag");
+        let e = ro
+            .mark_reviewed(
+                "alice",
+                "https://github.com/o/r/pull/2",
+                "def5678",
+                "o/r",
+                "t",
+            )
+            .expect_err("mark_reviewed must trap on a read-only handle");
+        assert!(
+            e.to_string()
+                .contains("BUG: write attempted on a read-only foreign store"),
+            "wrong trap error: {e}"
+        );
+        // Reads still work on the RO handle.
+        assert_eq!(ro.list_reviews("alice", 50).unwrap().len(), 1);
     }
 
     #[test]

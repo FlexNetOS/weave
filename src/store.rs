@@ -8,7 +8,7 @@
 use crate::config::StoreSource;
 use crate::model::{
     now, Ask, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, ReviewRow,
 };
 use anyhow::Result;
 
@@ -25,7 +25,7 @@ pub use crate::store_libsql::{
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, AskGroup,
-    AskManyChildView, AskState, BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    AskManyChildView, AskState, BROADCAST_SQL, MAX_DELIVERY_ROWS, MAX_REVIEW_ROWS,
 };
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -517,6 +517,31 @@ pub trait Store: Send {
     /// return an unbounded vector. Read-only, metadata-only.
     #[allow(dead_code)]
     fn list_delivery(&self, ref_id: i64, limit: i64) -> Result<Vec<DeliveryTrace>>;
+
+    /// P7 review queue: OWNER-ONLY upsert of the CALLER's own review of a PR. Keyed
+    /// on `(reviewer, pr_url)` — re-marking the same PR UPDATES the recorded sha, ts,
+    /// and metadata (no duplicate row), mirroring repowire's `upsert`. SECRET-FREE:
+    /// only (reviewer, pr_url, sha, repo, title, ts) are bound; NEVER a gh token (gh
+    /// owns its auth; weave never reads or stores it). All values bound via `params!`
+    /// (the table/column identifiers are the only constant literals). A reviewer
+    /// records ONLY rows where `reviewer == caller` (the owner-only-writes invariant);
+    /// the libsql backend additionally write-traps a read-only handle first.
+    #[allow(dead_code)]
+    fn mark_reviewed(
+        &self,
+        reviewer: &str,
+        pr_url: &str,
+        sha: &str,
+        repo: &str,
+        title: &str,
+    ) -> Result<()>;
+
+    /// P7: list `reviewer`'s recorded reviews, most-recent-first (`reviewed_ts DESC`),
+    /// BOUNDED at `min(limit, MAX_REVIEW_ROWS)` so a pathological reviewer can never
+    /// return an unbounded vector (or trigger an unbounded best-effort `gh` fan-out at
+    /// the surface). Read-only, metadata-only. Owner-scoped: only this reviewer's rows.
+    #[allow(dead_code)]
+    fn list_reviews(&self, reviewer: &str, limit: i64) -> Result<Vec<ReviewRow>>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1218,6 +1243,16 @@ CREATE TABLE IF NOT EXISTS delivery_log (
 );
 CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind);
 CREATE INDEX IF NOT EXISTS idx_delivery_log_ts  ON delivery_log(ts);
+CREATE TABLE IF NOT EXISTS reviews (
+    reviewer     TEXT NOT NULL,
+    pr_url       TEXT NOT NULL,
+    reviewed_sha TEXT NOT NULL DEFAULT '',
+    repo         TEXT NOT NULL DEFAULT '',
+    title        TEXT NOT NULL DEFAULT '',
+    reviewed_ts  INTEGER NOT NULL,
+    PRIMARY KEY (reviewer, pr_url)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_reviewer ON reviews(reviewer, reviewed_ts);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1681,6 +1716,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind);
         CREATE INDEX IF NOT EXISTS idx_delivery_log_ts  ON delivery_log(ts);",
+    )?;
+    // reviews (P7): the review-queue durable state. Created via SCHEMA above for a
+    // fresh DB; also created idempotently here for a legacy DB that predates it (the
+    // `delivery_log`/`jobs` additive template). SECRET-FREE by construction — columns
+    // are (reviewer, pr_url, reviewed_sha, repo, title, reviewed_ts) ONLY; never a gh
+    // token. `CREATE TABLE/INDEX IF NOT EXISTS` is idempotent and the DDL identifiers
+    // are constant — no user data interpolated.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reviews (
+            reviewer     TEXT NOT NULL,
+            pr_url       TEXT NOT NULL,
+            reviewed_sha TEXT NOT NULL DEFAULT '',
+            repo         TEXT NOT NULL DEFAULT '',
+            title        TEXT NOT NULL DEFAULT '',
+            reviewed_ts  INTEGER NOT NULL,
+            PRIMARY KEY (reviewer, pr_url)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reviews_reviewer ON reviews(reviewer, reviewed_ts);",
     )?;
     Ok(())
 }
@@ -2594,6 +2647,55 @@ impl Store for SqliteStore {
                     stage: r.get(4)?,
                     outcome: r.get(5)?,
                     ts: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn mark_reviewed(
+        &self,
+        reviewer: &str,
+        pr_url: &str,
+        sha: &str,
+        repo: &str,
+        title: &str,
+    ) -> Result<()> {
+        // OWNER-ONLY upsert keyed on (reviewer, pr_url): re-marking the same PR
+        // updates sha/ts/metadata in place (no dup row). SECRET-FREE — only these
+        // metadata fields are bound; never a gh token. All values bound via params!
+        // (the table/column identifiers are the only constant literals).
+        self.conn.execute(
+            "INSERT INTO reviews (reviewer, pr_url, reviewed_sha, repo, title, reviewed_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(reviewer, pr_url) DO UPDATE SET
+                 reviewed_sha = excluded.reviewed_sha,
+                 repo         = excluded.repo,
+                 title        = excluded.title,
+                 reviewed_ts  = excluded.reviewed_ts",
+            params![reviewer, pr_url, sha, repo, title, now()],
+        )?;
+        Ok(())
+    }
+
+    fn list_reviews(&self, reviewer: &str, limit: i64) -> Result<Vec<ReviewRow>> {
+        // BOUNDED: never return more than MAX_REVIEW_ROWS regardless of `limit`.
+        // OWNER-SCOPED: only this reviewer's rows.
+        let lim = limit.clamp(1, MAX_REVIEW_ROWS);
+        let mut stmt = self.conn.prepare(
+            "SELECT reviewer, pr_url, reviewed_sha, repo, title, reviewed_ts
+             FROM reviews WHERE reviewer = ?1
+             ORDER BY reviewed_ts DESC, pr_url ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![reviewer, lim], |r| {
+                Ok(ReviewRow {
+                    reviewer: r.get(0)?,
+                    pr_url: r.get(1)?,
+                    reviewed_sha: r.get(2)?,
+                    repo: r.get(3)?,
+                    title: r.get(4)?,
+                    reviewed_ts: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4793,6 +4895,91 @@ mod tests {
         {
             let s = SqliteStore::open(&path).unwrap();
             assert_eq!(s.list_delivery(1, 50).unwrap().len(), 1);
+        }
+    }
+
+    /// P7: mark_reviewed is an OWNER-keyed upsert — re-marking the same PR updates
+    /// the sha/ts/metadata in place (no duplicate row); list_reviews is owner-scoped.
+    #[test]
+    fn reviews_upsert_and_owner_scoped() {
+        let s = mem();
+        let url = "https://github.com/o/r/pull/1";
+        s.mark_reviewed("alice", url, "aaaaaaa", "o/r", "t1")
+            .unwrap();
+        // Re-mark the SAME PR with a new sha/title: updates in place (no dup).
+        s.mark_reviewed("alice", url, "bbbbbbb", "o/r", "t2")
+            .unwrap();
+        let rows = s.list_reviews("alice", 50).unwrap();
+        assert_eq!(rows.len(), 1, "re-mark must not create a duplicate row");
+        assert_eq!(rows[0].reviewed_sha, "bbbbbbb");
+        assert_eq!(rows[0].title, "t2");
+
+        // A DIFFERENT reviewer's row is invisible to alice (owner-scoped read).
+        s.mark_reviewed("bob", url, "ccccccc", "o/r", "tb").unwrap();
+        let alice = s.list_reviews("alice", 50).unwrap();
+        assert_eq!(alice.len(), 1);
+        assert!(alice.iter().all(|r| r.reviewer == "alice"));
+        let bob = s.list_reviews("bob", 50).unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].reviewed_sha, "ccccccc");
+    }
+
+    /// P7: list_reviews is bounded by MAX_REVIEW_ROWS regardless of the requested
+    /// limit, and orders most-recent-first.
+    #[test]
+    fn reviews_read_is_bounded() {
+        let s = mem();
+        for i in 0..(MAX_REVIEW_ROWS + 10) {
+            let url = format!("https://github.com/o/r/pull/{i}");
+            s.mark_reviewed("alice", &url, "", "", "").unwrap();
+        }
+        assert_eq!(
+            s.list_reviews("alice", i64::MAX).unwrap().len() as i64,
+            MAX_REVIEW_ROWS
+        );
+        assert!(s.list_reviews("alice", -1).unwrap().len() as i64 <= MAX_REVIEW_ROWS);
+    }
+
+    /// P7: a legacy DB without the reviews table gains it on open (idempotent
+    /// migrate), and mark/list work afterward. Mirrors legacy_db_gains_delivery_log.
+    #[test]
+    fn legacy_db_gains_reviews() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-reviews-legacy-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        {
+            // A pre-P7 store: messages only, NO reviews table.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                    sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT,
+                    body TEXT NOT NULL, in_reply_to INTEGER
+                 );",
+            )
+            .unwrap();
+        }
+        // First open migrates reviews in; mark + list work.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.mark_reviewed(
+                "alice",
+                "https://github.com/o/r/pull/7",
+                "abc1234",
+                "o/r",
+                "t",
+            )
+            .unwrap();
+            assert_eq!(s.list_reviews("alice", 50).unwrap().len(), 1);
+        }
+        // Re-open is a clean idempotent no-op; the row persists.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.list_reviews("alice", 50).unwrap().len(), 1);
         }
     }
 

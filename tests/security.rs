@@ -3139,3 +3139,166 @@ fn mcp_delivery_trace_is_secret_free() {
     );
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P7 — Review queue: no-shell gh argv, input caps, secret-free.
+// ---------------------------------------------------------------------------
+
+/// Create a temp dir with an executable fake `gh` that appends its full argv to
+/// `log_path` and prints a fixed OPEN-PR JSON (exit 0). Mirrors `make_fake_tmux`.
+fn make_fake_gh(log_path: &std::path::Path) -> std::path::PathBuf {
+    let dir = TestDb::new().path_str();
+    let dir = std::path::PathBuf::from(format!("{dir}.ghbin"));
+    std::fs::create_dir_all(&dir).expect("create fake-gh dir");
+    let script = dir.join("gh");
+    // Echo argv to the log AND print a usable PR view so gh "succeeds".
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s' '{{\"headRefOid\":\"deadbeef\",\"state\":\"OPEN\"}}'\nexit 0\n",
+        log_path.display()
+    );
+    std::fs::write(&script, body).expect("write fake gh");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake gh");
+    dir
+}
+
+/// NO-SHELL (the P7 headline): `gh` is spawned via an explicit argv vector, never a
+/// shell. We mark a review WITHOUT a sha (so weave best-effort calls gh to fill the
+/// head) and assert the fake gh recorded EXACTLY `pr view <url> --json
+/// headRefOid,state` — the url is a single inert argv element behind `pr view`, never
+/// word-split, never interpreted. If weave had built a command string / used `sh -c`,
+/// the recorded argv would differ.
+#[test]
+fn review_gh_is_argv_spawned_never_shell() {
+    let db = TestDb::new();
+    let url = "https://github.com/owner/repo/pull/99";
+    let log = TestDb::new().path_str();
+    let log = std::path::PathBuf::from(format!("{log}.ghlog"));
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_gh(&log);
+    let fake_str = fake_dir.display().to_string();
+
+    // Mark WITHOUT a sha ⇒ weave calls gh to fill the head.
+    let (ok, out, err) = run_with_fake_mux(
+        &db,
+        &fake_dir,
+        &[("WEAVE_MUX_DIR", fake_str.as_str())],
+        &["review", "mark", url, "--me", "rev"],
+    );
+    assert!(ok, "mark (gh-fill) must succeed: {out}\n{err}");
+
+    let logged = read_mux_log(&log);
+    // The fake gh saw the EXACT argv: `pr view <url> --json headRefOid,state`.
+    assert!(
+        logged.contains(&format!("pr view {url} --json headRefOid,state")),
+        "gh must be argv-spawned with the url as a single element: {logged:?}"
+    );
+    // The url reached gh verbatim (the head SHA from the fixture was recorded).
+    let q = run_ok_env(
+        &db,
+        &["review", "queue", "--json", "--offline", "--me", "rev"],
+        &[],
+    );
+    let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+    assert_eq!(
+        v["reviews"][0]["last_reviewed_sha"], "deadbeef",
+        "gh-filled head SHA must be the stored review sha: {q}"
+    );
+}
+
+/// Input caps: an oversized pr_url and a non-hex / oversized sha are REJECTED before
+/// any DB bind or gh spawn (exit non-zero), never persisted.
+#[test]
+fn review_caps_reject_oversized_and_nonhex() {
+    let db = TestDb::new();
+    // Oversized pr_url (well over MAX_PR_URL_LEN=512).
+    let big_url = format!("https://github.com/o/r/pull/{}", "1".repeat(600));
+    let (ok, _o, _e) = run(&db, &["review", "mark", &big_url, "abc1234", "--me", "rev"]);
+    assert!(!ok, "oversized pr_url must be rejected");
+
+    // Non-hex sha.
+    let (ok, _o, _e) = run(
+        &db,
+        &[
+            "review",
+            "mark",
+            "https://github.com/o/r/pull/1",
+            "zzzzzzz",
+            "--me",
+            "rev",
+        ],
+    );
+    assert!(!ok, "non-hex sha must be rejected");
+
+    // A non-PR url (no /pull/) is rejected too.
+    let (ok, _o, _e) = run(
+        &db,
+        &[
+            "review",
+            "mark",
+            "https://github.com/o/r",
+            "abc1234",
+            "--me",
+            "rev",
+        ],
+    );
+    assert!(!ok, "non-PR url must be rejected");
+
+    // None of the rejected marks persisted: an empty queue.
+    let q = run_ok_env(
+        &db,
+        &["review", "queue", "--json", "--offline", "--me", "rev"],
+        &[],
+    );
+    let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+    assert_eq!(v["count"], 0, "no rejected mark persisted: {q}");
+}
+
+/// SECRET-FREE: a metachar-bearing pr_url is rejected (never reaches gh/shell), and
+/// the review queue output carries only url/sha/state metadata — never a token.
+#[test]
+fn review_url_metachars_rejected_and_output_is_secret_free() {
+    let db = TestDb::new();
+    // A url bearing shell metacharacters is rejected by pr_url_valid (it contains a
+    // space + `;`), so it never reaches gh nor a shell.
+    let (ok, _o, _e) = run(
+        &db,
+        &[
+            "review",
+            "mark",
+            "https://github.com/o/r/pull/1; touch /tmp/pwned",
+            "abc1234",
+            "--me",
+            "rev",
+        ],
+    );
+    assert!(!ok, "metachar pr_url must be rejected before any gh spawn");
+    assert!(
+        !std::path::Path::new("/tmp/pwned").exists(),
+        "no shell ran the injected command"
+    );
+
+    // A clean recorded review's output is pure metadata — no token-shaped field.
+    run_ok(
+        &db,
+        &[
+            "review",
+            "mark",
+            "https://github.com/o/r/pull/2",
+            "abc1234",
+            "--me",
+            "rev",
+        ],
+    );
+    let q = run_ok_env(
+        &db,
+        &["review", "queue", "--json", "--offline", "--me", "rev"],
+        &[],
+    );
+    let lower = q.to_lowercase();
+    assert!(
+        !lower.contains("token") && !lower.contains("auth"),
+        "review output must be secret-free (no token/auth): {q}"
+    );
+}

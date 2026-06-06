@@ -39,6 +39,7 @@ compile_error!(
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
 mod config;
+mod gh;
 mod git;
 mod inject;
 mod mcp;
@@ -222,6 +223,15 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+    },
+    /// PR review queue (P7): record your reviews and poll their live state.
+    /// `weave review mark <pr_url> [sha]` records a review (sha omitted ⇒ best-effort
+    /// gh fill); `weave review queue [--offline]` lists your reviews with a derived
+    /// my_action (none-needed | re-review-suggested | merged-since-review |
+    /// closed-since-review | unknown). Live state needs the `gh` CLI; absent ⇒ unknown.
+    Review {
+        #[command(subcommand)]
+        cmd: ReviewCmd,
     },
     /// Tail your inbox: poll the store and print new messages until interrupted
     /// (Ctrl-C). Messages are peeked (not marked read) so your normal hook drain
@@ -517,6 +527,47 @@ enum Cmd {
     },
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
+}
+
+/// `weave review` subcommands (P7). Daemon-free PR review tracking: record your own
+/// reviews (owner-only) and poll their live state via the external `gh` CLI.
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// Record (OWNER-ONLY) that YOU reviewed a PR at a commit SHA. `sha` is optional:
+    /// when omitted, weave best-effort fills the PR's current head via `gh` (gh
+    /// absent ⇒ no sha recorded ⇒ every future read suggests a re-review). The PR url
+    /// and sha reach `gh` only as inert argv elements — never a shell.
+    Mark {
+        /// the PR url you reviewed (http(s) GitHub /pull/ URL)
+        pr_url: String,
+        /// the commit SHA you reviewed (7..=64 hex); omit to best-effort gh-fill
+        sha: Option<String>,
+        /// optional owner/repo metadata
+        #[arg(long)]
+        repo: Option<String>,
+        /// optional PR title metadata
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        me: Option<String>,
+    },
+    /// List YOUR recorded reviews with a derived my_action (none-needed |
+    /// re-review-suggested | merged-since-review | closed-since-review | unknown).
+    /// Live state is fetched best-effort per row via `gh`; `--offline` skips it (all
+    /// rows report unknown). Read-only.
+    Queue {
+        /// skip the gh calls entirely (all rows report my_action=unknown)
+        #[arg(long)]
+        offline: bool,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// max reviews to list (clamped to a sane cap)
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long)]
+        me: Option<String>,
+    },
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -3214,6 +3265,8 @@ fn main() -> Result<()> {
             println!("turn_state set for '{me}': {state}");
         }
 
+        Cmd::Review { cmd } => handle_review(store, &cfg, cmd)?,
+
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
     Ok(())
@@ -3821,6 +3874,134 @@ fn handle_audit(store: &dyn Store, cmd: AuditCmd) -> Result<()> {
                         model::fmt_ts(r.ts),
                         r.kind.as_str(),
                         r.fp
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// P7 `weave review {mark,queue}` handler. The ONLY place store + gh meet (no
+/// store→gh edge): record an owner-only review, or list reviews and derive each
+/// row's my_action PURELY from the PR's best-effort live state.
+fn handle_review(store: &dyn Store, cfg: &Config, cmd: ReviewCmd) -> Result<()> {
+    match cmd {
+        ReviewCmd::Mark {
+            pr_url,
+            sha,
+            repo,
+            title,
+            me,
+        } => {
+            let me = resolve_me(me, None, cfg);
+            store::check_ident("name", &me)?;
+            // Validate the url shape + bound BEFORE any DB bind / gh spawn.
+            if !model::pr_url_valid(&pr_url) {
+                anyhow::bail!(
+                    "'{pr_url}' is not a valid PR url (expected an http(s) GitHub /pull/ URL, \
+                     max {} chars)",
+                    model::MAX_PR_URL_LEN
+                );
+            }
+            // sha optional: when provided, must be hex + bounded; when omitted,
+            // best-effort gh-fill the PR's current head (gh absent ⇒ '').
+            let sha = match sha.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => {
+                    if !model::sha_valid(s) {
+                        anyhow::bail!(
+                            "'{s}' is not a valid commit SHA (7..={} hex digits)",
+                            model::MAX_SHA_LEN
+                        );
+                    }
+                    s.to_string()
+                }
+                None => gh::gh_pr_info(&pr_url)
+                    .head_sha
+                    .filter(|s| model::sha_valid(s))
+                    .unwrap_or_default(),
+            };
+            let repo = repo.as_deref().unwrap_or("");
+            let title = title.as_deref().unwrap_or("");
+            store.mark_reviewed(&me, &pr_url, &sha, repo, title)?;
+            if sha.is_empty() {
+                println!(
+                    "recorded review of {pr_url} as '{me}' (no sha — re-review will be suggested)"
+                );
+            } else {
+                println!("recorded review of {pr_url} at {sha} as '{me}'");
+            }
+        }
+        ReviewCmd::Queue {
+            offline,
+            json,
+            limit,
+            me,
+        } => {
+            let me = resolve_me(me, None, cfg);
+            store::check_ident("name", &me)?;
+            let rows = store.list_reviews(&me, limit)?;
+            // Best-effort live state per row (skipped when offline). gh failure or
+            // offline ⇒ unknown for that row; the listing always renders.
+            let enriched: Vec<(model::ReviewRow, gh::GhPrInfo, model::MyAction)> = rows
+                .into_iter()
+                .map(|r| {
+                    let info = if offline {
+                        gh::GhPrInfo {
+                            head_sha: None,
+                            state: model::PrState::Unknown,
+                        }
+                    } else {
+                        gh::gh_pr_info(&r.pr_url)
+                    };
+                    let action = model::compute_my_action(
+                        &r.reviewed_sha,
+                        info.head_sha.as_deref(),
+                        info.state,
+                    );
+                    (r, info, action)
+                })
+                .collect();
+            if json {
+                let arr: Vec<_> = enriched
+                    .iter()
+                    .map(|(r, info, action)| {
+                        serde_json::json!({
+                            "pr_url": r.pr_url,
+                            "last_reviewed_sha": r.reviewed_sha,
+                            "current_head_sha": info.head_sha,
+                            "state": info.state.as_str(),
+                            "my_action": action.as_str(),
+                            "repo": r.repo,
+                            "title": r.title,
+                            "reviewed_ts": r.reviewed_ts,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "reviewer": me,
+                        "reviews": arr,
+                        "count": enriched.len(),
+                    }))?
+                );
+            } else if enriched.is_empty() {
+                println!("0 recorded review(s) for '{me}'");
+            } else {
+                println!("{} recorded review(s) for '{me}':", enriched.len());
+                for (r, info, action) in &enriched {
+                    let head = info.head_sha.as_deref().unwrap_or("-");
+                    let reviewed = if r.reviewed_sha.is_empty() {
+                        "-"
+                    } else {
+                        &r.reviewed_sha
+                    };
+                    println!(
+                        "  {} [reviewed {reviewed} / head {head} / {}] => {}",
+                        r.pr_url,
+                        info.state.as_str(),
+                        action.as_str()
                     );
                 }
             }
