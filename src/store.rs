@@ -187,6 +187,22 @@ pub trait Store: Send {
     /// of repowire's heartbeat verdict). `present` is true iff a LIVE holder
     /// exists; `holder` is the most-recently-seen live one.
     fn orchestrator_status(&self, circle: Option<&str>) -> Result<OrchestratorStatus>;
+
+    /// Set the live turn-state of a peer (P5 rich presence). SELF-ONLY: `name` is
+    /// the CALLER's own resolved identity (the MCP/CLI/hook layer binds it, never
+    /// an arg-supplied target). `state` is validated through [`TurnState::from_str`]
+    /// — an unknown value is a hard error (never stored raw). UPDATE-only on the
+    /// named row, so it never creates or consumes a foreign row. Idempotent.
+    fn set_turn_state(&self, name: &str, state: &str) -> Result<()>;
+
+    /// Set a peer's free-form, self-reported description (P5). SELF-ONLY (`name` is
+    /// the caller's own identity). The text is control-stripped + capped to
+    /// [`MAX_DESC_LEN`] via `sanitize_tag` at this seam (lossy-but-total, never
+    /// errors on oversized input — it truncates). Stamps `description_ts = now()`;
+    /// a cleared (empty) description stamps `description_ts = 0` so it is
+    /// unambiguously "absent" rather than "set-to-empty-at-T". UPDATE-only.
+    fn set_description(&self, name: &str, description: &str) -> Result<()>;
+
     /// Backend label for diagnostics.
     fn backend(&self) -> &'static str;
 
@@ -1067,7 +1083,10 @@ CREATE TABLE IF NOT EXISTS peers (
     branch      TEXT NOT NULL DEFAULT '',
     worktree_id TEXT NOT NULL DEFAULT '',
     circle      TEXT NOT NULL DEFAULT 'default',
-    role        TEXT NOT NULL DEFAULT 'peer'
+    role        TEXT NOT NULL DEFAULT 'peer',
+    turn_state     TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    description_ts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1344,6 +1363,9 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         worktree_id: r.get(10)?,
         circle: r.get(11)?,
         role: r.get(12)?,
+        turn_state: r.get(13)?,
+        description: r.get(14)?,
+        description_ts: r.get(15)?,
     })
 }
 
@@ -1429,6 +1451,23 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "peers", "role")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN role TEXT NOT NULL DEFAULT 'peer';")?;
+    }
+    // peers.turn_state / description / description_ts (P5 rich presence) — present
+    // on fresh DBs via SCHEMA, added here for DBs created before P5. `turn_state`
+    // defaults to '' (== Unknown, a legacy/pre-hook row); `description` defaults to
+    // '' (no description); `description_ts` defaults to 0 (no TTL anchor). All DDL
+    // strings are constant (no user data), the same discipline as the
+    // socket/pid/host/repo/circle steps above. Idempotent.
+    if !column_exists(conn, "peers", "turn_state")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN turn_state TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !column_exists(conn, "peers", "description")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN description TEXT NOT NULL DEFAULT '';")?;
+    }
+    if !column_exists(conn, "peers", "description_ts")? {
+        conn.execute_batch(
+            "ALTER TABLE peers ADD COLUMN description_ts INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     // Tier-2 tables: present on fresh DBs via SCHEMA, created here for DBs made
     // before cross-store delivery existed. `CREATE TABLE IF NOT EXISTS` is itself
@@ -2501,22 +2540,34 @@ impl Store for SqliteStore {
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
-            Some(p) => Ok(Some(p?)),
+            Some(p) => {
+                let mut p = p?;
+                // Read-time TTL: a stale description ages out to "" (daemon-free;
+                // the stored row is left untouched — pure read-time view).
+                crate::model::expire_description(&mut p, now());
+                Ok(Some(p))
+            }
             None => Ok(None),
         }
     }
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers ORDER BY name",
         )?;
-        let rows = stmt
+        let mut rows: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
             .collect::<rusqlite::Result<_>>()?;
+        // Read-time TTL: blank any stale description so every listing surface
+        // treats it as absent (daemon-free; stored rows untouched).
+        let now = now();
+        for p in &mut rows {
+            crate::model::expire_description(p, now);
+        }
         Ok(rows)
     }
 
@@ -2546,7 +2597,7 @@ impl Store for SqliteStore {
         };
         // Current orchestrators in the circle (normalize empty/legacy to default).
         let mut stmt = tx.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -2602,7 +2653,7 @@ impl Store for SqliteStore {
             .unwrap_or(crate::model::DEFAULT_CIRCLE)
             .to_string();
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
         )?;
         let holder = stmt
             .query_map([], row_to_peer)?
@@ -2615,6 +2666,39 @@ impl Store for SqliteStore {
             present: holder.is_some(),
             holder,
         })
+    }
+
+    fn set_turn_state(&self, name: &str, state: &str) -> Result<()> {
+        check_ident("peer name", name)?;
+        // Validate against the enum at the seam — an unknown value is a hard error,
+        // never stored raw (the AskState/PeerRole precedent). The canonical label
+        // re-derived from `as_str` is the only inlined turn_state SQL value.
+        let canonical = crate::model::TurnState::from_str(state)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .as_str();
+        // UPDATE-only on the caller's own row: never an INSERT, so a guessed name
+        // worst-case touches 0 rows (harmless) and no foreign row can be created.
+        self.conn.execute(
+            "UPDATE peers SET turn_state=?2 WHERE name=?1",
+            params![name, canonical],
+        )?;
+        Ok(())
+    }
+
+    fn set_description(&self, name: &str, description: &str) -> Result<()> {
+        check_ident("peer name", name)?;
+        // Bound + control-strip at the single store seam (lossy-but-total). An
+        // oversized description truncates rather than errors.
+        let clean = sanitize_tag(description, crate::model::MAX_DESC_LEN);
+        // A cleared description stamps ts=0 (unambiguously "absent"); a set one
+        // stamps now() so the read-time TTL can age it out independently of
+        // liveness. UPDATE-only on the caller's own row (owner-only by construction).
+        let ts = if clean.is_empty() { 0 } else { now() };
+        self.conn.execute(
+            "UPDATE peers SET description=?2, description_ts=?3 WHERE name=?1",
+            params![name, clean, ts],
+        )?;
+        Ok(())
     }
 
     fn reply_target(&self, sender: &str, in_reply_to: i64) -> Result<(String, Option<String>)> {
@@ -3754,6 +3838,9 @@ mod federation_tests {
             worktree_id: String::new(),
             circle: crate::model::DEFAULT_CIRCLE.to_string(),
             role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         }
     }
 
@@ -4720,6 +4807,9 @@ mod tests {
                 worktree_id: String::new(),
                 circle: crate::model::DEFAULT_CIRCLE.to_string(),
                 role: crate::model::PeerRole::Peer.as_str().to_string(),
+                turn_state: String::new(),
+                description: String::new(),
+                description_ts: 0,
             };
 
             // Determinism: two evaluations of the same inputs agree.
@@ -5272,6 +5362,9 @@ mod tests {
             worktree_id: String::new(),
             circle: crate::model::DEFAULT_CIRCLE.to_string(),
             role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -5352,6 +5445,9 @@ mod tests {
             worktree_id: String::new(),
             circle: crate::model::DEFAULT_CIRCLE.to_string(),
             role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         };
 
         // same-host + live pid (our own) => AliveLocal.
@@ -7279,5 +7375,278 @@ mod tests {
             mapped.is_err(),
             "unknown stored state must be a mapper error"
         );
+    }
+
+    // ───────────────────────── P5: rich presence (turn_state + description) ──────
+
+    /// A fresh peer takes the table defaults: `turn_state=''` (Unknown),
+    /// `description=''`, `description_ts=0`. register does NOT set any of them.
+    #[test]
+    fn fresh_peer_has_default_presence() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.turn_state, "");
+        assert_eq!(p.description, "");
+        assert_eq!(p.description_ts, 0);
+        assert_eq!(
+            crate::model::TurnState::from_str(&p.turn_state).unwrap(),
+            crate::model::TurnState::Unknown
+        );
+    }
+
+    /// `set_turn_state` round-trips every enum value; an unknown value is a hard Err
+    /// that performs NO write; the setter touches ONLY the named (caller's own) row.
+    #[test]
+    fn set_turn_state_roundtrip_self_only_and_rejects_unknown() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.register_peer("b", "tmux", "%2", "", Some("/y")).unwrap();
+        for st in [
+            crate::model::TurnState::PendingFirstTurn,
+            crate::model::TurnState::Working,
+            crate::model::TurnState::AwaitingInput,
+            crate::model::TurnState::Idle,
+        ] {
+            s.set_turn_state("a", st.as_str()).unwrap();
+            assert_eq!(s.get_peer("a").unwrap().unwrap().turn_state, st.as_str());
+            // Self-only: b is never touched.
+            assert_eq!(s.get_peer("b").unwrap().unwrap().turn_state, "");
+        }
+        // Unknown value: hard Err, NO write (a's prior valid state is unchanged).
+        let before = s.get_peer("a").unwrap().unwrap().turn_state;
+        assert!(s.set_turn_state("a", "garbage").is_err());
+        assert_eq!(s.get_peer("a").unwrap().unwrap().turn_state, before);
+    }
+
+    /// `set_description` round-trips, control-strips + caps via `sanitize_tag`, and
+    /// stamps `description_ts`; clearing stamps ts=0.
+    #[test]
+    fn set_description_roundtrips_sanitizes_and_stamps() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.set_description("a", "reviewing PR #23").unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.description, "reviewing PR #23");
+        assert!(p.description_ts > 0, "a set description stamps now()");
+
+        // Control chars stripped; internal spaces preserved.
+        s.set_description("a", "do\u{1b}[2J the\nthing\u{0}")
+            .unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.description, "do[2J thething");
+        assert!(!p.description.chars().any(|c| c.is_control()));
+
+        // Oversized truncates (never errors), bounded to MAX_DESC_LEN.
+        let huge = "z".repeat(crate::model::MAX_DESC_LEN + 500);
+        s.set_description("a", &huge).unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert!(p.description.chars().count() <= crate::model::MAX_DESC_LEN);
+
+        // Clearing stamps ts=0 (unambiguously "absent").
+        s.set_description("a", "").unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.description, "");
+        assert_eq!(p.description_ts, 0);
+    }
+
+    /// `set_description` is SELF-ONLY: setting "a" never touches "b".
+    #[test]
+    fn set_description_self_only() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.register_peer("b", "tmux", "%2", "", Some("/y")).unwrap();
+        s.set_description("a", "mine").unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().description, "mine");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().description, "");
+    }
+
+    /// Read-time TTL: a description older than `DESCRIPTION_TTL_SECS` reads BLANK from
+    /// get_peer/list_peers WITHOUT a DB write (the stored row keeps the text + ts); a
+    /// fresh one within the window is honored.
+    #[test]
+    fn description_expires_at_read_time_without_db_write() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.set_description("a", "stale task").unwrap();
+        // Poke description_ts past the TTL window via a direct UPDATE (test-only).
+        let stale = now() - crate::model::DESCRIPTION_TTL_SECS - 1;
+        s.conn
+            .execute(
+                "UPDATE peers SET description_ts=?2 WHERE name=?1",
+                params!["a", stale],
+            )
+            .unwrap();
+        // Read paths see it as absent (expired).
+        assert_eq!(s.get_peer("a").unwrap().unwrap().description, "");
+        assert_eq!(
+            s.list_peers()
+                .unwrap()
+                .iter()
+                .find(|p| p.name == "a")
+                .unwrap()
+                .description,
+            ""
+        );
+        // But the STORED row is untouched (no read-time write): the raw column still
+        // holds the text + the stale ts.
+        let (raw_desc, raw_ts): (String, i64) = s
+            .conn
+            .query_row(
+                "SELECT description, description_ts FROM peers WHERE name='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_desc, "stale task",
+            "stored row not mutated at read time"
+        );
+        assert_eq!(raw_ts, stale);
+
+        // A fresh description within the window IS honored.
+        s.set_description("a", "fresh task").unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().description, "fresh task");
+    }
+
+    /// register_peer_full re-register PRESERVES a self-set turn_state + description
+    /// (the `role`-omitted-from-upsert discipline): a session hook re-register must
+    /// not wipe presence.
+    #[test]
+    fn reregister_preserves_self_set_turn_state_and_description() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.set_turn_state("a", "working").unwrap();
+        s.set_description("a", "deep in the weeds").unwrap();
+        let ts_before = s.get_peer("a").unwrap().unwrap().description_ts;
+        // Re-register (a session hook would do this): new pane, same name.
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%9",
+            "",
+            Some("/x"),
+            Some(1234),
+            "host",
+            "repo",
+            "br",
+            "wt",
+            "default",
+        )
+        .unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.target, "%9", "re-register updated the pane");
+        assert_eq!(
+            p.turn_state, "working",
+            "turn_state preserved across re-register"
+        );
+        assert_eq!(
+            p.description, "deep in the weeds",
+            "description preserved across re-register"
+        );
+        assert_eq!(p.description_ts, ts_before, "description_ts preserved");
+    }
+
+    /// A legacy peers DB (pre-P5: no turn_state/description/description_ts columns)
+    /// upgrades in place on open — columns added with the correct defaults, the old
+    /// row survives reading Unknown/empty/0, and a re-open is an idempotent no-op.
+    #[test]
+    fn legacy_db_gains_presence_columns() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-presence-legacy-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        // A pre-P5 peers table: has role (post-P4) but NOT the three presence cols.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                    name TEXT PRIMARY KEY, mux TEXT NOT NULL, target TEXT NOT NULL,
+                    socket TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
+                    last_seen INTEGER NOT NULL, pid INTEGER, host TEXT NOT NULL DEFAULT '',
+                    repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+                    worktree_id TEXT NOT NULL DEFAULT '', circle TEXT NOT NULL DEFAULT 'default',
+                    role TEXT NOT NULL DEFAULT 'peer'
+                 );
+                 INSERT INTO peers (name, mux, target, last_seen)
+                 VALUES ('old', 'tmux', '%1', 1);",
+            )
+            .unwrap();
+            assert!(!column_exists(&conn, "peers", "turn_state").unwrap());
+            assert!(!column_exists(&conn, "peers", "description").unwrap());
+            assert!(!column_exists(&conn, "peers", "description_ts").unwrap());
+        }
+        // First open migrates: the three columns appear with defaults, the old row
+        // survives reading Unknown/empty/0, and the new setters work on it.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(p.turn_state, "", "legacy row reads Unknown");
+            assert_eq!(p.description, "", "legacy row reads empty description");
+            assert_eq!(p.description_ts, 0, "legacy row reads ts=0");
+            s.set_turn_state("old", "idle").unwrap();
+            s.set_description("old", "post-migrate desc").unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(p.turn_state, "idle");
+            assert_eq!(p.description, "post-migrate desc");
+        }
+        // Re-open is an idempotent no-op; the row + its set presence persist.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(p.turn_state, "idle");
+            assert_eq!(p.description, "post-migrate desc");
+        }
+    }
+
+    /// `expire_description` totality (colocated with the store TTL constant): never
+    /// panics for extreme `(now, ts)` and the expiry boundary is exact.
+    #[test]
+    fn expire_description_boundary_and_totality() {
+        let mk = |desc: &str, ts: i64| Peer {
+            name: "p".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: now(),
+            pid: None,
+            host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: desc.to_string(),
+            description_ts: ts,
+        };
+        let ttl = crate::model::DESCRIPTION_TTL_SECS;
+        // Exactly at the TTL boundary => expired (>=).
+        let mut p = mk("x", 1000);
+        crate::model::expire_description(&mut p, 1000 + ttl);
+        assert_eq!(p.description, "", "at the boundary the description expires");
+        // One second inside the window => honored.
+        let mut p = mk("x", 1000);
+        crate::model::expire_description(&mut p, 1000 + ttl - 1);
+        assert_eq!(p.description, "x");
+        // ts=0 (never anchored) is never expired regardless of now.
+        let mut p = mk("x", 0);
+        crate::model::expire_description(&mut p, i64::MAX);
+        assert_eq!(p.description, "x");
+        // Totality: extreme values never panic (saturating arithmetic).
+        for (now, ts) in [
+            (i64::MAX, i64::MIN),
+            (i64::MIN, i64::MAX),
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (-1, -1),
+        ] {
+            let mut p = mk("x", ts);
+            crate::model::expire_description(&mut p, now);
+        }
     }
 }

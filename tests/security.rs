@@ -2921,3 +2921,116 @@ fn orchestrator_output_is_secret_free() {
         assert!(!out.contains("/home/"), "no filesystem path leakage: {out}");
     }
 }
+
+// ─────────────────────────── P5: rich presence security ─────────────────────────
+
+/// Read a peer's description from `peers --json` (the structured surface that carries
+/// the read-time-TTL'd view).
+fn peer_description(db: &TestDb, name: &str) -> Option<String> {
+    let out = run_ok(db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("peers --json must parse: {e}\n{out}"));
+    v.as_array()?
+        .iter()
+        .find(|p| p["name"] == name)
+        .map(|p| p["description"].as_str().unwrap_or_default().to_string())
+}
+
+/// A hostile, oversized description carrying embedded control characters is CAPPED to
+/// MAX_DESC_LEN and CONTROL-STRIPPED at the store seam — never errors (truncates), and
+/// the stored/surfaced value is bounded + control-free. The `sanitize_tag` idiom.
+#[test]
+fn hostile_oversized_description_is_capped_and_control_stripped() {
+    const MAX_DESC_LEN: usize = 200;
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "dd"]);
+    // Oversized + embedded control chars (newline, tab, CR, ESC, bell) + a long run.
+    // (NUL is excluded: the OS forbids NUL bytes in a process argument, so it can
+    // never reach the sanitizer as an argv value in the first place.)
+    let hostile = format!("evil\n\t\r\u{1b}\u{7}{}", "Z".repeat(5_000));
+    let (ok, _o, err) = common::run(&db, &["describe", &hostile, "--me", "dd"]);
+    assert!(
+        ok,
+        "describe must succeed with a sanitized description: {err}"
+    );
+
+    let desc = peer_description(&db, "dd").expect("dd peer present");
+    assert!(
+        desc.chars().count() <= MAX_DESC_LEN,
+        "stored description must be <= MAX_DESC_LEN chars, got {}: {desc:?}",
+        desc.chars().count()
+    );
+    assert!(
+        !desc.chars().any(|c| c.is_control()),
+        "stored description must be control-char free: {desc:?}"
+    );
+}
+
+/// `weave status` rejects a non-enum turn_state at the seam (a hard error, never a
+/// panic, never a raw store) — turn_state is an ENUM, not free text.
+#[test]
+fn status_rejects_non_enum_turn_state_security() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "ss"]);
+    // (NUL is excluded: the OS forbids NUL bytes in a process argument, so it can
+    // never reach the validator as an argv value in the first place.)
+    for bad in ["working;DROP", "../idle", "RUNNING", "idle\u{1b}", "  "] {
+        let (ok, _o, _e) = common::run(&db, &["status", bad, "--me", "ss"]);
+        assert!(!ok, "a non-enum turn_state {bad:?} must be rejected");
+    }
+    // No marker ever leaked from a rejected value.
+    let peers = run_ok(&db, &["peers"]);
+    assert!(
+        !peers.contains("[working]") && !peers.contains("[pending]"),
+        "a rejected turn_state never surfaces: {peers}"
+    );
+}
+
+/// OWNER-ONLY: a peer cannot set ANOTHER peer's description/turn_state. The CLI binds
+/// the row key to the caller's OWN resolved identity (`--me`), so a describe/status
+/// issued as "attacker" never mutates "victim"'s row.
+#[test]
+fn presence_setters_are_owner_only() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "victim"]);
+    run_ok(&db, &["register", "--name", "attacker"]);
+    // The attacker sets ITS OWN presence; victim is untouched.
+    run_ok(&db, &["describe", "attacker note", "--me", "attacker"]);
+    run_ok(&db, &["status", "working", "--me", "attacker"]);
+    assert_eq!(
+        peer_description(&db, "victim").as_deref(),
+        Some(""),
+        "victim's description must stay empty (owner-only)"
+    );
+    // victim's turn_state stays unset (no [working] marker on victim's line).
+    let peers = run_ok(&db, &["peers"]);
+    // attacker carries the marker; victim's line must NOT.
+    let victim_line = peers.lines().find(|l| l.contains("victim")).unwrap_or("");
+    assert!(
+        !victim_line.contains("[working]"),
+        "victim must not inherit the attacker's turn_state: {victim_line}"
+    );
+}
+
+/// The presence surfaces are SECRET-FREE: a description set from typical text never
+/// leaks tokens/auth/filesystem paths into peers/whoami/scan output.
+#[test]
+fn presence_surfaces_are_secret_free() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "sf"]);
+    run_ok(
+        &db,
+        &["describe", "refactoring the store layer", "--me", "sf"],
+    );
+    run_ok(&db, &["status", "working", "--me", "sf"]);
+    for cmd in [vec!["peers"], vec!["scan"]] {
+        let out = run_ok(&db, &cmd);
+        let low = out.to_lowercase();
+        assert!(!low.contains("token"), "no token leakage in {cmd:?}: {out}");
+        assert!(
+            !low.contains("secret"),
+            "no secret leakage in {cmd:?}: {out}"
+        );
+        assert!(!out.contains("/home/"), "no path leakage in {cmd:?}: {out}");
+    }
+}

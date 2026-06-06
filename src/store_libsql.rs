@@ -87,7 +87,10 @@ const SCHEMA: &[&str] = &[
         branch      TEXT NOT NULL DEFAULT '',
         worktree_id TEXT NOT NULL DEFAULT '',
         circle      TEXT NOT NULL DEFAULT 'default',
-        role        TEXT NOT NULL DEFAULT 'peer'
+        role        TEXT NOT NULL DEFAULT 'peer',
+        turn_state     TEXT NOT NULL DEFAULT '',
+        description    TEXT NOT NULL DEFAULT '',
+        description_ts INTEGER NOT NULL DEFAULT 0
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -341,7 +344,7 @@ fn row_to_job(r: &libsql::Row) -> Result<Job> {
 }
 
 /// Column order: name, mux, target, socket, cwd, last_seen, pid, host, repo,
-/// branch, worktree_id, circle, role.
+/// branch, worktree_id, circle, role, turn_state, description, description_ts.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
     Ok(Peer {
         name: r.get::<String>(0)?,
@@ -357,6 +360,9 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         worktree_id: r.get::<String>(10)?,
         circle: r.get::<String>(11)?,
         role: r.get::<String>(12)?,
+        turn_state: r.get::<String>(13)?,
+        description: r.get::<String>(14)?,
+        description_ts: r.get::<i64>(15)?,
     })
 }
 
@@ -510,6 +516,36 @@ impl LibsqlStore {
                     conn.execute(&ddl, ())
                         .await
                         .with_context(|| format!("adding {col} column"))?;
+                }
+            }
+            // Migration (P5): a DB created before rich presence lacks the
+            // `peers.turn_state` / `description` / `description_ts` columns. Add
+            // each idempotently (mirrors SqliteStore::migrate). `turn_state` and
+            // `description` default to '' (== Unknown / no description for legacy
+            // rows); `description_ts` defaults to 0 (no TTL anchor). The col names
+            // and default literals are constant DDL (no user data interpolated).
+            for col in ["turn_state", "description"] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('peers') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    let ddl =
+                        format!("ALTER TABLE peers ADD COLUMN {col} TEXT NOT NULL DEFAULT ''");
+                    conn.execute(&ddl, ())
+                        .await
+                        .with_context(|| format!("adding {col} column"))?;
+                }
+            }
+            {
+                let probe =
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='description_ts'";
+                let mut it = conn.query(probe, ()).await?;
+                if it.next().await?.is_none() {
+                    conn.execute(
+                        "ALTER TABLE peers ADD COLUMN description_ts INTEGER NOT NULL DEFAULT 0",
+                        (),
+                    )
+                    .await
+                    .context("adding description_ts column")?;
                 }
             }
             // Migration (#7): the multi-key `identity_keys` registry. A DB created
@@ -1519,12 +1555,18 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
             match it.next().await? {
-                Some(r) => Ok(Some(row_to_peer(&r)?)),
+                Some(r) => {
+                    let mut p = row_to_peer(&r)?;
+                    // Read-time TTL: a stale description ages out to "" (daemon-free;
+                    // the stored row is left untouched — pure read-time view).
+                    crate::model::expire_description(&mut p, now());
+                    Ok(Some(p))
+                }
                 None => Ok(None),
             }
         })
@@ -1536,13 +1578,19 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
             let mut out = Vec::new();
             while let Some(r) = it.next().await? {
                 out.push(row_to_peer(&r)?);
+            }
+            // Read-time TTL: blank any stale description so every listing surface
+            // treats it as absent (daemon-free; stored rows untouched).
+            let now = now();
+            for p in &mut out {
+                crate::model::expire_description(p, now);
             }
             Ok(out)
         })
@@ -1586,7 +1634,7 @@ impl Store for LibsqlStore {
             let holders: Vec<Peer> = {
                 let mut it = tx
                     .query(
-                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
                         (),
                     )
                     .await?;
@@ -1655,7 +1703,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
                     (),
                 )
                 .await?;
@@ -1677,6 +1725,48 @@ impl Store for LibsqlStore {
                 present: holder.is_some(),
                 holder,
             })
+        })
+    }
+
+    fn set_turn_state(&self, name: &str, state: &str) -> Result<()> {
+        self.guard_writable()?;
+        check_ident("peer name", name)?;
+        // Validate against the enum at the seam — an unknown value is a hard error,
+        // never stored raw (mirrors the sqlite backend). The canonical label
+        // re-derived from `as_str` is the only inlined turn_state SQL value.
+        let canonical = crate::model::TurnState::from_str(state)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .as_str();
+        self.rt.block_on(async {
+            // UPDATE-only on the caller's own row: never an INSERT, so a guessed
+            // name worst-case touches 0 rows and no foreign row can be created.
+            self.conn
+                .execute(
+                    "UPDATE peers SET turn_state=?2 WHERE name=?1",
+                    params(vec![name.into(), canonical.into()]),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn set_description(&self, name: &str, description: &str) -> Result<()> {
+        self.guard_writable()?;
+        check_ident("peer name", name)?;
+        // Bound + control-strip at the store seam (lossy-but-total, mirrors the
+        // sqlite backend). An oversized description truncates rather than errors.
+        let clean = sanitize_tag(description, crate::model::MAX_DESC_LEN);
+        // A cleared description stamps ts=0 (unambiguously "absent"); a set one
+        // stamps now() so the read-time TTL can age it out independently of liveness.
+        let ts = if clean.is_empty() { 0 } else { now() };
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE peers SET description=?2, description_ts=?3 WHERE name=?1",
+                    params(vec![name.into(), clean.into(), ts.into()]),
+                )
+                .await?;
+            Ok(())
         })
     }
 
@@ -5150,6 +5240,267 @@ mod tests {
         assert!(ro.create_job("alice", jspec("nope")).is_err());
         assert!(ro.claim_job(&j.id, "w").is_err());
         assert!(ro.cancel_job(&j.id, "alice", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── P5: rich presence parity (libsql backend) ────────────
+
+    /// libsql parity: a fresh peer takes the presence defaults; set_turn_state
+    /// round-trips each enum value SELF-ONLY and rejects an unknown value with NO
+    /// write; set_description round-trips + sanitizes + caps SELF-ONLY.
+    #[test]
+    fn presence_setters_roundtrip_self_only_libsql() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.register_peer("b", "tmux", "%2", "", Some("/y")).unwrap();
+        // Fresh defaults.
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(
+            (
+                p.turn_state.as_str(),
+                p.description.as_str(),
+                p.description_ts
+            ),
+            ("", "", 0)
+        );
+
+        // turn_state round-trip, self-only, unknown-reject.
+        s.set_turn_state("a", "working").unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().turn_state, "working");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().turn_state, "");
+        assert!(s.set_turn_state("a", "garbage").is_err());
+        assert_eq!(s.get_peer("a").unwrap().unwrap().turn_state, "working");
+
+        // description round-trip, sanitize (control-strip), cap, self-only.
+        s.set_description("a", "review\u{1b}[2J PR\u{0}").unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.description, "review[2J PR");
+        assert!(p.description_ts > 0);
+        assert_eq!(s.get_peer("b").unwrap().unwrap().description, "");
+        let huge = "z".repeat(crate::model::MAX_DESC_LEN + 300);
+        s.set_description("a", &huge).unwrap();
+        assert!(
+            s.get_peer("a")
+                .unwrap()
+                .unwrap()
+                .description
+                .chars()
+                .count()
+                <= crate::model::MAX_DESC_LEN
+        );
+        // Clearing stamps ts=0.
+        s.set_description("a", "").unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!((p.description.as_str(), p.description_ts), ("", 0));
+    }
+
+    /// libsql parity: read-time TTL blanks a stale description on get_peer/list_peers
+    /// WITHOUT a DB write (the raw stored column is untouched); a fresh one within the
+    /// window is honored.
+    #[test]
+    fn description_expires_at_read_time_libsql() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.set_description("a", "stale task").unwrap();
+        // Poke description_ts past the TTL window via a direct UPDATE (test-only).
+        let stale = now() - crate::model::DESCRIPTION_TTL_SECS - 1;
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE peers SET description_ts=?2 WHERE name=?1",
+                    params(vec!["a".into(), stale.into()]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .unwrap();
+        // Read paths see it absent (expired).
+        assert_eq!(s.get_peer("a").unwrap().unwrap().description, "");
+        assert_eq!(
+            s.list_peers()
+                .unwrap()
+                .iter()
+                .find(|p| p.name == "a")
+                .unwrap()
+                .description,
+            ""
+        );
+        // The STORED row is untouched (no read-time write).
+        let (raw_desc, raw_ts) =
+            s.rt.block_on(async {
+                let mut it = s
+                    .conn
+                    .query(
+                        "SELECT description, description_ts FROM peers WHERE name='a'",
+                        (),
+                    )
+                    .await?;
+                let r = it.next().await?.unwrap();
+                Ok::<(String, i64), anyhow::Error>((r.get::<String>(0)?, r.get::<i64>(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            raw_desc, "stale task",
+            "stored row not mutated at read time"
+        );
+        assert_eq!(raw_ts, stale);
+        // A fresh description within the window is honored.
+        s.set_description("a", "fresh task").unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().description, "fresh task");
+    }
+
+    /// libsql parity: register_peer_full re-register PRESERVES a self-set
+    /// turn_state + description (the role-omitted-from-upsert discipline).
+    #[test]
+    fn reregister_preserves_presence_libsql() {
+        let s = mem();
+        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        s.set_turn_state("a", "working").unwrap();
+        s.set_description("a", "deep work").unwrap();
+        let ts_before = s.get_peer("a").unwrap().unwrap().description_ts;
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%9",
+            "",
+            Some("/x"),
+            Some(1234),
+            "host",
+            "repo",
+            "br",
+            "wt",
+            "default",
+        )
+        .unwrap();
+        let p = s.get_peer("a").unwrap().unwrap();
+        assert_eq!(p.target, "%9");
+        assert_eq!(
+            p.turn_state, "working",
+            "turn_state preserved across re-register"
+        );
+        assert_eq!(
+            p.description, "deep work",
+            "description preserved across re-register"
+        );
+        assert_eq!(p.description_ts, ts_before);
+    }
+
+    /// libsql parity: a legacy DB predating the three presence columns upgrades in
+    /// place on open — columns added with the correct defaults, the old row survives
+    /// reading Unknown/empty/0, the setters work, and a re-open is an idempotent no-op.
+    #[test]
+    fn legacy_db_gains_presence_columns_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-presence-legacy-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        // A pre-P5 store: open normally (creates the full P5 schema), then DROP the
+        // three presence columns is not trivial in SQLite — instead recreate a peers
+        // table without them via a fresh raw connection.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            s.rt.block_on(async {
+                s.conn.execute("DROP TABLE peers", ()).await?;
+                s.conn
+                    .execute(
+                        "CREATE TABLE peers (
+                            name TEXT PRIMARY KEY, mux TEXT NOT NULL, target TEXT NOT NULL,
+                            socket TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
+                            last_seen INTEGER NOT NULL, pid INTEGER, host TEXT NOT NULL DEFAULT '',
+                            repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+                            worktree_id TEXT NOT NULL DEFAULT '', circle TEXT NOT NULL DEFAULT 'default',
+                            role TEXT NOT NULL DEFAULT 'peer'
+                         )",
+                        (),
+                    )
+                    .await?;
+                s.conn
+                    .execute(
+                        "INSERT INTO peers (name, mux, target, last_seen) VALUES ('old','tmux','%1',1)",
+                        (),
+                    )
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+        }
+        // Re-open migrates the legacy table in place.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(
+                (
+                    p.turn_state.as_str(),
+                    p.description.as_str(),
+                    p.description_ts
+                ),
+                ("", "", 0)
+            );
+            s.set_turn_state("old", "idle").unwrap();
+            s.set_description("old", "post-migrate").unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(p.turn_state, "idle");
+            assert_eq!(p.description, "post-migrate");
+        }
+        // Re-open is an idempotent no-op; the set presence persists.
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let p = s.get_peer("old").unwrap().unwrap();
+            assert_eq!(p.turn_state, "idle");
+            assert_eq!(p.description, "post-migrate");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// libsql parity: the presence setters TRAP through a read-only handle (the
+    /// guard_writable write-trap, FIRST in each setter) — never a silent foreign
+    /// write, never a panic.
+    #[test]
+    fn presence_setters_trap_on_readonly_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-presence-ro-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ro.db");
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.register_peer("seed", "tmux", "%1", "", Some("/w"))
+                .unwrap();
+        }
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(
+            ro.set_turn_state("seed", "working").is_err(),
+            "set_turn_state through a read-only handle must trap"
+        );
+        assert!(
+            ro.set_description("seed", "intruder").is_err(),
+            "set_description through a read-only handle must trap"
+        );
+        // The failed writes were no-ops.
+        let p = ro.get_peer("seed").unwrap().unwrap();
+        assert_eq!(p.turn_state, "");
+        assert_eq!(p.description, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

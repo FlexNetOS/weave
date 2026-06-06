@@ -23,6 +23,12 @@
 //!   weave man            print a roff man page to stdout
 //!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|notification
 
+// The MCP `tools()` registry is a single large `json!([...])` literal; each added
+// tool deepens the `serde_json::json!` macro recursion. Raising the crate recursion
+// limit (a compile-time attribute, NO dependency) keeps that one literal expanding
+// as the tool table grows — the rustc-recommended fix.
+#![recursion_limit = "256"]
+
 // Backends statically link their own SQLite and cannot coexist; guard loudly.
 #[cfg(all(feature = "sqlite", feature = "libsql"))]
 compile_error!(
@@ -464,6 +470,25 @@ enum Cmd {
     Audit {
         #[command(subcommand)]
         cmd: AuditCmd,
+    },
+    /// Set this session's free-form, self-reported task description (P5 rich
+    /// presence). Surfaces compactly in `peers`/`sessions`/`scan` and ages out after
+    /// the description TTL (900s). Self-only: targets your OWN peer row.
+    Describe {
+        /// description text (a one-line task summary; control-stripped + capped)
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        #[arg(long)]
+        me: Option<String>,
+    },
+    /// Explicitly set this session's turn-state (P5). Normally hook-auto via
+    /// `weave hook session|prompt|stop|notification`; this is the manual override.
+    /// Self-only. Valid states: pending_first_turn|working|awaiting_input|idle.
+    Status {
+        /// turn-state label (pending_first_turn|working|awaiting_input|idle)
+        state: String,
+        #[arg(long)]
+        me: Option<String>,
     },
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
@@ -1442,6 +1467,32 @@ fn fmt_peer_tags(p: &model::Peer) -> String {
     format!(" {{{}}}", parts.join(" "))
 }
 
+/// Compact turn_state marker for a human listing (P5), e.g. ` [working]`. NON-NOISY
+/// by design (the #8/#19 liveness-reason pattern): an `idle` or `Unknown` peer
+/// renders NOTHING, so a legacy/pre-P5 peer's line is byte-identical to before; only
+/// a `working`/`awaiting_input`/`pending_first_turn` state adds a marker. Pure
+/// formatting. The Peer is expected to carry the read-time-TTL'd view already.
+fn fmt_turn_state(p: &model::Peer) -> String {
+    match model::TurnState::from_str(&p.turn_state) {
+        Ok(model::TurnState::Working) => " [working]".to_string(),
+        Ok(model::TurnState::AwaitingInput) => " [awaiting-input]".to_string(),
+        Ok(model::TurnState::PendingFirstTurn) => " [pending]".to_string(),
+        // Idle / Unknown / an unparseable legacy value ⇒ nothing (default unchanged).
+        _ => String::new(),
+    }
+}
+
+/// Compact description suffix for a human listing (P5), e.g. ` "reviewing PR #23"`.
+/// An empty (unset/TTL-expired) description renders NOTHING, so the default line is
+/// unchanged. The text is already bounded + control-stripped at the store seam. Pure.
+fn fmt_description(p: &model::Peer) -> String {
+    if p.description.is_empty() {
+        String::new()
+    } else {
+        format!(" \"{}\"", p.description)
+    }
+}
+
 /// Upper bound on messages returned for a `thread` view.
 const MAX_THREAD: i64 = 1_000;
 
@@ -1482,6 +1533,12 @@ struct SessionRow {
     last_seen: i64,
     /// foreign-origin label (e.g. `messages.db`) for `(via …)`, empty when local.
     via: String,
+    /// Live turn_state label (P5); `""` (Unknown) for a legacy/pre-P5 row. Rendered
+    /// compactly + non-noisily (only working/awaiting-input/pending add a marker).
+    turn_state: String,
+    /// Free-form description (P5), already read-time-TTL'd by the store; `""` ⇒
+    /// nothing rendered.
+    description: String,
 }
 
 /// Pure-render options for the presence dashboard. `clear` toggles the ANSI
@@ -1529,6 +1586,8 @@ fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
                 } else {
                     String::new()
                 },
+                turn_state: p.turn_state.clone(),
+                description: p.description.clone(),
             }
         })
         .collect();
@@ -1669,8 +1728,21 @@ fn render_sessions_dashboard(
             } else {
                 format!(" (via {})", r.via)
             };
+            // P5 non-noisy presence markers: an idle/unknown turn_state and an empty
+            // description render NOTHING, so a pre-P5 row's line is byte-identical.
+            let ts_marker = match model::TurnState::from_str(&r.turn_state) {
+                Ok(model::TurnState::Working) => " [working]",
+                Ok(model::TurnState::AwaitingInput) => " [awaiting-input]",
+                Ok(model::TurnState::PendingFirstTurn) => " [pending]",
+                _ => "",
+            };
+            let desc = if r.description.is_empty() {
+                String::new()
+            } else {
+                format!(" \"{}\"", r.description)
+            };
             out.push_str(&format!(
-                "  {}{remote_marker} [{reason}] worktree={} mux={} host={}{via}\n",
+                "  {}{remote_marker} [{reason}]{ts_marker} worktree={} mux={} host={}{desc}{via}\n",
                 r.name,
                 dash(&r.worktree),
                 dash(&r.mux),
@@ -2389,6 +2461,11 @@ fn main() -> Result<()> {
                             "repo": p.repo, "branch": p.branch, "worktree": p.worktree_id,
                             "circle": model::circle_or_default(&p.circle),
                             "role": p.role,
+                            "turn_state": model::TurnState::from_str(&p.turn_state)
+                                .unwrap_or_default()
+                                .as_str(),
+                            "description": p.description,
+                            "description_ts": p.description_ts,
                             "online": is_alive(p),
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
@@ -2422,8 +2499,10 @@ fn main() -> Result<()> {
                         String::new()
                     };
                     let tags = fmt_peer_tags(p);
+                    let ts_marker = fmt_turn_state(p);
+                    let desc = fmt_description(p);
                     println!(
-                        "{}{remote_marker} [{presence}] [{reason}] [{}] {} ({inj}){tags} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -2697,6 +2776,11 @@ fn main() -> Result<()> {
                             "host": p.host,
                             "circle": model::circle_or_default(&p.circle),
                             "role": p.role,
+                            "turn_state": model::TurnState::from_str(&p.turn_state)
+                                .unwrap_or_default()
+                                .as_str(),
+                            "description": p.description,
+                            "description_ts": p.description_ts,
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
@@ -2737,8 +2821,10 @@ fn main() -> Result<()> {
                     } else {
                         String::new()
                     };
+                    let ts_marker = fmt_turn_state(p);
+                    let desc = fmt_description(p);
                     println!(
-                        "{}{remote_marker} [{reason}] repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{via}",
+                        "{}{remote_marker} [{reason}]{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
                         p.name, p.mux
                     );
                 }
@@ -2903,6 +2989,34 @@ fn main() -> Result<()> {
 
         #[cfg(feature = "sign")]
         Cmd::Audit { cmd } => handle_audit(store, cmd)?,
+
+        Cmd::Describe { text, me } => {
+            // Self-only: bind the row key to OUR OWN resolved identity, never an
+            // arg-supplied foreign target (the Attach precedent). The store
+            // control-strips + caps the text.
+            let me = resolve_me(me, None, &cfg);
+            store::check_ident("name", &me)?;
+            store.set_description(&me, &text)?;
+            // Echo the stored (post-sanitize, post-TTL) view back.
+            let shown = store
+                .get_peer(&me)?
+                .map(|p| p.description)
+                .unwrap_or_default();
+            if shown.is_empty() {
+                println!("description cleared for '{me}'");
+            } else {
+                println!("description set for '{me}': {shown}");
+            }
+        }
+
+        Cmd::Status { state, me } => {
+            // Self-only; the store validates the state against the TurnState enum
+            // (an unknown value is a hard error).
+            let me = resolve_me(me, None, &cfg);
+            store::check_ident("name", &me)?;
+            store.set_turn_state(&me, &state)?;
+            println!("turn_state set for '{me}': {state}");
+        }
 
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
@@ -3586,6 +3700,13 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                     Err(e) => eprintln!("[weave] gc skipped (non-fatal): {e}"),
                 }
             }
+            // P5: a freshly-registered session that has not taken its first turn is
+            // `pending_first_turn`. Best-effort + AFTER registration so a setter
+            // failure can never sink registration/presence (the gc/git-tags
+            // precedent). UPDATE-only on the caller's own row — not gated on
+            // `explicit_identity` because a guessed name worst-case touches 0 rows
+            // (it cannot consume an inbox the way read-marking can).
+            set_turn_state_best_effort(store, &me, model::TurnState::PendingFirstTurn);
         }
         // UserPromptSubmit: Claude Code injects this hook's stdout into the model
         // as additionalContext, so the printed messages are actually delivered.
@@ -3625,11 +3746,33 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                     println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
                 }
             }
+            // P5: a UserPromptSubmit means a turn just started (working); a Stop
+            // means the turn finished cleanly (idle). Best-effort + AFTER the drain
+            // (the delivery hot path) so a setter failure never blocks delivery.
+            let next = if event == "prompt" {
+                model::TurnState::Working
+            } else {
+                model::TurnState::Idle
+            };
+            set_turn_state_best_effort(store, &me, next);
         }
-        "notification" => { /* reserved for future use */ }
+        // Notification: the agent's prompt is live + unconsumed (awaiting input).
+        // This arm has no drain — just the best-effort turn_state setter.
+        "notification" => {
+            set_turn_state_best_effort(store, &me, model::TurnState::AwaitingInput);
+        }
         other => eprintln!("[weave] unknown hook event: {other}"),
     }
     Ok(())
+}
+
+/// Best-effort turn_state update for the hook hot path (P5). The setter targets the
+/// CALLER's own row only and is SWALLOWED on error (to stderr) so a turn_state write
+/// can never sink message delivery or registration — the gc/git-tags precedent.
+fn set_turn_state_best_effort(store: &dyn Store, me: &str, state: model::TurnState) {
+    if let Err(e) = store.set_turn_state(me, state.as_str()) {
+        eprintln!("[weave] turn_state update skipped (non-fatal): {e}");
+    }
 }
 
 #[cfg(test)]
@@ -3670,6 +3813,8 @@ mod tests {
                 FIXED_NOW - STALE_OFFSET
             },
             via: String::new(),
+            turn_state: String::new(),
+            description: String::new(),
         }
     }
 
@@ -3901,6 +4046,9 @@ mod tests {
             worktree_id: String::new(),
             circle: model::DEFAULT_CIRCLE.to_string(),
             role: model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         };
         let cases: &[(&str, Option<i64>, i64)] = &[
             ("h1", None, now),                               // same host, recent, no pid
@@ -3920,5 +4068,43 @@ mod tests {
                 "delegation mismatch for host={host:?} pid={pid:?} last_seen={last_seen}",
             );
         }
+    }
+
+    /// HOOK BEST-EFFORT (P5): a turn_state write FAILURE is swallowed and can never
+    /// sink the hook. Proven against a read-only store (every write traps): the
+    /// underlying `set_turn_state` returns Err, yet `set_turn_state_best_effort`
+    /// returns normally (no panic, no propagation) — the gc/git-tags precedent. Since
+    /// the helper is the LAST statement in each hook arm (after the drain/registration
+    /// `?`-paths), a swallowed setter cannot affect delivery. (sqlite-only because it
+    /// builds a concrete `SqliteStore` read-only handle; the swallow logic itself is
+    /// backend-agnostic, and the libsql read-only trap is proven in
+    /// `presence_setters_trap_on_readonly_libsql`.)
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn turn_state_best_effort_swallows_a_write_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-besteffort-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // Seed the peer via a normal RW open, then drop it.
+        {
+            let s = store::SqliteStore::open(&path).unwrap();
+            s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        }
+        // A read-only handle: any write (including set_turn_state) traps.
+        let ro = store::SqliteStore::open_readonly(&path).unwrap();
+        assert!(
+            ro.set_turn_state("a", "working").is_err(),
+            "precondition: a write through a read-only store must error"
+        );
+        // The best-effort wrapper swallows that error and returns normally — no panic,
+        // no propagation. A hook arm calling this after its drain is unaffected.
+        set_turn_state_best_effort(&ro, "a", model::TurnState::Working);
+        // The failed write was a no-op (the row is untouched).
+        assert_eq!(ro.get_peer("a").unwrap().unwrap().turn_state, "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

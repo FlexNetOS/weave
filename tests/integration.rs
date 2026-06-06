@@ -95,6 +95,94 @@ fn mcp_stdio_initialize_list_and_send_inbox_roundtrip() {
     mcp.shutdown();
 }
 
+/// P5: the two new presence tools are advertised, behave self-only, and the failure
+/// paths are clean (NOT a panic, NEVER a silent persist): set_turn_state rejects a
+/// bad enum value with isError; set_description truncates oversized text (never an
+/// error); both surface on whoami/peers. stdout stays JSON-RPC only.
+#[test]
+fn mcp_presence_tools_set_and_fail_cleanly() {
+    let db = TestDb::new();
+    // Pin an explicit identity so whoami/setters resolve a stable caller row.
+    let mut mcp = McpServer::spawn_full(&db, &["mcp", "--session", "p5mcp"], &[], None);
+
+    // tools/list advertises BOTH new tools.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools/list returns a tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in ["weave_set_description", "weave_set_turn_state"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "tools/list missing {expected}; got {names:?}"
+        );
+    }
+
+    // Register the caller's own peer row first: the setters are UPDATE-only on an
+    // existing row (a never-registered identity is a 0-row no-op by design).
+    let (is_err, _t) = mcp.call_tool("weave_attach", serde_json::json!({}));
+    assert!(!is_err, "weave_attach should register the caller's row");
+
+    // Happy: set_turn_state working.
+    let (is_err, t) = mcp.call_tool(
+        "weave_set_turn_state",
+        serde_json::json!({"state": "working"}),
+    );
+    assert!(!is_err, "set_turn_state working should succeed: {t}");
+
+    // FAILURE PATH: a bad state is isError (enum-reject), not a panic, not persisted.
+    let (is_err, t) = mcp.call_tool(
+        "weave_set_turn_state",
+        serde_json::json!({"state": "bogus-state"}),
+    );
+    assert!(is_err, "an unknown turn_state must be isError: {t}");
+
+    // Happy: set_description; oversized truncates rather than errors.
+    let huge = "z".repeat(5000);
+    let (is_err, t) = mcp.call_tool(
+        "weave_set_description",
+        serde_json::json!({"description": huge}),
+    );
+    assert!(
+        !is_err,
+        "oversized description truncates (never errors): {t}"
+    );
+    let (is_err, t) = mcp.call_tool(
+        "weave_set_description",
+        serde_json::json!({"description": "reviewing PR #23"}),
+    );
+    assert!(!is_err, "set_description should succeed: {t}");
+    assert!(
+        t.contains("reviewing PR #23"),
+        "echoes the stored view: {t}"
+    );
+
+    // whoami ALWAYS surfaces turn_state + description for the caller.
+    let (is_err, who) = mcp.call_tool("weave_whoami", serde_json::json!({}));
+    assert!(!is_err, "whoami should not error: {who}");
+    assert!(
+        who.contains("turn_state: working"),
+        "whoami surfaces turn_state: {who}"
+    );
+    assert!(
+        who.contains("description: reviewing PR #23"),
+        "whoami surfaces description: {who}"
+    );
+
+    // peers surfaces the compact marker + quoted description.
+    let (is_err, peers) = mcp.call_tool("weave_peers", serde_json::json!({}));
+    assert!(!is_err, "weave_peers should not error: {peers}");
+    assert!(
+        peers.contains("[working]") && peers.contains("\"reviewing PR #23\""),
+        "peers surfaces the presence markers: {peers}"
+    );
+
+    mcp.shutdown();
+}
+
 #[test]
 fn mcp_unknown_method_returns_jsonrpc_error() {
     let db = TestDb::new();
@@ -264,6 +352,156 @@ fn cli_register_then_peers_lists_peer() {
     assert!(
         peers.contains("no-inject"),
         "a peer registered outside any mux should be no-inject: {peers:?}"
+    );
+}
+
+// ─────────────────────── P5: rich presence (turn_state + description) ───────────
+
+/// The full hook turn_state lifecycle surfaces in `weave peers` (human): session ⇒
+/// pending, prompt ⇒ working, stop ⇒ idle (non-noisy markers), notification ⇒
+/// awaiting-input. Each transition is driven through the compiled binary's hook arm.
+#[test]
+fn hook_turn_state_transitions_surface_in_peers() {
+    let db = TestDb::new();
+    // SessionStart ⇒ pending_first_turn (the [pending] marker).
+    let (ok, _o, _e) = run_hook(&db, "session", r#"{"cwd":"/proj/p5a"}"#);
+    assert!(ok);
+    let peers = run_ok(&db, &["peers"]);
+    assert!(peers.contains("p5a"), "peer registered: {peers}");
+    assert!(
+        peers.contains("[pending]"),
+        "session hook ⇒ pending marker: {peers}"
+    );
+
+    // UserPromptSubmit ⇒ working.
+    let (ok, _o, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/p5a"}"#);
+    assert!(ok);
+    assert!(
+        run_ok(&db, &["peers"]).contains("[working]"),
+        "prompt hook ⇒ working marker"
+    );
+
+    // Stop ⇒ idle (NON-noisy: no marker, line back to baseline).
+    let (ok, _o, _e) = run_hook(&db, "stop", r#"{"cwd":"/proj/p5a"}"#);
+    assert!(ok);
+    let after_stop = run_ok(&db, &["peers"]);
+    assert!(
+        !after_stop.contains("[working]")
+            && !after_stop.contains("[pending]")
+            && !after_stop.contains("[awaiting-input]"),
+        "stop hook ⇒ idle renders NO turn_state marker (non-noisy): {after_stop}"
+    );
+
+    // Notification ⇒ awaiting-input.
+    let (ok, _o, _e) = run_hook(&db, "notification", r#"{"cwd":"/proj/p5a"}"#);
+    assert!(ok);
+    assert!(
+        run_ok(&db, &["peers"]).contains("[awaiting-input]"),
+        "notification hook ⇒ awaiting-input marker"
+    );
+}
+
+/// `weave describe` sets a self-only description that surfaces in `peers`, and
+/// `--json` peers/whoami carry the new presence keys. (TTL expiry is unit-tested at
+/// the store seam; integration confirms the wiring + JSON shape.)
+#[test]
+fn describe_surfaces_in_peers_and_json_carries_presence_keys() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "p5b"]);
+    let out = run_ok(&db, &["describe", "reviewing PR #23", "--me", "p5b"]);
+    assert!(
+        out.contains("description set for 'p5b'") && out.contains("reviewing PR #23"),
+        "describe echoes the stored view: {out}"
+    );
+    let peers = run_ok(&db, &["peers"]);
+    assert!(
+        peers.contains("\"reviewing PR #23\""),
+        "description surfaces (quoted) in peers human output: {peers}"
+    );
+
+    // status sets turn_state self-only; surfaces as a marker.
+    run_ok(&db, &["status", "working", "--me", "p5b"]);
+    assert!(
+        run_ok(&db, &["peers"]).contains("[working]"),
+        "status working ⇒ marker"
+    );
+
+    // --json peers carries additive keys, no error.
+    let json = run_ok(&db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("peers --json parses");
+    let p = v
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["name"] == "p5b"))
+        .expect("p5b in peers --json");
+    assert_eq!(p["turn_state"], "working", "json turn_state key: {p}");
+    assert_eq!(p["description"], "reviewing PR #23", "json description key");
+    assert!(
+        p.get("description_ts").is_some(),
+        "json description_ts key present"
+    );
+}
+
+/// A bad turn_state via `weave status` is a clean error (enum-reject), NOT a panic,
+/// and writes nothing.
+#[test]
+fn status_rejects_unknown_turn_state() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "p5c"]);
+    let (ok, _out, err) = run(&db, &["status", "totally-bogus", "--me", "p5c"]);
+    assert!(!ok, "an unknown turn_state must fail cleanly");
+    assert!(
+        err.to_lowercase().contains("unknown turn state"),
+        "error names the bad state: {err}"
+    );
+    // No marker leaked into the listing.
+    let peers = run_ok(&db, &["peers"]);
+    assert!(
+        !peers.contains("[working]") && !peers.contains("[pending]"),
+        "rejected state never surfaced: {peers}"
+    );
+}
+
+/// BACKWARD-COMPAT REGRESSION: a peer with NO turn_state/description set renders the
+/// SAME human line as pre-P5 — no presence marker tokens appear anywhere in
+/// peers/sessions/scan default output, and the peers line still matches the legacy
+/// format exactly (only the presence-marker insertion points differ, and they insert
+/// the empty string). Proves the non-noisy default.
+#[test]
+fn unset_presence_default_output_is_byte_identical() {
+    let db = TestDb::new();
+    // Register via a hook session (a realistic fresh peer) WITHOUT any describe/status.
+    let (ok, _o, _e) = run_hook(&db, "session", r#"{"cwd":"/proj/legacy_view"}"#);
+    assert!(ok);
+    // After the session hook the peer is pending_first_turn — but that DOES surface a
+    // marker by design. The regression target is a peer with turn_state idle/unknown
+    // AND no description: drive it to idle (stop) to reach the "no marker" baseline.
+    run_hook(&db, "stop", r#"{"cwd":"/proj/legacy_view"}"#);
+
+    for cmd in [vec!["peers"], vec!["sessions"], vec!["scan"]] {
+        let out = run_ok(&db, &cmd);
+        for marker in ["[working]", "[awaiting-input]", "[pending]"] {
+            assert!(
+                !out.contains(marker),
+                "default `weave {}` must not emit {marker} for an idle/no-description peer: {out}",
+                cmd.join(" ")
+            );
+        }
+        // No stray description quoting from an empty description.
+        assert!(
+            !out.contains(" \"\""),
+            "an empty description must render NOTHING (no quotes): {out}"
+        );
+    }
+
+    // The peers line still has the legacy bracket shape: [presence] [reason] then the
+    // mux bracket — with NO extra bracket inserted between them when idle/unknown.
+    let peers = run_ok(&db, &["peers"]);
+    assert!(peers.contains("legacy_view"), "peer present: {peers}");
+    // The marker insertion point is "[reason]<here> [mux]"; for an idle peer it is
+    // empty, so two consecutive "] [" sequences (reason]→[mux) survive unchanged.
+    assert!(
+        peers.contains("] ["),
+        "legacy bracket adjacency preserved (no marker inserted): {peers}"
     );
 }
 
