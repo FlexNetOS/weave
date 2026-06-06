@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
+
+> **A fire-and-forget notify primitive + a transport-side delivery trace, both pure-DB
+> and daemon-free.** `weave notify` / `weave_notify` is a thin no-reply notification over
+> the existing send + the P1 honest-verdict seam: it persists a normal stored message,
+> fires the SAME caller-side live nudge `weave_send` does, and RETURNS the normalized
+> HONEST verdict token (`transport_delivered` / `queued_next_turn` /
+> `recipient_not_injectable`). It does **not** fork send and opens **no tracked thread**
+> (the difference from `weave_ask`); an unknown peer is honest success (the message waits
+> in the store), not an error. Point-to-point only — broadcast notify is deferred (use
+> `weave send`). The new **`delivery_log`** table is weave's first *transport-state*
+> surface (read receipts are *read-state*): a **metadata-only, SECRET-FREE** per-delivery
+> trace of stages (`queued → injected / inject_failed / not_injectable → drained`) written
+> **best-effort, caller-side, AFTER the inject** at every send/notify/ask/answer/drain
+> point — the store records the OUTCOME it is passed and **never injects** (no
+> `store → inject` edge). It stores ONLY `(ref_id, ref_kind, to_peer, stage, outcome, ts)`
+> — **never the body, subject, sig, or any token**. Always-on but **bounded** (reads capped
+> at `MAX_DELIVERY_ROWS`) and **pruned by the existing `gc()` retention** (no new sweeper).
+> **No new dependency**; mirrored across both storage backends with a guarded additive
+> migration (a legacy DB upgrades in place); local-mesh only.
+
+### Added
+- **model:** `DeliveryRefKind` (`message`/`notify`/`ask`), `DeliveryStage`
+  (`queued`/`injected`/`inject_failed`/`not_injectable`/`drained`), `DeliveryOutcome`
+  (`ok`/`fail`) enums (`as_str`/`from_str`, the `AskState` enum-as-TEXT precedent);
+  `DeliveryTrace` value struct (metadata-only); `MAX_DELIVERY_ROWS = 500`.
+- **store (both backends):** `delivery_log` table (6 metadata columns) via a guarded
+  idempotent additive migration (legacy DB upgrades in place); `record_delivery`
+  (single parameterized INSERT, records the passed-in outcome — no inject) and
+  `list_delivery` (oldest-first, bounded by `MAX_DELIVERY_ROWS`) trait methods;
+  `gc()` extended to prune `delivery_log` by the same retention cutoff in the same
+  transaction. libsql `record_delivery` traps on a read-only handle first
+  (owner-only-writes). All SQL parameterized; the only inlined literals are constant
+  identifiers + the enum `as_str` constants.
+- **mcp:** `weave_notify` (thin over `store.send` + the P1 `ask_delivery_verdict`
+  helper; broadcast/oversized → `isError`, unknown peer → honest verdict) and
+  `weave_delivery` (read-only trace; unknown ref → empty-trace line, not an error)
+  tools; best-effort `record_delivery_best_effort` (logs to stderr, never sinks
+  delivery); the pure `verdict_to_stage` fold; trace writes in send/ask/answer.
+- **main:** `weave notify` and `weave delivery [--json]` CLI subcommands; the
+  caller-side `inject_and_trace` (injects, records queued + the post-inject stage,
+  returns the honest verdict); the drain-side `drained` trace at the `prompt`
+  mark-read branch (best-effort, after the drain).
+
 ## [Unreleased] — rich presence: turn_state + description (weave⊇repowire parity, epic 5 / P5)
 
 > **Daemon-free rich presence, pure-DB.** Three additive `peers` columns — `turn_state`

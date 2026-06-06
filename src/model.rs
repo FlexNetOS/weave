@@ -1099,6 +1099,145 @@ pub struct Peer {
     pub description_ts: i64,
 }
 
+/// Hard upper bound on the number of rows a single `delivery_log` (delivery-trace)
+/// read returns. The trace is append-only and bounded by retention (`gc()`), but a
+/// read is additionally capped so a pathological ref can never return an unbounded
+/// vector to the MCP/CLI surface — the `MAX_ASK_MANY`/inbox-limit precedent. 500 is
+/// far more stages than any real delivery accrues (≤5 per message typically).
+pub const MAX_DELIVERY_ROWS: i64 = 500;
+
+/// Which kind of artifact a `delivery_log` row traces. `Message` = a plain
+/// `weave_send`; `Notify` = a fire-and-forget `weave_notify`; `Ask` = a tracked
+/// `weave_ask` question. Stored as TEXT (see the `delivery_log` table) and validated
+/// through this enum so the store never binds raw garbage; mirrors the `AskState`
+/// as_str/from_str pattern. Pure value type — DAG layer `model` (no I/O).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryRefKind {
+    Message,
+    Notify,
+    Ask,
+}
+
+impl DeliveryRefKind {
+    /// Canonical lowercase label stored in `delivery_log.ref_kind`. The only inlined
+    /// SQL "literals" for ref_kind are derived from this (compile-time constants,
+    /// never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryRefKind::Message => "message",
+            DeliveryRefKind::Notify => "notify",
+            DeliveryRefKind::Ask => "ask",
+        }
+    }
+
+    /// Parse a stored ref_kind back into the enum; an unknown value is a hard error
+    /// at the store mapper (never a panic, never silently coerced). Currently a
+    /// drift-guard/round-trip surface (the store binds the `.as_str()` verbatim and
+    /// never reads the column back into an enum), so flagged like the Tier-2 methods.
+    #[allow(dead_code)]
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "message" => Ok(DeliveryRefKind::Message),
+            "notify" => Ok(DeliveryRefKind::Notify),
+            "ask" => Ok(DeliveryRefKind::Ask),
+            other => Err(format!("unknown delivery ref kind '{other}'")),
+        }
+    }
+}
+
+/// One stage in a delivery's transport trace, mapping weave's daemon-free reality
+/// (inject + hook-drain; no websocket/broker) onto a repowire-style stage vocabulary:
+/// `Queued` (persisted, awaiting nudge/drain) → `Injected` / `InjectFailed` /
+/// `NotInjectable` (the caller-side live-nudge outcome) → `Drained` (consumed in a
+/// recipient turn). Stored as TEXT (`delivery_log.stage`); validated through this
+/// enum. Pure value type — DAG layer `model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    Queued,
+    Injected,
+    InjectFailed,
+    NotInjectable,
+    Drained,
+}
+
+impl DeliveryStage {
+    /// Canonical label stored in `delivery_log.stage` (compile-time constant).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryStage::Queued => "queued",
+            DeliveryStage::Injected => "injected",
+            DeliveryStage::InjectFailed => "inject_failed",
+            DeliveryStage::NotInjectable => "not_injectable",
+            DeliveryStage::Drained => "drained",
+        }
+    }
+
+    /// Parse a stored stage back into the enum; unknown is a hard error. Drift-guard/
+    /// round-trip surface (see `DeliveryRefKind::from_str`).
+    #[allow(dead_code)]
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "queued" => Ok(DeliveryStage::Queued),
+            "injected" => Ok(DeliveryStage::Injected),
+            "inject_failed" => Ok(DeliveryStage::InjectFailed),
+            "not_injectable" => Ok(DeliveryStage::NotInjectable),
+            "drained" => Ok(DeliveryStage::Drained),
+            other => Err(format!("unknown delivery stage '{other}'")),
+        }
+    }
+}
+
+/// Coarse pass/fail of a delivery stage. `Ok` = the stage completed as intended
+/// (queued, injected, not-injectable-but-persisted, drained); `Fail` = the stage's
+/// operation errored (an inject that returned `Err`). Stored as TEXT
+/// (`delivery_log.outcome`); validated through this enum. Pure value type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryOutcome {
+    Ok,
+    Fail,
+}
+
+impl DeliveryOutcome {
+    /// Canonical label stored in `delivery_log.outcome` (compile-time constant).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryOutcome::Ok => "ok",
+            DeliveryOutcome::Fail => "fail",
+        }
+    }
+
+    /// Parse a stored outcome back into the enum; unknown is a hard error. Drift-guard/
+    /// round-trip surface (see `DeliveryRefKind::from_str`).
+    #[allow(dead_code)]
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "ok" => Ok(DeliveryOutcome::Ok),
+            "fail" => Ok(DeliveryOutcome::Fail),
+            other => Err(format!("unknown delivery outcome '{other}'")),
+        }
+    }
+}
+
+/// One row of a delivery's transport trace, surfaced read-only by
+/// `weave_delivery` / `weave delivery`. METADATA ONLY — it deliberately carries NO
+/// body, subject, sig, or token; the trace records *that and whether* a delivery
+/// happened, never its content (the secret-free design point). `ref_id` points at
+/// the `messages` row for an operator who wants the body (already access-controlled
+/// by the inbox). Pure data assembled by the store at read time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryTrace {
+    pub id: i64,
+    pub ref_id: i64,
+    pub ref_kind: String,
+    pub to_peer: String,
+    pub stage: String,
+    pub outcome: String,
+    pub ts: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,6 +1296,46 @@ mod tests {
             assert_eq!(AskState::from_str(s.as_str()), Ok(s));
         }
         assert!(AskState::from_str("bogus").is_err());
+    }
+
+    /// Every `DeliveryStage` variant round-trips through `as_str`/`from_str`; an
+    /// unknown label is a clean error (the exhaustiveness lock for the trace
+    /// vocabulary — adding a variant without updating both maps fails this test).
+    #[test]
+    fn delivery_stage_str_roundtrips() {
+        for s in [
+            DeliveryStage::Queued,
+            DeliveryStage::Injected,
+            DeliveryStage::InjectFailed,
+            DeliveryStage::NotInjectable,
+            DeliveryStage::Drained,
+        ] {
+            assert_eq!(DeliveryStage::from_str(s.as_str()), Ok(s));
+        }
+        assert!(DeliveryStage::from_str("bogus").is_err());
+        assert!(DeliveryStage::from_str("").is_err());
+    }
+
+    /// `DeliveryOutcome` round-trips; unknown is a clean error.
+    #[test]
+    fn delivery_outcome_str_roundtrips() {
+        for s in [DeliveryOutcome::Ok, DeliveryOutcome::Fail] {
+            assert_eq!(DeliveryOutcome::from_str(s.as_str()), Ok(s));
+        }
+        assert!(DeliveryOutcome::from_str("bogus").is_err());
+    }
+
+    /// `DeliveryRefKind` round-trips; unknown is a clean error.
+    #[test]
+    fn delivery_ref_kind_str_roundtrips() {
+        for s in [
+            DeliveryRefKind::Message,
+            DeliveryRefKind::Notify,
+            DeliveryRefKind::Ask,
+        ] {
+            assert_eq!(DeliveryRefKind::from_str(s.as_str()), Ok(s));
+        }
+        assert!(DeliveryRefKind::from_str("bogus").is_err());
     }
 
     /// A minted id is always accepted by the validator; hostile/oversized/charset

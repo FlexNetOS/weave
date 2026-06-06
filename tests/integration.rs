@@ -7218,3 +7218,306 @@ fn mcp_orchestrator_claim_status_whoami() {
 
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P6 — notify_peer + delivery observability
+// ---------------------------------------------------------------------------
+
+/// Extract the leading `#<n>` message id from a notify/send result line.
+fn extract_mid(text: &str) -> i64 {
+    text.split_whitespace()
+        .find_map(|w| {
+            let w = w.trim_start_matches('(').trim_start_matches('#');
+            let w = w.trim_end_matches([',', '.', ')', ':']);
+            w.parse::<i64>().ok()
+        })
+        .unwrap_or_else(|| panic!("no message id in: {text:?}"))
+}
+
+/// CLI end-to-end: `weave notify` returns the honest verdict, persists a normal
+/// message (visible in the recipient's inbox), and `weave delivery` shows the
+/// queued + not_injectable stages (hermetic ⇒ no live pane). `--json` shape checked.
+#[test]
+fn cli_notify_and_delivery_trace() {
+    let db = TestDb::new();
+
+    let out = run_ok(
+        &db,
+        &["notify", "--from", "a", "--to", "b", "--body", "ping-body"],
+    );
+    assert!(out.contains("notified 'b'"), "notify line: {out}");
+    assert!(
+        out.contains("recipient_not_injectable") || out.contains("queued_next_turn"),
+        "honest verdict surfaces: {out}"
+    );
+    let mid = extract_mid(&out);
+
+    // The message persisted as a normal inbox row (notify == send + verdict).
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--peek"]);
+    assert!(inbox.contains("ping-body"), "notify persisted: {inbox}");
+
+    // Delivery trace shows queued + not_injectable (no live pane in a hermetic env).
+    let trace = run_ok(&db, &["delivery", "--id", &mid.to_string()]);
+    assert!(trace.contains("delivery trace"), "trace header: {trace}");
+    assert!(trace.contains("queued"), "queued stage present: {trace}");
+    assert!(
+        trace.contains("not_injectable"),
+        "not_injectable stage present: {trace}"
+    );
+
+    // --json shape: an array of {ts, stage, outcome, to_peer, ref_kind}.
+    let json = run_ok(&db, &["delivery", "--id", &mid.to_string(), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("delivery --json parses");
+    let arr = v.get("delivery").and_then(|d| d.as_array()).expect("array");
+    assert!(!arr.is_empty(), "json trace non-empty: {json}");
+    let first = &arr[0];
+    for key in ["ts", "stage", "outcome", "to_peer", "ref_kind"] {
+        assert!(first.get(key).is_some(), "json row missing {key}: {json}");
+    }
+    assert_eq!(
+        first.get("ref_kind").and_then(|k| k.as_str()),
+        Some("notify"),
+        "ref_kind is notify: {json}"
+    );
+
+    // Unknown id is the empty-trace line, NOT an error.
+    let (ok, empty, _e) = run(&db, &["delivery", "--id", "999999"]);
+    assert!(ok, "delivery of unknown id exits 0");
+    assert!(
+        empty.contains("no delivery trace"),
+        "empty-trace line: {empty}"
+    );
+}
+
+/// CLI: a `prompt` drain records a `drained` stage for the delivered message — the
+/// transport-side proof it landed in a turn. A `stop` peek does NOT drain.
+#[test]
+fn cli_drain_records_drained_stage() {
+    let db = TestDb::new();
+    run_hook(&db, "session", r#"{"cwd":"/proj/p6drain"}"#);
+
+    let sent = run_ok(
+        &db,
+        &[
+            "send", "--from", "bob", "--to", "p6drain", "--body", "drain-me",
+        ],
+    );
+    let mid = extract_mid(&sent);
+
+    // A Stop peek must NOT record a drained stage.
+    run_hook(&db, "stop", r#"{"cwd":"/proj/p6drain"}"#);
+    let after_stop = run_ok(&db, &["delivery", "--id", &mid.to_string()]);
+    assert!(
+        !after_stop.contains("drained"),
+        "stop peek does not drain: {after_stop}"
+    );
+
+    // A prompt drain (explicit cwd ⇒ marks read) records the drained stage.
+    run_hook(&db, "prompt", r#"{"cwd":"/proj/p6drain"}"#);
+    let after_prompt = run_ok(&db, &["delivery", "--id", &mid.to_string()]);
+    assert!(
+        after_prompt.contains("drained"),
+        "prompt drain records drained: {after_prompt}"
+    );
+}
+
+/// REGRESSION: `weave send` + `weave receipts` output and read-marking are
+/// unchanged with the P6 trace present (the trace is purely additive). Pins the
+/// historical send/receipts contract byte-for-byte at the observable level.
+#[test]
+fn cli_send_and_receipts_unchanged_with_trace() {
+    let db = TestDb::new();
+    let sent = run_ok(
+        &db,
+        &["send", "--from", "x", "--to", "y", "--body", "regress"],
+    );
+    assert!(sent.contains("sent #"), "send line unchanged: {sent}");
+    assert!(sent.contains("x -> y"), "send routing unchanged: {sent}");
+    let mid = extract_mid(&sent);
+
+    // Receipts: none until y reads it.
+    let r0 = run_ok(&db, &["receipts", "--id", &mid.to_string()]);
+    assert!(r0.contains("no reads yet"), "no receipts yet: {r0}");
+
+    // y reads (marks read).
+    let inbox = run_ok(&db, &["inbox", "--me", "y"]);
+    assert!(inbox.contains("regress"), "y reads message: {inbox}");
+
+    // Now receipts show y.
+    let r1 = run_ok(&db, &["receipts", "--id", &mid.to_string()]);
+    assert!(r1.contains("read by"), "receipts show reader: {r1}");
+    assert!(r1.contains("y at"), "receipts name reader: {r1}");
+}
+
+/// BEST-EFFORT NEVER SINKS DELIVERY: a `weave notify` to a peer whose live nudge
+/// FAILS (the fake mux's `send-keys` exits non-zero, the realistic "delivery path
+/// errored" case) must STILL succeed — exit 0, the message persists to the inbox,
+/// and the verdict prints. The trace records the `inject_failed/fail` stage,
+/// proving (a) the failing inject path was exercised and (b) neither the inject
+/// failure NOR the subsequent best-effort trace write sinks the notify. The message
+/// is the durable contract; the nudge + trace are advisory.
+#[test]
+fn notify_inject_failure_never_sinks_delivery() {
+    let db = TestDb::new();
+
+    // A fake tmux: liveness probe succeeds (target considered alive) but send-keys
+    // exits 1 — forcing inject() to return Err -> the InjectFailed/Fail trace stage.
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let dir = common::unique_db().with_extension("muxbin");
+    std::fs::create_dir_all(&dir).expect("create fake-mux dir");
+    let script = dir.join("tmux");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a in \"$@\"; do\n  if [ \"$a\" = send-keys ]; then exit 1; fi\ndone\nexit 0\n",
+        log.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+
+    // Register 'b' as an injectable tmux pane in the SAME store (local notify).
+    let reg = weave_with_fake_path(
+        &db,
+        &dir,
+        &[("TMUX_PANE", "%8")],
+        &["register", "--name", "b"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(
+        reg.status.success(),
+        "register failed: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    // Notify 'b' with the failing mux on PATH. Despite the inject failing, the notify
+    // MUST exit 0 and print the verdict line.
+    let out = weave_with_fake_path(
+        &db,
+        &dir,
+        &[],
+        &[
+            "notify",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "survive-fail",
+        ],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn notify");
+    assert!(
+        out.status.success(),
+        "a failed inject (and any trace write) must NOT sink the notify (exit 0): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.contains("notified 'b'"), "notify printed: {stdout}");
+    let mid = extract_mid(&stdout);
+
+    // Confirm the inject WAS attempted and failed (we exercised the failure path).
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("send-keys"),
+        "the inject was attempted (and failed): {logged}"
+    );
+
+    // The message still persisted to b's inbox (the durable contract).
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--peek"]);
+    assert!(
+        inbox.contains("survive-fail"),
+        "message persisted despite inject failure: {inbox}"
+    );
+
+    // The trace records the failing stage — proving the post-inject best-effort write
+    // happened AND captured inject_failed/fail without sinking delivery.
+    let trace = run_ok(&db, &["delivery", "--id", &mid.to_string()]);
+    assert!(trace.contains("queued"), "queued stage present: {trace}");
+    assert!(
+        trace.contains("inject_failed"),
+        "inject_failed stage recorded (best-effort trace survived): {trace}"
+    );
+    assert!(trace.contains("fail"), "fail outcome recorded: {trace}");
+}
+
+/// MCP black-box: `weave_notify` + `weave_delivery` are present; the happy path
+/// returns a verdict token (NOT isError) even for an unknown peer; broadcast and
+/// oversized body are clean isError results; `weave_delivery` of a known msg lists
+/// stages and of an unknown ref is the empty-trace line (not an error).
+#[test]
+fn mcp_notify_and_delivery_lifecycle_and_failures() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // tools/list contains both new tools.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in ["weave_notify", "weave_delivery"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "tools/list missing {expected}; got {names:?}"
+        );
+    }
+
+    // Happy path: notify to an unknown peer is HONEST SUCCESS with a verdict, NOT an
+    // error (degrade-to-store), and persists the message.
+    let (is_err, text) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "alice", "to": "bob", "body": "notify-secret-marker"}),
+    );
+    assert!(!is_err, "notify to not-injectable peer is success: {text}");
+    assert!(text.contains("Notified 'bob'"), "notify result: {text:?}");
+    assert!(
+        text.contains("recipient_not_injectable"),
+        "honest verdict token surfaces: {text:?}"
+    );
+    let mid = extract_mid(&text);
+
+    // weave_delivery of the known message lists stages (queued + not_injectable).
+    let (is_err, dtext) = mcp.call_tool("weave_delivery", serde_json::json!({"message_id": mid}));
+    assert!(!is_err, "delivery read is not an error: {dtext}");
+    assert!(dtext.contains("queued"), "queued stage: {dtext:?}");
+    assert!(
+        dtext.contains("not_injectable"),
+        "not_injectable stage: {dtext:?}"
+    );
+    // SECRET-FREE: the body marker never appears in the trace surface.
+    assert!(
+        !dtext.contains("notify-secret-marker"),
+        "delivery trace must NOT leak the body: {dtext:?}"
+    );
+
+    // FAILURE: broadcast notify -> isError pointing to send.
+    let (is_err, t) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "alice", "to": "all", "body": "x"}),
+    );
+    assert!(is_err, "broadcast notify must be isError: {t}");
+    assert!(t.contains("weave_send"), "points to send: {t:?}");
+
+    // FAILURE: oversized body -> isError, no panic / partial persist.
+    let big = "z".repeat(70_000);
+    let (is_err, t) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "alice", "to": "bob", "body": big}),
+    );
+    assert!(is_err, "oversized notify body must be isError: {t}");
+
+    // weave_delivery of an UNKNOWN ref -> empty trace line, NOT an error.
+    let (is_err, t) = mcp.call_tool("weave_delivery", serde_json::json!({"message_id": 999999}));
+    assert!(!is_err, "delivery of unknown ref is not an error: {t}");
+    assert!(t.contains("No delivery trace"), "empty-trace line: {t:?}");
+
+    mcp.shutdown();
+}

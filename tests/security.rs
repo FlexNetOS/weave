@@ -3034,3 +3034,108 @@ fn presence_surfaces_are_secret_free() {
         assert!(!out.contains("/home/"), "no path leakage in {cmd:?}: {out}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// P6 — delivery trace: secret-free, capped, bounded, best-effort.
+// ---------------------------------------------------------------------------
+
+/// Extract the leading `#<n>` message id from a notify/send result line.
+fn mid_of(text: &str) -> String {
+    text.split_whitespace()
+        .find_map(|w| {
+            let w = w.trim_start_matches('(').trim_start_matches('#');
+            let w = w.trim_end_matches([',', '.', ')', ':']);
+            w.parse::<i64>().ok().map(|n| n.to_string())
+        })
+        .unwrap_or_else(|| panic!("no message id in: {text:?}"))
+}
+
+/// SECRET-FREE: a hostile/marker body sent via `weave notify` must NEVER appear in
+/// any `weave delivery` row (human OR --json) — the trace is metadata-only
+/// (ref_id, ref_kind, to_peer, stage, outcome, ts). The body still lives in the
+/// inbox (access-controlled), but the transport trace leaks nothing.
+#[test]
+fn delivery_trace_never_contains_the_body() {
+    let db = TestDb::new();
+    let marker = "TOPSECRET-DELIVERY-MARKER-7f3a";
+    let out = run_ok(
+        &db,
+        &["notify", "--from", "a", "--to", "b", "--body", marker],
+    );
+    let mid = mid_of(&out);
+
+    // Human trace.
+    let human = run_ok(&db, &["delivery", "--id", &mid]);
+    assert!(
+        !human.contains(marker),
+        "delivery (human) leaked the body: {human}"
+    );
+    // JSON trace.
+    let json = run_ok(&db, &["delivery", "--id", &mid, "--json"]);
+    assert!(
+        !json.contains(marker),
+        "delivery (--json) leaked the body: {json}"
+    );
+    // Sanity: the body DID persist to the inbox (so we know it was really sent).
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--peek"]);
+    assert!(inbox.contains(marker), "body persisted to inbox: {inbox}");
+}
+
+/// CAPS + NO-SHELL: an oversized notify body is rejected (never a panic / partial
+/// persist). A metachar/space-bearing `to` is NOT shelled (weave never reaches a
+/// shell) — it is treated as a literal recipient name, bound as a SQL param, so the
+/// notify completes safely without spawning anything. A control-bearing `to` is
+/// rejected by `check_ident`.
+#[test]
+fn notify_caps_and_hostile_target_are_safe() {
+    let db = TestDb::new();
+    // Oversized body (> MAX_BODY 65536) is rejected.
+    let big = "x".repeat(70_000);
+    let (ok, _o, err) = run(&db, &["notify", "--from", "a", "--to", "b", "--body", &big]);
+    assert!(!ok, "oversized notify body must be rejected");
+    assert!(err.contains("too long"), "clear cap error: {err}");
+
+    // A shell-metachar `to` must NEVER be shelled — it is a literal recipient name.
+    // The notify succeeds (degrade-to-store) and the message is addressed verbatim,
+    // proving the value was bound, not interpreted. The fs sentinel proves nothing
+    // ran a shell.
+    let sentinel = std::env::temp_dir().join(format!("weave-notify-pwn-{}", std::process::id()));
+    let _ = std::fs::remove_file(&sentinel);
+    let hostile = format!("evil; touch {}", sentinel.display());
+    let (ok, _o, _e) = run(
+        &db,
+        &["notify", "--from", "a", "--to", &hostile, "--body", "x"],
+    );
+    assert!(ok, "a metachar target is a literal name, handled safely");
+    assert!(
+        !sentinel.exists(),
+        "no shell ran: the sentinel file must not exist"
+    );
+
+    // A control-character target IS rejected by check_ident (never persisted).
+    let ctrl = "evil\n\t\u{1b}";
+    let (ok, _o, _e) = run(&db, &["notify", "--from", "a", "--to", ctrl, "--body", "x"]);
+    assert!(!ok, "control-bearing target must be rejected");
+}
+
+/// SECRET-FREE (MCP surface): a hostile body sent through `weave_notify` and then
+/// read back through `weave_delivery` never leaks the body byte. Mirrors the CLI
+/// secret-free test on the JSON-RPC seam.
+#[test]
+fn mcp_delivery_trace_is_secret_free() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let marker = "MCP-DELIVERY-SECRET-9b2c";
+    let (is_err, text) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "a", "to": "b", "body": marker}),
+    );
+    assert!(!is_err, "notify success: {text}");
+    let mid: i64 = mid_of(&text).parse().unwrap();
+    let (_e, dtext) = mcp.call_tool("weave_delivery", serde_json::json!({"message_id": mid}));
+    assert!(
+        !dtext.contains(marker),
+        "MCP delivery trace leaked the body: {dtext}"
+    );
+    mcp.shutdown();
+}
