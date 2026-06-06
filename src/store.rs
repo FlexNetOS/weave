@@ -7,8 +7,8 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    now, Ask, AskManyResult, AskRole, ClaimOutcome, Intent, Job, JobFilter, JobPatch,
-    JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    now, Ask, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
 };
 use anyhow::Result;
 
@@ -25,7 +25,7 @@ pub use crate::store_libsql::{
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, AskGroup,
-    AskManyChildView, AskState, BROADCAST_SQL,
+    AskManyChildView, AskState, BROADCAST_SQL, MAX_DELIVERY_ROWS,
 };
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -492,6 +492,31 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn cancel_job(&self, id: &str, requested_by: &str, reason: Option<&str>)
         -> Result<Option<Job>>;
+
+    /// P6 delivery observability: append ONE metadata-only stage row to the
+    /// `delivery_log` trace for `ref_id`. The store records the OUTCOME its CALLER
+    /// passes (post-inject); it NEVER injects — there is no store→inject edge. Owner-
+    /// only: writes the LOCAL store. SECRET-FREE — only (ref_id, ref_kind, to_peer,
+    /// stage, outcome, ts) are bound; NO body/subject/sig/token ever reaches this
+    /// table. `stage`/`outcome`/`ref_kind` are the model enum `.as_str()` constants
+    /// (the only inlined SQL "literals"); the row's user-derived fields are bound via
+    /// `params!`. Best-effort by convention: callers wrap it so a trace failure can
+    /// never sink the delivery hot path.
+    #[allow(dead_code)]
+    fn record_delivery(
+        &self,
+        ref_id: i64,
+        ref_kind: &str,
+        to_peer: &str,
+        stage: &str,
+        outcome: &str,
+    ) -> Result<()>;
+
+    /// P6: read the delivery trace for `ref_id`, oldest-first (`ts ASC, id ASC`),
+    /// BOUNDED at `min(limit, MAX_DELIVERY_ROWS)` so a pathological ref can never
+    /// return an unbounded vector. Read-only, metadata-only.
+    #[allow(dead_code)]
+    fn list_delivery(&self, ref_id: i64, limit: i64) -> Result<Vec<DeliveryTrace>>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1182,6 +1207,17 @@ CREATE INDEX IF NOT EXISTS idx_jobs_state            ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated    ON jobs(owner, updated_ts);
 CREATE INDEX IF NOT EXISTS idx_jobs_assignee_updated ON jobs(assignee, updated_ts);
 CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated   ON jobs(circle, updated_ts);
+CREATE TABLE IF NOT EXISTS delivery_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_id    INTEGER NOT NULL,
+    ref_kind  TEXT NOT NULL,
+    to_peer   TEXT NOT NULL,
+    stage     TEXT NOT NULL,
+    outcome   TEXT NOT NULL,
+    ts        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind);
+CREATE INDEX IF NOT EXISTS idx_delivery_log_ts  ON delivery_log(ts);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1626,6 +1662,25 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated    ON jobs(owner, updated_ts);
         CREATE INDEX IF NOT EXISTS idx_jobs_assignee_updated ON jobs(assignee, updated_ts);
         CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated   ON jobs(circle, updated_ts);",
+    )?;
+    // delivery_log (P6): the metadata-only transport-trace surface. Created via
+    // SCHEMA above for a fresh DB; also created idempotently here for a legacy DB
+    // that predates it (the `asks`/`revocations`/`jobs` additive template). SECRET-
+    // FREE by construction — columns are (ref_id, ref_kind, to_peer, stage, outcome,
+    // ts) ONLY; never body/subject/sig/token. `CREATE TABLE/INDEX IF NOT EXISTS` is
+    // idempotent and the DDL identifiers are constant — no user data interpolated.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS delivery_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref_id    INTEGER NOT NULL,
+            ref_kind  TEXT NOT NULL,
+            to_peer   TEXT NOT NULL,
+            stage     TEXT NOT NULL,
+            outcome   TEXT NOT NULL,
+            ts        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind);
+        CREATE INDEX IF NOT EXISTS idx_delivery_log_ts  ON delivery_log(ts);",
     )?;
     Ok(())
 }
@@ -2493,8 +2548,56 @@ impl Store for SqliteStore {
             params![cutoff],
         )?;
         tx.execute("DELETE FROM messages WHERE ts < ?1", params![cutoff])?;
+        // P6: prune the delivery trace by the SAME retention cutoff so it is bounded
+        // by the existing gc pass (no new sweeper). Mirrors the `messages` prune;
+        // the count returned still reflects messages only (the trace is metadata).
+        tx.execute("DELETE FROM delivery_log WHERE ts < ?1", params![cutoff])?;
         tx.commit()?;
         Ok(n)
+    }
+
+    fn record_delivery(
+        &self,
+        ref_id: i64,
+        ref_kind: &str,
+        to_peer: &str,
+        stage: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        // SECRET-FREE: only these six metadata fields are bound — never a body,
+        // subject, sig, or token. The store NEVER injects; it records the outcome
+        // its caller already computed post-inject. All values are bound via params!
+        // (the table/column identifiers are the only constant literals).
+        self.conn.execute(
+            "INSERT INTO delivery_log (ref_id, ref_kind, to_peer, stage, outcome, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ref_id, ref_kind, to_peer, stage, outcome, now()],
+        )?;
+        Ok(())
+    }
+
+    fn list_delivery(&self, ref_id: i64, limit: i64) -> Result<Vec<DeliveryTrace>> {
+        // BOUNDED: never return more than MAX_DELIVERY_ROWS regardless of `limit`.
+        let lim = limit.clamp(1, MAX_DELIVERY_ROWS);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ref_id, ref_kind, to_peer, stage, outcome, ts
+             FROM delivery_log WHERE ref_id = ?1
+             ORDER BY ts ASC, id ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![ref_id, lim], |r| {
+                Ok(DeliveryTrace {
+                    id: r.get(0)?,
+                    ref_id: r.get(1)?,
+                    ref_kind: r.get(2)?,
+                    to_peer: r.get(3)?,
+                    stage: r.get(4)?,
+                    outcome: r.get(5)?,
+                    ts: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn register_peer_full(
@@ -4544,6 +4647,153 @@ mod tests {
         assert_eq!(s.total_messages().unwrap(), 1);
         let (rows, _) = s.inbox("b", true, false, 50).unwrap();
         assert_eq!(rows[0].body, "new");
+    }
+
+    /// P6: record_delivery appends metadata-only stage rows that list_delivery
+    /// returns oldest-first (ts ASC, id ASC). The trace carries NO body.
+    #[test]
+    fn delivery_log_records_and_lists_oldest_first() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        let s = mem();
+        let mid = s.send("a", "b", None, "SECRET-BODY-XYZ").unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Queued.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Injected.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        let trace = s.list_delivery(mid, 50).unwrap();
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].stage, "queued");
+        assert_eq!(trace[1].stage, "injected");
+        assert_eq!(trace[0].to_peer, "b");
+        // SECRET-FREE: the body never appears anywhere in a trace row.
+        for t in &trace {
+            let blob = format!("{t:?}");
+            assert!(
+                !blob.contains("SECRET-BODY-XYZ"),
+                "trace leaked body: {blob}"
+            );
+        }
+        // Unknown ref ⇒ empty (not an error).
+        assert!(s.list_delivery(999_999, 50).unwrap().is_empty());
+    }
+
+    /// P6: list_delivery never returns more than MAX_DELIVERY_ROWS regardless of
+    /// the requested limit (bounded read).
+    #[test]
+    fn delivery_log_read_is_bounded() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
+        let s = mem();
+        let mid = s.send("a", "b", None, "x").unwrap();
+        for _ in 0..(MAX_DELIVERY_ROWS + 25) {
+            s.record_delivery(
+                mid,
+                DeliveryRefKind::Notify.as_str(),
+                "b",
+                DeliveryStage::Queued.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap();
+        }
+        // A huge / negative limit is clamped to MAX_DELIVERY_ROWS.
+        assert_eq!(
+            s.list_delivery(mid, i64::MAX).unwrap().len() as i64,
+            MAX_DELIVERY_ROWS
+        );
+        assert!(s.list_delivery(mid, -1).unwrap().len() as i64 <= MAX_DELIVERY_ROWS);
+    }
+
+    /// P6: gc prunes old delivery_log rows in the same retention pass, keeping
+    /// recent ones (mirrors gc_deletes_old_keeps_new for messages).
+    #[test]
+    fn gc_prunes_old_delivery_log() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        let s = mem();
+        let mid = s.send("a", "b", None, "m").unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Queued.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        // Backdate the trace row well past the threshold.
+        s.conn
+            .execute(
+                "UPDATE delivery_log SET ts = ts - 100000 WHERE ref_id = ?1",
+                params![mid],
+            )
+            .unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Drained.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        s.gc(3600).unwrap();
+        let trace = s.list_delivery(mid, 50).unwrap();
+        assert_eq!(trace.len(), 1, "only the recent (drained) row survives gc");
+        assert_eq!(trace[0].stage, "drained");
+    }
+
+    /// P6: a legacy DB without delivery_log gains it on open (idempotent migrate),
+    /// and record/list work afterward. Mirrors legacy_asks_gains_parent_id.
+    #[test]
+    fn legacy_db_gains_delivery_log() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        let dir = std::env::temp_dir().join(format!(
+            "weave-delivery-legacy-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        {
+            // A pre-P6 store: messages only, NO delivery_log table.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                    sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT,
+                    body TEXT NOT NULL, in_reply_to INTEGER
+                 );
+                 INSERT INTO messages (ts, sender, recipient, subject, body)
+                 VALUES (1, 'a', 'b', NULL, 'q');",
+            )
+            .unwrap();
+        }
+        // First open migrates delivery_log in; record + list work.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.record_delivery(
+                1,
+                DeliveryRefKind::Ask.as_str(),
+                "b",
+                DeliveryStage::Queued.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap();
+            assert_eq!(s.list_delivery(1, 50).unwrap().len(), 1);
+        }
+        // Re-open is a clean idempotent no-op; the trace persists.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert_eq!(s.list_delivery(1, 50).unwrap().len(), 1);
+        }
     }
 
     #[test]

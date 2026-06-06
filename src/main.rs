@@ -152,6 +152,20 @@ enum Cmd {
         #[arg(long)]
         to_host: Option<String>,
     },
+    /// Fire-and-forget notification to a peer (no reply expected). Persists +
+    /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
+    /// (transport_delivered / queued_next_turn / recipient_not_injectable).
+    /// Point-to-point only; use `weave send` for broadcast.
+    Notify {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+    },
     /// List pending cross-store intents in your outbox (Tier-2, read-only).
     Outbox {
         #[arg(long, default_value_t = 200)]
@@ -192,6 +206,17 @@ enum Cmd {
     /// Show read receipts for a message: who has read it, and when.
     Receipts {
         /// id of the message to inspect
+        #[arg(long)]
+        id: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the DELIVERY/transport trace for a message (queued -> injected /
+    /// inject_failed / not_injectable -> drained). The transport-side complement to
+    /// `weave receipts` (read receipts). Read-only and metadata-only.
+    Delivery {
+        /// id of the message to trace
         #[arg(long)]
         id: i64,
         /// machine-readable JSON output
@@ -1043,6 +1068,95 @@ fn ask_inject_verdict(
             }
         },
     }
+}
+
+/// Best-effort delivery-trace write (CLI side): append one metadata-only stage row,
+/// swallowing (and logging to STDERR) any store error so a trace failure can NEVER
+/// sink the delivery path. Mirrors the gc/git-tag best-effort precedent. The store
+/// records the OUTCOME passed here AFTER the inject — NO `store → inject` edge.
+fn record_delivery_best_effort(
+    store: &dyn Store,
+    ref_id: i64,
+    kind: model::DeliveryRefKind,
+    to: &str,
+    stage: model::DeliveryStage,
+    outcome: model::DeliveryOutcome,
+) {
+    if let Err(err) =
+        store.record_delivery(ref_id, kind.as_str(), to, stage.as_str(), outcome.as_str())
+    {
+        eprintln!("delivery-trace write failed (non-fatal): {err}");
+    }
+}
+
+/// Inject a freshly-persisted point-to-point message AND record its delivery trace
+/// (queued + the post-inject stage), returning the normalized HONEST verdict token so
+/// the caller can print it WITHOUT a second inject. Caller-side, best-effort trace —
+/// never sinks the send. Skips broadcast (not injected, not traced in P6 — returns
+/// `recipient_not_injectable`). The recorded stage and the returned verdict are
+/// derived from the SAME inject result, so they can never disagree.
+fn inject_and_trace(
+    store: &dyn Store,
+    cfg: &Config,
+    ref_id: i64,
+    kind: model::DeliveryRefKind,
+    from: &str,
+    to: &str,
+    body: &str,
+) -> Result<&'static str> {
+    if model::is_broadcast(to) {
+        return Ok("recipient_not_injectable");
+    }
+    record_delivery_best_effort(
+        store,
+        ref_id,
+        kind,
+        to,
+        model::DeliveryStage::Queued,
+        model::DeliveryOutcome::Ok,
+    );
+    let (stage, outcome, verdict) = if let Some(peer) = store.get_peer(to)? {
+        let t = inject::Target::from_peer(&peer);
+        if t.injectable() {
+            match inject::inject(&t, &cfg.nudge(from, body)) {
+                Ok(true) => {
+                    println!("injected into {} '{}'", t.mux.as_str(), t.id);
+                    (
+                        model::DeliveryStage::Injected,
+                        model::DeliveryOutcome::Ok,
+                        "transport_delivered",
+                    )
+                }
+                Ok(false) => (
+                    model::DeliveryStage::Queued,
+                    model::DeliveryOutcome::Ok,
+                    "queued_next_turn",
+                ),
+                Err(err) => {
+                    eprintln!("inject failed ({err}); will arrive on next turn");
+                    (
+                        model::DeliveryStage::InjectFailed,
+                        model::DeliveryOutcome::Fail,
+                        "queued_next_turn",
+                    )
+                }
+            }
+        } else {
+            (
+                model::DeliveryStage::NotInjectable,
+                model::DeliveryOutcome::Ok,
+                "recipient_not_injectable",
+            )
+        }
+    } else {
+        (
+            model::DeliveryStage::NotInjectable,
+            model::DeliveryOutcome::Ok,
+            "recipient_not_injectable",
+        )
+    };
+    record_delivery_best_effort(store, ref_id, kind, to, stage, outcome);
+    Ok(verdict)
 }
 
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
@@ -1986,9 +2100,50 @@ fn main() -> Result<()> {
                 None => {
                     let mid = store.send(&from, &to, subject.as_deref(), &body)?;
                     println!("sent #{mid}: {from} -> {to}");
-                    try_inject(store, &cfg, &from, &to, &body)?;
+                    let _ = inject_and_trace(
+                        store,
+                        &cfg,
+                        mid,
+                        model::DeliveryRefKind::Message,
+                        &from,
+                        &to,
+                        &body,
+                    )?;
                 }
             }
+        }
+
+        Cmd::Notify {
+            from,
+            to,
+            subject,
+            body,
+        } => {
+            // Fire-and-forget point-to-point notification. Persist via the normal send
+            // path (no fork), fire the SAME caller-side nudge + trace, and print the
+            // honest verdict. Broadcast is rejected (point-to-point only).
+            if model::is_broadcast(&to) {
+                anyhow::bail!(
+                    "notify is point-to-point (no reply expected); use `weave send` for broadcast \
+                     (broadcast notify is deferred)."
+                );
+            }
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+            // Trace + nudge (best-effort trace, no store→inject edge). The honest
+            // verdict is derived from the SAME inject result that drove the trace, so
+            // the printed token and the recorded stage can never disagree.
+            let verdict = inject_and_trace(
+                store,
+                &cfg,
+                mid,
+                model::DeliveryRefKind::Notify,
+                &from,
+                &to,
+                &body,
+            )?;
+            println!("notified '{to}' (#{mid}, no reply expected) [{verdict}]");
         }
 
         Cmd::Outbox { limit, json } => {
@@ -2358,6 +2513,47 @@ fn main() -> Result<()> {
                 println!("#{id} read by:");
                 for (reader, ts) in &receipts {
                     println!("  {reader} at {}", model::fmt_ts(*ts));
+                }
+            }
+        }
+
+        Cmd::Delivery { id, json } => {
+            // Transport trace (queued -> injected/inject_failed/not_injectable ->
+            // drained). Read-only, metadata-only — no body. An unknown id is the
+            // empty-trace line, not an error.
+            let trace = store.list_delivery(id, model::MAX_DELIVERY_ROWS)?;
+            if json {
+                let arr: Vec<_> = trace
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "ts": t.ts,
+                            "stage": t.stage,
+                            "outcome": t.outcome,
+                            "to_peer": t.to_peer,
+                            "ref_kind": t.ref_kind,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "message_id": id, "delivery": arr
+                    }))?
+                );
+            } else if trace.is_empty() {
+                println!("#{id}: no delivery trace");
+            } else {
+                println!("#{id} delivery trace:");
+                for t in &trace {
+                    println!(
+                        "  [{}] {}/{} -> {} ({})",
+                        model::fmt_ts(t.ts),
+                        t.stage,
+                        t.outcome,
+                        t.to_peer,
+                        t.ref_kind
+                    );
                 }
             }
         }
@@ -3744,6 +3940,23 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                         .map(|s| format!(" ({s})"))
                         .unwrap_or_default();
                     println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
+                }
+                // P6 drain trace: ONLY on the marking-read branch (a peek/Stop does not
+                // "drain"). This is the transport-side proof the message actually landed
+                // in a turn. Best-effort + AFTER the drain (the hot path) so a trace
+                // write can never sink delivery; the OUTCOME is recorded by the store —
+                // no store->inject edge.
+                if mark_read {
+                    for m in &rows {
+                        record_delivery_best_effort(
+                            store,
+                            m.id,
+                            model::DeliveryRefKind::Message,
+                            &me,
+                            model::DeliveryStage::Drained,
+                            model::DeliveryOutcome::Ok,
+                        );
+                    }
                 }
             }
             // P5: a UserPromptSubmit means a turn just started (working); a Stop

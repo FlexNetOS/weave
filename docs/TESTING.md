@@ -618,6 +618,37 @@ enforces the caps and the **owner-only** rule: a description is control-stripped
 secret-free, and a caller **cannot set another peer's** turn_state/description (every
 setter is an UPDATE bound to the caller's own resolved identity).
 
+### notify_peer + delivery observability (P6)
+
+P6 is tested **hermetically across both backends** and end-to-end. The pure `model`
+layer locks the trace vocabulary: `DeliveryRefKind`/`DeliveryStage`/`DeliveryOutcome`
+each round-trip `from_str(as_str())` for **every** variant (unknown ⇒ a hard `Err`) —
+the exhaustiveness lock for the enum-as-TEXT columns. The store layer (`store.rs` /
+`store_libsql.rs` `#[cfg(test)]`, run under sqlite **and** `--features libsql`) covers:
+**migration idempotency on a legacy DB** (a pre-P6 DB with no `delivery_log` gains it
+on open; `record`/`list` work; re-open is a no-op); `record_delivery` append →
+`list_delivery` returns stages **oldest-first** (`ts ASC, id ASC`) and the body **never**
+appears in a trace row (secret-free at the store seam); the read is **bounded** by
+`MAX_DELIVERY_ROWS` regardless of the requested limit; `gc` prunes old `delivery_log`
+rows in the **same retention pass** while keeping recent ones; and (libsql)
+`record_delivery` **traps on a read-only handle first** (owner-only-writes). The pure
+`verdict_to_stage` fold has a `mcp.rs` unit test pinning each verdict token → (stage,
+outcome) and the safe `Queued/Ok` default. The `McpServer` + `CARGO_BIN_EXE_weave`
+black-box layers cover the happy `weave_notify` path (verdict token, NOT `isError`,
+even for an unknown peer — degrade-to-store) **and the failure paths** (broadcast `to`
+⇒ `isError` pointing to send; oversized body ⇒ `isError`, no partial persist;
+`weave_delivery` of an unknown ref ⇒ the empty-trace line, not an error), the **drain
+trace** (a `prompt` mark-read drain records a `drained` stage; a `stop` peek does not),
+and the **send/receipts regression-lock** (send + receipts output and read-marking are
+byte-identical with the trace present — the trace is purely additive). `tests/security.rs`
+asserts the **secret-free** invariant directly (a hostile body marker never appears in
+any `delivery` row — human, `--json`, or MCP), the caps (oversized notify body rejected),
+and **no-shell** handling of a metachar `to` (bound as a literal, no shell sentinel; a
+control-char `to` is rejected). The trace is **best-effort** everywhere — a write failure
+logs to stderr and never sinks delivery (the `set_turn_state_best_effort`/gc precedent),
+and there is **no `store → inject` edge** (the store records the outcome it is passed
+after the inject; neither backend imports `inject`).
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

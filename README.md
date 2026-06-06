@@ -96,6 +96,11 @@ weave describe "reviewing PR #23"    # set a short self-description (TTL'd, cont
 weave status working                 # explicitly set your turn_state (pending_first_turn|working|awaiting_input|idle)
                                      # (turn_state is normally auto-set by the lifecycle hooks — see below)
 
+# Notify + delivery observability (P6): fire-and-forget + transport-side trace
+weave notify --from desktop --to envctl --body "heads up"   # no reply expected; prints the honest delivery verdict
+weave delivery --id 42               # show the transport trace (queued -> injected/not_injectable -> drained); --json
+                                     # (the complement to `weave receipts`, which shows READ receipts)
+
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
 
@@ -243,6 +248,7 @@ is pulled in.
 · `weave_job_update` · `weave_job_result` · `weave_job_cancel`
 · `weave_claim_orchestrator` · `weave_orchestrator_status` (P4 circles)
 · `weave_set_turn_state` · `weave_set_description` (P5 rich presence)
+· `weave_notify` · `weave_delivery` (P6 notify + delivery observability)
 
 `weave_peers` / `weave_sessions` / `weave_scan` take an optional `circle` arg
 (`"*"` = mesh-wide; omitted = your circle), and `weave_whoami` echoes your circle +
@@ -256,6 +262,17 @@ compactly (non-idle turn_state + a live description only), `weave_whoami` always
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
+
+`weave_notify` `{ to, body, subject? }` is a **fire-and-forget** (no-reply) notification: it
+persists a normal message, fires the same live nudge if the recipient is injectable, and
+returns the **honest delivery verdict** — `transport_delivered` (nudge landed live) /
+`queued_next_turn` (registered/not-alive — arrives next drain) / `recipient_not_injectable`.
+An unknown peer is honest success (the message waits), not an error; it is point-to-point
+(use `weave_send` for broadcast) and opens no tracked thread (the difference from `weave_ask`).
+`weave_delivery` `{ message_id }` shows the **transport** trace (queued → injected /
+inject_failed / not_injectable → drained) — the complement to `weave_receipts` (which shows
+READ receipts). The trace is **metadata-only** (it never carries the message body); an
+unknown/never-traced id returns an empty trace, not an error.
 
 **Cross-store (Tier-2).** Pass `to_store` (a path to another store) to `weave_send` to queue
 the message as a directed intent in **your own** outbox — the recipient pulls and commits it

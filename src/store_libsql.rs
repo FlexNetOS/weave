@@ -39,8 +39,9 @@ use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
-    AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, BROADCAST_SQL,
+    AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job,
+    JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    BROADCAST_SQL, MAX_DELIVERY_ROWS,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
@@ -186,6 +187,19 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated ON jobs(owner, updated_ts)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_assignee_updated ON jobs(assignee, updated_ts)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated ON jobs(circle, updated_ts)",
+    // delivery_log (P6): metadata-only transport trace. SECRET-FREE — only (ref_id,
+    // ref_kind, to_peer, stage, outcome, ts); never body/subject/sig/token.
+    "CREATE TABLE IF NOT EXISTS delivery_log (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ref_id    INTEGER NOT NULL,
+        ref_kind  TEXT NOT NULL,
+        to_peer   TEXT NOT NULL,
+        stage     TEXT NOT NULL,
+        outcome   TEXT NOT NULL,
+        ts        INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -705,6 +719,33 @@ impl LibsqlStore {
                 "CREATE INDEX IF NOT EXISTS idx_jobs_circle_updated ON jobs(circle, updated_ts)",
             ] {
                 conn.execute(idx, ()).await.context("creating jobs index")?;
+            }
+            // Migration (P6): the metadata-only delivery trace. Created via SCHEMA
+            // above for a fresh DB; also created idempotently here for a DB that
+            // predates it (mirrors SqliteStore::migrate). SECRET-FREE — only (ref_id,
+            // ref_kind, to_peer, stage, outcome, ts); never body/subject/sig/token.
+            // Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_log (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ref_id    INTEGER NOT NULL,
+                    ref_kind  TEXT NOT NULL,
+                    to_peer   TEXT NOT NULL,
+                    stage     TEXT NOT NULL,
+                    outcome   TEXT NOT NULL,
+                    ts        INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating delivery_log table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
+                "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating delivery_log index")?;
             }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
@@ -1336,6 +1377,13 @@ impl Store for LibsqlStore {
             .await?;
             tx.execute(
                 "DELETE FROM messages WHERE ts < ?1",
+                params(vec![cutoff.into()]),
+            )
+            .await?;
+            // P6: prune the delivery trace by the SAME cutoff so it is bounded by the
+            // existing retention pass (no new sweeper). Mirrors SqliteStore::gc.
+            tx.execute(
+                "DELETE FROM delivery_log WHERE ts < ?1",
                 params(vec![cutoff.into()]),
             )
             .await?;
@@ -2962,6 +3010,69 @@ impl Store for LibsqlStore {
             Ok(None)
         }
     }
+
+    fn record_delivery(
+        &self,
+        ref_id: i64,
+        ref_kind: &str,
+        to_peer: &str,
+        stage: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        // OWNER-ONLY-WRITES: trap on a read_only handle FIRST (write-trap parity).
+        self.guard_writable()?;
+        // SECRET-FREE: only these six metadata fields are bound — never a body,
+        // subject, sig, or token. The store NEVER injects; it records the outcome its
+        // caller computed post-inject. All values bound via params().
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO delivery_log (ref_id, ref_kind, to_peer, stage, outcome, ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params(vec![
+                        ref_id.into(),
+                        ref_kind.into(),
+                        to_peer.into(),
+                        stage.into(),
+                        outcome.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    fn list_delivery(&self, ref_id: i64, limit: i64) -> Result<Vec<DeliveryTrace>> {
+        // BOUNDED: never return more than MAX_DELIVERY_ROWS regardless of `limit`.
+        let lim = limit.clamp(1, MAX_DELIVERY_ROWS);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, ref_id, ref_kind, to_peer, stage, outcome, ts
+                     FROM delivery_log WHERE ref_id = ?1
+                     ORDER BY ts ASC, id ASC LIMIT ?2",
+                    params(vec![ref_id.into(), lim.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(DeliveryTrace {
+                    id: r.get::<i64>(0)?,
+                    ref_id: r.get::<i64>(1)?,
+                    ref_kind: r.get::<String>(2)?,
+                    to_peer: r.get::<String>(3)?,
+                    stage: r.get::<String>(4)?,
+                    outcome: r.get::<String>(5)?,
+                    ts: r.get::<i64>(6)?,
+                });
+            }
+            Ok(out)
+        })
+    }
 }
 
 /// Count unread messages for `me` against any connection (the live connection or
@@ -3627,6 +3738,151 @@ mod tests {
         assert_eq!(s.total_messages().unwrap(), 1);
         let (rows, _) = s.inbox("b", true, false, 50).unwrap();
         assert_eq!(rows[0].body, "new");
+    }
+
+    /// P6 (libsql parity): record_delivery appends metadata-only stages that
+    /// list_delivery returns oldest-first; the body never appears in a trace.
+    #[test]
+    fn delivery_log_records_and_lists_oldest_first_libsql() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        let s = mem();
+        let mid = s.send("a", "b", None, "SECRET-BODY-XYZ").unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Queued.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Drained.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        let trace = s.list_delivery(mid, 50).unwrap();
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].stage, "queued");
+        assert_eq!(trace[1].stage, "drained");
+        for t in &trace {
+            assert!(!format!("{t:?}").contains("SECRET-BODY-XYZ"));
+        }
+        assert!(s.list_delivery(999_999, 50).unwrap().is_empty());
+    }
+
+    /// P6 (libsql parity): list_delivery is bounded by MAX_DELIVERY_ROWS.
+    #[test]
+    fn delivery_log_read_is_bounded_libsql() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
+        let s = mem();
+        let mid = s.send("a", "b", None, "x").unwrap();
+        for _ in 0..(MAX_DELIVERY_ROWS + 10) {
+            s.record_delivery(
+                mid,
+                DeliveryRefKind::Notify.as_str(),
+                "b",
+                DeliveryStage::Queued.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.list_delivery(mid, i64::MAX).unwrap().len() as i64,
+            MAX_DELIVERY_ROWS
+        );
+    }
+
+    /// P6 (libsql parity): gc prunes old delivery_log rows in the same pass.
+    #[test]
+    fn gc_prunes_old_delivery_log_libsql() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        let s = mem();
+        let mid = s.send("a", "b", None, "m").unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Queued.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        // Backdate the trace row past the threshold.
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE delivery_log SET ts = ts - 100000 WHERE ref_id = ?1",
+                    params(vec![mid.into()]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .unwrap();
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "b",
+            DeliveryStage::Drained.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        s.gc(3600).unwrap();
+        let trace = s.list_delivery(mid, 50).unwrap();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].stage, "drained");
+    }
+
+    /// P6 (libsql OWNER-ONLY-WRITES): record_delivery traps on a read-only handle
+    /// FIRST (write-trap parity); reads still work. Mirrors record_revocation.
+    #[test]
+    fn record_delivery_traps_on_readonly_handle_libsql() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-delivguard-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foreign.db");
+        {
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            let rw = LibsqlStore::open(&cfg).unwrap();
+            rw.record_delivery(
+                1,
+                DeliveryRefKind::Message.as_str(),
+                "b",
+                DeliveryStage::Queued.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap();
+        }
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        assert!(ro.read_only, "open_readonly sets the guard flag");
+        let e = ro
+            .record_delivery(
+                2,
+                DeliveryRefKind::Message.as_str(),
+                "b",
+                DeliveryStage::Injected.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .expect_err("record_delivery must trap on a read-only handle");
+        assert!(
+            e.to_string()
+                .contains("BUG: write attempted on a read-only foreign store"),
+            "wrong trap error: {e}"
+        );
+        // Reads still work on the RO handle.
+        assert_eq!(ro.list_delivery(1, 50).unwrap().len(), 1);
     }
 
     #[test]

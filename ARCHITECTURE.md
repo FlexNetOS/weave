@@ -203,8 +203,30 @@ pub trait Store: Send {
     fn get_keys(&self, identity:&str) -> Result<Vec<String>>;          // ALL keys, oldest-first
     fn remove_key(&self, identity:&str, pubkey:&str) -> Result<bool>;  // prune a retired key
     fn list_keys(&self) -> Result<Vec<(String,String)>>;
+    // P6 delivery observability, additive (the delivery_log table is always present):
+    fn record_delivery(&self, ref_id:i64, ref_kind:&str, to_peer:&str, stage:&str, outcome:&str) -> Result<()>; // metadata-only INSERT; NEVER injects
+    fn list_delivery(&self, ref_id:i64, limit:i64) -> Result<Vec<DeliveryTrace>>; // oldest-first, bounded by MAX_DELIVERY_ROWS
 }
 ```
+
+**P6 — delivery observability (`delivery_log`).** weave's read receipts capture
+*read-state*; the `delivery_log` table captures *transport-state*. It is a
+**metadata-only, SECRET-FREE** append-only trace — columns are exactly
+`(id, ref_id, ref_kind, to_peer, stage, outcome, ts)`, **never** the body, subject,
+sig, or any token. `ref_kind ∈ {message, notify, ask}`, `stage ∈ {queued, injected,
+inject_failed, not_injectable, drained}`, `outcome ∈ {ok, fail}` are `model` enums
+(stored as TEXT, validated via `as_str`/`from_str`). Rows are written **caller-side,
+best-effort, AFTER the inject** at every send/notify/ask/answer point (and a `drained`
+stage at the hook `prompt` mark-read drain) by a thin `record_delivery_best_effort`
+wrapper that logs to stderr and never sinks delivery — exactly the live-nudge seam, so
+there is **no `store → inject` edge**: `record_delivery` records the outcome it is
+*passed* and never injects. Reads (`list_delivery` / `weave_delivery` / `weave delivery`)
+are bounded by `MAX_DELIVERY_ROWS`; lifetime is bounded by the **existing `gc()`
+retention** (gc prunes `delivery_log WHERE ts < cutoff` in the same pass — no new
+sweeper). `weave_notify` is a thin no-reply primitive over `store.send` + the P1 honest
+verdict (it does not fork send and opens no tracked thread); broadcast notify is deferred.
+Mirrored across both backends with a guarded additive migration; a legacy DB gains the
+table on open.
 
 Key semantics:
 
