@@ -2817,3 +2817,107 @@ fn job_list_limit_is_bounded_and_output_secret_free() {
     let (ok, _o, _e) = run(&db, &["job", "list", "--limit=-1"]);
     assert!(ok, "negative limit clamps rather than erroring");
 }
+
+// ---------------------------------------------------------------------------
+// P4: circle/role input hardening
+// ---------------------------------------------------------------------------
+
+/// A metachar/oversized/control WEAVE_CIRCLE is sanitized to the default circle
+/// (never stored raw, never crashes). The peer still registers; its circle reads
+/// "default".
+#[test]
+fn invalid_weave_circle_is_sanitized_to_default() {
+    for bad in ["a/b; rm -rf", "a$b", "a\nb", &"x".repeat(200)] {
+        let db = TestDb::new();
+        // register must not crash on a hostile circle.
+        let (ok, _o, _e) = run_env(
+            &db,
+            &["register"],
+            &[("WEAVE_SESSION", "victim"), ("WEAVE_CIRCLE", bad)],
+        );
+        assert!(ok, "register must not crash on hostile circle {bad:?}");
+        // The peer is visible in the default circle (sanitized), JSON confirms.
+        let out = run_ok_env(
+            &db,
+            &["peers", "--json", "--all-circles"],
+            &[("WEAVE_SESSION", "victim")],
+        );
+        let arr: serde_json::Value = serde_json::from_str(&out).expect("peers json");
+        let victim = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("victim"))
+            .expect("victim present");
+        assert_eq!(
+            victim.get("circle").and_then(|v| v.as_str()),
+            Some("default"),
+            "hostile circle {bad:?} must sanitize to default, got {victim}"
+        );
+    }
+}
+
+/// Role is an enum, never free text: there is no CLI/MCP surface to set an
+/// arbitrary role. A fresh registration is always role='peer'; only `orchestrator
+/// claim` promotes — and only to the single 'orchestrator' label.
+#[test]
+fn role_is_never_free_text() {
+    let db = TestDb::new();
+    run_ok_env(&db, &["register"], &[("WEAVE_SESSION", "p1")]);
+    let out = run_ok_env(&db, &["peers", "--json"], &[("WEAVE_SESSION", "p1")]);
+    let arr: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let p1 = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("p1"))
+        .unwrap();
+    assert_eq!(
+        p1.get("role").and_then(|v| v.as_str()),
+        Some("peer"),
+        "a fresh registration is always 'peer': {p1}"
+    );
+
+    // After a claim the role is exactly 'orchestrator' (never an attacker string).
+    run_ok_env(&db, &["orchestrator", "claim"], &[("WEAVE_SESSION", "p1")]);
+    let out2 = run_ok_env(&db, &["peers", "--json"], &[("WEAVE_SESSION", "p1")]);
+    let arr2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+    let p1b = arr2
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("p1"))
+        .unwrap();
+    assert_eq!(
+        p1b.get("role").and_then(|v| v.as_str()),
+        Some("orchestrator"),
+        "claim sets exactly 'orchestrator': {p1b}"
+    );
+}
+
+/// Orchestrator claim/status output is secret-free (no token/path leakage).
+#[test]
+fn orchestrator_output_is_secret_free() {
+    let db = TestDb::new();
+    run_ok_env(
+        &db,
+        &["register"],
+        &[("WEAVE_SESSION", "lead"), ("WEAVE_CIRCLE", "sec")],
+    );
+    let claimed = run_ok_env(
+        &db,
+        &["orchestrator", "claim"],
+        &[("WEAVE_SESSION", "lead"), ("WEAVE_CIRCLE", "sec")],
+    );
+    let status = run_ok_env(
+        &db,
+        &["orchestrator", "status", "--circle", "sec"],
+        &[("WEAVE_SESSION", "lead")],
+    );
+    for out in [&claimed, &status] {
+        let low = out.to_lowercase();
+        assert!(!low.contains("token"), "no token leakage: {out}");
+        assert!(!low.contains("auth"), "no auth leakage: {out}");
+        assert!(!out.contains("/home/"), "no filesystem path leakage: {out}");
+    }
+}

@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased] — circles + orchestrator role (weave⊇repowire parity, epic 4 / P4)
+
+> **Coordination topology, daemon-free and pure-DB.** Two additive `peers` columns —
+> `circle` (a visibility-scoping group, default `"default"`) and `role`
+> (`PeerRole::{Peer, Orchestrator}`, an enum stored as TEXT, never free text). Legacy
+> rows read `circle='default'`/`role='peer'`, so a single-circle deployment is
+> **byte-identical** to before. `weave peers`/`sessions`/`scan` default to the caller's
+> circle (an orchestrator caller defaults to mesh-wide); `--circle <c>` / `--all-circles`
+> (`circle='*'`) scope explicitly. New `weave orchestrator claim [--circle] [--force]` and
+> `weave orchestrator status [--circle]`: a single per-circle coordinator, claimed (never
+> self-asserted at registration — a re-register PRESERVES an existing orchestrator). A
+> non-force claim is **refused** while a LIVE holder exists; `--force` steals it in ONE
+> transaction (demote every other orchestrator in the circle → set the caller), a
+> **non-destructive** role-bit flip (no confirm gate). "Live" REUSES the existing
+> `is_alive` verdict (no new probe, no daemon). New MCP tools `weave_claim_orchestrator` /
+> `weave_orchestrator_status`, a `circle` arg on `weave_peers`/`weave_sessions`/
+> `weave_scan`, and circle+role in `weave_whoami`. `WEAVE_CIRCLE` env + config `circle`
+> key resolve the circle like `WEAVE_SESSION` resolves identity. No new dependency;
+> mirrored across both storage backends with guarded additive migrations.
+
 ## [Unreleased] — poll-only job board (weave⊇repowire parity, epic 3)
 
 > **Durable, daemon-free work queue.** A persistent `jobs` board on top of the same

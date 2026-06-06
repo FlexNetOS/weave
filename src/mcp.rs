@@ -327,7 +327,7 @@ fn call_tool(
         "weave_history" => tool_history(store, me_default, args),
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
-        "weave_peers" => tool_peers(store, extra_dbs),
+        "weave_peers" => tool_peers(store, me_default, extra_dbs, args),
         "weave_scan" => tool_scan(store, me_default, extra_dbs, args),
         "weave_reply" => tool_reply(store, me_default, nudge_template, args),
         "weave_thread" => tool_thread(store, args),
@@ -351,6 +351,8 @@ fn call_tool(
         "weave_job_update" => tool_job_update(store, args),
         "weave_job_result" => tool_job_result(store, args),
         "weave_job_cancel" => tool_job_cancel(store, me_default, args),
+        "weave_claim_orchestrator" => tool_claim_orchestrator(store, me_default, args),
+        "weave_orchestrator_status" => tool_orchestrator_status(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -670,12 +672,12 @@ fn tool_sessions(
     store: &dyn Store,
     def: &Option<String>,
     extra_dbs: &[StoreSource],
-    _args: &Value,
+    args: &Value,
 ) -> Result<String, String> {
     let me = def.clone().unwrap_or_default();
     // Tier-1 federation: union local sessions with read-only extra stores,
     // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
-    let info = store::federated_sessions(store, extra_dbs).map_err(e)?;
+    let mut info = store::federated_sessions(store, extra_dbs).map_err(e)?;
     let total = store.total_messages().map_err(e)?;
     if info.is_empty() {
         return Ok("No sessions seen yet — the store is empty.".into());
@@ -691,6 +693,21 @@ fn tool_sessions(
         .into_iter()
         .map(|p| (p.name.clone(), p))
         .collect();
+    // P4 circle scope: a session's circle is its registered local peer's circle (a
+    // session with no peer row classifies as "default"). With everyone in "default"
+    // and no arg this keeps every row.
+    if let Some(target) = resolve_mcp_circle(store, def, args).as_deref() {
+        info.retain(|v| {
+            let c = local_peers
+                .get(&v.name)
+                .map(|p| p.circle.as_str())
+                .unwrap_or("");
+            crate::model::circle_or_default(c) == target
+        });
+        if info.is_empty() {
+            return Ok(format!("No sessions in circle '{target}'."));
+        }
+    }
     let mut out = format!("Known sessions ({}), {total} message(s) total:", info.len());
     for v in info {
         let mine = if !me.is_empty() && v.name == me {
@@ -742,10 +759,48 @@ fn tool_clear(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<S
     Ok(format!("Marked {n} message(s) read for '{me}'."))
 }
 
-fn tool_peers(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, String> {
+/// Resolve the effective circle for an MCP `weave_peers`/`weave_sessions`/
+/// `weave_scan` listing (P4), returning `None` for "no filter" (mesh-wide).
+/// Mirrors the CLI `resolve_list_circle`: an explicit `circle` arg (`"*"` ⇒
+/// mesh-wide) wins; else an orchestrator caller goes mesh-wide; else the caller's
+/// own configured circle. With everyone in `"default"` and no arg this returns
+/// `Some("default")` ⇒ byte-identical to pre-P4.
+fn resolve_mcp_circle(store: &dyn Store, def: &Option<String>, args: &Value) -> Option<String> {
+    if let Some(c) = args
+        .get("circle")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if c == "*" {
+            return None;
+        }
+        return Some(crate::model::circle_or_default(c).to_string());
+    }
+    if let Some(d) = def.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Ok(Some(p)) = store.get_peer(d.trim()) {
+            if crate::model::PeerRole::from_str(&p.role) == Ok(crate::model::PeerRole::Orchestrator)
+            {
+                return None;
+            }
+        }
+    }
+    Some(crate::config::Config::load().circle())
+}
+
+fn tool_peers(
+    store: &dyn Store,
+    def: &Option<String>,
+    extra_dbs: &[StoreSource],
+    args: &Value,
+) -> Result<String, String> {
     // Tier-1 federation: union local peers with read-only extra stores,
     // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
-    let views = store::federated_peers(store, extra_dbs).map_err(e)?;
+    let mut views = store::federated_peers(store, extra_dbs).map_err(e)?;
+    // P4 circle scope (caller-side filter; federation composes).
+    if let Some(target) = resolve_mcp_circle(store, def, args).as_deref() {
+        views.retain(|v| crate::model::circle_or_default(&v.peer.circle) == target);
+    }
     if views.is_empty() {
         return Ok("No peers registered yet. Sessions register via `weave hook session`.".into());
     }
@@ -847,6 +902,7 @@ fn tool_scan(
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
+                &crate::config::Config::load().circle(),
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -870,6 +926,10 @@ fn tool_scan(
     }
     if let Some(b) = branch_filter.as_deref() {
         views.retain(|v| v.peer.branch == b);
+    }
+    // P4 circle scope (caller-side filter; federation composes).
+    if let Some(target) = resolve_mcp_circle(store, def, args).as_deref() {
+        views.retain(|v| crate::model::circle_or_default(&v.peer.circle) == target);
     }
     if views.is_empty() {
         return Ok("No peers match the scan.".into());
@@ -921,6 +981,58 @@ fn tool_scan(
         "\nsummary: {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale"
     ));
     Ok(out)
+}
+
+/// `weave_claim_orchestrator` (P4): claim the per-circle orchestrator slot for the
+/// caller. `{from?, circle?, force?}`. A live-holder-without-force is a clean
+/// REFUSAL (a normal tool result, not a protocol error). An unregistered caller is
+/// an error. NO injector involvement (a role is a pure DB bit). All output is the
+/// returned tool-result TEXT; any diagnostics go to stderr.
+fn tool_claim_orchestrator(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "from", def)?;
+    let circle = args
+        .get("circle")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    match store.claim_orchestrator_role(&me, circle, force).map_err(e)? {
+        crate::model::ClaimOutcome::Claimed { circle, demoted } => {
+            let mut out = format!("claimed role=orchestrator for '{me}' in circle '{circle}'");
+            if !demoted.is_empty() {
+                out.push_str(&format!(" (demoted: {})", demoted.join(", ")));
+            }
+            Ok(out)
+        }
+        crate::model::ClaimOutcome::Refused { circle, holder } => Ok(format!(
+            "refused: '{holder}' is the live orchestrator in circle '{circle}' (pass force=true to steal)"
+        )),
+    }
+}
+
+/// `weave_orchestrator_status` (P4): report the live orchestrator of a circle.
+/// `{circle?}` (omitted ⇒ the caller's configured circle). "live" reuses the
+/// store's `is_alive` verdict (no new probe). Secret-free; tool-result TEXT only.
+fn tool_orchestrator_status(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let circle = args
+        .get("circle")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::config::Config::load().circle());
+    let st = store.orchestrator_status(Some(&circle)).map_err(e)?;
+    match st.holder {
+        Some(h) if st.present => Ok(format!(
+            "orchestrator present in circle '{}': '{}' (online)",
+            st.circle, h.name
+        )),
+        _ => Ok(format!("no live orchestrator in circle '{}'", st.circle)),
+    }
 }
 
 /// Reply to an existing message. The recipient is derived by the store from the
@@ -1261,8 +1373,22 @@ fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String
     } else {
         &target.id
     };
+    // P4: report the caller's resolved circle (config/$WEAVE_CIRCLE) and its
+    // current registered role, so a caller can confirm its visibility scope.
+    let circle = crate::config::Config::load().circle();
+    let role = match def {
+        Some(d) if !d.trim().is_empty() => store
+            .get_peer(d.trim())
+            .ok()
+            .flatten()
+            .and_then(|p| crate::model::PeerRole::from_str(&p.role).ok())
+            .unwrap_or(crate::model::PeerRole::Peer)
+            .as_str()
+            .to_string(),
+        _ => crate::model::PeerRole::Peer.as_str().to_string(),
+    };
     Ok(format!(
-        "identity:   {identity}\nbackend:    {}\nthis pane:  mux={} target={} injectable={}",
+        "identity:   {identity}\nbackend:    {}\ncircle:     {circle}\nrole:       {role}\nthis pane:  mux={} target={} injectable={}",
         store.backend(),
         target.mux.as_str(),
         tgt,
@@ -1310,6 +1436,7 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
             &tags.repo,
             &tags.branch,
             &tags.worktree_id,
+            &crate::config::Config::load().circle(),
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -2063,8 +2190,10 @@ fn tools() -> Value {
         },
         {
             "name": "weave_sessions",
-            "description": "List session names seen, with unread counts and last activity.",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "List session names seen, with unread counts and last activity. By default scoped to your own circle; pass circle='*' for mesh-wide (an orchestrator caller defaults to mesh-wide).",
+            "inputSchema": {"type":"object","properties":{
+                "circle":{"type":"string","description":"Scope to this circle; '*' = every circle (mesh-wide). Omit for your own circle."}
+            },"required":[]}
         },
         {
             "name": "weave_clear",
@@ -2075,15 +2204,18 @@ fn tools() -> Value {
         },
         {
             "name": "weave_peers",
-            "description": "List registered peers and whether each is injectable (live push) or delivery-on-next-turn.",
-            "inputSchema": {"type":"object","properties":{},"required":[]}
+            "description": "List registered peers and whether each is injectable (live push) or delivery-on-next-turn. By default scoped to your own circle; pass circle='*' for mesh-wide (an orchestrator caller defaults to mesh-wide).",
+            "inputSchema": {"type":"object","properties":{
+                "circle":{"type":"string","description":"Scope to this circle; '*' = every circle (mesh-wide). Omit for your own circle."}
+            },"required":[]}
         },
         {
             "name": "weave_scan",
             "description": "Scan, identify, and tag running sessions: refresh YOUR OWN row's git tags (repo/branch/worktree), then list every (federated) peer with liveness and its repo/branch/worktree tags. Optional 'repo'/'branch' filters narrow the set by exact tag match. Only ever (re)registers the caller's own row (owner-only-writes); other/federated rows are read-only.",
             "inputSchema": {"type":"object","properties":{
                 "repo":{"type":"string","description":"Only show peers whose repo tag equals this value."},
-                "branch":{"type":"string","description":"Only show peers whose branch tag equals this value."}
+                "branch":{"type":"string","description":"Only show peers whose branch tag equals this value."},
+                "circle":{"type":"string","description":"Scope to this circle; '*' = every circle (mesh-wide). Omit for your own circle."}
             },"required":[]}
         },
         {
@@ -2117,7 +2249,7 @@ fn tools() -> Value {
         },
         {
             "name": "weave_whoami",
-            "description": "Echo the resolved identity (default session from WEAVE_SESSION), the active storage backend, and how this process would inject. Use to confirm who you are before sending.",
+            "description": "Echo the resolved identity (default session from WEAVE_SESSION), the active storage backend, your visibility circle, your orchestrator role, and how this process would inject. Use to confirm who you are before sending.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
         },
         {
@@ -2280,6 +2412,22 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "reason":{"type":"string","description":"Optional cancellation reason."}
             },"required":["job_id"]}
+        },
+        {
+            "name": "weave_claim_orchestrator",
+            "description": "Claim the single per-circle orchestrator role for yourself. Refused if a DIFFERENT live orchestrator already holds the circle, unless force=true steals it (a non-destructive role-bit flip — the demoted peer can re-claim; no data is lost, so no confirm is required). Demotes any prior orchestrators in the circle to 'peer' in one transaction. An unregistered caller is an error.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "circle":{"type":"string","description":"Circle to claim (defaults to your own circle)."},
+                "force":{"type":"boolean","description":"Steal the role even from a live orchestrator."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_orchestrator_status",
+            "description": "Report the live orchestrator of a circle (or that none is present). 'live' reuses weave's daemon-free liveness verdict (no new probe).",
+            "inputSchema": {"type":"object","properties":{
+                "circle":{"type":"string","description":"Circle to query (defaults to your own circle)."}
+            },"required":[]}
         }
     ])
 }

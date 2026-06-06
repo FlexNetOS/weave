@@ -7,8 +7,8 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    now, Ask, AskManyResult, AskRole, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec,
-    JobState, Message, Peer,
+    now, Ask, AskManyResult, AskRole, ClaimOutcome, Intent, Job, JobFilter, JobPatch,
+    JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
 };
 use anyhow::Result;
 
@@ -28,7 +28,7 @@ use crate::model::{
     AskManyChildView, AskState, BROADCAST_SQL,
 };
 #[cfg(feature = "sqlite")]
-use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 #[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
@@ -88,10 +88,17 @@ pub trait Store: Send {
     /// Returns how many messages were removed. Retention / disk-bound guard.
     fn gc(&self, older_than_secs: i64) -> Result<i64>;
     /// Register (upsert) a peer carrying every field, including the registering
-    /// process's `pid` and `host` for real process-liveness. This is the full
-    /// primitive each backend implements; the 6-arg [`Store::register_peer`]
-    /// forwards here with `pid=None, host=""` so legacy call sites that do not
-    /// know a PID/host keep working unchanged.
+    /// process's `pid` and `host` for real process-liveness, and the visibility
+    /// `circle` (P4). This is the full primitive each backend implements; the
+    /// [`Store::register_peer`] wrapper forwards here with `pid=None, host=""`,
+    /// empty git tags, and `circle="default"` so legacy call sites keep working
+    /// unchanged.
+    ///
+    /// **Role is NOT a parameter.** A registration NEVER asserts a role: a new
+    /// row inserts `role='peer'` and an upsert of an existing row PRESERVES its
+    /// current role (so a re-register can never silently demote an orchestrator).
+    /// The only path to `role='orchestrator'` is
+    /// [`Store::claim_orchestrator_role`].
     #[allow(clippy::too_many_arguments)]
     fn register_peer_full(
         &self,
@@ -105,6 +112,7 @@ pub trait Store: Send {
         repo: &str,
         branch: &str,
         worktree_id: &str,
+        circle: &str,
     ) -> Result<()>;
 
     /// Register (upsert) a peer without PID/host liveness info or git tags.
@@ -125,10 +133,60 @@ pub trait Store: Send {
         socket: &str,
         cwd: Option<&str>,
     ) -> Result<()> {
-        self.register_peer_full(name, mux, target, socket, cwd, None, "", "", "", "")
+        self.register_peer_full(
+            name, mux, target, socket, cwd, None, "", "", "", "", "default",
+        )
     }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
+
+    /// List peers scoped to `circle`. `None` (or the literal `"*"`) ⇒ all
+    /// circles (mesh-wide). A concrete name keeps only peers whose
+    /// [`circle_or_default`]-normalized circle matches (so an empty/legacy circle
+    /// classifies into `"default"`). Default impl filters [`Store::list_peers`];
+    /// backends share it. Backward-compatible: a `"default"` filter over an
+    /// all-default DB returns exactly the same set as `list_peers`.
+    #[allow(dead_code)]
+    fn list_peers_in_circle(&self, circle: Option<&str>) -> Result<Vec<Peer>> {
+        let all = self.list_peers()?;
+        match circle {
+            None | Some("*") => Ok(all),
+            Some(target) => {
+                let target = crate::model::circle_or_default(target);
+                Ok(all
+                    .into_iter()
+                    .filter(|p| crate::model::circle_or_default(&p.circle) == target)
+                    .collect())
+            }
+        }
+    }
+
+    /// Claim the orchestrator role for a circle (P4). Resolves the effective
+    /// circle (`circle` arg, else the caller's own peer-row circle, else
+    /// `"default"`), then in ONE transaction: if a DIFFERENT peer is the LIVE
+    /// (`role='orchestrator'` AND [`is_alive`](crate::store::is_alive)) holder and
+    /// `force` is false ⇒ returns [`ClaimOutcome::Refused`] WITHOUT any write;
+    /// otherwise demotes every other `role='orchestrator'` row in the circle to
+    /// `'peer'` and sets the caller's row to `'orchestrator'`, returning
+    /// [`ClaimOutcome::Claimed`] with the demoted list. The caller MUST already be
+    /// registered (Err otherwise). The forced demote is a single-row UPDATE within
+    /// the caller's OWN store (never a foreign store), the only cross-row peer
+    /// write P4 adds; it is non-destructive (a role bit) so it is NOT
+    /// `confirm`-gated.
+    fn claim_orchestrator_role(
+        &self,
+        me: &str,
+        circle: Option<&str>,
+        force: bool,
+    ) -> Result<ClaimOutcome>;
+
+    /// Report the orchestrator status of a circle (P4). Resolves the effective
+    /// circle like [`Store::claim_orchestrator_role`], selects every
+    /// `role='orchestrator'` row in it, and classifies each via
+    /// [`is_alive`](crate::store::is_alive) (NO new probe — the daemon-free analog
+    /// of repowire's heartbeat verdict). `present` is true iff a LIVE holder
+    /// exists; `holder` is the most-recently-seen live one.
+    fn orchestrator_status(&self, circle: Option<&str>) -> Result<OrchestratorStatus>;
     /// Backend label for diagnostics.
     fn backend(&self) -> &'static str;
 
@@ -1007,7 +1065,9 @@ CREATE TABLE IF NOT EXISTS peers (
     host        TEXT NOT NULL DEFAULT '',
     repo        TEXT NOT NULL DEFAULT '',
     branch      TEXT NOT NULL DEFAULT '',
-    worktree_id TEXT NOT NULL DEFAULT ''
+    worktree_id TEXT NOT NULL DEFAULT '',
+    circle      TEXT NOT NULL DEFAULT 'default',
+    role        TEXT NOT NULL DEFAULT 'peer'
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1282,6 +1342,8 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         repo: r.get(8)?,
         branch: r.get(9)?,
         worktree_id: r.get(10)?,
+        circle: r.get(11)?,
+        role: r.get(12)?,
     })
 }
 
@@ -1355,6 +1417,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "peers", "worktree_id")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN worktree_id TEXT NOT NULL DEFAULT '';")?;
+    }
+    // peers.circle / role — present on fresh DBs via SCHEMA, added here for DBs
+    // created before P4 (circles + orchestrator role). `circle` defaults to the
+    // non-empty literal 'default' so legacy rows classify into the default circle
+    // with no runtime coalesce; `role` defaults to 'peer' so legacy rows are
+    // plain participants. Both DDL strings are constant (no user data), the same
+    // discipline as the socket/pid/host/repo steps above. Idempotent.
+    if !column_exists(conn, "peers", "circle")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN circle TEXT NOT NULL DEFAULT 'default';")?;
+    }
+    if !column_exists(conn, "peers", "role")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN role TEXT NOT NULL DEFAULT 'peer';")?;
     }
     // Tier-2 tables: present on fresh DBs via SCHEMA, created here for DBs made
     // before cross-store delivery existed. `CREATE TABLE IF NOT EXISTS` is itself
@@ -2396,6 +2470,7 @@ impl Store for SqliteStore {
         repo: &str,
         branch: &str,
         worktree_id: &str,
+        circle: &str,
     ) -> Result<()> {
         check_ident("peer name", name)?;
         // Descriptive git tags are bounded + control-free at this single store
@@ -2403,18 +2478,30 @@ impl Store for SqliteStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // Re-validate the circle at the store seam (defense-in-depth, the
+        // check_ident precedent): an invalid value falls back to the default
+        // circle rather than being stored raw.
+        let circle = if crate::model::circle_valid(circle) {
+            circle
+        } else {
+            crate::model::DEFAULT_CIRCLE
+        };
+        // `role` is INTENTIONALLY omitted from both the column list and the
+        // ON CONFLICT SET: a NEW row gets the table default ('peer'); an upsert of
+        // an EXISTING row leaves `role` untouched, so a re-register can never
+        // demote an orchestrator.
         self.conn.execute(
-            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11",
-            params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id],
+            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11, circle=?12",
+            params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle],
         )?;
         Ok(())
     }
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
@@ -2425,12 +2512,109 @@ impl Store for SqliteStore {
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers ORDER BY name",
         )?;
         let rows = stmt
             .query_map([], row_to_peer)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    fn claim_orchestrator_role(
+        &self,
+        me: &str,
+        circle: Option<&str>,
+        force: bool,
+    ) -> Result<ClaimOutcome> {
+        check_ident("peer name", me)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // The caller must already be registered (a fresh peer always registers as
+        // role='peer' first; claim is the only promotion path).
+        let my_circle: String = match tx
+            .query_row("SELECT circle FROM peers WHERE name=?1", params![me], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            Some(c) => c,
+            None => anyhow::bail!("peer '{me}' is not registered"),
+        };
+        // Resolve the effective circle: arg if given, else the caller's own row.
+        let target = match circle {
+            Some(c) => crate::model::circle_or_default(c).to_string(),
+            None => crate::model::circle_or_default(&my_circle).to_string(),
+        };
+        // Current orchestrators in the circle (normalize empty/legacy to default).
+        let mut stmt = tx.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+        )?;
+        let holders: Vec<Peer> = stmt
+            .query_map([], row_to_peer)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| crate::model::circle_or_default(&p.circle) == target)
+            .collect();
+        drop(stmt);
+        // A DIFFERENT live holder blocks an unforced claim.
+        if !force {
+            if let Some(live) = holders
+                .iter()
+                .filter(|p| p.name != me && is_alive(p))
+                .max_by_key(|p| p.last_seen)
+            {
+                return Ok(ClaimOutcome::Refused {
+                    circle: target,
+                    holder: live.name.clone(),
+                });
+            }
+        }
+        // Demote every OTHER orchestrator in the circle, then promote the caller.
+        let mut demoted = Vec::new();
+        for p in &holders {
+            if p.name != me {
+                tx.execute(
+                    "UPDATE peers SET role=?1 WHERE name=?2",
+                    params![crate::model::PeerRole::Peer.as_str(), p.name],
+                )?;
+                demoted.push(p.name.clone());
+            }
+        }
+        // Promote the caller (and pin its circle to the resolved target so a claim
+        // with an explicit --circle co-locates the caller into that circle).
+        tx.execute(
+            "UPDATE peers SET role=?1, circle=?2 WHERE name=?3",
+            params![crate::model::PeerRole::Orchestrator.as_str(), target, me],
+        )?;
+        tx.commit()?;
+        demoted.sort();
+        Ok(ClaimOutcome::Claimed {
+            circle: target,
+            demoted,
+        })
+    }
+
+    fn orchestrator_status(&self, circle: Option<&str>) -> Result<OrchestratorStatus> {
+        // No caller identity here, so an omitted circle resolves to the default
+        // circle (the CLI/MCP layer passes the caller's resolved circle when it
+        // wants a caller-scoped status).
+        let target = circle
+            .map(crate::model::circle_or_default)
+            .unwrap_or(crate::model::DEFAULT_CIRCLE)
+            .to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role FROM peers WHERE role='orchestrator'",
+        )?;
+        let holder = stmt
+            .query_map([], row_to_peer)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| crate::model::circle_or_default(&p.circle) == target && is_alive(p))
+            .max_by_key(|p| p.last_seen);
+        Ok(OrchestratorStatus {
+            circle: target,
+            present: holder.is_some(),
+            holder,
+        })
     }
 
     fn reply_target(&self, sender: &str, in_reply_to: i64) -> Result<(String, Option<String>)> {
@@ -3568,6 +3752,8 @@ mod federation_tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
         }
     }
 
@@ -4532,6 +4718,8 @@ mod tests {
                 repo: String::new(),
                 branch: String::new(),
                 worktree_id: String::new(),
+                circle: crate::model::DEFAULT_CIRCLE.to_string(),
+                role: crate::model::PeerRole::Peer.as_str().to_string(),
             };
 
             // Determinism: two evaluations of the same inputs agree.
@@ -4590,6 +4778,7 @@ mod tests {
             "weave",
             "feat/x",
             "wt-1",
+            "default",
         )
         .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -4611,6 +4800,7 @@ mod tests {
             "weave2",
             "bad\nbranch",
             "(main)",
+            "default",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -4680,6 +4870,7 @@ mod tests {
             "weave",
             "main",
             "(main)",
+            "default",
         )
         .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -4693,8 +4884,20 @@ mod tests {
         assert_eq!(lp.pid, Some(4321));
         assert_eq!(lp.host, "boxA");
         // Upsert overwrites pid/host (and a None pid clears it).
-        s.register_peer_full("p", "tmux", "%3", "", Some("/w"), None, "boxB", "", "", "")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%3",
+            "",
+            Some("/w"),
+            None,
+            "boxB",
+            "",
+            "",
+            "",
+            "default",
+        )
+        .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p2.pid, None);
         assert_eq!(p2.host, "boxB");
@@ -4752,8 +4955,20 @@ mod tests {
         let s2 = SqliteStore::open(&path).unwrap();
         assert!(s2.get_peer("old").unwrap().is_some());
         // And a fresh register_peer_full now works against the upgraded table.
-        s2.register_peer_full("new", "tmux", "%2", "", None, Some(7), "h", "", "", "")
-            .unwrap();
+        s2.register_peer_full(
+            "new",
+            "tmux",
+            "%2",
+            "",
+            None,
+            Some(7),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+        )
+        .unwrap();
         let n = s2.get_peer("new").unwrap().unwrap();
         assert_eq!(n.pid, Some(7));
         assert_eq!(n.host, "h");
@@ -4832,6 +5047,7 @@ mod tests {
             "weave",
             "feat/x",
             "wt-9",
+            "default",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -4863,6 +5079,176 @@ mod tests {
             .is_some());
     }
 
+    /// P4: a pre-P4 peers table (no circle/role columns) migrates IN PLACE — the
+    /// columns are added, a legacy row reads `circle='default'`/`role='peer'`, and
+    /// re-opening is a no-op (the guarded ALTERs never error twice).
+    #[test]
+    fn legacy_db_without_circle_role_migrates_in_place() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-legacy-circle-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-circle.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // A post-tags but pre-P4 peers table (has the git tag columns, lacks
+            // circle/role).
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                    name        TEXT PRIMARY KEY,
+                    mux         TEXT NOT NULL,
+                    target      TEXT NOT NULL,
+                    socket      TEXT NOT NULL DEFAULT '',
+                    cwd         TEXT,
+                    last_seen   INTEGER NOT NULL,
+                    pid         INTEGER,
+                    host        TEXT NOT NULL DEFAULT '',
+                    repo        TEXT NOT NULL DEFAULT '',
+                    branch      TEXT NOT NULL DEFAULT '',
+                    worktree_id TEXT NOT NULL DEFAULT ''
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id)
+                 VALUES ('old', 'tmux', '%1', '', '/legacy', ?1, 42, 'h', '', '', '')",
+                params![now()],
+            )
+            .unwrap();
+            assert!(!column_exists(&conn, "peers", "circle").unwrap());
+            assert!(!column_exists(&conn, "peers", "role").unwrap());
+        }
+        // Opening through SqliteStore runs migrate(): circle/role are added.
+        let s = SqliteStore::open(&path).unwrap();
+        let old = s.get_peer("old").unwrap().unwrap();
+        assert_eq!(old.circle, "default", "legacy row classifies into default");
+        assert_eq!(old.role, "peer", "legacy row is a plain peer");
+        // Re-opening is idempotent.
+        assert!(SqliteStore::open(&path)
+            .unwrap()
+            .get_peer("old")
+            .unwrap()
+            .is_some());
+    }
+
+    /// P4: `register_peer_full` round-trips the circle; a re-register PRESERVES an
+    /// existing role (a re-register must never demote an orchestrator).
+    #[test]
+    fn register_roundtrips_circle_and_preserves_role() {
+        let s = mem();
+        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+            .unwrap();
+        assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
+        // Promote, then re-register: the role must survive the upsert.
+        let out = s.claim_orchestrator_role("p", None, false).unwrap();
+        assert!(matches!(out, crate::model::ClaimOutcome::Claimed { .. }));
+        assert_eq!(s.get_peer("p").unwrap().unwrap().role, "orchestrator");
+        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+            .unwrap();
+        assert_eq!(
+            s.get_peer("p").unwrap().unwrap().role,
+            "orchestrator",
+            "a re-register must not demote an orchestrator"
+        );
+        // An invalid circle at the seam falls back to the default circle.
+        s.register_peer_full(
+            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("q").unwrap().unwrap().circle, "default");
+    }
+
+    /// P4: claim refuses a non-force claim while a LIVE holder exists, and a
+    /// `force=true` claim steals it (demoting the prior holder to 'peer').
+    #[test]
+    fn claim_refuses_live_holder_then_force_steals() {
+        let s = mem();
+        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        // a claims (no contest) ⇒ Claimed.
+        assert!(matches!(
+            s.claim_orchestrator_role("a", None, false).unwrap(),
+            crate::model::ClaimOutcome::Claimed { .. }
+        ));
+        // b claims without force while a is a LIVE holder ⇒ Refused (no write).
+        match s.claim_orchestrator_role("b", None, false).unwrap() {
+            crate::model::ClaimOutcome::Refused { holder, circle } => {
+                assert_eq!(holder, "a");
+                assert_eq!(circle, "c1");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "peer");
+        // b claims WITH force ⇒ Claimed, a demoted to 'peer'.
+        match s.claim_orchestrator_role("b", None, true).unwrap() {
+            crate::model::ClaimOutcome::Claimed { demoted, circle } => {
+                assert_eq!(circle, "c1");
+                assert_eq!(demoted, vec!["a".to_string()]);
+            }
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+        assert_eq!(s.get_peer("a").unwrap().unwrap().role, "peer");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "orchestrator");
+        // An unregistered caller is an error.
+        assert!(s.claim_orchestrator_role("ghost", None, false).is_err());
+    }
+
+    /// P4: `list_peers_in_circle` scopes correctly; `None`/`'*'` ⇒ all.
+    #[test]
+    fn list_peers_in_circle_scopes() {
+        let s = mem();
+        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c2")
+            .unwrap();
+        assert_eq!(s.list_peers_in_circle(Some("c1")).unwrap().len(), 1);
+        assert_eq!(s.list_peers_in_circle(Some("c2")).unwrap().len(), 1);
+        assert_eq!(s.list_peers_in_circle(None).unwrap().len(), 2);
+        assert_eq!(s.list_peers_in_circle(Some("*")).unwrap().len(), 2);
+        assert_eq!(s.list_peers_in_circle(Some("none")).unwrap().len(), 0);
+    }
+
+    /// P4: `orchestrator_status` reuses `is_alive` — a fresh holder reads present;
+    /// a holder past the TTL window reads absent (no new probe).
+    #[test]
+    fn orchestrator_status_liveness_reuses_is_alive() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-orch-status-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orch.db");
+        let s = SqliteStore::open(&path).unwrap();
+        s.register_peer_full("o", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
+            .unwrap();
+        s.claim_orchestrator_role("o", None, false).unwrap();
+        // Fresh holder ⇒ present.
+        let st = s.orchestrator_status(Some("c1")).unwrap();
+        assert!(st.present);
+        assert_eq!(st.holder.unwrap().name, "o");
+        // An empty circle ⇒ absent.
+        let st2 = s.orchestrator_status(Some("empty")).unwrap();
+        assert!(!st2.present);
+        assert!(st2.holder.is_none());
+        // Backdate last_seen well past the TTL window ⇒ is_alive false ⇒ absent.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE peers SET last_seen = ?1 WHERE name = 'o'",
+                params![now() - 10_000_000],
+            )
+            .unwrap();
+        }
+        let s2 = SqliteStore::open(&path).unwrap();
+        let st3 = s2.orchestrator_status(Some("c1")).unwrap();
+        assert!(!st3.present, "a stale holder reads absent (is_alive reuse)");
+    }
+
     /// `is_alive` matrix. A fresh peer with `last_seen = now()` is recency-online;
     /// liveness then depends on pid/host:
     ///   (a) local host + dead pid + recent  => false (probe sees the gap)
@@ -4884,6 +5270,8 @@ mod tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -4962,6 +5350,8 @@ mod tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
         };
 
         // same-host + live pid (our own) => AliveLocal.
@@ -5135,6 +5525,7 @@ mod tests {
                 "",
                 "",
                 "",
+                "default",
             )
             .unwrap();
         }
@@ -5146,8 +5537,9 @@ mod tests {
         assert_eq!(peers[0].name, "seed");
 
         // But ANY write is rejected by the engine, not by convention.
-        let wr =
-            ro.register_peer_full("intruder", "tmux", "%2", "", None, None, "boxA", "", "", "");
+        let wr = ro.register_peer_full(
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+        );
         assert!(wr.is_err(), "a write through a read-only handle must error");
         let send = ro.send("a", "b", None, "x");
         assert!(
@@ -5176,12 +5568,16 @@ mod tests {
 
         let local = SqliteStore::open(&local_path).unwrap();
         local
-            .register_peer_full("me", "tmux", "%1", "", None, None, "boxA", "", "", "")
+            .register_peer_full(
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default",
+            )
             .unwrap();
         {
             let foreign = SqliteStore::open(&foreign_path).unwrap();
             foreign
-                .register_peer_full("them", "tmux", "%2", "", None, None, "boxA", "", "", "")
+                .register_peer_full(
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+                )
                 .unwrap();
         }
 

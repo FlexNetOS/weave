@@ -83,6 +83,13 @@ weave job update <job_id> --attempt <att_id> --state completed --result '{"ok":t
 weave job result <job_id>            # terminal payload (summary/result/error/artifacts) or not_ready
 weave job cancel <job_id> --reason "superseded"   # cooperative cancel request (worker honors it)
 
+# Circles + orchestrator role (P4): visibility scoping + a per-circle coordinator
+weave peers --circle team-a          # scope a listing to one circle (default: your own circle)
+weave peers --all-circles            # mesh-wide (circle='*'); also on `sessions`/`scan`
+weave orchestrator claim             # claim the single coordinator slot for your circle
+weave orchestrator claim --force     # steal it from a live holder (non-destructive role flip)
+weave orchestrator status --circle team-a   # who (if anyone) is the live orchestrator
+
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
 
@@ -228,6 +235,11 @@ is pulled in.
 · `weave_ask_many` · `weave_ask_many_result`
 · `weave_job_create` · `weave_job_list` · `weave_job_show` · `weave_job_status` · `weave_job_claim`
 · `weave_job_update` · `weave_job_result` · `weave_job_cancel`
+· `weave_claim_orchestrator` · `weave_orchestrator_status` (P4 circles)
+
+`weave_peers` / `weave_sessions` / `weave_scan` take an optional `circle` arg
+(`"*"` = mesh-wide; omitted = your circle), and `weave_whoami` echoes your circle +
+role.
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
@@ -368,6 +380,40 @@ idempotent migration — a legacy DB upgrades in place) and routes every CLI and
 MCP path through one set of store methods. There is **no `store → inject` edge**
 (jobs don't nudge in this release) and the autonomous JobRunner / scheduler /
 spawn machinery is explicitly out of scope here.
+
+## Circles + orchestrator role
+
+A **circle** is a visibility-scoping group on a peer (a `peers.circle` column,
+default `"default"`). `weave peers` / `sessions` / `scan` default to the **caller's
+circle**; pass `--circle <name>` to scope to another, or `--all-circles` (MCP:
+`circle='*'`) to go **mesh-wide**. An **orchestrator** caller defaults to mesh-wide
+visibility (the repowire rule, daemon-free). Set your circle with the `circle`
+config key or `WEAVE_CIRCLE` (resolved like `WEAVE_SESSION` resolves identity). With
+everyone in `"default"` and no flag, every listing is **byte-identical** to a
+pre-circles weave — a single-circle deployment is unchanged.
+
+The **orchestrator role** (a `peers.role` column; an enum `peer | orchestrator`,
+never free text) is the single per-circle coordinator:
+
+- `weave orchestrator claim [--circle <c>] [--force]` (`weave_claim_orchestrator`)
+  promotes the caller. It is **claimed, never self-asserted** — a fresh registration
+  is always `role='peer'`, and a **re-register PRESERVES** an existing orchestrator
+  (it can never silently demote you). A claim while a **different LIVE** orchestrator
+  holds the circle is **refused** unless `--force` **steals** it: in ONE transaction
+  every other orchestrator in the circle is demoted to `peer` and the caller is set.
+  The forced steal is a **non-destructive role-bit flip** (the demoted peer can
+  re-claim; no data is lost), so it is **not** confirm-gated.
+- `weave orchestrator status [--circle <c>]` (`weave_orchestrator_status`) reports
+  the live holder (or that none is present). **"Live" REUSES `is_alive`** — the same
+  daemon-free liveness verdict the peer listings use (no new probe, no heartbeat).
+- `weave_whoami` (MCP) echoes your resolved circle + role.
+
+Circles and roles are **pure DB**: two additive `peers` columns (both backends,
+guarded idempotent migration — a legacy DB upgrades in place reading
+`circle='default'`/`role='peer'`), no new dependency, and **no `store → inject`
+edge** (a circle/role never reaches the injector). The forced demote is the only
+cross-row peer write P4 adds — a single-row UPDATE in the caller's **own** store
+(never a foreign store); a peer still can never set another peer's circle/identity.
 
 ## Native injector
 

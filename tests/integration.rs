@@ -6731,3 +6731,252 @@ fn mcp_job_tools_happy_and_failure_paths() {
 
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// P4: circles + orchestrator role
+// ---------------------------------------------------------------------------
+
+/// Two peers register in different circles via WEAVE_CIRCLE. `weave peers`
+/// defaults to the caller's circle; `--all-circles` shows both.
+#[test]
+fn cli_peers_circle_scoping_and_all_circles() {
+    let db = TestDb::new();
+    // Register two sessions in distinct circles.
+    run_ok_env(
+        &db,
+        &["register"],
+        &[("WEAVE_SESSION", "a"), ("WEAVE_CIRCLE", "alpha")],
+    );
+    run_ok_env(
+        &db,
+        &["register"],
+        &[("WEAVE_SESSION", "b"), ("WEAVE_CIRCLE", "beta")],
+    );
+
+    // Caller in 'alpha' sees only 'a' by default.
+    let alpha = run_ok_env(
+        &db,
+        &["peers"],
+        &[("WEAVE_SESSION", "a"), ("WEAVE_CIRCLE", "alpha")],
+    );
+    assert!(
+        alpha.contains("a "),
+        "alpha caller should see peer a: {alpha}"
+    );
+    assert!(
+        !alpha.contains("\nb "),
+        "alpha caller must not see peer b: {alpha}"
+    );
+
+    // --all-circles shows both.
+    let all = run_ok_env(
+        &db,
+        &["peers", "--all-circles"],
+        &[("WEAVE_SESSION", "a"), ("WEAVE_CIRCLE", "alpha")],
+    );
+    assert!(all.contains("a "), "all-circles should include a: {all}");
+    assert!(all.contains("b "), "all-circles should include b: {all}");
+
+    // --circle beta scopes to beta only.
+    let beta = run_ok_env(
+        &db,
+        &["peers", "--circle", "beta"],
+        &[("WEAVE_SESSION", "a"), ("WEAVE_CIRCLE", "alpha")],
+    );
+    assert!(beta.contains("b "), "circle=beta should show b: {beta}");
+    assert!(
+        !beta.contains("\na "),
+        "circle=beta must not show a: {beta}"
+    );
+}
+
+/// `weave orchestrator claim` then `status` reports the holder present; a second
+/// peer's non-force claim while the first is live is refused.
+#[test]
+fn cli_orchestrator_claim_status_and_refusal() {
+    let db = TestDb::new();
+    // Register the rows under a foreign HOSTNAME so their stored host differs from
+    // the query-time this_host ⇒ liveness fails OPEN (TTL recency-online), never a
+    // pid probe (a one-shot CLI register's PID is dead by the time status runs).
+    // The status/claim queries DELIBERATELY omit HOSTNAME so this_host is the real
+    // machine host (≠ "remote-box"), making the rows remote ⇒ TTL-judged. This is
+    // the proven remote-host liveness fixture used by the scan/peers tests.
+    run_ok_env(
+        &db,
+        &["register"],
+        &[
+            ("WEAVE_SESSION", "lead"),
+            ("WEAVE_CIRCLE", "ring"),
+            ("HOSTNAME", "remote-box"),
+        ],
+    );
+    run_ok_env(
+        &db,
+        &["register"],
+        &[
+            ("WEAVE_SESSION", "other"),
+            ("WEAVE_CIRCLE", "ring"),
+            ("HOSTNAME", "remote-box"),
+        ],
+    );
+
+    let claimed = run_ok_env(
+        &db,
+        &["orchestrator", "claim"],
+        &[("WEAVE_SESSION", "lead"), ("WEAVE_CIRCLE", "ring")],
+    );
+    assert!(
+        claimed.contains("claimed role=orchestrator"),
+        "claim text: {claimed}"
+    );
+    assert!(claimed.contains("lead"));
+
+    let status = run_ok_env(
+        &db,
+        &["orchestrator", "status", "--circle", "ring"],
+        &[("WEAVE_SESSION", "lead")],
+    );
+    assert!(status.contains("orchestrator present"), "status: {status}");
+    assert!(status.contains("lead"), "status names the holder: {status}");
+
+    // A second peer's non-force claim is refused while lead is live.
+    let refused = run_ok_env(
+        &db,
+        &["orchestrator", "claim"],
+        &[("WEAVE_SESSION", "other"), ("WEAVE_CIRCLE", "ring")],
+    );
+    assert!(
+        refused.contains("refused"),
+        "non-force claim refused: {refused}"
+    );
+    assert!(refused.contains("lead"), "names the live holder: {refused}");
+
+    // An empty circle reports absent.
+    let absent = run_ok_env(
+        &db,
+        &["orchestrator", "status", "--circle", "empty"],
+        &[("WEAVE_SESSION", "lead")],
+    );
+    assert!(absent.contains("no live orchestrator"), "absent: {absent}");
+}
+
+/// REGRESSION (backward-compat): with everyone in the default circle and NO new
+/// flag, `weave peers` human output is byte-identical whether or not P4 columns
+/// exist — i.e. the default-circle line carries no circle/role token.
+#[test]
+fn cli_peers_default_circle_human_output_unchanged() {
+    let db = TestDb::new();
+    run_ok_env(&db, &["register"], &[("WEAVE_SESSION", "solo")]);
+    let out = run_ok_env(&db, &["peers"], &[("WEAVE_SESSION", "solo")]);
+    // The default-circle human line must NOT print a circle= or role= token.
+    assert!(
+        !out.contains("circle="),
+        "default human output must not show circle=: {out}"
+    );
+    assert!(
+        !out.contains("role="),
+        "default human output must not show role=: {out}"
+    );
+    assert!(out.contains("solo"), "lists the peer: {out}");
+}
+
+/// MCP: weave_claim_orchestrator happy path + refusal failure path;
+/// weave_orchestrator_status absent; weave_whoami echoes circle + role.
+#[test]
+fn mcp_orchestrator_claim_status_whoami() {
+    let db = TestDb::new();
+    // Register two peers in the same circle through the CLI under a foreign
+    // HOSTNAME so their stored host differs from the MCP server's this_host ⇒
+    // liveness fails OPEN (TTL recency-online), not pid-probed (a one-shot CLI
+    // register's PID is dead). The MCP server is spawned WITHOUT HOSTNAME so its
+    // this_host is the real machine host (≠ "remote-box").
+    run_ok_env(
+        &db,
+        &["register"],
+        &[
+            ("WEAVE_SESSION", "lead"),
+            ("WEAVE_CIRCLE", "mcpc"),
+            ("HOSTNAME", "remote-box"),
+        ],
+    );
+    run_ok_env(
+        &db,
+        &["register"],
+        &[
+            ("WEAVE_SESSION", "other"),
+            ("WEAVE_CIRCLE", "mcpc"),
+            ("HOSTNAME", "remote-box"),
+        ],
+    );
+
+    let mut mcp = McpServer::spawn_env(&db, &[("WEAVE_SESSION", "lead"), ("WEAVE_CIRCLE", "mcpc")]);
+    let _ = mcp.request("initialize", serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"0"}}));
+
+    // tools/list contains the two new tools.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in ["weave_claim_orchestrator", "weave_orchestrator_status"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing {expected}: {names:?}"
+        );
+    }
+
+    // status of the circle is absent before a claim.
+    let (is_err, absent) = mcp.call_tool(
+        "weave_orchestrator_status",
+        serde_json::json!({"circle":"mcpc"}),
+    );
+    assert!(!is_err);
+    assert!(absent.contains("no live orchestrator"), "absent: {absent}");
+
+    // lead claims.
+    let (is_err, claimed) = mcp.call_tool(
+        "weave_claim_orchestrator",
+        serde_json::json!({"from":"lead"}),
+    );
+    assert!(!is_err, "claim not error: {claimed}");
+    assert!(
+        claimed.contains("claimed role=orchestrator"),
+        "claim: {claimed}"
+    );
+
+    // status now present.
+    let (_e, present) = mcp.call_tool(
+        "weave_orchestrator_status",
+        serde_json::json!({"circle":"mcpc"}),
+    );
+    assert!(
+        present.contains("orchestrator present"),
+        "present: {present}"
+    );
+
+    // FAILURE PATH: other claims without force while lead is live ⇒ refused (a
+    // normal tool result, not a protocol error).
+    let (is_err, refused) = mcp.call_tool(
+        "weave_claim_orchestrator",
+        serde_json::json!({"from":"other"}),
+    );
+    assert!(
+        !is_err,
+        "refusal is a normal result, not a protocol error: {refused}"
+    );
+    assert!(refused.contains("refused"), "refusal text: {refused}");
+
+    // whoami echoes circle + role for lead.
+    let (_e, who) = mcp.call_tool("weave_whoami", serde_json::json!({"me":"lead"}));
+    assert!(who.contains("circle:"), "whoami has circle: {who}");
+    assert!(who.contains("role:"), "whoami has role: {who}");
+    assert!(
+        who.contains("orchestrator"),
+        "whoami shows orchestrator role: {who}"
+    );
+
+    mcp.shutdown();
+}
