@@ -408,16 +408,23 @@ stdin (for `cwd`), resolves the session identity, and acts:
 
 | Hook event | Claude Code trigger | Action |
 |---|---|---|
-| `session` | `SessionStart` | `detect_target()` + `register_peer_full(name, mux, id, cwd, pid, host)` — the session becomes an injectable peer, capturing its PID + host for liveness (§6). |
-| `prompt` | `UserPromptSubmit` | Drain unread (`inbox` with `mark_read`) and print each to **stdout**, which Claude Code folds into the agent's context. |
-| `stop` | `Stop` | Same drain as `prompt`. |
-| `notification` | `Notification` | Reserved for future use (no-op today). |
+| `session` | `SessionStart` | `detect_target()` + `register_peer_full(name, mux, id, cwd, pid, host)` — the session becomes an injectable peer, capturing its PID + host for liveness (§6). Then sets `turn_state = pending_first_turn` (P5). |
+| `prompt` | `UserPromptSubmit` | Drain unread (`inbox` with `mark_read`) and print each to **stdout**, which Claude Code folds into the agent's context. Then sets `turn_state = working` (P5). |
+| `stop` | `Stop` | Same drain as `prompt`. Then sets `turn_state = idle` (P5). |
+| `notification` | `Notification` | Sets `turn_state = awaiting_input` (P5 — activated this previously-reserved arm). |
 
 This is the **graceful-degradation** path: even with no multiplexer present (so
 no live injection is possible), unread messages are still delivered into the
 agent's context on its next turn or when it stops. The two delivery channels
 compose — an injectable peer gets an instant nudge *and* the full message on its
 next hook drain; a non-injectable session gets only the hook drain.
+
+The P5 `turn_state` write each hook performs is **best-effort** — it runs *after*
+the drain/registration above, and a failure is logged to stderr and swallowed
+(`if let Err`/`let _`, never `?`-propagated, the gc/git-tags precedent), so a
+presence-update failure can never sink message delivery. It is UPDATE-only on the
+caller's **own** row, so it is not gated on explicit identity (a guessed name
+worst-case touches zero rows; it can never consume a foreign inbox).
 
 ---
 
@@ -441,7 +448,10 @@ peers       (name TEXT PRIMARY KEY, mux TEXT, target TEXT, cwd TEXT NULL,
              repo TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
              worktree_id TEXT NOT NULL DEFAULT '',
              circle TEXT NOT NULL DEFAULT 'default',                -- visibility-scoping group (P4, additive)
-             role TEXT NOT NULL DEFAULT 'peer')                     -- peer | orchestrator (P4, PeerRole enum)
+             role TEXT NOT NULL DEFAULT 'peer',                     -- peer | orchestrator (P4, PeerRole enum)
+             turn_state TEXT NOT NULL DEFAULT '',                   -- '' | pending_first_turn | working | awaiting_input | idle (P5, TurnState enum; '' = unknown)
+             description TEXT NOT NULL DEFAULT '',                  -- free-form self-description (P5, ≤200 chars, control-stripped)
+             description_ts INTEGER NOT NULL DEFAULT 0)             -- description set-time; read-time TTL anchor (P5; 0 = unset)
 -- Tier-2 cross-store delivery (§10):
 outbox      (id INTEGER PK AUTOINCREMENT, ts INTEGER, to_peer TEXT, to_host TEXT NOT NULL DEFAULT '',
              from_peer TEXT, subject TEXT NULL, body TEXT, sig TEXT NOT NULL DEFAULT '')
@@ -550,7 +560,32 @@ jobs        (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TE
   `peers`/`sessions`/`scan` filter by circle caller-side over the merged views
   (federation composes); the default is the caller's circle, an orchestrator caller
   defaults to mesh-wide, `--all-circles`/`circle='*'` is mesh-wide. There is **no
-  `store → inject` edge** for circles/roles.
+  `store → inject` edge** for circles/roles. The P5 **rich-presence** columns
+  `turn_state` / `description` / `description_ts` are appended LAST (positions
+  13/14/15) by the same additive idempotent migration in both backends; a legacy row
+  reads `turn_state=''` (unknown) / `description=''` / `description_ts=0`, so an
+  un-upgraded peer's surfaced output is byte-identical to a pre-P5 weave. **turn_state**
+  is a `TurnState::{Unknown, PendingFirstTurn, Working, AwaitingInput, Idle}` enum
+  stored as TEXT (`Unknown ⇒ ''`, the `PeerRole`/`AskState` precedent — an enum,
+  never free text; `from_str` hard-errors an unknown value at the seam). It is
+  **auto-set by the lifecycle hooks** (§5: session→pending_first_turn,
+  prompt→working, stop→idle, notification→awaiting_input) and also exposed via the
+  explicit `set_turn_state` setter. **description** is a free-form self-set string,
+  sanitized through `sanitize_tag(_, MAX_DESC_LEN=200)` (control-stripped, capped on a
+  UTF-8 boundary, internal spaces kept — oversized truncates, never errors) and
+  stamped with `description_ts = now()` on set (`0` on clear, so a cleared description
+  is unambiguously absent). It carries a **read-time TTL** of `DESCRIPTION_TTL_SECS`
+  (900 s — the value of `ONLINE_TTL_SECS`, but a **named, independent** constant so a
+  description ages out independently of liveness): the pure `model::expire_description(&mut
+  Peer, now)` helper (no I/O, no clock of its own — `now` is passed in, totality via
+  `saturating_sub`) blanks a description whose `description_ts` is older than the window.
+  It is applied at the **store read seam** (`get_peer`/`list_peers`, both backends) right
+  after the row map — **daemon-free, no sweeper**, and the **stored row is never mutated**
+  (a pure read-time view; the next `set_description` re-stamps). Both setters are
+  **owner-only**: an `UPDATE … WHERE name = ?` bound to the caller's resolved identity
+  (the `claim`/`attach` precedent), never an arg-supplied target; the only inlined
+  turn_state SQL literals come from `TurnState::as_str` (compile-time). There is **no
+  `store → inject` edge** for presence, and **no new dependency**.
 - **`outbox`** — Tier-2 pending intents the owner queued for recipients in *other*
   stores (§10). Append-only; `id` is the monotonic dedup key the receiver tracks.
   `sig` is empty unless `--features sign` signed the intent.
@@ -881,6 +916,7 @@ keep what worked and drop the operational weight.
 | Durable job board (poll/claim) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, poll-only** |
 | Circles (visibility scoping) | ❌ | ✅ (daemon-mediated) | ✅ **daemon-free, pure-DB column + caller-side filter** |
 | Orchestrator role (per-circle coordinator) | ❌ | ✅ (daemon registry) | ✅ **daemon-free, claim + `is_alive` verdict** |
+| Rich presence (turn_state + description) | ❌ | ✅ (daemon registry) | ✅ **daemon-free, hook-auto + read-time TTL** |
 | Autonomous dispatch / agent-spawn | ❌ | ✅ (JobRunner daemon) | ⏳ deferred (later runner epic) |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
 | Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
@@ -934,6 +970,20 @@ keep what worked and drop the operational weight.
   job by spawning an agent, the cron scheduler, and the dispatch-lease ledger belong to a
   later runner epic (Tier B). P3 is **local-mesh poll-only**: workers poll and claim; there
   is no auto-dispatch yet.
+- **weave⊇repowire parity (P5 — rich presence).** repowire's peer registry carried a
+  live `turn_state` (idle/working/awaiting_input/pending_first_turn) and a self-reported
+  `description`, both mediated by its daemon. weave now matches this **daemon-free** with
+  three additive `peers` columns (§6): **turn_state** is **auto-set by the lifecycle hooks**
+  (session→pending_first_turn, prompt→working, stop→idle, notification→awaiting_input) as a
+  best-effort write that never sinks delivery, plus an explicit `set_turn_state` setter;
+  **description** is a free-form, control-stripped, 200-char self-set string with a
+  **read-time 900 s TTL** (the pure `expire_description` at the store read seam — no sweeper,
+  the stored row untouched). Both are **owner-only** (UPDATE bound to the caller's own row),
+  surfaced **compactly and non-noisily** (a marker only for a non-idle turn_state or a live
+  description, so an unset peer's output is byte-identical to pre-P5). It ships with a
+  **dual-backend additive migration**, **no `store → inject` edge**, and **no new dependency**
+  (a `#![recursion_limit = "256"]` compile-time attribute was added for the larger MCP tool
+  registry — an attribute, not a crate). Local-mesh only.
 
 ---
 

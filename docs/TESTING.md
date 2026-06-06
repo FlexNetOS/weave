@@ -585,6 +585,39 @@ query-time `this_host` ⇒ liveness fails OPEN (TTL recency-online) rather than
 pid-probing a one-shot CLI process's already-dead PID — the same remote-host fixture
 the scan/peers liveness tests use.
 
+### Rich presence: turn_state + description (P5)
+
+Rich presence is tested **hermetically across both backends** and end-to-end. The
+pure `model` layer locks the enum and the TTL: `TurnState` round-trips
+`from_str(as_str())` for every variant (empty/`unknown` ⇒ `Unknown`, any other value
+⇒ a hard `Err`), and a **proptest** asserts `expire_description` **totality** (never
+panics for any `(now, description_ts)` incl. `i64::MIN`/`MAX`/negatives via
+`saturating_sub`; blanks iff non-empty, anchored, and `now - ts >= DESCRIPTION_TTL_SECS`;
+never mutates a fresh-within-window description). The store layer (`store.rs` /
+`store_libsql.rs` `#[cfg(test)]`, run under sqlite **and** `--features libsql`) covers:
+**migration idempotency on a legacy peers table** (a pre-P5 `peers` gains the three
+columns; a legacy row reads `turn_state=''`(unknown)/`description=''`/`description_ts=0`;
+re-open is a no-op); `set_turn_state` updates **only the named row** and rejects a
+non-enum value (`Err`, no write); `set_description` round-trips, sanitizes (control-strip
++ 200-char cap, oversized truncates rather than erroring), and stamps `description_ts=0`
+on clear; the **read-time TTL** (poke `description_ts` past `DESCRIPTION_TTL_SECS` via a
+direct UPDATE ⇒ `get_peer`/`list_peers` read `description==""`, while a fresh one within
+the window is honored and the **stored row is never mutated**); and the
+register-preserving upsert (a re-register does **not** clobber a self-set
+turn_state/description — the `role`-omission precedent). The `McpServer` +
+`CARGO_BIN_EXE_weave` black-box layers cover the happy `set_turn_state`/`set_description`/
+`whoami` path **and the failure paths** (a bad turn_state ⇒ an `isError` result, not a
+protocol crash; an oversized description truncates, never errors), the **hook
+auto-transitions** (`hook session` ⇒ `pending_first_turn`, `hook prompt` ⇒ `working`,
+`hook stop` ⇒ `idle`, `hook notification` ⇒ `awaiting_input`, each surfaced in `weave
+peers`) including that a turn_state-write failure **never sinks the drain**, and the
+**load-bearing backward-compat regression** (an unset peer's `peers`/`sessions`/`scan`
+human line is byte-identical to pre-P5; `--json` only ADDS keys). `tests/security.rs`
+enforces the caps and the **owner-only** rule: a description is control-stripped
+(newline/NUL/ESC) and capped, a non-enum turn_state is rejected, surfaced fields are
+secret-free, and a caller **cannot set another peer's** turn_state/description (every
+setter is an UPDATE bound to the caller's own resolved identity).
+
 ### What proptest caught: the leading-hyphen bug
 
 The unicode/flag-shaped generators surfaced a real defect: a body that *started*

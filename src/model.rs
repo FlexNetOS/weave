@@ -874,6 +874,96 @@ impl PeerRole {
     }
 }
 
+/// The live turn-state of a peer within its current session (P5 rich presence).
+/// A deliberately small enum stored as TEXT in `peers.turn_state` (the
+/// [`PeerRole`]/`AskState` precedent): an empty string (`Unknown`, the column
+/// default) is a legacy/pre-hook row that has never reported a state; the four
+/// labels are the canonical lifecycle vocabulary (mirrors repowire's
+/// `TurnState`). turn_state is hook-auto-set from `handle_hook` (zero friction)
+/// and never free text — every store write validates through [`TurnState::from_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnState {
+    /// No state reported yet (legacy/pre-hook row); the empty-string default.
+    #[default]
+    Unknown,
+    /// A freshly-registered session that has not taken its first turn
+    /// (SessionStart fired, no prompt yet).
+    PendingFirstTurn,
+    /// Mid-turn — a UserPromptSubmit fired and the agent is working.
+    Working,
+    /// The agent's prompt is live + unconsumed (Notification fired); a human or
+    /// orchestrator should respond.
+    AwaitingInput,
+    /// The turn finished cleanly (Stop fired); no turn in progress.
+    Idle,
+}
+
+impl TurnState {
+    /// Canonical label stored in the `peers.turn_state` TEXT column. `Unknown` ⇒
+    /// the empty string (matching the column default and the `PeerRole`/empty
+    /// precedent). The only inlined SQL "literals" for turn_state are derived from
+    /// this (compile-time constants, never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnState::Unknown => "",
+            TurnState::PendingFirstTurn => "pending_first_turn",
+            TurnState::Working => "working",
+            TurnState::AwaitingInput => "awaiting_input",
+            TurnState::Idle => "idle",
+        }
+    }
+
+    /// Parse a stored turn_state string back into the enum. An empty value (a
+    /// legacy/pre-hook row) coalesces to [`TurnState::Unknown`]; any other unknown
+    /// value is a hard error at the store/setter seam (never a panic, never
+    /// silently coerced) so a corrupt/foreign value surfaces loudly rather than
+    /// being stored raw — the [`PeerRole::from_str`]/`AskState::from_str` precedent.
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "" | "unknown" => Ok(TurnState::Unknown),
+            "pending_first_turn" => Ok(TurnState::PendingFirstTurn),
+            "working" => Ok(TurnState::Working),
+            "awaiting_input" => Ok(TurnState::AwaitingInput),
+            "idle" => Ok(TurnState::Idle),
+            other => Err(format!("unknown turn state '{other}'")),
+        }
+    }
+}
+
+/// Hard upper bound (in chars) on a peer's free-form description (P5). A
+/// description is a one-line self-reported task summary echoed into other agents'
+/// listings, so an unbounded one is a token/RAM/UI hazard. 200 is generous (well
+/// over the git-tag caps, far under [`crate::store::MAX_BODY`]). The description
+/// is control-stripped + capped via `store::sanitize_tag(_, MAX_DESC_LEN)` at the
+/// store seam (lossy-but-total, internal spaces preserved).
+pub const MAX_DESC_LEN: usize = 200;
+
+/// Read-time TTL (seconds) after which a peer's free-form description ages out and
+/// reads as absent (P5). Equal to [`crate::store::ONLINE_TTL_SECS`] (900s) by
+/// value but kept as its own named constant so the description ages out
+/// INDEPENDENTLY of liveness (a session can be alive-and-working for >900s yet its
+/// description should still go stale; matches repowire's separate
+/// `description_ttl_seconds`). Lives in `model` so [`expire_description`] stays
+/// pure + self-contained (no I/O, no store dependency).
+pub const DESCRIPTION_TTL_SECS: i64 = 900;
+
+/// Pure, read-time TTL expiry for a peer's description (P5). If the description is
+/// non-empty, anchored (`description_ts > 0`), and older than
+/// [`DESCRIPTION_TTL_SECS`], blank it so every surface treats it as absent. The
+/// stored row is NOT mutated — this is a read-time view; the next `set_description`
+/// (or a natural overwrite) re-stamps. Daemon-free (no sweeper), the liveness-TTL
+/// idiom. Totality: never panics for any `(now, description_ts)` including
+/// negatives/overflow (uses `i64::saturating_sub`).
+pub fn expire_description(p: &mut Peer, now: i64) {
+    if !p.description.is_empty()
+        && p.description_ts > 0
+        && now.saturating_sub(p.description_ts) >= DESCRIPTION_TTL_SECS
+    {
+        p.description = String::new();
+    }
+}
+
 /// serde default for [`Peer::circle`] so older JSON payloads (which omit the
 /// field) deserialize to the [`DEFAULT_CIRCLE`].
 fn default_circle() -> String {
@@ -984,6 +1074,29 @@ pub struct Peer {
     /// `PeerRole::Peer`) keeps older JSON payloads deserializable.
     #[serde(default)]
     pub role: String,
+    /// Live turn-state label within the current session (P5): `""` (Unknown, the
+    /// default), `"pending_first_turn"`, `"working"`, `"awaiting_input"`, or
+    /// `"idle"`. Stored as the TEXT label and mapped through [`TurnState`] at the
+    /// surface seam (the `role`-is-a-plain-`String` precedent). Hook-auto-set from
+    /// `handle_hook`; NEVER set at registration (omitted from the upsert, like
+    /// `role`). Additive + backward-compatible: legacy rows read `""` (Unknown).
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub turn_state: String,
+    /// Free-form, self-reported task summary (P5). Empty == none. Bounded +
+    /// control-stripped via `sanitize_tag(_, MAX_DESC_LEN)` at the store seam, and
+    /// TTL'd at READ time via [`expire_description`] so a stale description ages
+    /// out to `""` independently of liveness. Explicit-set only (`weave describe`
+    /// / `weave_set_description`); never set at registration (omitted from the
+    /// upsert, like `role`). Additive + backward-compatible: legacy rows read `""`.
+    #[serde(default)]
+    pub description: String,
+    /// Unix-seconds when [`Peer::description`] was last set (P5); `0` == never set
+    /// / no TTL anchor. A SEPARATE column (not `last_seen`) so the description
+    /// expires independently of liveness. Additive + backward-compatible: legacy
+    /// rows read `0`. `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub description_ts: i64,
 }
 
 #[cfg(test)]
@@ -1429,6 +1542,85 @@ mod tests {
             if s.bytes().any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b' ' | b'\n' | b'\'' | b'"' | b'/')) {
                 prop_assert!(!got);
             }
+        }
+
+        /// EXPIRE-DESCRIPTION TOTALITY (P5): for ANY `(now, description_ts)` —
+        /// including i64 extremes and negatives — `expire_description` never panics
+        /// (saturating arithmetic) and matches its exact contract: the description is
+        /// blanked IFF it was non-empty AND anchored (`ts > 0`) AND
+        /// `now.saturating_sub(ts) >= DESCRIPTION_TTL_SECS`; otherwise it is left
+        /// untouched. A never-anchored (`ts <= 0`) or empty description is never
+        /// expired. Idempotent: a second call is a no-op.
+        #[test]
+        fn expire_description_is_total(
+            now in any::<i64>(),
+            ts in any::<i64>(),
+            desc in proptest::option::of("[ -~]{1,40}"),
+        ) {
+            let mut p = prop_peer(desc.as_deref().unwrap_or(""), ts);
+            let was_empty = p.description.is_empty();
+            let should_expire = !was_empty
+                && ts > 0
+                && now.saturating_sub(ts) >= DESCRIPTION_TTL_SECS;
+            let before = p.description.clone();
+            expire_description(&mut p, now);
+            if should_expire {
+                prop_assert_eq!(&p.description, "", "an expired description must blank");
+            } else {
+                prop_assert_eq!(&p.description, &before, "a live/unanchored description is untouched");
+            }
+            // Idempotent: a second pass changes nothing.
+            let after = p.description.clone();
+            expire_description(&mut p, now);
+            prop_assert_eq!(&p.description, &after, "expiry is idempotent");
+        }
+
+        /// TURN-STATE ROUND-TRIP TOTALITY (P5): every enum value's `as_str` parses
+        /// back to itself, and `from_str` never panics on arbitrary input — an
+        /// unknown value is always an `Err` (never a silent coercion), while the
+        /// empty string and "unknown" coalesce to `Unknown`.
+        #[test]
+        fn turn_state_from_str_is_total(s in ".*") {
+            // from_str never panics; the result matches the contract.
+            let got = TurnState::from_str(&s);
+            let known = matches!(
+                s.as_str(),
+                "" | "unknown" | "pending_first_turn" | "working" | "awaiting_input" | "idle"
+            );
+            prop_assert_eq!(got.is_ok(), known);
+            // Every enum value round-trips through as_str.
+            for st in [
+                TurnState::Unknown,
+                TurnState::PendingFirstTurn,
+                TurnState::Working,
+                TurnState::AwaitingInput,
+                TurnState::Idle,
+            ] {
+                prop_assert_eq!(TurnState::from_str(st.as_str()).unwrap(), st);
+            }
+        }
+    }
+
+    /// Build a minimal Peer carrying just the description fields the `expire_description`
+    /// proptest exercises (other fields are inert for that pure helper).
+    fn prop_peer(desc: &str, ts: i64) -> Peer {
+        Peer {
+            name: "p".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: 0,
+            pid: None,
+            host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: DEFAULT_CIRCLE.to_string(),
+            role: PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: desc.to_string(),
+            description_ts: ts,
         }
     }
 

@@ -38,7 +38,8 @@ auto-receive (use `weave setup` to do all of this automatically):
   "hooks": {
     "SessionStart":      [{ "hooks": [{ "type": "command", "command": "weave hook session" }] }],
     "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "weave hook prompt" }] }],
-    "Stop":              [{ "hooks": [{ "type": "command", "command": "weave hook stop" }] }]
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "weave hook stop" }] }],
+    "Notification":      [{ "hooks": [{ "type": "command", "command": "weave hook notification" }] }]
   }
 }
 ```
@@ -89,6 +90,11 @@ weave peers --all-circles            # mesh-wide (circle='*'); also on `sessions
 weave orchestrator claim             # claim the single coordinator slot for your circle
 weave orchestrator claim --force     # steal it from a live holder (non-destructive role flip)
 weave orchestrator status --circle team-a   # who (if anyone) is the live orchestrator
+
+# Rich presence (P5): self-reported turn_state + free-form description
+weave describe "reviewing PR #23"    # set a short self-description (TTL'd, control-stripped, ≤200 chars)
+weave status working                 # explicitly set your turn_state (pending_first_turn|working|awaiting_input|idle)
+                                     # (turn_state is normally auto-set by the lifecycle hooks — see below)
 
 weave inject --to envctl --text "live nudge"   # test the injector directly
 weave mcp --session desktop          # run the MCP stdio server
@@ -236,10 +242,17 @@ is pulled in.
 · `weave_job_create` · `weave_job_list` · `weave_job_show` · `weave_job_status` · `weave_job_claim`
 · `weave_job_update` · `weave_job_result` · `weave_job_cancel`
 · `weave_claim_orchestrator` · `weave_orchestrator_status` (P4 circles)
+· `weave_set_turn_state` · `weave_set_description` (P5 rich presence)
 
 `weave_peers` / `weave_sessions` / `weave_scan` take an optional `circle` arg
 (`"*"` = mesh-wide; omitted = your circle), and `weave_whoami` echoes your circle +
-role.
+role (and now your `turn_state` + `description`).
+
+`weave_set_turn_state` `{ state }` and `weave_set_description` `{ description }` are
+**owner-only** self-setters (bound to the caller's identity). turn_state is normally
+auto-set by the lifecycle hooks; the description is free-form, capped (oversized
+truncates, never errors), and TTL'd. `weave_peers` / `weave_scan` surface both
+compactly (non-idle turn_state + a live description only), `weave_whoami` always.
 
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
@@ -414,6 +427,49 @@ guarded idempotent migration — a legacy DB upgrades in place reading
 edge** (a circle/role never reaches the injector). The forced demote is the only
 cross-row peer write P4 adds — a single-row UPDATE in the caller's **own** store
 (never a foreign store); a peer still can never set another peer's circle/identity.
+
+## Rich presence (turn_state + description)
+
+Two self-reported presence fields on each peer — the fifth repowire-parity epic,
+still **daemon-free**, **no new dependency**, **local-mesh**, and **owner-only**:
+
+- **`turn_state`** — a lifecycle signal, one of `pending_first_turn | working |
+  awaiting_input | idle` (unset reads `unknown`). It is **auto-set by the lifecycle
+  hooks** — zero-friction, no explicit call needed:
+
+  | Hook event | Sets turn_state |
+  |---|---|
+  | `session` (SessionStart) | `pending_first_turn` (registered, no turn yet) |
+  | `prompt` (UserPromptSubmit) | `working` (mid-turn) |
+  | `stop` (Stop) | `idle` (turn finished) |
+  | `notification` (Notification) | `awaiting_input` (agent prompt live + unconsumed) |
+
+  The hook write is **best-effort** and runs *after* the message drain/registration,
+  so a turn_state update failure can never sink delivery. An explicit setter is also
+  available — `weave status <state>` / `weave_set_turn_state` (enum-validated; a
+  non-enum value is rejected) — but the hooks make it optional.
+
+- **`description`** — a free-form self-set string (`weave describe <text>` /
+  `weave_set_description`), capped at **200 chars** and control-stripped. It carries a
+  **900 s read-time TTL** (the same `ONLINE_TTL_SECS` liveness window, on its own
+  `description_ts` so it ages out independently of liveness): a description older than
+  the window simply reads blank, computed at read time with **no sweeper** and without
+  mutating the stored row. Set early in a session to advertise what you're working on.
+
+Both are **owner-only** — every setter binds the row to the caller's own resolved
+identity (`UPDATE … WHERE name = me`); a peer can never set another peer's presence.
+
+**Compact, non-noisy display.** `weave peers` / `weave sessions` / `weave scan` add a
+marker **only** when there's something to show — a `[working]` / `[awaiting-input]` /
+`[pending]` tag (idle/unknown adds nothing) and a short `"…"` description suffix (an
+unset or expired description adds nothing) — so an unset peer's output is byte-identical
+to a pre-P5 weave. `weave_whoami` always shows the `turn_state` and `description` lines
+(`-` when unset — whoami is a verbose self-report). `--json` only **adds** the
+`turn_state` / `description` / `description_ts` keys.
+
+Rich presence is **pure DB**: three additive `peers` columns (both backends, guarded
+idempotent migration — a legacy DB upgrades in place reading `unknown`/empty), and
+**no `store → inject` edge** (presence never reaches the injector).
 
 ## Native injector
 

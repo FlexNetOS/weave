@@ -335,6 +335,8 @@ fn call_tool(
         "weave_doctor" => tool_doctor(store, extra_dbs),
         "weave_whoami" => tool_whoami(store, me_default),
         "weave_attach" => tool_attach(store, me_default, args),
+        "weave_set_description" => tool_set_description(store, me_default, args),
+        "weave_set_turn_state" => tool_set_turn_state(store, me_default, args),
         "weave_connect" => tool_connect(store, args),
         "weave_ask" => tool_ask(store, me_default, nudge_template, args),
         "weave_answer" => tool_answer(store, me_default, nudge_template, args),
@@ -831,8 +833,10 @@ fn tool_peers(
             String::new()
         };
         let tags = fmt_peer_tags(p);
+        let ts_marker = fmt_turn_state(p);
+        let desc = fmt_description(p);
         out.push_str(&format!(
-            "\n  • {}{remote_marker} [{presence}] [{reason}] [{}] {} ({inj}){tags} seen {}{via}",
+            "\n  • {}{remote_marker} [{presence}] [{reason}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
             p.name,
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
@@ -860,6 +864,29 @@ fn fmt_peer_tags(p: &crate::model::Peer) -> String {
         parts.push(format!("#{}", p.worktree_id));
     }
     format!(" {{{}}}", parts.join(" "))
+}
+
+/// Compact, NON-NOISY turn_state marker for an MCP listing (P5), e.g. ` [working]`.
+/// An idle/unknown turn_state renders nothing (so a pre-P5 peer's line is unchanged);
+/// mirrors the CLI `fmt_turn_state`. Pure formatting.
+fn fmt_turn_state(p: &crate::model::Peer) -> String {
+    match crate::model::TurnState::from_str(&p.turn_state) {
+        Ok(crate::model::TurnState::Working) => " [working]".to_string(),
+        Ok(crate::model::TurnState::AwaitingInput) => " [awaiting-input]".to_string(),
+        Ok(crate::model::TurnState::PendingFirstTurn) => " [pending]".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Compact description suffix for an MCP listing (P5), e.g. ` "reviewing PR #23"`.
+/// An empty (unset/TTL-expired) description renders nothing. The Peer is expected to
+/// carry the read-time-TTL'd view from the store. Pure formatting.
+fn fmt_description(p: &crate::model::Peer) -> String {
+    if p.description.is_empty() {
+        String::new()
+    } else {
+        format!(" \"{}\"", p.description)
+    }
 }
 
 /// Capture the git session tags for the MCP server's cwd (best-effort, total).
@@ -962,8 +989,10 @@ fn tool_scan(
         } else {
             String::new()
         };
+        let ts_marker = fmt_turn_state(p);
+        let desc = fmt_description(p);
         out.push_str(&format!(
-            "\n  • {}{remote_marker} [{reason}] repo={} branch={} worktree={} mux={} pane={} host={}{via}",
+            "\n  • {}{remote_marker} [{reason}]{ts_marker} repo={} branch={} worktree={} mux={} pane={} host={}{desc}{via}",
             p.name,
             if p.repo.is_empty() { "-" } else { &p.repo },
             if p.branch.is_empty() { "-" } else { &p.branch },
@@ -1374,21 +1403,37 @@ fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String
         &target.id
     };
     // P4: report the caller's resolved circle (config/$WEAVE_CIRCLE) and its
-    // current registered role, so a caller can confirm its visibility scope.
+    // current registered role, so a caller can confirm its visibility scope. P5:
+    // also surface the caller's own turn_state + description (read-time-TTL'd by the
+    // store). One peer-row lookup feeds role/turn_state/description; a missing row
+    // falls back to the defaults.
     let circle = crate::config::Config::load().circle();
-    let role = match def {
-        Some(d) if !d.trim().is_empty() => store
-            .get_peer(d.trim())
-            .ok()
-            .flatten()
-            .and_then(|p| crate::model::PeerRole::from_str(&p.role).ok())
-            .unwrap_or(crate::model::PeerRole::Peer)
-            .as_str()
-            .to_string(),
-        _ => crate::model::PeerRole::Peer.as_str().to_string(),
+    let me_row = match def {
+        Some(d) if !d.trim().is_empty() => store.get_peer(d.trim()).ok().flatten(),
+        _ => None,
     };
+    let role = me_row
+        .as_ref()
+        .and_then(|p| crate::model::PeerRole::from_str(&p.role).ok())
+        .unwrap_or(crate::model::PeerRole::Peer)
+        .as_str()
+        .to_string();
+    // whoami is a verbose self-report (noise is fine), so turn_state/description are
+    // ALWAYS shown — `-` when unset (Unknown / empty / TTL-expired).
+    let turn_state = me_row
+        .as_ref()
+        .and_then(|p| crate::model::TurnState::from_str(&p.turn_state).ok())
+        .map(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("-")
+        .to_string();
+    let description = me_row
+        .as_ref()
+        .map(|p| p.description.clone())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "-".to_string());
     Ok(format!(
-        "identity:   {identity}\nbackend:    {}\ncircle:     {circle}\nrole:       {role}\nthis pane:  mux={} target={} injectable={}",
+        "identity:   {identity}\nbackend:    {}\ncircle:     {circle}\nrole:       {role}\nturn_state: {turn_state}\ndescription: {description}\nthis pane:  mux={} target={} injectable={}",
         store.backend(),
         target.mux.as_str(),
         tgt,
@@ -1449,6 +1494,53 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
         "Attached '{me}' to the store [{}] {tgt} ({inj}). It is now visible to other sessions.",
         t.mux.as_str()
     ))
+}
+
+/// `weave_set_description`: set the CALLER's OWN free-form task description (P5).
+/// Self-only — the row key is the resolved caller identity (`ident`), never an
+/// arg-supplied target (the `tool_attach` precedent). The store control-strips +
+/// caps the text (oversized truncates, never errors); an empty string clears it.
+/// All output is the returned tool-result TEXT (MCP stdout carries only JSON-RPC).
+fn tool_set_description(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .ok_or("'description' is required (a one-line task summary; empty clears it).")?;
+    store.set_description(&me, description).map_err(e)?;
+    // Echo the stored (post-sanitize, post-TTL) view back so the caller sees what
+    // actually persisted.
+    let shown = store
+        .get_peer(&me)
+        .map_err(e)?
+        .map(|p| p.description)
+        .unwrap_or_default();
+    if shown.is_empty() {
+        Ok(format!("Cleared description for '{me}'."))
+    } else {
+        Ok(format!("Set description for '{me}': {shown}"))
+    }
+}
+
+/// `weave_set_turn_state`: explicitly set the CALLER's OWN turn-state (P5).
+/// Self-only (the `ident`-bound caller row). The store validates the state against
+/// the `TurnState` enum — an unknown value is a hard error (the failure path).
+fn tool_set_turn_state(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let state = args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .ok_or("'state' is required (pending_first_turn|working|awaiting_input|idle).")?;
+    store.set_turn_state(&me, state).map_err(e)?;
+    Ok(format!("Set turn_state for '{me}': {state}"))
 }
 
 /// Connect handshake: capability-probe `peer` before sending. Reports a structured
@@ -2258,6 +2350,22 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
             },"required":[]}
+        },
+        {
+            "name": "weave_set_description",
+            "description": "Set YOUR OWN free-form, self-reported task description (a one-line summary). Surfaces compactly in weave_peers/weave_sessions/weave_scan and to whoami, and ages out after the description TTL (900s). Self-only: only ever updates the caller's own peer row. Oversized text is truncated (never an error); control chars are stripped. Pass an empty string to clear it.",
+            "inputSchema": {"type":"object","properties":{
+                "description":{"type":"string","description":"One-line task summary (capped + control-stripped; empty clears it)."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["description"]}
+        },
+        {
+            "name": "weave_set_turn_state",
+            "description": "Explicitly set YOUR OWN turn-state (P5 rich presence). Normally hook-auto via `weave hook session|prompt|stop|notification`; this is the manual override. Self-only. An invalid state is an error.",
+            "inputSchema": {"type":"object","properties":{
+                "state":{"type":"string","enum":["pending_first_turn","working","awaiting_input","idle"],"description":"The turn-state to set."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["state"]}
         },
         {
             "name": "weave_connect",

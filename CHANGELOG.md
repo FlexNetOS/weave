@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased] — rich presence: turn_state + description (weave⊇repowire parity, epic 5 / P5)
+
+> **Daemon-free rich presence, pure-DB.** Three additive `peers` columns — `turn_state`
+> (a `TurnState::{Unknown, PendingFirstTurn, Working, AwaitingInput, Idle}` enum stored
+> as TEXT, never free text), `description` (a free-form self-set string, ≤200 chars,
+> control-stripped), and `description_ts` (its read-time TTL anchor). **turn_state is
+> auto-set by the lifecycle hooks** — session→`pending_first_turn`, prompt→`working`,
+> stop→`idle`, notification→`awaiting_input` — as a best-effort write that runs *after*
+> the drain/registration and can never sink delivery; an explicit `weave status <state>`
+> / `weave_set_turn_state` setter exists too (enum-validated; a non-enum value is
+> rejected). **description** (`weave describe <text>` / `weave_set_description`) carries a
+> **900 s read-time TTL** (`DESCRIPTION_TTL_SECS`, the `ONLINE_TTL_SECS` value but an
+> independent constant so it ages out independently of liveness): a stale description
+> reads blank, computed at read time by the pure `model::expire_description` — **no
+> sweeper**, the stored row untouched. Both setters are **owner-only** (UPDATE bound to
+> the caller's own row). Surfaced **compactly and non-noisily** in `peers`/`sessions`/
+> `scan` (a `[working]`/`[awaiting-input]`/`[pending]` marker only for a non-idle
+> turn_state, a `"…"` suffix only for a live description) and **always** in `weave_whoami`;
+> `--json` only ADDS keys. An unset peer's human output is **byte-identical** to pre-P5.
+> **No new dependency** (a `#![recursion_limit = "256"]` compile-time attribute was added
+> for the larger MCP tool registry — an attribute, not a crate); no `store → inject` edge;
+> mirrored across both storage backends with guarded additive migrations (a legacy DB
+> upgrades in place reading `unknown`/empty); local-mesh only.
+
+### Added
+- **model:** `TurnState` enum (`as_str`/`from_str`, `Unknown` default ⇒ `''`; unknown
+  value ⇒ hard `Err`) — the `PeerRole`/`AskState` enum-as-TEXT precedent; `MAX_DESC_LEN =
+  200` and `DESCRIPTION_TTL_SECS = 900`; the pure `expire_description(&mut Peer, now)`
+  read-time TTL helper (totality via `saturating_sub`, never mutates the stored row);
+  three `#[serde(default)]` `Peer` fields `turn_state` / `description` / `description_ts`.
+- **store (both backends):** three additive `peers` columns (guarded idempotent
+  migration); `set_turn_state` (enum-validated, never stores raw) and `set_description`
+  (`sanitize_tag(_, MAX_DESC_LEN)` — oversized truncates, control-stripped; clear stamps
+  `description_ts=0`, set stamps `now()`) trait methods, both **owner-only UPDATE-by-name**;
+  the read-time `expire_description` applied at the `get_peer`/`list_peers` read seam.
+  `register_peer_full` OMITS the three columns from the upsert (the `role` discipline — a
+  re-register preserves a self-set turn_state/description). All SQL parameterized; the only
+  inlined turn_state literals are the compile-time `TurnState::as_str` constants.
+- **main:** lifecycle hooks auto-set `turn_state` best-effort after the drain/registration
+  (the previously-reserved `notification` arm now sets `awaiting_input`); `weave describe
+  <text>` and `weave status <state>` CLI subcommands (self-only, identity-bound);
+  non-noisy `turn_state`/`description` surfacing in `peers`/`scan`/`sessions --watch`
+  (human + JSON).
+- **mcp:** `weave_set_turn_state` / `weave_set_description` tools (owner-only, the
+  `tool_attach` caller-bound precedent; bad turn_state ⇒ Err, oversized description
+  truncates rather than erroring); `turn_state`/`description` in `weave_peers`/`weave_scan`
+  (compact) and always in `weave_whoami`; additive JSON keys.
+
 ## [Unreleased] — circles + orchestrator role (weave⊇repowire parity, epic 4 / P4)
 
 > **Coordination topology, daemon-free and pure-DB.** Two additive `peers` columns —

@@ -1189,6 +1189,9 @@ mod tests {
             worktree_id: String::new(),
             circle: crate::model::DEFAULT_CIRCLE.to_string(),
             role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -1211,6 +1214,9 @@ mod tests {
             worktree_id: String::new(),
             circle: crate::model::DEFAULT_CIRCLE.to_string(),
             role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");
