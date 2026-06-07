@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] — workspace split
+
+> Mechanical refactor: the previous single crate is now a Cargo workspace with four
+> members (`weave-core`, `weave-inject`, `weave-mcp`, `weave`). No behavior changes.
+
+### Changed
+- Split source into workspace crates:
+  - `weave-core` — `model`, `config`, `store` (+ `store_libsql`), optional `sign`, and the
+    shared `testenv` helper.
+  - `weave-inject` — the native mux injector (`inject.rs`) plus the new `Injector` trait
+    so the MCP server can accept a mock injector in tests.
+  - `weave-mcp` — the MCP stdio JSON-RPC server (`mcp.rs`), now exposing `serve<I: Injector>`.
+  - `weave` — the binary crate (`main.rs`, `git.rs`, `setup.rs`, `testenv.rs` re-export),
+    plus the moved integration/security/property tests and criterion benchmarks.
+- The binary name remains `weave`; integration tests still resolve it via
+  `CARGO_BIN_EXE_weave`.
+- Feature flags still control the storage backend (`sqlite` default, `libsql`) and the
+  optional signer (`sign`), now hosted primarily in `weave-core` and propagated by the
+  binary crate.
+
+### Added
+- `Injector` trait in `weave-inject`, implemented by the binary crate (`RealInjector`)
+  and usable by tests as a mock seam.
+- `WorktreeTags` moved into `weave-core::model` so the `Injector` trait can expose
+  git-tag capture without adding an `mcp → git` dependency.
+
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
 
 > **A fire-and-forget notify primitive + a transport-side delivery trace, both pure-DB

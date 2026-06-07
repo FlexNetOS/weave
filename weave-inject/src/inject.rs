@@ -19,9 +19,9 @@
 //! paste-safe submission idiom for that terminal (e.g. tmux closes bracketed paste
 //! with the hex `ESC [ 2 0 1 ~` sequence before sending Enter).
 
-use crate::model::Peer;
 use anyhow::{bail, Result};
 use std::process::Command;
+use weave_core::model::Peer;
 
 /// A carriage return — the byte a TUI reads as "Enter".
 const CR: &str = "\r";
@@ -29,7 +29,7 @@ const CR: &str = "\r";
 /// Hard cap on injected characters. A nudge is a short ping; a hostile or huge
 /// message body must never flood the recipient's input line. Anything longer is
 /// truncated with an ellipsis (the full body still arrives via the store).
-const MAX_INJECT_CHARS: usize = 240;
+pub const MAX_INJECT_CHARS: usize = 240;
 
 /// Wall-clock cap for a single mux subprocess. A wedged tmux/zellij server must
 /// never hang the caller (the MCP server serves other sessions).
@@ -859,6 +859,44 @@ fn run_capture(cmd: &[String], dur: std::time::Duration) -> Result<Option<String
     }
 }
 
+/// Abstraction over the native injector (and related environment probes) so that
+/// `weave-mcp::serve` can be driven by a real mux detector in production and by a
+/// deterministic mock in tests.
+///
+/// The default implementation for the weave binary simply delegates to the free
+/// functions in this module; tests can provide a fake `Injector` that records calls
+/// and returns canned `Target`s / `Capability`s.
+pub trait Injector {
+    /// Detect the injection target for the current process from the environment.
+    fn detect_target(&self) -> Target;
+
+    /// Probe whether `target`'s pane/session is currently alive (best-effort).
+    fn target_alive(&self, target: &Target) -> bool;
+
+    /// Inject `body` into `target` using the chosen nudge mode.
+    fn inject_mode(&self, target: &Target, body: &str, mode: Nudge) -> anyhow::Result<bool>;
+
+    /// Describe how live the target is (live / registered-but-not-alive / not injectable).
+    fn capability(&self, target: &Target) -> Capability;
+
+    /// Check whether a named binary exists on PATH (via `resolve_trusted`).
+    fn have(&self, name: &str) -> bool;
+
+    /// Validate a mux-specific target id (`tmux` pane id, `zellij` session, etc).
+    fn id_valid(&self, mux: Mux, id: &str) -> bool;
+
+    /// Capture git worktree tags for `cwd`.
+    fn git_tags(&self, cwd: &std::path::Path) -> anyhow::Result<weave_core::model::WorktreeTags>;
+
+    /// Convenience helper: git tags for the current working directory.
+    fn git_tags_here(&self) -> weave_core::model::WorktreeTags {
+        match std::env::current_dir() {
+            Ok(p) => self.git_tags(&p).unwrap_or_default(),
+            Err(_) => weave_core::model::WorktreeTags::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,8 +1225,8 @@ mod tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
-            circle: crate::model::DEFAULT_CIRCLE.to_string(),
-            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            circle: weave_core::model::DEFAULT_CIRCLE.to_string(),
+            role: weave_core::model::PeerRole::Peer.as_str().to_string(),
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
@@ -1212,8 +1250,8 @@ mod tests {
             repo: String::new(),
             branch: String::new(),
             worktree_id: String::new(),
-            circle: crate::model::DEFAULT_CIRCLE.to_string(),
-            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            circle: weave_core::model::DEFAULT_CIRCLE.to_string(),
+            role: weave_core::model::PeerRole::Peer.as_str().to_string(),
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
@@ -1372,8 +1410,8 @@ mod tests {
         // token/timeout tests, the concurrency stress test, and any reader of
         // trusted_dirs()). The EnvVarGuard restores the prior value (or removes it
         // if it was absent) on drop — even on panic — so no state leaks.
-        let _g = crate::testenv::lock_env();
-        let _v = crate::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", "/tmp/weave-fake-mux");
+        let _g = weave_core::testenv::lock_env();
+        let _v = weave_core::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", "/tmp/weave-fake-mux");
         let dirs = trusted_dirs();
 
         let opt_in = std::path::Path::new("/tmp/weave-fake-mux");
@@ -1500,7 +1538,7 @@ mod tests {
 
     /// Proof that the canonical env guard serializes concurrent `WEAVE_MUX_DIR`
     /// mutation against `trusted_dirs()` reads. N threads × K iterations each take
-    /// `crate::testenv::lock_env()`, set a UNIQUE `WEAVE_MUX_DIR` via `EnvVarGuard`,
+    /// `weave_core::testenv::lock_env()`, set a UNIQUE `WEAVE_MUX_DIR` via `EnvVarGuard`,
     /// then assert the dir they just set is the FIRST entry of `trusted_dirs()`. With
     /// the unified lock every critical section is exclusive, so the read always sees
     /// the writer's own value; without it, another thread's set/remove could
@@ -1516,8 +1554,8 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..ITERS {
                         let unique = format!("/tmp/weave-stress-{t}-{i}");
-                        let _g = crate::testenv::lock_env();
-                        let _v = crate::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", &unique);
+                        let _g = weave_core::testenv::lock_env();
+                        let _v = weave_core::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", &unique);
                         let dirs = trusted_dirs();
                         assert_eq!(
                             dirs.first().map(|p| p.as_path()),

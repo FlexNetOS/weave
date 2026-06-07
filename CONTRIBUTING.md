@@ -1,6 +1,6 @@
 # Contributing to weave
 
-Thanks for hacking on weave. It is a single Rust binary with a small, focused
+Thanks for hacking on weave. It is a Rust workspace with a small, focused
 surface — the goal is to keep it dependency-light, well-tested, and easy to read.
 Please read [ARCHITECTURE.md](ARCHITECTURE.md) first; it explains the module
 layout, the `Store` trait, and the injector design you will be extending.
@@ -16,8 +16,7 @@ feature.
 
 ## Build, test, lint, format
 
-Run all four before opening a PR. The default build uses **no features** and must
-stay green.
+Run all four before opening a PR from the workspace root. The default build uses **sqlite** (via default features) and must stay green.
 
 ```bash
 cargo build                 # debug build

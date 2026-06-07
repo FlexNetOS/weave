@@ -31,7 +31,7 @@ fn env_mutex() -> &'static Mutex<()> {
 /// panicking test must not cascade-fail or deadlock the rest of the suite — the
 /// panicking test still fails on its own merits; this only keeps the *lock* usable
 /// so unrelated tests run and report their own results.
-pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
+pub fn lock_env() -> MutexGuard<'static, ()> {
     env_mutex().lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -45,14 +45,14 @@ pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
 /// SAFETY / correctness: callers MUST already hold [`lock_env`] for this guard's
 /// whole lifetime. The lock is what makes the process-global `set_var`/`remove_var`
 /// it performs race-free; this type only guarantees restoration, not exclusion.
-pub(crate) struct EnvVarGuard {
+pub struct EnvVarGuard {
     key: String,
     prev: Option<OsString>,
 }
 
 impl EnvVarGuard {
     /// Set `key=val`, remembering the prior value for restoration on `Drop`.
-    pub(crate) fn set(key: &str, val: &str) -> Self {
+    pub fn set(key: &str, val: &str) -> Self {
         let prev = std::env::var_os(key);
         std::env::set_var(key, val);
         Self {
@@ -62,7 +62,7 @@ impl EnvVarGuard {
     }
 
     /// Remove `key`, remembering the prior value for restoration on `Drop`.
-    pub(crate) fn remove(key: &str) -> Self {
+    pub fn remove(key: &str) -> Self {
         let prev = std::env::var_os(key);
         std::env::remove_var(key);
         Self {

@@ -1,0 +1,36 @@
+[package]
+name = "weave"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust-native agent-to-agent session mesh with a native injector"
+
+[[bin]]
+name = "weave"
+path = "src/main.rs"
+
+[[bench]]
+name = "weave_bench"
+harness = false
+
+[features]
+default = ["sqlite"]
+sqlite = ["weave-core/sqlite"]
+libsql = ["weave-core/libsql", "weave-mcp/libsql"]
+sign = ["weave-core/sign", "weave-mcp/sign"]
+
+[dependencies]
+weave-core = { path = "../weave-core", default-features = false }
+weave-inject = { path = "../weave-inject" }
+weave-mcp = { path = "../weave-mcp", default-features = false }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6.1"
+clap_mangen = "0.2.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+
+[dev-dependencies]
+proptest = "1.8.0"
+criterion = { version = "0.7.0", features = ["html_reports"] }

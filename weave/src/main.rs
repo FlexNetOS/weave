@@ -38,26 +38,22 @@ compile_error!(
 #[cfg(not(any(feature = "sqlite", feature = "libsql")))]
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
-mod config;
 mod git;
-mod inject;
-mod mcp;
-mod model;
 mod setup;
 #[cfg(feature = "sign")]
-mod sign;
-mod store;
-#[cfg(feature = "libsql")]
-mod store_libsql;
+use weave_core::sign;
 #[cfg(test)]
 mod testenv;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use config::Config;
 use std::io::Read;
 use std::path::PathBuf;
-use store::{is_alive, Store};
+use weave_core::config::Config;
+use weave_core::store::{is_alive, Store};
+use weave_core::{config, model, store};
+use weave_inject::{self as inject, inject_text, Injector};
+use weave_mcp::{self as mcp};
 
 /// `--version` provenance: the package version plus the storage backend(s)
 /// compiled into THIS binary. Because the `sqlite` and `libsql` backends are
@@ -87,6 +83,38 @@ fn long_version() -> &'static str {
         };
         format!("{}\nbackends: {}", env!("CARGO_PKG_VERSION"), backends)
     })
+}
+
+/// Production injector implementation passed to `weave_mcp::serve`.
+struct RealInjector;
+
+impl Injector for RealInjector {
+    fn detect_target(&self) -> weave_inject::Target {
+        weave_inject::detect_target()
+    }
+    fn target_alive(&self, target: &weave_inject::Target) -> bool {
+        weave_inject::target_alive(target)
+    }
+    fn inject_mode(
+        &self,
+        target: &weave_inject::Target,
+        body: &str,
+        mode: weave_inject::Nudge,
+    ) -> anyhow::Result<bool> {
+        weave_inject::inject_mode(target, body, mode)
+    }
+    fn capability(&self, target: &weave_inject::Target) -> weave_inject::Capability {
+        weave_inject::capability(target)
+    }
+    fn have(&self, name: &str) -> bool {
+        weave_inject::have(name)
+    }
+    fn id_valid(&self, mux: weave_inject::Mux, id: &str) -> bool {
+        weave_inject::id_valid(mux, id)
+    }
+    fn git_tags(&self, cwd: &std::path::Path) -> anyhow::Result<weave_core::model::WorktreeTags> {
+        Ok(git::capture_worktree_tags(cwd))
+    }
 }
 
 /// Long `--help` preamble. Documents the exit-code contract so scripts wrapping
@@ -799,7 +827,7 @@ fn open_store(cfg: &Config) -> Result<Box<dyn Store>> {
                          db/WEAVE_DB path override is ignored."
                     );
                 }
-                Ok(Box::new(store_libsql::LibsqlStore::open(cfg)?))
+                Ok(Box::new(weave_core::store_libsql::LibsqlStore::open(cfg)?))
             }
             #[cfg(not(feature = "libsql"))]
             {
@@ -1029,7 +1057,7 @@ fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str)
     if let Some(peer) = store.get_peer(to)? {
         let t = inject::Target::from_peer(&peer);
         if t.injectable() {
-            match inject::inject(&t, &cfg.nudge(from, body)) {
+            match inject_text(&t, &cfg.nudge(from, body)) {
                 Ok(true) => println!("injected into {} '{}'", t.mux.as_str(), t.id),
                 Ok(false) => {}
                 Err(err) => eprintln!("inject failed ({err}); will arrive on next turn"),
@@ -1059,7 +1087,7 @@ fn ask_inject_verdict(
     let t = inject::Target::from_peer(&peer);
     match inject::capability(&t) {
         inject::Capability::NotInjectable => "recipient_not_injectable",
-        _ => match inject::inject(&t, &cfg.nudge(from, body)) {
+        _ => match inject_text(&t, &cfg.nudge(from, body)) {
             Ok(true) => "transport_delivered",
             Ok(false) => "queued_next_turn",
             Err(err) => {
@@ -1118,7 +1146,7 @@ fn inject_and_trace(
     let (stage, outcome, verdict) = if let Some(peer) = store.get_peer(to)? {
         let t = inject::Target::from_peer(&peer);
         if t.injectable() {
-            match inject::inject(&t, &cfg.nudge(from, body)) {
+            match inject_text(&t, &cfg.nudge(from, body)) {
                 Ok(true) => {
                     println!("injected into {} '{}'", t.mux.as_str(), t.id);
                     (
@@ -2060,7 +2088,14 @@ fn main() -> Result<()> {
                 allow_inject_from: cfg.allow_inject_from_sources(),
                 policy: verify_policy(&cfg),
             };
-            mcp::run(store, def, nudge_tpl.as_deref(), extra_dbs, pull)?;
+            mcp::serve(
+                store,
+                def,
+                nudge_tpl.as_deref(),
+                extra_dbs,
+                pull,
+                &RealInjector,
+            )?;
         }
 
         Cmd::Send {

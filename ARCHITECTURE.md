@@ -13,32 +13,48 @@ this box (`mcp-broker` and `repowire`).
 
 ---
 
-## 1. Module map
+## 1. Workspace map
 
-The crate is one binary (`src/main.rs`) with focused modules. Each module owns
-one concern and depends only on the layers beneath it.
+`weave` is organized as a Cargo workspace. The default build still produces one
+static binary (`weave`), but the code is split into crates so the core types,
+store, injector, and MCP server can be reused and tested independently.
 
 ```
-src/
-├── model.rs         core types + helpers (no I/O); incl. the Tier-2 Intent
-├── config.rs        config file + env overlay
-├── sign.rs          OPTIONAL Ed25519 sign/verify + keyfile (cfg(feature="sign"))
-├── store.rs         Store trait + bundled SQLite backend
-├── store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
-├── inject.rs        native multi-mux injector (pure command tables + runner)
-├── mcp.rs           MCP stdio JSON-RPC 2.0 server (weave_* tools)
-├── setup.rs         `weave setup` / `weave uninstall` (MCP register + hook merge)
-└── main.rs          clap CLI; wires config → store → {mcp, cli, hooks}
+weave-core/          library: model + config + Store trait + both backends + sign
+  src/model.rs         core types + helpers (no I/O); incl. the Tier-2 Intent
+  src/config.rs        config file + env overlay
+  src/sign.rs          OPTIONAL Ed25519 sign/verify + keyfile (cfg(feature="sign"))
+  src/store.rs         Store trait + bundled SQLite backend (cfg(feature="sqlite"))
+  src/store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
+  src/testenv.rs       test-only env lock / guard helpers
+weave-inject/        library: native multi-mux injector + `Injector` trait
+  src/inject.rs        pure command tables + runner
+weave-mcp/           library: MCP stdio JSON-RPC 2.0 server (weave_* tools)
+  src/mcp.rs           `serve<I: Injector>` — generic over the injector trait
+weave/               binary crate: CLI, setup, hooks, git tagging
+  src/main.rs          clap CLI; wires core + inject + mcp
+  src/git.rs           best-effort git session tagging
+  src/setup.rs         `weave setup` / `weave uninstall`
+  tests/               black-box integration / security / property tests
+  benches/weave_bench.rs  criterion throughput benchmarks
 ```
 
 Dependency direction (top depends on bottom):
 
 ```
-main ──▶ mcp ──▶ store ──▶ model
-  │       │        │  │      ▲
-  │       └────────┴── inject ┘   (inject and mcp both use model::Peer)
-  └──▶ config ◀── store          (store calls config::this_host / peer_db_paths)
+weave ──▶ weave-mcp ──▶ weave-core
+  │           │            ▲
+  │           └────────────┤
+  └──▶ weave-inject ───────┘
+              │
+              └──▶ weave-core
 ```
+
+`weave-core` has no upward dependencies. `weave-inject` depends only on
+`weave-core`. `weave-mcp` depends on `weave-core` + `weave-inject`. The `weave`
+binary wires all three together and owns I/O-heavy glue (`git.rs`, `setup.rs`,
+CLI). The optional `sign` module lives in `weave-core`; the `libsql` backend is
+also in `weave-core`.
 
 `config` is the lowest layer above `model`: `store`'s liveness (`is_alive` →
 `this_host`), federation (`federated_*` → `peer_db_paths`), and Tier-2 delivery

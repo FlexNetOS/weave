@@ -67,6 +67,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// The three descriptive session tags captured from a cwd's git state. Pure data
+/// (no I/O); the store bounds each field on write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeTags {
+    /// Repo name = basename of the git toplevel. Empty when non-git / unknown.
+    pub repo: String,
+    /// Current branch (`rev-parse --abbrev-ref HEAD`). Empty when detached /
+    /// non-git / unknown.
+    pub branch: String,
+    /// Canonical worktree id: the `<name>` of `.git/worktrees/<name>` for a linked
+    /// worktree, the `"(main)"` sentinel for a main worktree, or `""` when the cwd
+    /// is not a git repo at all.
+    pub worktree_id: String,
+}
+
 /// A stored message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

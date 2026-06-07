@@ -4,13 +4,15 @@
 //!
 //! stdout is reserved for protocol messages; all logging goes to stderr.
 
-use crate::config::StoreSource;
-use crate::inject::{self, Nudge, Target};
-use crate::model::{self, fmt_ts};
-use crate::store::{self, is_alive, Store};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use weave_core::config::StoreSource;
+use weave_core::model::{self, fmt_ts};
+#[cfg(feature = "sign")]
+use weave_core::sign;
+use weave_core::store::{self, is_alive, Store};
+use weave_inject::{Capability, Injector, Nudge, Target};
 
 const SERVER_NAME: &str = "weave";
 const SERVER_VERSION: &str = "0.1.0";
@@ -97,8 +99,8 @@ impl PullConsent {
 /// is never logged. Mirror of `main::sign_intent_if_keyed`.
 #[cfg(feature = "sign")]
 fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
-    match crate::sign::load_signing_key() {
-        Ok(Some(key)) => crate::sign::sign_intent(&key, from, to, body),
+    match sign::load_signing_key() {
+        Ok(Some(key)) => sign::sign_intent(&key, from, to, body),
         Ok(None) => String::new(),
         Err(err) => {
             log(&format!(
@@ -114,12 +116,13 @@ fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
     String::new()
 }
 
-pub fn run(
+pub fn serve<I: Injector>(
     store: &dyn Store,
     me_default: Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
+    injector: &I,
 ) -> Result<()> {
     log(&format!(
         "starting; backend={} default_session={:?}",
@@ -150,7 +153,15 @@ pub fn run(
                 continue;
             }
         };
-        if let Some(resp) = handle(store, &me_default, nudge_template, &extra_dbs, &pull, &req) {
+        if let Some(resp) = handle(
+            store,
+            &me_default,
+            nudge_template,
+            &extra_dbs,
+            &pull,
+            &req,
+            injector as &dyn Injector,
+        ) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
             // cleanly; any other io error is logged and we keep serving.
@@ -242,6 +253,7 @@ fn handle(
     extra_dbs: &[StoreSource],
     pull: &PullConsent,
     req: &Value,
+    injector: &dyn Injector,
 ) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").cloned();
@@ -291,6 +303,7 @@ fn handle(
                 pull,
                 name,
                 &args,
+                injector,
             ) {
                 Ok(text) => Some(reply(
                     &id,
@@ -319,33 +332,34 @@ fn call_tool(
     pull: &PullConsent,
     name: &str,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     match name {
-        "weave_send" => tool_send(store, me_default, nudge_template, args),
-        "weave_notify" => tool_notify(store, me_default, nudge_template, args),
+        "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
+        "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
         "weave_delivery" => tool_delivery(store, args),
         "weave_outbox" => tool_outbox(store, args),
-        "weave_inbox" => tool_inbox(store, me_default, pull, args),
+        "weave_inbox" => tool_inbox(store, me_default, pull, args, injector),
         "weave_history" => tool_history(store, me_default, args),
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
-        "weave_peers" => tool_peers(store, me_default, extra_dbs, args),
-        "weave_scan" => tool_scan(store, me_default, extra_dbs, args),
-        "weave_reply" => tool_reply(store, me_default, nudge_template, args),
+        "weave_peers" => tool_peers(store, me_default, extra_dbs, args, injector),
+        "weave_scan" => tool_scan(store, me_default, extra_dbs, args, injector),
+        "weave_reply" => tool_reply(store, me_default, nudge_template, args, injector),
         "weave_thread" => tool_thread(store, args),
         "weave_receipts" => tool_receipts(store, args),
-        "weave_doctor" => tool_doctor(store, extra_dbs),
-        "weave_whoami" => tool_whoami(store, me_default),
-        "weave_attach" => tool_attach(store, me_default, args),
+        "weave_doctor" => tool_doctor(store, extra_dbs, injector),
+        "weave_whoami" => tool_whoami(store, me_default, injector),
+        "weave_attach" => tool_attach(store, me_default, args, injector),
         "weave_set_description" => tool_set_description(store, me_default, args),
         "weave_set_turn_state" => tool_set_turn_state(store, me_default, args),
-        "weave_connect" => tool_connect(store, args),
-        "weave_ask" => tool_ask(store, me_default, nudge_template, args),
-        "weave_answer" => tool_answer(store, me_default, nudge_template, args),
+        "weave_connect" => tool_connect(store, args, injector),
+        "weave_ask" => tool_ask(store, me_default, nudge_template, args, injector),
+        "weave_answer" => tool_answer(store, me_default, nudge_template, args, injector),
         "weave_ack" => tool_ack(store, me_default, args),
         "weave_asks" => tool_asks(store, me_default, args),
         "weave_ask_get" => tool_ask_get(store, args),
-        "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args),
+        "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args, injector),
         "weave_ask_many_result" => tool_ask_many_result(store, args),
         "weave_job_create" => tool_job_create(store, me_default, args),
         "weave_job_list" => tool_job_list(store, args),
@@ -395,6 +409,7 @@ fn tool_send(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     // `to` is bounded just like `from`: reject empty/whitespace and cap length.
@@ -472,7 +487,7 @@ fn tool_send(
             // edge — the store records the outcome we pass it).
             let (stage, outcome) = if target.injectable() {
                 let (nudge, mode) = build_nudge(nudge_template, &from, body);
-                match inject::inject_mode(&target, &nudge, mode) {
+                match injector.inject_mode(&target, &nudge, mode) {
                     Ok(true) => {
                         out.push_str(&format!(
                             " Injected live nudge into {} target '{}'.",
@@ -575,6 +590,7 @@ fn tool_notify(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     let to_raw = args
@@ -618,7 +634,7 @@ fn tool_notify(
     // Caller-side live nudge + honest verdict (REUSE the P1 helper — no store→inject
     // edge). The helper folds the raw inject Err into `queued_next_turn`; that is the
     // verdict we surface. The trace records the matching post-inject stage.
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(
         store,
@@ -699,6 +715,7 @@ fn tool_inbox(
     def: &Option<String>,
     pull: &PullConsent,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let me = ident(args, "me", def)?;
     // Tier-2: pull cross-store intents into the local inbox BEFORE reading, so a
@@ -716,7 +733,7 @@ fn tool_inbox(
                 // `mcp` (which depends on both `store` and `inject`) so
                 // `pull_from_store` never gains a `store → inject` edge. Diagnostics
                 // → stderr only (stdout carries JSON-RPC frames). Best-effort.
-                nudge_pulled(store, pull, &me, &p.committed_sources);
+                nudge_pulled(store, pull, &me, &p.committed_sources, injector);
             }
             Ok(_) => {}
             Err(err) => log(&format!("pull skipped (non-fatal): {err}")),
@@ -780,7 +797,7 @@ fn tool_inbox(
 
 /// Tier-2 consent nudge (decision 5, DEFAULT ON) for the MCP inbox drain: after a
 /// pull commits cross-store messages, fire the EXISTING paste-safe content-free
-/// [`inject::Nudge::Nudge`] into THIS session's OWN registered pane (never a
+/// [`Nudge::Nudge`] into THIS session's OWN registered pane (never a
 /// foreign pane, never the body). Mirrors `main::nudge_pulled`. Done caller-side
 /// so `store::pull_from_store` never gains a `store → inject` edge.
 ///
@@ -794,6 +811,7 @@ fn nudge_pulled(
     pull: &PullConsent,
     me: &str,
     committed_sources: &[StoreSource],
+    injector: &dyn Injector,
 ) {
     if !pull.inject_pulled {
         return;
@@ -813,10 +831,10 @@ fn nudge_pulled(
         }
     };
     let target = Target::from_peer(&peer);
-    if !target.injectable() || !inject::target_alive(&target) {
+    if !target.injectable() || !injector.target_alive(&target) {
         return;
     }
-    match inject::inject_mode(&target, "", inject::Nudge::Nudge) {
+    match injector.inject_mode(&target, "", Nudge::Nudge) {
         Ok(_) => {}
         Err(err) => log(&format!("pull-nudge inject failed (non-fatal): {err}")),
     }
@@ -880,7 +898,7 @@ fn tool_sessions(
     // peer by session name and attach its repo/branch/worktree for display only. Only
     // the local store's peers are consulted (never foreign rows); a session without a
     // registered peer simply renders no tags.
-    let local_peers: std::collections::HashMap<String, crate::model::Peer> = store
+    let local_peers: std::collections::HashMap<String, weave_core::model::Peer> = store
         .list_peers()
         .unwrap_or_default()
         .into_iter()
@@ -895,7 +913,7 @@ fn tool_sessions(
                 .get(&v.name)
                 .map(|p| p.circle.as_str())
                 .unwrap_or("");
-            crate::model::circle_or_default(c) == target
+            weave_core::model::circle_or_default(c) == target
         });
         if info.is_empty() {
             return Ok(format!("No sessions in circle '{target}'."));
@@ -968,17 +986,18 @@ fn resolve_mcp_circle(store: &dyn Store, def: &Option<String>, args: &Value) -> 
         if c == "*" {
             return None;
         }
-        return Some(crate::model::circle_or_default(c).to_string());
+        return Some(weave_core::model::circle_or_default(c).to_string());
     }
     if let Some(d) = def.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Ok(Some(p)) = store.get_peer(d.trim()) {
-            if crate::model::PeerRole::from_str(&p.role) == Ok(crate::model::PeerRole::Orchestrator)
+            if weave_core::model::PeerRole::from_str(&p.role)
+                == Ok(weave_core::model::PeerRole::Orchestrator)
             {
                 return None;
             }
         }
     }
-    Some(crate::config::Config::load().circle())
+    Some(weave_core::config::Config::load().circle())
 }
 
 fn tool_peers(
@@ -986,25 +1005,26 @@ fn tool_peers(
     def: &Option<String>,
     extra_dbs: &[StoreSource],
     args: &Value,
+    _injector: &dyn Injector,
 ) -> Result<String, String> {
     // Tier-1 federation: union local peers with read-only extra stores,
     // origin-tagged. Default (no extra stores) ⇒ the local listing unchanged.
     let mut views = store::federated_peers(store, extra_dbs).map_err(e)?;
     // P4 circle scope (caller-side filter; federation composes).
     if let Some(target) = resolve_mcp_circle(store, def, args).as_deref() {
-        views.retain(|v| crate::model::circle_or_default(&v.peer.circle) == target);
+        views.retain(|v| weave_core::model::circle_or_default(&v.peer.circle) == target);
     }
     if views.is_empty() {
         return Ok("No peers registered yet. Sessions register via `weave hook session`.".into());
     }
     // Host-aware liveness reason per peer (A2 vocabulary, display-only); mirrors
     // `weave scan` / `weave_scan`. Never a cross-machine probe; secret-free.
-    let this_host = crate::config::this_host();
-    let now_ts = crate::model::now();
+    let this_host = weave_core::config::this_host();
+    let now_ts = weave_core::model::now();
     let mut out = format!("Registered peers ({}):", views.len());
     for v in views {
         let p = &v.peer;
-        let inj = if inject::Target::from_peer(p).injectable() {
+        let inj = if Target::from_peer(p).injectable() {
             "injectable"
         } else {
             "no-inject"
@@ -1040,7 +1060,7 @@ fn tool_peers(
 /// Render a peer's git session tags for an MCP listing, e.g. ` {weave@feat/x
 /// #my-wt}`, omitting empty fields and the whole group for a non-git session.
 /// Mirrors the CLI `fmt_peer_tags`. Pure formatting.
-fn fmt_peer_tags(p: &crate::model::Peer) -> String {
+fn fmt_peer_tags(p: &weave_core::model::Peer) -> String {
     if p.repo.is_empty() && p.branch.is_empty() && p.worktree_id.is_empty() {
         return String::new();
     }
@@ -1060,11 +1080,11 @@ fn fmt_peer_tags(p: &crate::model::Peer) -> String {
 /// Compact, NON-NOISY turn_state marker for an MCP listing (P5), e.g. ` [working]`.
 /// An idle/unknown turn_state renders nothing (so a pre-P5 peer's line is unchanged);
 /// mirrors the CLI `fmt_turn_state`. Pure formatting.
-fn fmt_turn_state(p: &crate::model::Peer) -> String {
-    match crate::model::TurnState::from_str(&p.turn_state) {
-        Ok(crate::model::TurnState::Working) => " [working]".to_string(),
-        Ok(crate::model::TurnState::AwaitingInput) => " [awaiting-input]".to_string(),
-        Ok(crate::model::TurnState::PendingFirstTurn) => " [pending]".to_string(),
+fn fmt_turn_state(p: &weave_core::model::Peer) -> String {
+    match weave_core::model::TurnState::from_str(&p.turn_state) {
+        Ok(weave_core::model::TurnState::Working) => " [working]".to_string(),
+        Ok(weave_core::model::TurnState::AwaitingInput) => " [awaiting-input]".to_string(),
+        Ok(weave_core::model::TurnState::PendingFirstTurn) => " [pending]".to_string(),
         _ => String::new(),
     }
 }
@@ -1072,21 +1092,11 @@ fn fmt_turn_state(p: &crate::model::Peer) -> String {
 /// Compact description suffix for an MCP listing (P5), e.g. ` "reviewing PR #23"`.
 /// An empty (unset/TTL-expired) description renders nothing. The Peer is expected to
 /// carry the read-time-TTL'd view from the store. Pure formatting.
-fn fmt_description(p: &crate::model::Peer) -> String {
+fn fmt_description(p: &weave_core::model::Peer) -> String {
     if p.description.is_empty() {
         String::new()
     } else {
         format!(" \"{}\"", p.description)
-    }
-}
-
-/// Capture the git session tags for the MCP server's cwd (best-effort, total).
-/// MCP has no payload `cwd`, so this uses the process `current_dir()`. A non-git
-/// cwd or any failure yields empty tags.
-fn git_tags_here() -> crate::git::WorktreeTags {
-    match std::env::current_dir() {
-        Ok(p) => crate::git::capture_worktree_tags(&p),
-        Err(_) => crate::git::WorktreeTags::default(),
     }
 }
 
@@ -1102,13 +1112,14 @@ fn tool_scan(
     def: &Option<String>,
     extra_dbs: &[StoreSource],
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     // Self-refresh (owner-only-writes), best-effort: a failure is noted to STDERR
     // and never aborts the read.
     if let Some(me) = def.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Ok(me) = bound_ident("me", me) {
-            let t = inject::detect_target();
-            let tags = git_tags_here();
+            let t = injector.detect_target();
+            let tags = injector.git_tags_here();
             if let Err(err) = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -1116,11 +1127,11 @@ fn tool_scan(
                 &t.socket,
                 None,
                 Some(std::process::id() as i64),
-                &crate::config::this_host(),
+                &weave_core::config::this_host(),
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
-                &crate::config::Config::load().circle(),
+                &weave_core::config::Config::load().circle(),
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -1147,15 +1158,15 @@ fn tool_scan(
     }
     // P4 circle scope (caller-side filter; federation composes).
     if let Some(target) = resolve_mcp_circle(store, def, args).as_deref() {
-        views.retain(|v| crate::model::circle_or_default(&v.peer.circle) == target);
+        views.retain(|v| weave_core::model::circle_or_default(&v.peer.circle) == target);
     }
     if views.is_empty() {
         return Ok("No peers match the scan.".into());
     }
     // Host-aware liveness reason per row (pure A2 reinterpretation of the
     // read-only federated rows; never a cross-machine probe). Mirrors `weave scan`.
-    let this_host = crate::config::this_host();
-    let now_ts = crate::model::now();
+    let this_host = weave_core::config::this_host();
+    let now_ts = weave_core::model::now();
     let mut out = format!("Scan ({} peer(s)):", views.len());
     let mut local_alive = 0usize;
     let mut remote_alive = 0usize;
@@ -1221,14 +1232,14 @@ fn tool_claim_orchestrator(
         .filter(|s| !s.is_empty());
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     match store.claim_orchestrator_role(&me, circle, force).map_err(e)? {
-        crate::model::ClaimOutcome::Claimed { circle, demoted } => {
+        weave_core::model::ClaimOutcome::Claimed { circle, demoted } => {
             let mut out = format!("claimed role=orchestrator for '{me}' in circle '{circle}'");
             if !demoted.is_empty() {
                 out.push_str(&format!(" (demoted: {})", demoted.join(", ")));
             }
             Ok(out)
         }
-        crate::model::ClaimOutcome::Refused { circle, holder } => Ok(format!(
+        weave_core::model::ClaimOutcome::Refused { circle, holder } => Ok(format!(
             "refused: '{holder}' is the live orchestrator in circle '{circle}' (pass force=true to steal)"
         )),
     }
@@ -1244,7 +1255,7 @@ fn tool_orchestrator_status(store: &dyn Store, args: &Value) -> Result<String, S
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| crate::config::Config::load().circle());
+        .unwrap_or_else(|| weave_core::config::Config::load().circle());
     let st = store.orchestrator_status(Some(&circle)).map_err(e)?;
     match st.holder {
         Some(h) if st.present => Ok(format!(
@@ -1263,6 +1274,7 @@ fn tool_reply(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     let in_reply_to = args
@@ -1291,7 +1303,7 @@ fn tool_reply(
                 let target = Target::from_peer(&peer);
                 if target.injectable() {
                     let (nudge, mode) = build_nudge(nudge_template, &from, body);
-                    match inject::inject_mode(&target, &nudge, mode) {
+                    match injector.inject_mode(&target, &nudge, mode) {
                         Ok(true) => out.push_str(&format!(
                             " Injected live nudge into {} target '{}'.",
                             target.mux.as_str(),
@@ -1377,16 +1389,20 @@ fn tool_receipts(store: &dyn Store, args: &Value) -> Result<String, String> {
 /// into the MCP server (it only receives the live `Store`). We surface every
 /// diagnostic reachable from the store + current process environment; for the
 /// db/config file locations, run the `weave doctor` CLI.
-fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, String> {
-    let target = inject::detect_target();
+fn tool_doctor(
+    store: &dyn Store,
+    extra_dbs: &[StoreSource],
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let target = injector.detect_target();
     // Tier-1 federation: report the union peer count (local + read-only extras).
     let views = store::federated_peers(store, extra_dbs).map_err(e)?;
     let total_peers = views.len();
     let online = views.iter().filter(|v| is_alive(&v.peer)).count();
     // Host-aware liveness breakdown over the peer set (A2 vocabulary, display-only),
     // mirroring `weave doctor`. Deterministic given this_host/now; secret-free.
-    let this_host = crate::config::this_host();
-    let now_ts = crate::model::now();
+    let this_host = weave_core::config::this_host();
+    let now_ts = weave_core::model::now();
     let mut peers_alive_local = 0usize;
     let mut peers_alive_remote = 0usize;
     let mut peers_stale = 0usize;
@@ -1399,7 +1415,7 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     }
     let (fed_ok, fed_skipped) = store::federation_status(extra_dbs);
     let total = store.total_messages().map_err(e)?;
-    let claude = inject::have("claude");
+    let claude = injector.have("claude");
     let tgt = if target.id.is_empty() {
         "-"
     } else {
@@ -1438,18 +1454,18 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             out.push_str(&format!("\n  remote sources: {remote_count} configured"));
             // Token-FREE per-source token-tier observability, consistent with the CLI
             // `weave doctor`. NEVER prints any token byte — only aggregate counts.
-            let tiers = crate::config::Config::load().peer_db_remote_token_tiers();
+            let tiers = weave_core::config::Config::load().peer_db_remote_token_tiers();
             let per_source = tiers
                 .iter()
-                .filter(|t| **t == crate::config::PullTokenTier::PerSourceLabel)
+                .filter(|t| **t == weave_core::config::PullTokenTier::PerSourceLabel)
                 .count();
             let shared = tiers
                 .iter()
-                .filter(|t| **t == crate::config::PullTokenTier::Shared)
+                .filter(|t| **t == weave_core::config::PullTokenTier::Shared)
                 .count();
             let none = tiers
                 .iter()
-                .filter(|t| **t == crate::config::PullTokenTier::None)
+                .filter(|t| **t == weave_core::config::PullTokenTier::None)
                 .count();
             out.push_str(&format!(
                 "\n  remote tokens:  {per_source} per-source, {shared} shared, {none} none"
@@ -1458,18 +1474,18 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             // `weave doctor`. Only aggregate tier counts + an effective ms range; never
             // a token byte. The result string is the JSON-RPC tool RESULT (stdout
             // frame); all skip/timeout diagnostics stay on stderr.
-            let timeout_tiers = crate::config::Config::load().peer_db_remote_timeout_tiers();
+            let timeout_tiers = weave_core::config::Config::load().peer_db_remote_timeout_tiers();
             let t_per_source = timeout_tiers
                 .iter()
-                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::PerSourceLabel)
+                .filter(|(_, t)| *t == weave_core::config::PullTimeoutTier::PerSourceLabel)
                 .count();
             let t_global = timeout_tiers
                 .iter()
-                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::Global)
+                .filter(|(_, t)| *t == weave_core::config::PullTimeoutTier::Global)
                 .count();
             let t_default = timeout_tiers
                 .iter()
-                .filter(|(_, t)| *t == crate::config::PullTimeoutTier::Default)
+                .filter(|(_, t)| *t == weave_core::config::PullTimeoutTier::Default)
                 .count();
             let tmin = timeout_tiers.iter().map(|(ms, _)| *ms).min().unwrap_or(0);
             let tmax = timeout_tiers.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
@@ -1489,7 +1505,9 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     // `Config::load()` pattern the peer_db tiers above use (the full Config isn't
     // plumbed into the MCP server). The whole string is the JSON-RPC RESULT (stdout
     // frame); no skip/timeout note is emitted here, so stdout discipline holds.
-    let ph = crate::config::Config::load().federation_health().pull_from;
+    let ph = weave_core::config::Config::load()
+        .federation_health()
+        .pull_from;
     if ph.total > 0 {
         out.push_str(&format!(
             "\n  pull sources:   {} configured ({} local, {} remote)",
@@ -1516,7 +1534,7 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     // so stdout discipline holds (any logging stays on stderr elsewhere).
     #[cfg(feature = "sign")]
     {
-        let cfg = crate::config::Config::load();
+        let cfg = weave_core::config::Config::load();
         let trust = cfg.trust_set();
         let revoked = cfg.revoked_set();
         let mode = match cfg.strict_verify_override() {
@@ -1544,11 +1562,7 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
             ));
             let hit = pairs
                 .iter()
-                .filter(|(_, pk)| {
-                    revoked
-                        .iter()
-                        .any(|e| crate::sign::fingerprint_matches(e, pk))
-                })
+                .filter(|(_, pk)| revoked.iter().any(|e| sign::fingerprint_matches(e, pk)))
                 .count();
             out.push_str(&format!(
                 "\n  revoked keys:   {hit} registered key(s) currently revoked"
@@ -1557,10 +1571,10 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
         if let Ok(events) = store.count_revocations() {
             out.push_str(&format!("\n  revocation log: {events} event(s) recorded"));
         }
-        let local_fp = crate::sign::local_public_key()
+        let local_fp = sign::local_public_key()
             .ok()
             .flatten()
-            .and_then(|pk| crate::sign::fingerprint(&pk))
+            .and_then(|pk| sign::fingerprint(&pk))
             .unwrap_or_else(|| "none".to_string());
         out.push_str(&format!("\n  my fingerprint: {local_fp}"));
     }
@@ -1568,8 +1582,8 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     // FR6: warn when the resolved store is NOT the well-known XDG default — the most
     // common "why can't I see the other session's peers" cause is a mismatched
     // WEAVE_DB. Compare against the same default `Config::db_path` derives from.
-    let db = crate::config::Config::load().db_path();
-    let db_default = crate::config::default_db_path();
+    let db = weave_core::config::Config::load().db_path();
+    let db_default = weave_core::config::default_db_path();
     if db != db_default {
         out.push_str(&format!(
             "\n  note: using non-default WEAVE_DB ({}) — peers on a different store won't be visible.",
@@ -1582,12 +1596,16 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
 /// Echo the resolved identity (default session) and the active storage backend,
 /// plus how the current process would inject. Lets a caller confirm "who am I"
 /// before sending.
-fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String> {
+fn tool_whoami(
+    store: &dyn Store,
+    def: &Option<String>,
+    injector: &dyn Injector,
+) -> Result<String, String> {
     let identity = match def {
         Some(d) if !d.trim().is_empty() => d.trim().to_string(),
         _ => "(unset — pass 'from'/'me' explicitly)".to_string(),
     };
-    let target = inject::detect_target();
+    let target = injector.detect_target();
     let tgt = if target.id.is_empty() {
         "-"
     } else {
@@ -1598,22 +1616,22 @@ fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String
     // also surface the caller's own turn_state + description (read-time-TTL'd by the
     // store). One peer-row lookup feeds role/turn_state/description; a missing row
     // falls back to the defaults.
-    let circle = crate::config::Config::load().circle();
+    let circle = weave_core::config::Config::load().circle();
     let me_row = match def {
         Some(d) if !d.trim().is_empty() => store.get_peer(d.trim()).ok().flatten(),
         _ => None,
     };
     let role = me_row
         .as_ref()
-        .and_then(|p| crate::model::PeerRole::from_str(&p.role).ok())
-        .unwrap_or(crate::model::PeerRole::Peer)
+        .and_then(|p| weave_core::model::PeerRole::from_str(&p.role).ok())
+        .unwrap_or(weave_core::model::PeerRole::Peer)
         .as_str()
         .to_string();
     // whoami is a verbose self-report (noise is fine), so turn_state/description are
     // ALWAYS shown — `-` when unset (Unknown / empty / TTL-expired).
     let turn_state = me_row
         .as_ref()
-        .and_then(|p| crate::model::TurnState::from_str(&p.turn_state).ok())
+        .and_then(|p| weave_core::model::TurnState::from_str(&p.turn_state).ok())
         .map(|t| t.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("-")
@@ -1642,14 +1660,19 @@ fn tool_whoami(store: &dyn Store, def: &Option<String>) -> Result<String, String
 /// i.e. the agent's mux env captured when it spawned `weave mcp`. If an agent
 /// re-parents panes mid-session, the CLI `weave attach` (run inside the live pane)
 /// is the authoritative path.
-fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+fn tool_attach(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
     // Resolve + validate the caller's own identity (this is the row key).
     let me = ident(args, "me", def)?;
-    let t = inject::detect_target();
+    let t = injector.detect_target();
     // A detected mux must carry a structurally valid pane id, or we refuse to
     // persist a poisoned, un-injectable registration. A legitimate mux=none has an
     // empty id and is allowed (store-only delivery).
-    if t.injectable() && !inject::id_valid(t.mux, &t.id) {
+    if t.injectable() && !injector.id_valid(t.mux, &t.id) {
         return Err(format!(
             "refusing to attach: captured target {:?} is not a valid {} target.",
             t.id,
@@ -1659,7 +1682,7 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
     // Capture the MCP server process's PID + host so the adopted peer reflects
     // real liveness (this is the agent's own process), plus the git session tags
     // derived from the server's cwd (best-effort; a git failure ⇒ empty tags).
-    let tags = git_tags_here();
+    let tags = injector.git_tags_here();
     store
         .register_peer_full(
             &me,
@@ -1668,11 +1691,11 @@ fn tool_attach(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<
             &t.socket,
             None,
             Some(std::process::id() as i64),
-            &crate::config::this_host(),
+            &weave_core::config::this_host(),
             &tags.repo,
             &tags.branch,
             &tags.worktree_id,
-            &crate::config::Config::load().circle(),
+            &weave_core::config::Config::load().circle(),
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -1738,7 +1761,11 @@ fn tool_set_turn_state(
 /// verdict and degrades gracefully — a registered-but-not-alive or non-injectable
 /// peer is NOT an error (`isError=false`); its messages still arrive via the store
 /// on its next turn. Only a non-existent peer is an error.
-fn tool_connect(store: &dyn Store, args: &Value) -> Result<String, String> {
+fn tool_connect(
+    store: &dyn Store,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
     let to_raw = args
         .get("to")
         .and_then(|v| v.as_str())
@@ -1751,19 +1778,19 @@ fn tool_connect(store: &dyn Store, args: &Value) -> Result<String, String> {
         ));
     };
     let target = Target::from_peer(&peer);
-    let msg = match inject::capability(&target) {
-        inject::Capability::Live => format!(
+    let msg = match injector.capability(&target) {
+        Capability::Live => format!(
             "Peer '{to}' is live [{}] {} — a live nudge can be delivered now.",
             target.mux.as_str(),
             target.id
         ),
-        inject::Capability::RegisteredNotAlive => format!(
+        Capability::RegisteredNotAlive => format!(
             "Peer '{to}' is registered but not alive [{}] {} — delivery will be queued; \
              recipient drains on next turn.",
             target.mux.as_str(),
             target.id
         ),
-        inject::Capability::NotInjectable => format!(
+        Capability::NotInjectable => format!(
             "Peer '{to}' is not injectable (mux=none) — delivery will be queued; \
              recipient drains on next turn."
         ),
@@ -1788,18 +1815,19 @@ fn ask_delivery_verdict(
     from: &str,
     to: &str,
     body: &str,
+    injector: &dyn Injector,
 ) -> &'static str {
     let Ok(Some(peer)) = store.get_peer(to) else {
         return "recipient_not_injectable";
     };
     let target = Target::from_peer(&peer);
-    match inject::capability(&target) {
-        inject::Capability::NotInjectable => "recipient_not_injectable",
+    match injector.capability(&target) {
+        Capability::NotInjectable => "recipient_not_injectable",
         // Injectable (live or registered): fire the same paste-safe nudge tool_send
         // does and report whether it actually landed.
         _ => {
             let (nudge, mode) = build_nudge(nudge_template, from, body);
-            match inject::inject_mode(&target, &nudge, mode) {
+            match injector.inject_mode(&target, &nudge, mode) {
                 Ok(true) => "transport_delivered",
                 // Ok(false) (quiet/no-op) or Err (inject failed): the message is
                 // safely in the store and arrives on the next drain.
@@ -1831,6 +1859,7 @@ fn tool_ask(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     let to_raw = args
@@ -1873,7 +1902,7 @@ fn tool_ask(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(store, qid, model::DeliveryRefKind::Ask, &to, stage, outcome);
     Ok(format!(
@@ -1889,6 +1918,7 @@ fn tool_answer(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     let body = args
@@ -1911,7 +1941,7 @@ fn tool_answer(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, body);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(
         store,
@@ -2027,6 +2057,7 @@ fn tool_ask_many(
     def: &Option<String>,
     nudge_template: Option<&str>,
     args: &Value,
+    injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
     // `to` must be a non-empty JSON array of strings.
@@ -2072,7 +2103,8 @@ fn tool_ask_many(
         match res {
             Ok(cid) => {
                 created += 1;
-                let verdict = ask_delivery_verdict(store, nudge_template, &from, peer, body);
+                let verdict =
+                    ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
                 lines.push_str(&format!("  {peer}: {cid} — {verdict}\n"));
             }
             Err(err) => {
@@ -2781,6 +2813,46 @@ fn tools() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weave_core::model::WorktreeTags;
+    use weave_inject::Mux;
+
+    /// A mock injector must be usable as `&dyn Injector` so `serve` is testable without
+    /// a real mux environment. This is the compile-time + coercion proof for the trait
+    /// abstraction added during the workspace split.
+    #[test]
+    fn mock_injector_implements_trait() {
+        struct MockInjector;
+        impl Injector for MockInjector {
+            fn detect_target(&self) -> Target {
+                Target::none()
+            }
+            fn target_alive(&self, _target: &Target) -> bool {
+                false
+            }
+            fn inject_mode(
+                &self,
+                _target: &Target,
+                _body: &str,
+                _mode: Nudge,
+            ) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn capability(&self, _target: &Target) -> Capability {
+                Capability::NotInjectable
+            }
+            fn have(&self, _name: &str) -> bool {
+                false
+            }
+            fn id_valid(&self, _mux: Mux, _id: &str) -> bool {
+                false
+            }
+            fn git_tags(&self, _cwd: &std::path::Path) -> anyhow::Result<WorktreeTags> {
+                Ok(WorktreeTags::default())
+            }
+        }
+        let mock = MockInjector;
+        let _dyn_ref: &dyn Injector = &mock;
+    }
 
     /// The pure verdict→stage fold is exhaustive and stable: each P1 verdict token
     /// maps to the documented (stage, outcome), and an unrecognized token degrades to
