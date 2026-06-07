@@ -5,6 +5,7 @@
 //! backend        = "sqlite"       # "sqlite" (default) | "libsql"
 //! db             = "/path/to/messages.db"
 //! nudge_template = "[weave] msg from {from}: {body} — run weave_inbox"
+//! mux_preference = "zellij"        # override auto-detection: tmux|zellij|wezterm|kitty|screen
 //! libsql_url        = "libsql://..."   # only for backend = "libsql"
 //! libsql_auth_token = "..."
 //! ```
@@ -517,6 +518,11 @@ pub struct Config {
     pub backend: Option<String>,
     pub db: Option<String>,
     pub nudge_template: Option<String>,
+    /// Preferred multiplexer to use for injection, overriding the auto-detection
+    /// order. Accepts `"tmux"`, `"zellij"`, `"wezterm"`, `"kitty"`, `"screen"`.
+    /// When set, `detect_target` checks ONLY this mux's env var. `None` or
+    /// unrecognized ⇒ normal auto-detection. Overlaid by `WEAVE_MUX_PREFERENCE`.
+    pub mux_preference: Option<String>,
     pub libsql_url: Option<String>,
     pub libsql_auth_token: Option<String>,
     /// Age threshold (seconds) for the opportunistic GC run at SessionStart.
@@ -1405,6 +1411,13 @@ impl Config {
     /// `None` ⇒ the server uses its built-in default nudge text.
     pub fn nudge_template(&self) -> Option<&str> {
         self.nudge_template.as_deref()
+    }
+
+    /// The configured mux preference, if any. Returned as the raw config string
+    /// so the caller (in `weave` or `weave-inject`) can parse it via `Mux::parse`.
+    /// `None` or an unrecognized value ⇒ normal auto-detection.
+    pub fn mux_preference(&self) -> Option<&str> {
+        self.mux_preference.as_deref()
     }
 
     pub fn backend(&self) -> String {
@@ -3097,5 +3110,17 @@ mod tests {
             let second = cfg2.pull_from_sources();
             prop_assert_eq!(first, second);
         }
+    }
+
+    #[test]
+    fn mux_preference_roundtrips_via_config() {
+        let cfg: Config = toml::from_str(r#"mux_preference = "kitty""#).unwrap();
+        assert_eq!(cfg.mux_preference(), Some("kitty"));
+    }
+
+    #[test]
+    fn mux_preference_missing_is_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.mux_preference(), None);
     }
 }

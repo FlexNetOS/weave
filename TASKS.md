@@ -33,7 +33,7 @@
 - [x] Optional `weaved` presence daemon: online/offline, lifecycle eviction (pane-exited/session-closed), so `weave_peers` shows live status (implemented in WL-002)
 - [x] More mux adapters: kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (implemented in inject.rs)
 - [ ] Workspace split: `weave-core`, `weave-inject`, `weave-mcp`, `weave` (bin)
-- [ ] Config file (`~/.config/weave/config.toml`): default identity, nudge template, mux preference
+- [x] Config file (`~/.config/weave/config.toml`): default identity, nudge template, mux preference
 
 ## M4 — Cross-machine (maybe; only if needed)
 - [ ] libSQL embedded replicas (Turso/sqld) for a shared mailbox across machines — this is the concrete trigger to adopt the `libsql` crate

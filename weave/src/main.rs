@@ -86,12 +86,24 @@ fn long_version() -> &'static str {
     })
 }
 
+/// Parse a mux-preference config string into a real `Mux` variant, filtering
+/// out the catch-all `Mux::None` so an unrecognized value falls back to
+/// auto-detection rather than forcing "no mux".
+fn parse_mux_preference(cfg: &Config) -> Option<weave_inject::Mux> {
+    cfg.mux_preference().and_then(|s| {
+        let m = inject::Mux::parse(s);
+        if m == inject::Mux::None { None } else { Some(m) }
+    })
+}
+
 /// Production injector implementation passed to `weave_mcp::serve`.
-struct RealInjector;
+struct RealInjector {
+    preferred_mux: Option<weave_inject::Mux>,
+}
 
 impl Injector for RealInjector {
     fn detect_target(&self) -> weave_inject::Target {
-        weave_inject::detect_target()
+        weave_inject::detect_target_with_preference(self.preferred_mux)
     }
     fn target_alive(&self, target: &weave_inject::Target) -> bool {
         weave_inject::target_alive(target)
@@ -1216,7 +1228,7 @@ fn inject_and_trace(
 
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
-    let target = inject::detect_target();
+    let target = inject::detect_target_with_preference(parse_mux_preference(cfg));
     // Tier-1 federation: report the union peer count (local + read-only extra
     // stores). `extra` empty ⇒ exactly the local peers, identical-to-today.
     let extra = cfg.peer_db_sources();
@@ -2121,7 +2133,9 @@ fn main() -> Result<()> {
                 nudge_tpl.as_deref(),
                 extra_dbs,
                 pull,
-                &RealInjector,
+                &RealInjector {
+                    preferred_mux: parse_mux_preference(&cfg),
+                },
             )?;
         }
 
@@ -2786,7 +2800,7 @@ fn main() -> Result<()> {
             // refresh (mirroring `scan`) so the watcher's own row shows current.
             let (me, explicit) = resolve_me_explicit(None, None, &cfg);
             if explicit {
-                let t = inject::detect_target();
+                let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
                 let cwd_val = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
@@ -2977,7 +2991,7 @@ fn main() -> Result<()> {
             // Best-effort: a heartbeat/tag refresh failure must not sink the read.
             let (me, explicit) = resolve_me_explicit(None, None, &cfg);
             if explicit {
-                let t = inject::detect_target();
+                let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
                 let cwd_val = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
@@ -3103,7 +3117,7 @@ fn main() -> Result<()> {
 
         Cmd::Register { name, cwd } => {
             let me = resolve_me(name, cwd.as_deref(), &cfg);
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
             let cwd_val = cwd.or_else(|| {
                 std::env::current_dir()
                     .ok()
@@ -3144,7 +3158,7 @@ fn main() -> Result<()> {
             // Validate identity up front (the store also enforces this, but failing
             // here keeps the error close to the input).
             store::check_ident("name", &me)?;
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
             // If a mux was detected, the captured pane id must match that mux's
             // expected shape; a structurally invalid injectable target is refused so
             // we never persist a poisoned, un-injectable registration. A legitimate
@@ -4033,7 +4047,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
 
     match event {
         "session" => {
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(cfg));
             // Pass the captured kitty control socket through (empty for non-kitty);
             // see the Register arm. A poisoned/empty socket is harmless — only the
             // kitty injector consults it. Capture PID + host so presence reflects

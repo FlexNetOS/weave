@@ -1,13 +1,19 @@
-# Guardian review — WL-012
+# Guardian review — WL-013
 
 ## Invariants audit
-N/A — no source code changes.
+- No shell involvement (only env var reads).
+- No SQL changes.
+- No store→inject edge changes (detect_target is pure env-var reading).
+- Input caps: `Mux::parse` already validates; garbage falls through to `Mux::None`.
+- MCP stdout discipline unchanged.
 
 ## Drift scan
-N/A — no Rust files modified.
+- No new files.
+- `detect_target()` signature changed but backward-compat wrapper preserved.
 
 ## Docs sync
-- `backlog.md` and `TASKS.md` updated to reflect duplication.
+- Config template updated.
+- `ARCHITECTURE.md` injector section already documents all five backends.
 
 ## Verdict
-**APPROVE** — documentation-only backlog cleanup.
+**APPROVE** — clean config-only change with good test coverage.
