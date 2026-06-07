@@ -57,7 +57,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use std::io::Read;
 use std::path::PathBuf;
-use store::{is_alive, Store};
+use store::{is_alive, Liveness, Store};
 
 /// `--version` provenance: the package version plus the storage backend(s)
 /// compiled into THIS binary. Because the `sqlite` and `libsql` backends are
@@ -517,6 +517,13 @@ enum Cmd {
     },
     /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
     Hook { event: String },
+    /// Presence daemon (v0.2): start/stop/status the optional heartbeat process.
+    /// OFF by default; when running, writes ≤30s heartbeats to the `presence` table
+    /// so `weave peers` shows live status without relying on the 900s TTL guess.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -616,6 +623,27 @@ enum ConfigCmd {
     /// Scaffold a commented ~/.config/weave/config.toml. Never overwrites an
     /// existing file, so it is safe to run repeatedly.
     Init,
+}
+
+/// `weave daemon` subcommands (v0.2). The optional presence daemon writes
+/// periodic heartbeats to the `presence` table so peers show live status.
+/// OFF by default; degrades transparently to the TTL heuristic when stopped.
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Start the daemon in the background. It writes a heartbeat every 15s
+    /// and evicts stale rows every 60s. Idempotent: a second start is a no-op
+    /// if the daemon is already running.
+    Start,
+    /// Stop the daemon. Sends SIGTERM to the recorded PID and cleans up.
+    Stop,
+    /// Show daemon status: running (PID + since) or stopped.
+    Status,
+    /// Internal: run the daemon loop (called by Start after fork/exec).
+    /// Not intended for direct use.
+    Run {
+        #[arg(long)]
+        me: Option<String>,
+    },
 }
 
 /// `weave orchestrator` subcommands (P4). The per-circle coordinator slot is a
@@ -1168,7 +1196,13 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let remote_count = extra.iter().filter(|s| s.is_remote()).count();
     let views = store::federated_peers(store, &extra)?;
     let total_peers = views.len();
-    let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    let online = views
+        .iter()
+        .filter(|v| match store.peer_liveness(&v.peer) {
+            Ok(l) => !matches!(l, Liveness::Stale),
+            Err(_) => is_alive(&v.peer),
+        })
+        .count();
     // Session-scan observability: how many peers carry a git repo/worktree tag (a
     // self-describing, scan-able session). A 0 here on a populated mesh hints the
     // sessions predate the scan feature or run in non-git cwds.
@@ -2648,7 +2682,9 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|v| {
                         let p = &v.peer;
-                        let liveness = store::liveness_for(p, &this_host, now_ts);
+                        let liveness = store
+                            .peer_liveness(p)
+                            .unwrap_or_else(|_| store::liveness_for(p, &this_host, now_ts));
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "socket": p.socket, "cwd": p.cwd,
@@ -2662,8 +2698,8 @@ fn main() -> Result<()> {
                                 .as_str(),
                             "description": p.description,
                             "description_ts": p.description_ts,
-                            "online": is_alive(p),
-                            "alive": is_alive(p),
+                            "online": !matches!(liveness, Liveness::Stale),
+                            "alive": !matches!(liveness, Liveness::Stale),
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
                             "injectable": inject::Target::from_peer(p).injectable(),
@@ -2684,8 +2720,14 @@ fn main() -> Result<()> {
                     } else {
                         "no-inject"
                     };
-                    let presence = if is_alive(p) { "online" } else { "offline" };
-                    let liveness = store::liveness_for(p, &this_host, now_ts);
+                    let liveness = store
+                        .peer_liveness(p)
+                        .unwrap_or_else(|_| store::liveness_for(p, &this_host, now_ts));
+                    let presence = if matches!(liveness, Liveness::Stale) {
+                        "offline"
+                    } else {
+                        "online"
+                    };
                     let reason = scan_liveness_reason(p, liveness);
                     let remote_marker = if p.host != this_host { " <remote>" } else { "" };
                     let tgt = if p.target.is_empty() { "-" } else { &p.target };
@@ -2961,7 +3003,9 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|v| {
                         let p = &v.peer;
-                        let liveness = store::liveness_for(p, &this_host, now_ts);
+                        let liveness = store
+                            .peer_liveness(p)
+                            .unwrap_or_else(|_| store::liveness_for(p, &this_host, now_ts));
                         serde_json::json!({
                             "name": p.name,
                             "repo": p.repo,
@@ -2977,7 +3021,7 @@ fn main() -> Result<()> {
                                 .as_str(),
                             "description": p.description,
                             "description_ts": p.description_ts,
-                            "alive": is_alive(p),
+                            "alive": !matches!(liveness, Liveness::Stale),
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
                             "origin": v.origin.label(),
@@ -3215,6 +3259,8 @@ fn main() -> Result<()> {
         }
 
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
+
+        Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
     }
     Ok(())
 }
@@ -3823,6 +3869,95 @@ fn handle_audit(store: &dyn Store, cmd: AuditCmd) -> Result<()> {
                         r.fp
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn daemon_pidfile() -> std::path::PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| std::path::PathBuf::from(d).join("weave").join("weaved.pid"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("weaved.pid"))
+}
+
+fn daemon_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn handle_daemon(store: &dyn Store, cfg: &Config, cmd: DaemonCmd) -> Result<()> {
+    let me = resolve_me(None, None, cfg);
+    store::check_ident("name", &me)?;
+    let pidfile = daemon_pidfile();
+    if let Some(parent) = pidfile.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match cmd {
+        DaemonCmd::Start => {
+            if pidfile.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if daemon_running(pid) {
+                            println!("daemon already running (pid {pid})");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            let exe = std::env::current_exe()?;
+            let child = std::process::Command::new(&exe)
+                .args(["daemon", "run", "--me", &me])
+                .spawn()?;
+            std::fs::write(&pidfile, child.id().to_string())?;
+            println!("daemon started (pid {})", child.id());
+        }
+        DaemonCmd::Stop => {
+            if !pidfile.exists() {
+                println!("daemon not running");
+                return Ok(());
+            }
+            let pid_str = std::fs::read_to_string(&pidfile)?;
+            let pid = pid_str.trim().parse::<u32>()?;
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let _ = std::fs::remove_file(&pidfile);
+            println!("daemon stopped (pid {pid})");
+        }
+        DaemonCmd::Status => {
+            if !pidfile.exists() {
+                println!("daemon: stopped");
+                return Ok(());
+            }
+            let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            let pid = pid_str.trim().parse::<u32>().unwrap_or(0);
+            if daemon_running(pid) {
+                println!("daemon: running (pid {pid})");
+            } else {
+                println!("daemon: stopped (stale pidfile)");
+                let _ = std::fs::remove_file(&pidfile);
+            }
+        }
+        DaemonCmd::Run { me: me_arg } => {
+            let name = resolve_me(me_arg, None, cfg);
+            store::check_ident("name", &name)?;
+            let host = crate::config::this_host();
+            let pid = std::process::id() as i64;
+            let mut last_evict = std::time::Instant::now();
+            loop {
+                if let Err(e) = store.heartbeat(&name, &host, Some(pid)) {
+                    eprintln!("[weaved] heartbeat error: {e}");
+                }
+                if last_evict.elapsed().as_secs() >= 60 {
+                    if let Err(e) = store.evict_stale_presence() {
+                        eprintln!("[weaved] evict error: {e}");
+                    }
+                    last_evict = std::time::Instant::now();
+                }
+                std::thread::sleep(std::time::Duration::from_secs(15));
             }
         }
     }

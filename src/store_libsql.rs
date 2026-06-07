@@ -50,7 +50,7 @@ use crate::store::{
     validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
     RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
     MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN,
-    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -92,6 +92,12 @@ const SCHEMA: &[&str] = &[
         turn_state     TEXT NOT NULL DEFAULT '',
         description    TEXT NOT NULL DEFAULT '',
         description_ts INTEGER NOT NULL DEFAULT 0
+    )",
+    "CREATE TABLE IF NOT EXISTS presence (
+        name     TEXT PRIMARY KEY,
+        host     TEXT NOT NULL DEFAULT '',
+        pid      INTEGER,
+        ts       INTEGER NOT NULL DEFAULT 0
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -747,6 +753,20 @@ impl LibsqlStore {
                     .await
                     .context("creating delivery_log index")?;
             }
+            // Migration (v0.2): presence heartbeat table. Created via SCHEMA above
+            // for a fresh DB; also created idempotently here for a legacy DB.
+            // Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS presence (
+                    name     TEXT PRIMARY KEY,
+                    host     TEXT NOT NULL DEFAULT '',
+                    pid      INTEGER,
+                    ts       INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .context("creating presence table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -3071,6 +3091,60 @@ impl Store for LibsqlStore {
                 });
             }
             Ok(out)
+        })
+    }
+
+    fn heartbeat(&self, name: &str, host: &str, pid: Option<i64>) -> Result<()> {
+        check_ident("peer name", name)?;
+        let ts = crate::model::now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO presence (name, host, pid, ts)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(name) DO UPDATE SET
+                         host = excluded.host,
+                         pid = excluded.pid,
+                         ts = excluded.ts",
+                    params(vec![name.into(), host.into(), pid.into(), ts.into()]),
+                )
+                .await
+                .context("heartbeat")?;
+            Ok(())
+        })
+    }
+
+    fn presence(&self, name: &str, host: &str) -> Result<Option<i64>> {
+        let cutoff = crate::model::now().saturating_sub(PRESENCE_TTL_SECS);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT ts FROM presence
+                     WHERE name = ?1 AND host = ?2 AND ts >= ?3
+                     LIMIT 1",
+                    params(vec![name.into(), host.into(), cutoff.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(r.get::<i64>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn evict_stale_presence(&self) -> Result<usize> {
+        let cutoff = crate::model::now().saturating_sub(PRESENCE_TTL_SECS);
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM presence WHERE ts < ?1",
+                    params(vec![cutoff.into()]),
+                )
+                .await
+                .context("evict_stale_presence")?;
+            Ok(n as usize)
         })
     }
 }

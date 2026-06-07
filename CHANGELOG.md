@@ -1,3 +1,32 @@
+
+## [Unreleased] — presence seam + optional daemon (weave⊇repowire parity, v0.2)
+
+> **Two-tier presence resolver + optional `weave daemon` heartbeat process.**
+> The existing TTL-based presence (`is_online(last_seen)` with 900s window) is now
+> augmented by a `presence` table that stores daemon heartbeats. A fresh heartbeat
+> (≤30s) wins over the TTL fallback; absent/stale heartbeats transparently fall back
+> to the v0.1 heuristic so the no-daemon path is never second-class. The daemon is
+> OFF by default; start it with `weave daemon start`, stop with `weave daemon stop`,
+> and check status with `weave daemon status`. The daemon writes a heartbeat every
+> 15s and evicts stale rows every 60s. All presence queries are parameterized SQL;
+> the daemon uses argv-only process spawning (no shell). Mirrored across both storage
+> backends with a guarded additive migration.
+
+### Added
+- **model:** `PRESENCE_TTL_SECS = 30` constant.
+- **store (both backends):** `presence` table (`name`, `host`, `pid`, `ts`) via
+  guarded idempotent additive migration; `heartbeat`, `presence`, `evict_stale_presence`
+  Store trait methods; `peer_liveness` two-tier resolver (daemon heartbeat wins, then
+  TTL fallback).
+- **CLI:** `weave daemon` subcommand with `start`, `stop`, `status`, and internal `run`.
+- **MCP:** `weave_daemon_start` / `weave_daemon_stop` tools (planned — not yet wired).
+- **tests:** `presence_heartbeat_and_query`, `presence_evict_stale`, `peer_liveness_two_tier`
+  unit tests (both backends).
+
+### Changed
+- `weave peers`, `weave sessions`, `weave scan`, `weave doctor` (CLI + MCP) now use
+  `Store::peer_liveness` for presence display, showing live status when the daemon is
+  running and falling back to TTL when it is not.
 # Changelog
 
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)

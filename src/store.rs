@@ -36,6 +36,10 @@ use std::time::Duration;
 
 /// A peer is considered "online" if its last heartbeat is within this window.
 pub const ONLINE_TTL_SECS: i64 = 900;
+/// Daemon heartbeat window: a presence row written within this many seconds is
+/// considered FRESH and wins over the TTL fallback. 30s is tight enough to
+/// detect a crashed daemon quickly, loose enough to tolerate scheduling jitter.
+pub const PRESENCE_TTL_SECS: i64 = 30;
 
 /// Hard upper bound on how many peers a single `ask_many` fanout may target (after
 /// de-dup). The fanout opens one child ask + fires one live nudge per target, so an
@@ -517,6 +521,45 @@ pub trait Store: Send {
     /// return an unbounded vector. Read-only, metadata-only.
     #[allow(dead_code)]
     fn list_delivery(&self, ref_id: i64, limit: i64) -> Result<Vec<DeliveryTrace>>;
+
+    /// Presence seam (v0.2): write a heartbeat row for `name` on `host` with
+    /// `pid`. Upserts the `presence` table; stale rows (> PRESENCE_TTL_SECS) are
+    /// ignored by readers. Self-only: a peer writes its OWN heartbeat.
+    #[allow(dead_code)]
+    fn heartbeat(&self, name: &str, host: &str, pid: Option<i64>) -> Result<()>;
+
+    /// Presence seam (v0.2): read the freshest heartbeat for `name` on `host`.
+    /// Returns `Some(ts)` if a row exists AND is within `PRESENCE_TTL_SECS`,
+    /// else `None`. Falls back to the TTL recency guess when absent.
+    #[allow(dead_code)]
+    fn presence(&self, name: &str, host: &str) -> Result<Option<i64>>;
+
+    /// Presence seam (v0.2): delete stale presence rows older than
+    /// `PRESENCE_TTL_SECS`. Best-effort housekeeping; callers may run it
+    /// periodically (e.g. on daemon startup or after a batch of heartbeats).
+    #[allow(dead_code)]
+    fn evict_stale_presence(&self) -> Result<usize>;
+
+    /// Presence seam (v0.2): two-tier liveness resolver. A fresh daemon heartbeat
+    /// (≤ PRESENCE_TTL_SECS) wins; absent/stale falls back to the v0.1 TTL
+    /// heuristic (`is_online(last_seen)` with 900s window). This is the canonical
+    /// presence check for display surfaces (`peers`, `sessions`, `scan`).
+    #[allow(dead_code)]
+    fn peer_liveness(&self, peer: &Peer) -> Result<Liveness> {
+        let this_host = crate::config::this_host();
+        // Tier 1: daemon heartbeat wins unconditionally.
+        // The heartbeat is written by the daemon itself; if it is fresh,
+        // the peer is present regardless of the original PID state.
+        if self.presence(&peer.name, &peer.host)?.is_some() {
+            return Ok(if peer.host == this_host {
+                Liveness::AliveLocal
+            } else {
+                Liveness::AliveRemote
+            });
+        }
+        // Tier 2: TTL fallback
+        Ok(liveness_for(peer, &this_host, crate::model::now()))
+    }
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1113,6 +1156,12 @@ CREATE TABLE IF NOT EXISTS peers (
     description    TEXT NOT NULL DEFAULT '',
     description_ts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS presence (
+    name     TEXT PRIMARY KEY,
+    host     TEXT NOT NULL DEFAULT '',
+    pid      INTEGER,
+    ts       INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS outbox (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     ts        INTEGER NOT NULL,
@@ -1681,6 +1730,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind);
         CREATE INDEX IF NOT EXISTS idx_delivery_log_ts  ON delivery_log(ts);",
+    )?;
+    // Presence seam (v0.2): heartbeat table for the optional daemon. Inert in
+    // every build; created here for legacy DBs. `CREATE TABLE IF NOT EXISTS` is
+    // idempotent and the DDL identifiers are constant (no user data interpolated).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS presence (
+            name     TEXT PRIMARY KEY,
+            host     TEXT NOT NULL DEFAULT '',
+            pid      INTEGER,
+            ts       INTEGER NOT NULL DEFAULT 0
+        );",
     )?;
     Ok(())
 }
@@ -3799,6 +3859,43 @@ impl Store for SqliteStore {
         }
         tx.commit()?;
         self.get_job(id)
+    }
+
+    fn heartbeat(&self, name: &str, host: &str, pid: Option<i64>) -> Result<()> {
+        check_ident("peer name", name)?;
+        let ts = crate::model::now();
+        self.conn.execute(
+            "INSERT INTO presence (name, host, pid, ts)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                 host = excluded.host,
+                 pid = excluded.pid,
+                 ts = excluded.ts",
+            params![name, host, pid, ts],
+        )?;
+        Ok(())
+    }
+
+    fn presence(&self, name: &str, host: &str) -> Result<Option<i64>> {
+        let cutoff = crate::model::now().saturating_sub(PRESENCE_TTL_SECS);
+        let mut stmt = self.conn.prepare(
+            "SELECT ts FROM presence
+             WHERE name = ?1 AND host = ?2 AND ts >= ?3
+             LIMIT 1",
+        )?;
+        let ts: Result<Option<i64>> = stmt
+            .query_row(params![name, host, cutoff], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.into());
+        ts
+    }
+
+    fn evict_stale_presence(&self) -> Result<usize> {
+        let cutoff = crate::model::now().saturating_sub(PRESENCE_TTL_SECS);
+        let n = self
+            .conn
+            .execute("DELETE FROM presence WHERE ts < ?1", params![cutoff])?;
+        Ok(n)
     }
 }
 
@@ -7898,5 +7995,86 @@ mod tests {
             let mut p = mk("x", ts);
             crate::model::expire_description(&mut p, now);
         }
+    }
+
+    #[test]
+    fn presence_heartbeat_and_query() {
+        let s = mem();
+        let host = crate::config::this_host();
+        // No heartbeat yet → None
+        assert!(s.presence("alice", &host).unwrap().is_none());
+        // Write heartbeat
+        s.heartbeat("alice", &host, Some(1234)).unwrap();
+        // Fresh heartbeat → Some
+        let ts = s
+            .presence("alice", &host)
+            .unwrap()
+            .expect("fresh heartbeat");
+        assert!(ts > 0);
+        // Wrong host → None
+        assert!(s.presence("alice", "other-box").unwrap().is_none());
+        // Evict does not touch fresh rows
+        let n = s.evict_stale_presence().unwrap();
+        assert_eq!(n, 0);
+        assert!(s.presence("alice", &host).unwrap().is_some());
+    }
+
+    #[test]
+    fn presence_evict_stale() {
+        let s = mem();
+        let host = crate::config::this_host();
+        // Write an old heartbeat by cheating the clock via direct SQL
+        let old_ts = crate::model::now() - PRESENCE_TTL_SECS - 1;
+        s.conn
+            .execute(
+                "INSERT INTO presence (name, host, pid, ts) VALUES (?1, ?2, ?3, ?4)",
+                params!["bob", &host, 0i64, old_ts],
+            )
+            .unwrap();
+        // Stale → None
+        assert!(s.presence("bob", &host).unwrap().is_none());
+        // Evict removes it
+        let n = s.evict_stale_presence().unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn peer_liveness_two_tier() {
+        let s = mem();
+        let host = crate::config::this_host();
+        // Fresh heartbeat → AliveLocal even with old last_seen
+        s.heartbeat("carol", &host, Some(1234)).unwrap();
+        let p = Peer {
+            name: "carol".into(),
+            mux: "tmux".into(),
+            target: "%1".into(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: 0, // ancient
+            pid: Some(1234),
+            host: host.clone(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+        };
+        let liveness = s.peer_liveness(&p).unwrap();
+        assert!(
+            matches!(liveness, Liveness::AliveLocal),
+            "heartbeat wins over stale last_seen"
+        );
+        // No heartbeat → falls back to TTL
+        let p2 = Peer {
+            name: "dave".into(),
+            last_seen: crate::model::now(),
+            pid: None, // no PID so TTL wins cleanly
+            ..p.clone()
+        };
+        let liveness2 = s.peer_liveness(&p2).unwrap();
+        assert!(matches!(liveness2, Liveness::AliveLocal));
     }
 }

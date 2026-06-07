@@ -88,3 +88,4 @@ proptest = "1.8.0"
 # Benchmarking harness; see the [[bench]] entry above. `html_reports` keeps the
 # default feature set explicit.
 criterion = { version = "0.7.0", features = ["html_reports"] }
+[workspace]

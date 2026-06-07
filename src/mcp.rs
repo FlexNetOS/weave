@@ -1009,8 +1009,14 @@ fn tool_peers(
         } else {
             "no-inject"
         };
-        let presence = if is_alive(p) { "online" } else { "offline" };
-        let liveness = store::liveness_for(p, &this_host, now_ts);
+        let liveness = store
+            .peer_liveness(p)
+            .unwrap_or_else(|_| store::liveness_for(p, &this_host, now_ts));
+        let presence = if matches!(liveness, store::Liveness::Stale) {
+            "offline"
+        } else {
+            "online"
+        };
         let reason = match liveness {
             store::Liveness::AliveLocal if p.pid.is_some() => "alive (local, pid)",
             store::Liveness::AliveLocal => "alive (local, ttl)",
@@ -1382,7 +1388,13 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     // Tier-1 federation: report the union peer count (local + read-only extras).
     let views = store::federated_peers(store, extra_dbs).map_err(e)?;
     let total_peers = views.len();
-    let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    let online = views
+        .iter()
+        .filter(|v| match store.peer_liveness(&v.peer) {
+            Ok(l) => !matches!(l, store::Liveness::Stale),
+            Err(_) => is_alive(&v.peer),
+        })
+        .count();
     // Host-aware liveness breakdown over the peer set (A2 vocabulary, display-only),
     // mirroring `weave doctor`. Deterministic given this_host/now; secret-free.
     let this_host = crate::config::this_host();
@@ -1391,7 +1403,10 @@ fn tool_doctor(store: &dyn Store, extra_dbs: &[StoreSource]) -> Result<String, S
     let mut peers_alive_remote = 0usize;
     let mut peers_stale = 0usize;
     for v in &views {
-        match store::liveness_for(&v.peer, &this_host, now_ts) {
+        let liveness = store
+            .peer_liveness(&v.peer)
+            .unwrap_or_else(|_| store::liveness_for(&v.peer, &this_host, now_ts));
+        match liveness {
             store::Liveness::AliveLocal => peers_alive_local += 1,
             store::Liveness::AliveRemote => peers_alive_remote += 1,
             store::Liveness::Stale => peers_stale += 1,
