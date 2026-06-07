@@ -545,16 +545,18 @@ fn json_has_id(out: &str, want: i64) -> Option<bool> {
 /// remote-triggered send. We only run a mux found by ABSOLUTE path in one of these
 /// system/user-tool dirs.
 fn trusted_dirs() -> Vec<std::path::PathBuf> {
-    let mut v: Vec<std::path::PathBuf> =
-        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect();
+    let mut v = Vec::new();
     // Explicit opt-in for a mux installed in a nonstandard dir (the user vouches
-    // for it by setting this); also how tests point at a fake mux.
+    // for it by setting this); also how tests point at a fake mux. Keep it first
+    // so an explicit override wins over a system tmux/zellij on the same host.
     if let Some(extra) = std::env::var_os("WEAVE_MUX_DIR") {
         v.extend(std::env::split_paths(&extra));
     }
+    v.extend(
+        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(std::path::PathBuf::from),
+    );
     if let Some(home) = std::env::var_os("HOME") {
         let h = std::path::PathBuf::from(home);
         v.push(h.join(".cargo/bin"));

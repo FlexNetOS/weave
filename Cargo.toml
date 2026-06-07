@@ -6,6 +6,8 @@ description = "Rust-native agent-to-agent session mesh with a native injector (t
 license = "MIT OR Apache-2.0"
 repository = "local"
 
+[workspace]
+
 [[bin]]
 name = "weave"
 path = "src/main.rs"
