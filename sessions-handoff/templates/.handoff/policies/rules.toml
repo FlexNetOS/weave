@@ -1,35 +1,31 @@
-[policy]
-schema = "handoff.policy.rules.v1"
-default_write_mode = "deny_without_claim"
-default_network_mode = "deny_unless_task_allows"
-default_dependency_mode = "deny_without_audit_event"
+# weave-loop policy rules
+#
+# These are the hard and soft rules that govern the weave-loop.
+# Violations are caught by the verifier and guardian phases.
 
-[leases]
-heartbeat_seconds = 30
-stale_after_seconds = 300
-force_release_after_seconds = 1800
-require_disjoint_write_scopes = true
+[hard_rules]
+1 = "No write without running verify-on-resume.sh first"
+2 = "No commit without fmt + clippy -D warnings + test on BOTH backends"
+3 = "No handoff without updating HANDOFF.md, loop_state.md, and backlog.md"
+4 = "No generated state edited manually unless explicitly allowed"
+5 = "No provider-specific memory as authoritative project state"
+6 = "No stale HANDOFF.md — if it disagrees with Git, the file is stale; rewrite it"
+7 = "No swarm self-expansion — one item per cycle"
+8 = "No shell in injector — all commands use explicit argv only"
+9 = "No unparameterized SQL — parameterized queries only"
+10 = "No destructive op without confirm gate (weave_clear scope:all requires confirm:true)"
 
-[handoff]
-require_checkpoint = true
-require_test_evidence = true
-allow_test_waiver = true
-require_drift_audit = true
-require_next_command = true
+[soft_rules]
+1 = "Keep HANDOFF.md concise and current"
+2 = "Put changing state in _workspace/, not in committed source files"
+3 = "Keep WL items atomic — one cohesive change per item"
+4 = "Keep path scopes narrow"
+5 = "Prefer generated maps over hand-written summaries"
+6 = "Prefer creating new WL items over expanding current ones"
+7 = "Update sessions-handoff/ docs when the process changes"
 
-[drift]
-block_out_of_scope_write = true
-block_objective_change_without_adr = true
-block_acceptance_change_without_reclaim = true
-block_architecture_change_without_adr = true
-
-[commands.blocked]
-patterns = [
-  "rm -rf /",
-  "git reset --hard",
-  "git clean -fdx",
-  "sudo rm",
-  "chmod -R 777",
-  "curl * | sh",
-  "wget * | sh"
-]
+[drift_gates]
+pre_edit = "Check objective matches current WL item"
+pre_commit = "fmt + clippy + dual-backend test"
+pre_handoff = "HANDOFF.md, loop_state.md, backlog.md all updated and committed"
+post_merge = "Verify CI green on develop before merging to master"

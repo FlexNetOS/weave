@@ -1,25 +1,25 @@
-schema: handoff.task.v1
-id: TASK-0001
-title: Bootstrap Rust-native handoff workspace
+schema: weave.task.v1
+id: WL-014
+title: Reminder injection for open asks
 status: backlog
 priority: P0
-objective: Create the initial Rust workspace, hf CLI stub, xtask runner, root AGENTS.md, .handoff skeleton, schemas, and policy templates.
+objective: >
+  Unacked asks resurface as a content-free nudge at the start of every subsequent
+  prompt on the recipient side, so open asks never silently stall.
 path_scope:
-  - Cargo.toml
-  - rust-toolchain.toml
-  - AGENTS.md
-  - crates/**
-  - .handoff/**
-  - docs/**
+  - weave-core/src/store.rs
+  - weave-core/src/store_libsql.rs
+  - weave/src/main.rs
+  - weave-mcp/src/mcp.rs
 acceptance_criteria:
-  - Workspace uses Rust 2024 edition and resolver 3.
-  - hf CLI compiles.
-  - hf init is idempotent.
-  - .handoff/active.md exists.
-  - Root AGENTS.md directs agents to run hf resume first.
-test_commands:
-  - cargo fmt --check
-  - cargo clippy --workspace --all-targets -- -D warnings
-  - cargo test --workspace
-dependencies: []
-blocked_by: []
+  - New `reminder` column or table in both backends (guarded migration)
+  - On every `UserPromptSubmit` hook drain, check for unacked asks addressed to me
+  - If found, inject a content-free nudge (Nudge::Nudge) into own pane
+  - Nudge text: "[weave] <N> open ask(s) — run weave_asks to see"
+  - Wake-loop guard: track per-session high-water mark so two agents pinging each
+    other can't spin forever
+  - Only genuinely NEW unread since last wake triggers the nudge
+  - cargo test green on both sqlite and libsql backends
+  - cargo clippy --all-targets -- -D warnings green
+  - Update CHANGELOG [Unreleased]
+next_command: "weave-orchestrator skill → plan WL-014"

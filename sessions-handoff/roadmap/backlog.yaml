@@ -1,32 +1,170 @@
-schema: handoff.backlog.v1
+schema: weave.backlog.v1
 tasks:
-  - id: TASK-0001
-    title: Bootstrap Rust workspace
+  - id: WL-001
+    title: Workspace split
+    status: done
     priority: P0
-  - id: TASK-0002
-    title: Implement core schemas and type model
+  - id: WL-002
+    title: Presence daemon store + CLI + MCP tools
+    status: done
     priority: P0
-  - id: TASK-0003
-    title: Implement event ledger and replay
+  - id: WL-003
+    title: Zellij pane targeting
+    status: done
     priority: P0
-  - id: TASK-0004
-    title: Implement claim and lease engine
+  - id: WL-004
+    title: Integration tests for daemon lifecycle
+    status: done
     priority: P0
-  - id: TASK-0005
-    title: Implement hf resume
+  - id: WL-005
+    title: Harden ralph-weave.sh unified loop
+    status: done
     priority: P0
-  - id: TASK-0006
-    title: Implement hf claim
+  - id: WL-006
+    title: weave setup auto-registration
+    status: done
     priority: P0
-  - id: TASK-0007
-    title: Implement Git worktree engine
+  - id: WL-007
+    title: Bracketed-paste hardening for tmux
+    status: done
     priority: P0
-  - id: TASK-0008
-    title: Implement drift sentinel
+  - id: WL-008
+    title: Validate live injection on zellij target box
+    status: done
     priority: P0
-  - id: TASK-0009
-    title: Implement packet compiler
+  - id: WL-009
+    title: Wizard integration on RTX-5090 box
+    status: done
     priority: P0
-  - id: TASK-0010
-    title: Implement hook runner
+  - id: WL-010
+    title: Decide retirement of mcp-broker / repowire
+    status: done
     priority: P1
+  - id: WL-011
+    title: Optional weaved presence daemon
+    status: done
+    priority: P1
+  - id: WL-012
+    title: More mux adapters (kitty, wezterm, screen)
+    status: done
+    priority: P1
+  - id: WL-013
+    title: Config file with mux preference
+    status: done
+    priority: P1
+  - id: WL-014
+    title: Reminder injection for open asks
+    status: backlog
+    priority: P0
+  - id: WL-015
+    title: Structured question types
+    status: backlog
+    priority: P0
+  - id: WL-016
+    title: Scheduler / cron for messages
+    status: backlog
+    priority: P1
+  - id: WL-017
+    title: Mesh memory system
+    status: backlog
+    priority: P1
+  - id: WL-018
+    title: Birth certificates / runtime identity envelopes
+    status: backlog
+    priority: P1
+  - id: WL-019
+    title: Co-orchestrator support
+    status: backlog
+    priority: P1
+  - id: WL-020
+    title: GitHub review queue integration
+    status: backlog
+    priority: P2
+  - id: WL-021
+    title: PreToolUse tool approval
+    status: backlog
+    priority: P2
+  - id: WL-022
+    title: Streamable-HTTP MCP transport
+    status: backlog
+    priority: P2
+  - id: WL-023
+    title: iTerm2 injector backend
+    status: backlog
+    priority: P2
+  - id: WL-024
+    title: Reservation leases
+    status: backlog
+    priority: P2
+  - id: WL-025
+    title: Stop-boundary wake
+    status: backlog
+    priority: P2
+  - id: WL-026
+    title: Idempotency keys and trace IDs
+    status: backlog
+    priority: P2
+  - id: WL-027
+    title: Broadcast notify / broadcast ask
+    status: backlog
+    priority: P2
+  - id: WL-028
+    title: FTS5 full-text search
+    status: backlog
+    priority: P0
+  - id: WL-029
+    title: Advisory file leases
+    status: backlog
+    priority: P0
+  - id: WL-030
+    title: Pre-commit Git hook for file reservation guard
+    status: backlog
+    priority: P1
+  - id: WL-031
+    title: Message importance / priority levels
+    status: backlog
+    priority: P1
+  - id: WL-032
+    title: Per-peer contact policies
+    status: backlog
+    priority: P1
+  - id: WL-033
+    title: Thread summarization via LLM
+    status: backlog
+    priority: P1
+  - id: WL-034
+    title: Static mailbox export
+    status: backlog
+    priority: P2
+  - id: WL-035
+    title: Mailbox backup / restore
+    status: backlog
+    priority: P1
+  - id: WL-036
+    title: Post-send hooks
+    status: backlog
+    priority: P1
+  - id: WL-037
+    title: Message supersede / successor chains
+    status: backlog
+    priority: P1
+  - id: WL-038
+    title: Ephemeral messages with TTL
+    status: backlog
+    priority: P1
+  - id: WL-039
+    title: Idle notification deduplication
+    status: backlog
+    priority: P2
+  - id: WL-040
+    title: Session export/import in canonical format
+    status: backlog
+    priority: P1
+  - id: WL-041
+    title: Read-back verification for destructive operations
+    status: backlog
+    priority: P1
+  - id: WL-042
+    title: Multi-provider lifecycle hook templates
+    status: backlog
+    priority: P2
