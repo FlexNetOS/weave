@@ -432,9 +432,10 @@ Broadcasts are never injected (only persisted) — they fan out to every reader 
 inbox/hook delivery, not by pushing into N panes.
 
 The DB is the only shared state. Concurrent senders are serialized by SQLite's
-WAL mode + busy timeout. A presence daemon (`weaved`) is explicitly **optional
-future work**, needed only for live online/offline status and lifecycle eviction
-— not for messaging or injection.
+WAL mode + busy timeout. An optional presence daemon (`weave daemon start|stop|status|run`)
+provides live online/offline status and lifecycle eviction, but it is **not required**
+for messaging or injection — when stopped, the system degrades transparently to the
+existing TTL heuristic.
 
 ---
 
@@ -815,6 +816,31 @@ exactly as `scan`).
 Read paths keep `last_seen` warm: `weave peers` and a long-lived `weave watch`
 each refresh presence (heartbeat-on-read, explicit-identity only) so a session
 stays visible even with no message traffic.
+
+### Optional presence daemon
+
+The daemon is an **opt-in background process** that writes periodic heartbeats
+to the `presence` table (§2) so peers show **Live** status even without message
+traffic. It is started/stopped via the CLI (`weave daemon start|stop|status`)
+and exposed over MCP (`weave_daemon_start|stop|status`).
+
+- **Daemon loop** (`weave daemon run --me <name>`): every 15 s calls
+  `store.heartbeat(name, host, pid)`; every 60 s calls
+  `store.evict_stale_presence(30)` to prune rows older than 30 s.
+- **PID file** defaults to `$XDG_RUNTIME_DIR/weave/weaved.pid` with a temp
+  fallback; overridable via `WEAVE_PIDFILE` for test parallel safety.
+- **Idempotent start**: checks the pidfile with an argv-only `kill -0` probe;
+  if the recorded PID is alive, start is a no-op.
+- **Stop** sends `kill -TERM` (argv-only, no shell) and removes the pidfile.
+- **MCP tools** duplicate the small pidfile logic directly (they cannot depend on
+  the `weave` bin crate per the layer DAG). They return JSON-shaped text:
+  `{"started":true,"pid":N}` / `{"stopped":true}` / `{"running":true,"pid":N}`.
+- **No new dependency**: the daemon uses only `std::process::Command` and
+  `std::thread::sleep`.
+
+When the daemon is absent, the three-tier liveness resolver (`peer_liveness`)
+falls back to `Likely` (TTL recency) and then `Offline`, so presence display is
+never broken — the daemon only makes the **Live** tier more accurate.
 
 ### Presence dashboard: `weave sessions --watch`
 

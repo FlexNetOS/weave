@@ -96,6 +96,13 @@ weave describe "reviewing PR #23"    # set a short self-description (TTL'd, cont
 weave status working                 # explicitly set your turn_state (pending_first_turn|working|awaiting_input|idle)
                                      # (turn_state is normally auto-set by the lifecycle hooks — see below)
 
+# Presence daemon (optional heartbeat for live liveness)
+weave daemon start                   # start the background heartbeat daemon (idempotent)
+weave daemon stop                    # stop the daemon
+weave daemon status                  # show whether the daemon is running and its PID
+# The daemon writes heartbeats every 15s and evicts stale rows every 60s.
+# When stopped, liveness degrades transparently to the TTL heuristic.
+
 # Notify + delivery observability (P6): fire-and-forget + transport-side trace
 weave notify --from desktop --to envctl --body "heads up"   # no reply expected; prints the honest delivery verdict
 weave delivery --id 42               # show the transport trace (queued -> injected/not_injectable -> drained); --json
