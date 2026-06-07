@@ -11,6 +11,9 @@ Low-token supervisor entry point for running the weave loop through Kimi Code.
 Use this when the user wants Kimi to do the work while Codex only supervises
 small, structured state files.
 
+This slash command is mirrored by the Codex-owned `prompt-loop` skill at
+`.agents/skills/prompt-loop/SKILL.md`.
+
 ## Primary Form
 
 ```bash
