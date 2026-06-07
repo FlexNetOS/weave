@@ -22,3 +22,19 @@ and the open gaps the user flagged.
 - [x] WL-011: Optional `weaved` presence daemon — online/offline, lifecycle eviction (TASKS.md M3). **Duplicate:** fully implemented in WL-002 Phase A/B (heartbeat + evict + liveness + MCP tools). No additional work required.
 - [x] WL-012: More mux adapters — kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (TASKS.md M3). **Duplicate:** fully implemented in inject.rs with detect_target, commands_for, liveness probes, id validation, and unit tests for each backend.
 - [x] WL-013: Config file — `~/.config/weave/config.toml` with default identity, nudge template, mux preference (TASKS.md M3). `mux_preference` added to `Config`; `detect_target` honors it across CLI, hooks, and MCP.
+
+## Gaps discovered from repowire cross-reference (2026-06-07)
+- [ ] WL-014: Reminder injection for open asks — unacked asks resurface as a content-free nudge at the start of every subsequent prompt on the recipient side (repowire parity).
+- [ ] WL-015: Structured question types — extend `ask` to support choice, free-text, and tool-permission envelopes; render as actionable prompts in the recipient's pane (repowire parity).
+- [ ] WL-016: Scheduler / cron for messages — one-shot and recurring scheduled deliveries (`@daily`, `@hourly`, etc.) with SQLite-backed persistence and drift-safe execution (repowire parity).
+- [ ] WL-017: Mesh memory system — filesystem-backed scoped memory under `~/.config/weave/memory/` (global, project, persona, orchestrator) with CLI read/write/search and automatic context prefixing on ask delivery (repowire parity).
+- [ ] WL-018: Birth certificates / runtime identity envelopes — mint unguessable nonces at `SessionStart` to prevent path-based identity takeover during lazy MCP registration (repowire parity).
+- [ ] WL-019: Co-orchestrator support — allow multiple live orchestrators to coexist in the same circle for resilience against rate limits or credit caps (repowire parity).
+- [ ] WL-020: GitHub review queue integration — track PR review state across peers (`review_queue`, `mark_reviewed(pr_url)`) via CLI and MCP tools (repowire parity).
+- [ ] WL-021: PreToolUse tool approval — gate mutating tools (Bash, Edit, Write) behind blocking approval questions from human surfaces/peers, denying by default on timeout (repowire parity).
+- [ ] WL-022: Streamable-HTTP MCP transport — localhost-only opt-in endpoint for remote agents, bearer-authenticated, dangerous tools disabled by default (ROADMAP-v0.3 §4; repowire parity).
+- [ ] WL-023: iTerm2 injector backend — native injection support for iTerm2 terminal multiplexer (ROADMAP-v0.3 §6).
+- [ ] WL-024: Reservation leases — lightweight advisory file locks between agents to coordinate exclusive access to shared resources (ROADMAP-v0.3 §5).
+- [ ] WL-025: Stop-boundary wake — blocking `Stop`/`SubagentStop` hook that returns `additionalContext` to drive the next turn without polling (ROADMAP-v0.3 §1).
+- [ ] WL-026: Idempotency keys & trace IDs — per-message idempotency keys and distributed trace IDs for end-to-end debugging across stores (ROADMAP-v0.3 §3).
+- [ ] WL-027: Broadcast notify / broadcast ask — fan-out notifications and asks to all online peers in the caller's circle, not just `--to all` store broadcast (repowire parity).
