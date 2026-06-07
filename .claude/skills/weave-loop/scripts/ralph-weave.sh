@@ -11,14 +11,20 @@ WORKTREE="${WEAVE_WORKTREE:-/home/drdave/Desktop/meta/weave-harness-loop}"
 BUDGET="${WEAVE_BUDGET:-3}"
 MAX_ITERS="${WEAVE_MAX_ITERS:-50}"
 SLEEP_BETWEEN="${WEAVE_SLEEP:-5}"
-MODEL="${WEAVE_MODEL:-opus}"
+MODEL="${WEAVE_MODEL:-minimax-m3:cloud}"
+AGENT_CMD="${WEAVE_AGENT_CMD:-ollama launch claude --model minimax-m3:cloud --}"
+AGENT_MODEL_ARGS="${WEAVE_AGENT_MODEL_ARGS:-}"
+KIMI_REVIEW="${WEAVE_KIMI_REVIEW:-0}"
+KIMI_CMD="${WEAVE_KIMI_CMD:-kimi}"
 
 WS="$WORKTREE/_workspace"
 mkdir -p "$WS"
 
 log(){ printf '[ralph-weave %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
-command -v claude >/dev/null || { log "FATAL: claude not on PATH"; exit 1; }
+read -r -a AGENT_CMD_ARY <<<"$AGENT_CMD"
+read -r -a AGENT_MODEL_ARGS_ARY <<<"$AGENT_MODEL_ARGS"
+command -v "${AGENT_CMD_ARY[0]}" >/dev/null || { log "FATAL: ${AGENT_CMD_ARY[0]} not on PATH"; exit 1; }
 [ -d "$WORKTREE" ]   || { log "FATAL: worktree $WORKTREE not found"; exit 1; }
 [ -f "$WORKTREE/Cargo.toml" ] || { log "FATAL: $WORKTREE/Cargo.toml missing — wrong worktree?"; exit 1; }
 
@@ -51,11 +57,21 @@ while :; do
   [ -f "$WS/DONE" ]        && { log "DONE."; exit 0; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
-  log "iter $i/$MAX_ITERS — spawning fresh agent (budget=$BUDGET, model=$MODEL)"
+  log "iter $i/$MAX_ITERS — spawning fresh agent (budget=$BUDGET, model=$MODEL, cmd=$AGENT_CMD)"
   # Best-effort: nonzero exit is logged but does not abort the runner — durable
   # state on disk is the truth, not the per-iter exit code.
-  claude -p "$PROMPT" --model "$MODEL" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
+  "${AGENT_CMD_ARY[@]}" -p "$PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
     >>"$WS/ralph-run-$i.log" 2>&1 || log "iter $i nonzero (continuing from durable state)"
+
+  if [ "$KIMI_REVIEW" = "1" ]; then
+    if command -v "$KIMI_CMD" >/dev/null; then
+      log "iter $i — running Kimi review"
+      "$KIMI_CMD" -p "Review the weave-loop iteration in $WORKTREE. Read _workspace/HANDOFF.md if present, inspect the latest git diff/status, and report only concrete correctness risks, missing verification, or next-step recommendations. Do not edit files." \
+        >"$WS/kimi-review-$i.md" 2>"$WS/kimi-review-$i.err" || log "iter $i Kimi review failed (continuing; see $WS/kimi-review-$i.err)"
+    else
+      log "iter $i Kimi review skipped: $KIMI_CMD not on PATH"
+    fi
+  fi
 
   [ -f "$WS/DONE" ]        && { log "DONE."; exit 0; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }

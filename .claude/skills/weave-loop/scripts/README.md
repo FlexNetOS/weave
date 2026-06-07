@@ -1,7 +1,8 @@
 # Ralph runner
 
 External self-restart runner for the `weave-loop`. Each iteration spawns a **fresh**
-`claude -p` process (a clean context — the `/new` effect), which reads the committed
+agent process (default: `ollama launch claude --model minimax-m3:cloud -- -p`, a clean
+context with Ollama Cloud MiniMax — the `/new` effect), which reads the committed
 `_workspace/HANDOFF.md`, runs `verify-on-resume.sh`, does up to `WEAVE_BUDGET` cycles,
 writes exactly one sentinel (`DONE` / `NEEDS-HUMAN` / `HANDOFF.md`), and exits.
 
@@ -17,6 +18,10 @@ bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 # --dangerously-skip-permissions to the spawned agent.
 WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 
+# MiniMax implementation + Kimi review after each iteration.
+# Kimi review is fail-soft and writes _workspace/kimi-review-<n>.md when configured.
+WEAVE_KIMI_REVIEW=1 WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
+
 # Kill switch, any time:
 touch _workspace/STOP
 ```
@@ -29,8 +34,12 @@ touch _workspace/STOP
 | `WEAVE_BUDGET`   | `3` | Cycles per session before handoff |
 | `WEAVE_MAX_ITERS`| `50` | Hard cap on respawns (backstop) |
 | `WEAVE_SLEEP`    | `5` | Seconds between respawns |
-| `WEAVE_MODEL`    | `opus` | Model for spawned `claude -p` |
+| `WEAVE_MODEL`    | `minimax-m3:cloud` | Label used in logs |
+| `WEAVE_AGENT_CMD` | `ollama launch claude --model minimax-m3:cloud --` | Agent command used before `-p` |
+| `WEAVE_AGENT_MODEL_ARGS` | empty | Extra model args for raw `claude`, e.g. `--model opus` |
 | `WEAVE_APPLY`    | `0` | `1` → `--dangerously-skip-permissions` |
+| `WEAVE_KIMI_REVIEW` | `0` | `1` → run Kimi review after each iteration |
+| `WEAVE_KIMI_CMD` | `kimi` | Kimi executable for review hook |
 
 ## Exit codes
 
