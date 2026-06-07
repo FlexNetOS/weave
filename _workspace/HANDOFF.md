@@ -17,6 +17,7 @@ open_findings: []
 decisions:
   - PR #50 base changed from master → develop to resolve merge conflict (master had different MCP daemon merge commits).
   - WL-008 and WL-009 are infrastructure-blocked; next unblocked item is WL-010.
+runtime_env: yazelix (nushell + ghostty + nix + starship + zellij)
 dead_ends: []
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh
