@@ -50,7 +50,7 @@ use crate::store::{
     validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
     RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
     MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN,
-    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -204,6 +204,13 @@ const SCHEMA: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
+    // presence (v0.2 daemon): per-peer heartbeat tracking
+    "CREATE TABLE IF NOT EXISTS presence (
+        name         TEXT PRIMARY KEY,
+        host         TEXT NOT NULL DEFAULT '',
+        pid          INTEGER,
+        heartbeat_ts INTEGER NOT NULL DEFAULT 0
+    )",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -764,6 +771,20 @@ impl LibsqlStore {
                     .await
                     .context("creating delivery_log index")?;
             }
+            // Migration (v0.2): presence table for daemon heartbeats. Created via
+            // SCHEMA above for a fresh DB; also created idempotently here for a DB
+            // that predates it. Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS presence (
+                    name         TEXT PRIMARY KEY,
+                    host         TEXT NOT NULL DEFAULT '',
+                    pid          INTEGER,
+                    heartbeat_ts INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .context("creating presence table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -3112,6 +3133,60 @@ impl Store for LibsqlStore {
                 });
             }
             Ok(out)
+        })
+    }
+
+    fn heartbeat(&self, name: &str, host: &str, pid: Option<i64>) -> Result<()> {
+        check_ident("peer name", name)?;
+        let ts = crate::model::now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO presence (name, host, pid, heartbeat_ts)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(name) DO UPDATE SET
+                         host = excluded.host,
+                         pid = excluded.pid,
+                         heartbeat_ts = excluded.heartbeat_ts",
+                    params(vec![name.into(), host.into(), pid.into(), ts.into()]),
+                )
+                .await
+                .context("heartbeat")?;
+            Ok(())
+        })
+    }
+
+    fn presence(&self, name: &str, host: &str) -> Result<Option<i64>> {
+        let cutoff = crate::model::now().saturating_sub(PRESENCE_TTL_SECS);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT heartbeat_ts FROM presence
+                     WHERE name = ?1 AND host = ?2 AND heartbeat_ts >= ?3
+                     LIMIT 1",
+                    params(vec![name.into(), host.into(), cutoff.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(r.get::<i64>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn evict_stale_presence(&self, cutoff_secs: i64) -> Result<usize> {
+        let cutoff = crate::model::now().saturating_sub(cutoff_secs);
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM presence WHERE heartbeat_ts < ?1",
+                    params(vec![cutoff.into()]),
+                )
+                .await
+                .context("evict_stale_presence")?;
+            Ok(n as usize)
         })
     }
 }
@@ -5827,5 +5902,106 @@ mod tests {
         assert_eq!(p.turn_state, "");
         assert_eq!(p.description, "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Presence seam (v0.2) — libsql parity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn presence_heartbeat_and_query_libsql() {
+        let s = mem();
+        let host = crate::config::this_host();
+        assert!(s.presence("alice", &host).unwrap().is_none());
+        s.heartbeat("alice", &host, Some(1234)).unwrap();
+        let ts = s
+            .presence("alice", &host)
+            .unwrap()
+            .expect("fresh heartbeat");
+        assert!(ts > 0);
+        assert!(s.presence("alice", "other-box").unwrap().is_none());
+        let n = s
+            .evict_stale_presence(crate::store::PRESENCE_TTL_SECS)
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(s.presence("alice", &host).unwrap().is_some());
+    }
+
+    #[test]
+    fn presence_evict_stale_libsql() {
+        let s = mem();
+        let host = crate::config::this_host();
+        let old_ts = crate::model::now() - crate::store::PRESENCE_TTL_SECS - 1;
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "INSERT INTO presence (name, host, pid, heartbeat_ts) VALUES (?1, ?2, ?3, ?4)",
+                    params(vec![
+                        "bob".into(),
+                        host.clone().into(),
+                        0i64.into(),
+                        old_ts.into(),
+                    ]),
+                )
+                .await
+                .unwrap();
+        });
+        assert!(s.presence("bob", &host).unwrap().is_none());
+        let n = s
+            .evict_stale_presence(crate::store::PRESENCE_TTL_SECS)
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn peer_liveness_three_tier_libsql() {
+        let s = mem();
+        let host = crate::config::this_host();
+        s.heartbeat("carol", &host, Some(1234)).unwrap();
+        let p = Peer {
+            name: "carol".into(),
+            mux: "tmux".into(),
+            target: "%1".into(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: 0,
+            pid: Some(1234),
+            host: host.clone(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+        };
+        assert_eq!(
+            s.peer_liveness(&p).unwrap(),
+            crate::model::Liveness::Live,
+            "heartbeat wins over stale last_seen"
+        );
+
+        let p2 = Peer {
+            name: "dave".into(),
+            last_seen: crate::model::now(),
+            pid: None,
+            ..p.clone()
+        };
+        assert_eq!(
+            s.peer_liveness(&p2).unwrap(),
+            crate::model::Liveness::Likely
+        );
+
+        let p3 = Peer {
+            name: "eve".into(),
+            last_seen: 0,
+            pid: None,
+            ..p.clone()
+        };
+        assert_eq!(
+            s.peer_liveness(&p3).unwrap(),
+            crate::model::Liveness::Offline
+        );
     }
 }

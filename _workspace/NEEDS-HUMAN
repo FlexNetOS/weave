@@ -1,3 +1,0 @@
-reason: PR #30 for WL-001 workspace split is pushed and checks are running, but the repository does not allow auto-merge (GraphQL: "Auto merge is not allowed for this repository (enablePullRequestAutoMerge)"). The branch `feat/workspace-split` is at commit 6f5be80; all local dual-backend verification passed (sqlite, libsql, sign variants). A repository admin needs to either enable auto-merge in Settings → General → Pull Requests, or manually squash-merge PR #30 (https://github.com/FlexNetOS/weave/pull/30) once the required checks complete.
-artifact: _workspace/04_guardian_review.md (guardian APPROVE verdict)
-last_item: WL-001

@@ -49,6 +49,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
+use std::process::Stdio;
 use weave_core::config::Config;
 use weave_core::store::{is_alive, Store};
 use weave_core::{config, model, store};
@@ -545,6 +546,32 @@ enum Cmd {
     },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
     Hook { event: String },
+    /// Presence daemon (v0.2): start, stop, status, or run the heartbeat loop.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+/// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
+/// periodic heartbeats to the `presence` table so peers show live status.
+/// OFF by default; degrades transparently to the TTL heuristic when stopped.
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Start the daemon in the background.  It writes a heartbeat every 15 s
+    /// and evicts stale rows every 60 s.  Idempotent: a second start is a no-op
+    /// if the daemon is already running.
+    Start,
+    /// Stop the daemon.  Sends SIGTERM to the recorded PID and cleans up.
+    Stop,
+    /// Show daemon status: running (PID) or stopped.
+    Status,
+    /// Internal: run the daemon loop (called by Start after spawn).
+    /// Not intended for direct use.
+    Run {
+        #[arg(long)]
+        me: Option<String>,
+    },
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -3249,6 +3276,8 @@ fn main() -> Result<()> {
             println!("turn_state set for '{me}': {state}");
         }
 
+        Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
+
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
     Ok(())
@@ -3858,6 +3887,104 @@ fn handle_audit(store: &dyn Store, cmd: AuditCmd) -> Result<()> {
                         r.fp
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// PID file for the optional presence daemon.  Overridable via `WEAVE_PIDFILE`
+/// so integration tests can use temp-scoped paths for parallel safety.
+fn daemon_pidfile() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("WEAVE_PIDFILE") {
+        return std::path::PathBuf::from(p);
+    }
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| std::path::PathBuf::from(d).join("weave").join("weaved.pid"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("weaved.pid"))
+}
+
+/// argv-only probe: `kill -0 <pid>` returns success iff the process exists.
+fn daemon_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn handle_daemon(store: &dyn Store, cfg: &Config, cmd: DaemonCmd) -> Result<()> {
+    let me = resolve_me(None, None, cfg);
+    store::check_ident("name", &me)?;
+    let pidfile = daemon_pidfile();
+    if let Some(parent) = pidfile.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match cmd {
+        DaemonCmd::Start => {
+            if pidfile.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if daemon_running(pid) {
+                            println!("daemon already running (pid {pid})");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            let exe = std::env::current_exe()?;
+            let child = std::process::Command::new(&exe)
+                .args(["daemon", "run", "--me", &me])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            std::fs::write(&pidfile, child.id().to_string())?;
+            println!("daemon started (pid {})", child.id());
+        }
+        DaemonCmd::Stop => {
+            if !pidfile.exists() {
+                println!("daemon not running");
+                return Ok(());
+            }
+            let pid_str = std::fs::read_to_string(&pidfile)?;
+            let pid = pid_str.trim().parse::<u32>()?;
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let _ = std::fs::remove_file(&pidfile);
+            println!("daemon stopped (pid {pid})");
+        }
+        DaemonCmd::Status => {
+            if !pidfile.exists() {
+                println!("daemon: stopped");
+                return Ok(());
+            }
+            let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            let pid = pid_str.trim().parse::<u32>().unwrap_or(0);
+            if daemon_running(pid) {
+                println!("daemon: running (pid {pid})");
+            } else {
+                println!("daemon: stopped (stale pidfile)");
+                let _ = std::fs::remove_file(&pidfile);
+            }
+        }
+        DaemonCmd::Run { me: me_arg } => {
+            let name = resolve_me(me_arg, None, cfg);
+            store::check_ident("name", &name)?;
+            let host = config::this_host();
+            let pid = std::process::id() as i64;
+            let mut last_evict = std::time::Instant::now();
+            loop {
+                if let Err(e) = store.heartbeat(&name, &host, Some(pid)) {
+                    eprintln!("[weaved] heartbeat error: {e}");
+                }
+                if last_evict.elapsed().as_secs() >= 60 {
+                    if let Err(e) = store.evict_stale_presence(30) {
+                        eprintln!("[weaved] evict error: {e}");
+                    }
+                    last_evict = std::time::Instant::now();
+                }
+                std::thread::sleep(std::time::Duration::from_secs(15));
             }
         }
     }
