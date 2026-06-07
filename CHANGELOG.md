@@ -73,6 +73,21 @@
 - **Docs:** README daemon subsection; ARCHITECTURE.md optional-daemon section;
   docs/TESTING.md daemon lifecycle test notes.
 
+## [Unreleased] — zellij pane targeting (WL-003)
+
+> **Zellij injection now targets the correct pane instead of the focused one.**
+> `detect_target()` captures `ZELLIJ_PANE_ID` (stored in `Peer.socket`, reusing the
+> existing auxiliary-id column with no DB migration). `commands_for` threads it through
+> as `zellij action write-chars --pane-id <id>` (and `write --pane-id <id>`). When the
+> pane id is absent (legacy peers or pre-change registrations), behaviour falls back to
+> the focused pane unchanged.
+
+### Changed
+- **inject (`weave-inject`):** zellij `commands_for` arm now accepts `--pane-id` when
+  `Target.socket` is non-empty.
+- **detect (`weave-inject`):** `ZELLIJ_PANE_ID` is read alongside `ZELLIJ_SESSION_NAME`.
+- **Docs:** `ARCHITECTURE.md` mux table and paste-safe notes updated.
+
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
 
 > **A fire-and-forget notify primitive + a transport-side delivery trace, both pure-DB

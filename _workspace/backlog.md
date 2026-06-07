@@ -7,7 +7,7 @@ and the open gaps the user flagged.
 - [x] WL-001: Workspace split — carve `weave-core`, `weave-inject`, `weave-mcp`, `weave` bin (TASKS.md M3; ROADMAP-v0.2 Phase 1). Merged via PR #30 (sha 82ea6dd).
 - [x] WL-002 Phase A: presence daemon store + CLI — merged via PR #32.
 - [x] WL-002 Phase B: MCP daemon tools (`weave_daemon_start`/`stop`/`status`) — PR #33 auto-merging.
-- [ ] WL-003: zellij pane targeting — verify/focus `--pane` so write-chars hits the right pane, not just the focused one (TASKS.md M1).
+- [x] WL-003: zellij pane targeting — capture `ZELLIJ_PANE_ID` at registration, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one (TASKS.md M1).
 - [ ] WL-004: Integration tests for daemon lifecycle.
 - [ ] WL-005: Harden / execute `ralph-weave.sh` unified loop in anger.
 
