@@ -1,0 +1,72 @@
+# Project-local Codex command rules for the weave Rust workspace.
+# These rules affect commands that Codex asks to run outside the sandbox.
+
+prefix_rule(
+    pattern = ["rtk", "cargo", ["fmt", "clippy", "test", "build", "bench"]],
+    decision = "allow",
+    justification = "Rust verification commands are expected in this workspace.",
+    match = [
+        "rtk cargo fmt --all --check",
+        "rtk cargo clippy --all-targets -- -D warnings",
+        "rtk cargo test --all-targets",
+        "rtk cargo build --no-default-features --features libsql",
+    ],
+)
+
+prefix_rule(
+    pattern = ["cargo", ["fmt", "clippy", "test", "build", "bench"]],
+    decision = "allow",
+    justification = "Rust verification commands are expected in this workspace.",
+    match = [
+        "cargo fmt --all --check",
+        "cargo clippy --all-targets -- -D warnings",
+        "cargo test --all-targets",
+        "cargo build --no-default-features --features libsql",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", ["rg", "sed", "git", "ls"]],
+    decision = "allow",
+    justification = "Read-only repo inspection through rtk is expected for Codex work.",
+    match = [
+        "rtk rg prompt-loop .codex .agents",
+        "rtk sed -n 1,120p .codex/AGENTS.md",
+        "rtk git status --short",
+        "rtk ls -la .codex",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["status", "diff", "log", "show", "branch"]],
+    decision = "allow",
+    justification = "Read-only git inspection is expected for Codex work.",
+    match = [
+        "git status --short",
+        "git diff -- .codex",
+        "git log --oneline -1",
+        "git show --stat HEAD",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["commit", "push", "reset", "checkout"]],
+    decision = "prompt",
+    justification = "History-changing git operations should remain explicit.",
+    match = [
+        "git commit -m docs",
+        "git push origin branch",
+        "git reset --hard HEAD",
+        "git checkout -- file",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rm"],
+    decision = "prompt",
+    justification = "Deletion is destructive; prefer apply_patch deletes for tracked files.",
+    match = [
+        "rm file",
+        "rm -rf directory",
+    ],
+)

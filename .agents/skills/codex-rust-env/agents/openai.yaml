@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Rust Env"
+  short_description: "Maintain the repo-local Codex environment for the weave Rust workspace."
+  default_prompt: "Use codex-rust-env to update the Codex Rust environment."

@@ -1,3 +1,5 @@
+name = "explorer"
+description = "Read-only codebase explorer for gathering file, symbol, and execution-path evidence before implementation."
 model = "gpt-5.4"
 model_reasoning_effort = "medium"
 sandbox_mode = "read-only"

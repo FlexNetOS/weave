@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Review"
+  short_description: "Review weave Rust changes for bugs, parity gaps, and missing tests."
+  default_prompt: "Use rust-review to review the current weave diff."

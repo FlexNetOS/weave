@@ -1,0 +1,24 @@
+{
+  "name": "codex-rust-env",
+  "version": "0.1.0",
+  "description": "Codex Rust environment workflows for the weave workspace.",
+  "author": {
+    "name": "weave"
+  },
+  "interface": {
+    "displayName": "Codex Rust Env",
+    "shortDescription": "Rust-focused Codex environment workflows for weave.",
+    "longDescription": "Codex Rust Env packages reusable guidance for maintaining Codex-owned Rust workspace surfaces: guidance, project config, skills, plugins, hooks, rules, custom agents, MCP, and verification automation.",
+    "developerName": "weave",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Rust",
+      "Skills",
+      "Configuration"
+    ],
+    "defaultPrompt": [
+      "Use codex-rust-env to inspect and improve this repository's Codex Rust environment."
+    ]
+  },
+  "skills": "./skills/"
+}

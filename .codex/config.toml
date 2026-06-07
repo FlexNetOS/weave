@@ -1,39 +1,61 @@
 #:schema https://developers.openai.com/codex/config-schema.json
 
-# ECC Tools generated Codex baseline
+# Repo-local Codex baseline for the weave Rust workspace.
+# User credentials, provider overrides, and personal MCPs belong in
+# ~/.codex/config.toml, not in this project file.
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 web_search = "live"
+model_reasoning_effort = "medium"
+model_verbosity = "low"
+project_root_markers = [".git"]
+
+[features]
+hooks = true
+multi_agent = true
+
+[sandbox_workspace_write]
+network_access = false
+
+[shell_environment_policy]
+inherit = "core"
+ignore_default_excludes = false
+exclude = [
+  "AWS_*",
+  "AZURE_*",
+  "GITHUB_TOKEN",
+  "OPENAI_API_KEY",
+  "*SECRET*",
+  "*TOKEN*",
+]
 
 [mcp_servers.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
+command = "bunx"
+args = ["@modelcontextprotocol/server-github"]
 
 [mcp_servers.context7]
-command = "npx"
-args = ["-y", "@upstash/context7-mcp@latest"]
+command = "bunx"
+args = ["@upstash/context7-mcp@latest"]
 
 [mcp_servers.exa]
 url = "https://mcp.exa.ai/mcp"
 
 [mcp_servers.memory]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-memory"]
+command = "bunx"
+args = ["@modelcontextprotocol/server-memory"]
 
 [mcp_servers.playwright]
-command = "npx"
-args = ["-y", "@playwright/mcp@latest", "--extension"]
+command = "bunx"
+args = ["@playwright/mcp@latest", "--extension"]
 
 [mcp_servers.sequential-thinking]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-
-[features]
-multi_agent = true
+command = "bunx"
+args = ["@modelcontextprotocol/server-sequential-thinking"]
 
 [agents]
 max_threads = 6
 max_depth = 1
+job_max_runtime_seconds = 1800
 
 [agents.explorer]
 description = "Read-only codebase explorer for gathering evidence before changes are proposed."
@@ -46,3 +68,7 @@ config_file = "agents/reviewer.toml"
 [agents.docs_researcher]
 description = "Documentation specialist that verifies APIs, framework behavior, and release notes."
 config_file = "agents/docs-researcher.toml"
+
+[agents.rust_verifier]
+description = "Rust verification specialist for cargo gate planning, failure triage, and backend parity checks."
+config_file = "agents/rust-verifier.toml"
