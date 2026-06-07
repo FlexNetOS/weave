@@ -10,11 +10,11 @@ and the open gaps the user flagged.
 - [x] WL-003: zellij pane targeting — capture `ZELLIJ_PANE_ID` at registration, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one (TASKS.md M1).
 - [x] WL-004: Integration tests for daemon lifecycle — env-configurable heartbeat/evict intervals; idempotency + stale-pidfile coverage.
 - [x] WL-005: Harden / execute `ralph-weave.sh` unified loop in anger — fixed broken guardian default, added gh pre-flight, stale-report scrubbing, working-tree sanity check, WEAVE_SKIP_GUARDIAN escape hatch.
-- [ ] WL-006: `weave setup` — auto-register MCP server + write Claude hooks, merging with existing hooks (TASKS.md M1).
+- [x] WL-006: `weave setup` — auto-register MCP server + write Claude hooks, merging with existing hooks (TASKS.md M1). Implementation verified in `setup.rs` (register_mcp, merge_hooks, idempotent, uninstall; unit tests present).
+- [x] WL-007: Bracketed-paste hardening for tmux — close paste mode with hex `ESC[201~` instead of bare Enter (TASKS.md M1). Implementation verified in `weave-inject/src/inject.rs` (`-H 1b 5b 32 30 31 7e` before Enter).
+- [ ] WL-008: Validate live injection on the zellij target box (TASKS.md M1).
 
 ## M1 — Make it real on the box
-- [ ] WL-007: Bracketed-paste hardening for tmux — close paste mode with hex `ESC[201~` instead of bare Enter (TASKS.md M1).
-- [ ] WL-008: Validate live injection on the zellij target box (TASKS.md M1).
 - [ ] WL-009: Wizard integration — build `weave` in RTX-5090 image, run `weave setup` (TASKS.md M1).
 - [ ] WL-010: Decide retirement of `mcp-broker` / `repowire` (TASKS.md M1).
 
