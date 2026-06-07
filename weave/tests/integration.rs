@@ -14,6 +14,7 @@
 mod common;
 
 use common::{run, run_env, run_hook, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -861,6 +862,107 @@ fn hook_wake_blocks_once_then_rearms_after_drain() {
     assert!(
         out3.contains("\"decision\":\"block\"") && out3.contains("wakepayload2"),
         "wake should re-arm for newer unread work: {out3}"
+    );
+}
+
+/// WL-014: when the recipient has an open ask, the prompt hook fires a content-free
+/// reminder nudge into their own pane. The fake tmux records the injection.
+#[test]
+fn hook_prompt_nudges_open_asks() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    // Register 'alpha' as an injectable tmux pane %1.
+    let reg = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")],
+        &["register", "--name", "alpha"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(reg.status.success());
+
+    // Bob asks alpha a question. This also injects the ask nudge at send-time.
+    run_ok(
+        &db,
+        &["ask", "--from", "bob", "--to", "alpha", "--body", "q?"],
+    );
+
+    // Alpha's prompt hook drains the inbox AND nudges open asks.
+    let mut prompt =
+        weave_with_fake_path(&db, &fake_dir, &[("TMUX_PANE", "%1")], &["hook", "prompt"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn prompt");
+    prompt
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(r#"{"cwd":"/proj/alpha"}"#.as_bytes())
+        .expect("write prompt payload");
+    let out = prompt.wait_with_output().expect("wait prompt");
+    assert!(out.status.success());
+
+    let logged = read_log_with_retries(&log);
+    // The ask-time nudge + the prompt-time reminder both fire.
+    assert!(
+        logged.contains("send-keys") && logged.contains("-t %1"),
+        "fake tmux should record injections to pane %1:\n{logged}"
+    );
+    assert!(
+        logged.contains("open ask"),
+        "prompt hook should inject the open-ask reminder:\n{logged}"
+    );
+}
+
+/// WL-014: when there are no open asks, the prompt hook must NOT inject a reminder.
+#[test]
+fn hook_prompt_no_nudge_without_open_asks() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux(&log);
+
+    // Register 'beta' as an injectable tmux pane %2.
+    let reg = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%2")],
+        &["register", "--name", "beta"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(reg.status.success());
+
+    // Beta runs a prompt hook with no messages and no open asks.
+    let mut prompt =
+        weave_with_fake_path(&db, &fake_dir, &[("TMUX_PANE", "%2")], &["hook", "prompt"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn prompt");
+    prompt
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(r#"{"cwd":"/proj/beta"}"#.as_bytes())
+        .expect("write prompt payload");
+    let out = prompt.wait_with_output().expect("wait prompt");
+    assert!(out.status.success());
+
+    let logged = read_log_with_retries(&log);
+    // No injection should have occurred.
+    assert!(
+        !logged.contains("send-keys"),
+        "no open asks ⇒ no reminder injection:\n{logged}"
     );
 }
 

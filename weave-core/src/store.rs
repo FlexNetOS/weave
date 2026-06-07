@@ -411,6 +411,11 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn list_asks(&self, me: &str, role: AskRole, limit: i64) -> Result<Vec<Ask>>;
 
+    /// P1: true iff `me` has at least one ask in [`AskState::Open`] where they are
+    /// the askee. Used by the prompt-hook reminder nudge (WL-014).
+    #[allow(dead_code)]
+    fn has_open_asks(&self, me: &str) -> Result<bool>;
+
     /// P1: resolve the correlation id owning `message_id` (the ask whose
     /// `question_msg_id` OR `answer_msg_id` equals it), or `None` if the message
     /// belongs to no tracked ask. Backs the `in_reply_to` → ask resolver in the
@@ -3460,6 +3465,16 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn has_open_asks(&self, me: &str) -> Result<bool> {
+        check_ident("me", me)?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM asks WHERE askee = ?1 AND state = 'open'",
+            params![me],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     fn ask_for_message(&self, message_id: i64) -> Result<Option<String>> {
         let id: Option<String> = self
             .conn
@@ -4415,6 +4430,22 @@ mod tests {
         assert_eq!(as_askee[0].id, c2);
         let any = s.list_asks("a", AskRole::Any, 50).unwrap();
         assert_eq!(any.len(), 2);
+    }
+
+    /// `has_open_asks` is true only when the peer is the askee of an ask in
+    /// [`AskState::Open`]; it becomes false after the ask is answered.
+    #[test]
+    fn has_open_asks_true_only_for_open_askee() {
+        let s = mem();
+        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
+        assert!(s.has_open_asks("b").unwrap(), "b is askee of an open ask");
+        assert!(!s.has_open_asks("a").unwrap(), "a is asker, not askee");
+        assert!(!s.has_open_asks("z").unwrap(), "z has no asks at all");
+        s.answer("b", &c1, "ans").unwrap();
+        assert!(
+            !s.has_open_asks("b").unwrap(),
+            "b answered, ask no longer open"
+        );
     }
 
     /// `list_asks` is bounded: a request for more rows than `MAX_LIMIT` is clamped

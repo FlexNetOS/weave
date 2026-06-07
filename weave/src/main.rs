@@ -1093,6 +1093,33 @@ fn nudge_pulled(
     }
 }
 
+/// WL-014: after a prompt hook drain, if `me` has open asks where they are the
+/// askee, fire a content-free reminder nudge into THIS session's OWN registered
+/// pane. Best-effort: any failure is logged to stderr and never blocks the drain.
+fn nudge_open_asks(store: &dyn Store, me: &str) {
+    let has = match store.has_open_asks(me) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[weave] open-ask check skipped (non-fatal): {e}");
+            return;
+        }
+    };
+    if !has {
+        return;
+    }
+    let Ok(Some(peer)) = store.get_peer(me) else {
+        return;
+    };
+    let target = inject::Target::from_peer(&peer);
+    if !target.injectable() || !inject::target_alive(&target) {
+        return;
+    }
+    match inject::inject_text(&target, "[weave] you have open ask(s) — run weave_asks") {
+        Ok(_) => {}
+        Err(err) => eprintln!("[weave] open-ask nudge failed (non-fatal): {err}"),
+    }
+}
+
 fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str) -> Result<()> {
     if model::is_broadcast(to) {
         return Ok(());
@@ -4160,6 +4187,10 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 model::TurnState::Idle
             };
             set_turn_state_best_effort(store, &me, next);
+            // WL-014: remind the recipient of any open asks on every prompt.
+            if event == "prompt" {
+                nudge_open_asks(store, &me);
+            }
         }
         "wake" => {
             // Wake is a non-consuming guard. When we cannot trust the resolved

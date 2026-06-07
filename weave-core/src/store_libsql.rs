@@ -2490,6 +2490,26 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn has_open_asks(&self, me: &str) -> Result<bool> {
+        check_ident("me", me)?;
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM asks WHERE askee = ?1 AND state = 'open'",
+                    params(vec![me.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => {
+                    let count: i64 = r.get(0)?;
+                    Ok(count > 0)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
     fn ask_for_message(&self, message_id: i64) -> Result<Option<String>> {
         self.rt.block_on(async {
             let mut it = self
@@ -3376,6 +3396,17 @@ mod tests {
         assert_eq!(s.list_asks("a", AskRole::Asker, 50).unwrap()[0].id, c1);
         assert_eq!(s.list_asks("a", AskRole::Askee, 50).unwrap()[0].id, c2);
         assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 2);
+    }
+
+    /// libsql parity: `has_open_asks` matches the sqlite semantics.
+    #[test]
+    fn has_open_asks_libsql() {
+        let s = mem();
+        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
+        assert!(s.has_open_asks("b").unwrap(), "b is askee of an open ask");
+        assert!(!s.has_open_asks("a").unwrap(), "a is asker");
+        s.answer("b", &c1, "ans").unwrap();
+        assert!(!s.has_open_asks("b").unwrap(), "answered, no longer open");
     }
 
     /// libsql parity: `list_asks` is bounded (clamped to MAX_LIMIT), and

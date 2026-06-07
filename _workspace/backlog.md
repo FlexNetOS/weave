@@ -24,7 +24,7 @@ and the open gaps the user flagged.
 - [x] WL-013: Config file — `~/.config/weave/config.toml` with default identity, nudge template, mux preference (TASKS.md M3). `mux_preference` added to `Config`; `detect_target` honors it across CLI, hooks, and MCP.
 
 ## Gaps discovered from repowire cross-reference (2026-06-07)
-- [ ] WL-014: Reminder injection for open asks — unacked asks resurface as a content-free nudge at the start of every subsequent prompt on the recipient side (repowire parity).
+- [x] WL-014: Reminder injection for open asks — unacked asks resurface as a content-free nudge at the start of every subsequent prompt on the recipient side (repowire parity).
 - [ ] WL-015: Structured question types — extend `ask` to support choice, free-text, and tool-permission envelopes; render as actionable prompts in the recipient's pane (repowire parity).
 - [ ] WL-016: Scheduler / cron for messages — one-shot and recurring scheduled deliveries (`@daily`, `@hourly`, etc.) with SQLite-backed persistence and drift-safe execution (repowire parity).
 - [ ] WL-017: Mesh memory system — filesystem-backed scoped memory under `~/.config/weave/memory/` (global, project, persona, orchestrator) with CLI read/write/search and automatic context prefixing on ask delivery (repowire parity).
