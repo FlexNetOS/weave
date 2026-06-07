@@ -23,6 +23,22 @@ bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 ```
 
+## Low-token Kimi supervisor
+
+`/prompt-loop resume kimi-cli codex-min` uses
+`prompt-loop-kimi.sh` instead of watching the Kimi TUI. The script launches Kimi
+detached in YOLO mode, writes the full worker log to `_workspace/kimi-cli.log`,
+and keeps `_workspace/agent_status.json` as the small polling surface for Codex.
+
+```bash
+bash .claude/skills/weave-loop/scripts/prompt-loop-kimi.sh resume kimi-cli codex-min
+bash .claude/skills/weave-loop/scripts/prompt-loop-kimi.sh status
+bash .claude/skills/weave-loop/scripts/prompt-loop-kimi.sh status --tail 40
+```
+
+Codex should poll `status` and inspect log tails only on exceptions:
+`NEEDS-HUMAN`, stale heartbeat, dead PID, or wrong-worktree edits.
+
 ## Env knobs
 
 | Var | Default | Meaning |
