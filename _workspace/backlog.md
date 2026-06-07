@@ -13,7 +13,7 @@ and the open gaps the user flagged.
 - [x] WL-006: `weave setup` — auto-register MCP server + write Claude hooks, merging with existing hooks (TASKS.md M1). Implementation verified in `setup.rs`; merged via PR #50.
 - [x] WL-007: Bracketed-paste hardening for tmux — close paste mode with hex `ESC[201~` instead of bare Enter (TASKS.md M1). Implementation verified in `weave-inject/src/inject.rs`; merged via PR #50.
 - [x] WL-008: Validate live injection on the zellij target box (TASKS.md M1). **Validated:** live injection works; `connect` → Live, `inject`/`notify`/`send` → `injected/ok` delivery trace. **Bug found & fixed:** zellij `list-sessions` emits ANSI color codes by default, causing `id_present` token match to fail → liveness probe falsely reports absent. Fixed by adding `--no-formatting` to the liveness probe argv. Also verified `WEAVE_MUX_DIR` is required on Nix systems where zellij lives in `/nix/store/.../toolbin` (outside `trusted_dirs()`).
-- [!] WL-009: Wizard integration — build `weave` in RTX-5090 image, run `weave setup` (TASKS.md M1). **Blocked:** needs RTX-5090 build environment / image access.
+- [x] WL-009: Wizard integration — build `weave` in RTX-5090 image, run `weave setup` (TASKS.md M1). **Validated:** built weave 0.2.0 in release on the live RTX-5090 box (2x NVIDIA GeForce RTX 5090, 32GB each, CUDA 13.2, Threadripper PRO 7965WX, 498GB RAM). Ran `weave setup` — MCP registered (✓ Connected), hooks wired (session/prompt/stop/wake), settings.json updated. Live injection verified: `notify` → `transport_delivered` → `injected/ok` delivery trace.
 
 ## M1 — Make it real on the box
 - [x] WL-010: Decide retirement of `mcp-broker` / `repowire` (TASKS.md M1). Decision recorded in ARCHITECTURE.md §8.
