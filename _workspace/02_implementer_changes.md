@@ -1,8 +1,8 @@
-# Implementer changes — WL-011
+# Implementer changes — WL-012
 
 ## What changed
-- `backlog.md` — WL-011 marked done (duplicate of WL-002).
-- `TASKS.md` — M3 daemon line marked done, referencing WL-002.
+- `backlog.md` — WL-012 marked done (duplicate of existing inject.rs work).
+- `TASKS.md` — mux adapters line marked done.
 
 ## No Rust code changes
 Zero source edits.

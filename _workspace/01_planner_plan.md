@@ -1,26 +1,22 @@
-# Plan — WL-011: Optional weaved presence daemon
+# Plan — WL-012: More mux adapters
 
 ## Goal
-Verify whether WL-011 is already covered by prior work and update the backlog
-accordingly.
+Verify whether kitty, wezterm, and screen adapters are already implemented and
+update the backlog accordingly.
 
 ## Investigation
-- WL-002 Phase A (commit 2f1e753) implemented:
-  - `presence` table with heartbeat/eviction
-  - `Store` trait methods: `heartbeat`, `evict_stale_presence`, `peer_liveness`
-  - CLI: `weave daemon start|stop|status|run`
-- WL-002 Phase B (commit 2f1e753 / PR #43) implemented:
-  - MCP tools: `weave_daemon_start`, `weave_daemon_stop`, `weave_daemon_status`
-- The daemon is **optional** — weave works without it (hook-driven TTL fallback).
-- "Lifecycle eviction" is implemented as time-based eviction in the daemon loop
-  (`evict_stale_presence` with a 30 s cutoff).
+- `weave-inject/src/inject.rs` already contains:
+  - `Mux::Kitty` with `commands_for` using `kitten @ send-text`, `--match id:<n>`, `--to <socket>`
+  - `Mux::Wezterm` with `commands_for` using `wezterm cli send-text --pane-id --no-paste`
+  - `Mux::Screen` with `commands_for` using `screen -S <id> -X stuff`
+  - `detect_target()` reads `KITTY_WINDOW_ID` / `KITTY_LISTEN_ON`, `WEZTERM_PANE`, `STY`
+  - Liveness probes for all three backends
+  - `id_valid` validators for each
+  - Unit tests: `kitty_matches_window`, `kitty_honors_listen_socket`, `wezterm_no_paste`, `screen_stuffs_cr`, etc.
 
 ## Conclusion
-WL-011 is a **duplicate** of WL-002. No code changes required.
+WL-012 is a **duplicate** of already-shipped work. No code changes required.
 
 ## Changes
-- `backlog.md` — flip WL-011 to `- [x]` with a duplicate note.
-- `TASKS.md` — flip the M3 daemon line to `- [x]` referencing WL-002.
-
-## Verify
-- Run the full gate to confirm zero drift.
+- `backlog.md` — flip WL-012 to `- [x]` with a duplicate note.
+- `TASKS.md` — flip the mux adapters line to `- [x]`.

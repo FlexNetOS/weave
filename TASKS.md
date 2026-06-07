@@ -31,7 +31,7 @@
 
 ## M3 — Robustness & reach
 - [x] Optional `weaved` presence daemon: online/offline, lifecycle eviction (pane-exited/session-closed), so `weave_peers` shows live status (implemented in WL-002)
-- [ ] More mux adapters: kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`)
+- [x] More mux adapters: kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (implemented in inject.rs)
 - [ ] Workspace split: `weave-core`, `weave-inject`, `weave-mcp`, `weave` (bin)
 - [ ] Config file (`~/.config/weave/config.toml`): default identity, nudge template, mux preference
 
