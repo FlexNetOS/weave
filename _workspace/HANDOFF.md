@@ -5,18 +5,19 @@ worktree: /home/drdave/Desktop/meta/weave
 cycle_budget: 3
 cycles_total: 1
 last_item: WL-001
-next_item: WL-001
-orchestrator_phase: verify
-last_agent: weave-verifier
+next_item: WL-002
+orchestrator_phase: complete
+last_agent: weave-loop-delivery
 verifier_status: GREEN
-guardian_verdict: n/a
-pr_url: (none)
+guardian_verdict: APPROVE
+pr_url: https://github.com/FlexNetOS/weave/pull/30
 landed_this_session:
-  - fc5e705 weave-loop: resume (at WL-001)
+  - 82ea6dd feat: unify loop skills + wake hook + presence daemon (#30)
+    (squash merge containing WL-001 workspace split)
 open_findings: []
 decisions:
-  - Parent workspace `/home/drdave/Desktop/meta/Cargo.toml` was updated to remove `weave` from members so `weave/` can be its own workspace.
-  - `weave-core` default `sqlite` feature disabled; backend is now selected by the consuming bin/MCP crates to avoid libsql resolve conflicts.
+  - Parent workspace `/home/drdave/Desktop/meta/Cargo.toml` updated to remove `weave` member.
+  - `weave-core` default `sqlite` feature disabled; backend selected by consuming crates.
 dead_ends: []
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh

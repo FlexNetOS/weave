@@ -7575,3 +7575,54 @@ fn mcp_notify_and_delivery_lifecycle_and_failures() {
 
     mcp.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Daemon lifecycle (v0.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn daemon_lifecycle_start_stop_status() {
+    let db = TestDb::new();
+    let pidfile = db.path.with_extension("pid");
+    let pidfile_str = pidfile.to_string_lossy().into_owned();
+
+    // Start the daemon with a test-scoped PID file for parallel safety.
+    let out = run_ok_env(
+        &db,
+        &["daemon", "start"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        out.contains("started") || out.contains("running"),
+        "daemon start: {out}"
+    );
+
+    // Give the child a moment to write the pidfile and start its loop.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Status should report running.
+    let status1 = run_ok_env(
+        &db,
+        &["daemon", "status"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        status1.contains("running"),
+        "daemon status after start: {status1}"
+    );
+
+    // Stop the daemon.
+    let stop = run_ok_env(&db, &["daemon", "stop"], &[("WEAVE_PIDFILE", &pidfile_str)]);
+    assert!(stop.contains("stopped"), "daemon stop: {stop}");
+
+    // Status should now report stopped.
+    let status2 = run_ok_env(
+        &db,
+        &["daemon", "status"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        status2.contains("stopped"),
+        "daemon status after stop: {status2}"
+    );
+}
