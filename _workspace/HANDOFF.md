@@ -1,23 +1,22 @@
 # HANDOFF — weave-loop
-closed_utc: 2026-06-07T05:40:54Z
-branch: feat/workspace-split
+closed_utc: 2026-06-07T15:50:05Z
+branch: feat/mcp-daemon-tools-phase-b
 worktree: /home/drdave/Desktop/meta/weave
 cycle_budget: 3
-cycles_total: 1
-last_item: WL-001
-next_item: WL-002
-orchestrator_phase: complete
-last_agent: weave-loop-delivery
-verifier_status: GREEN
-guardian_verdict: APPROVE
-pr_url: https://github.com/FlexNetOS/weave/pull/30
+cycles_total: 2
+last_item: WL-002 Phase A
+next_item: WL-002 Phase B
+orchestrator_phase: resume
+last_agent: weave-loop-resume
+verifier_status: pending
+guardian_verdict: pending
+pr_url:
 landed_this_session:
-  - 82ea6dd feat: unify loop skills + wake hook + presence daemon (#30)
-    (squash merge containing WL-001 workspace split)
 open_findings: []
 decisions:
-  - Parent workspace `/home/drdave/Desktop/meta/Cargo.toml` updated to remove `weave` member.
-  - `weave-core` default `sqlite` feature disabled; backend selected by consuming crates.
+  - Reset to origin/master to catch up WL-002 Phase A (PR #32).
+  - Cherry-picked 16cfcca (Phase B) from feat/mcp-daemon-tools worktree.
+  - Continuing Phase B delivery in fresh branch feat/mcp-daemon-tools-phase-b.
 dead_ends: []
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh
