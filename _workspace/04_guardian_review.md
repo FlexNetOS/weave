@@ -1,14 +1,13 @@
-# Guardian review — WL-010
+# Guardian review — WL-011
 
 ## Invariants audit
-N/A — no source code changes. No shell, no SQL, no store→inject edge, no stdout discipline, no input caps touched.
+N/A — no source code changes.
 
 ## Drift scan
-N/A — no Rust files modified. Only ARCHITECTURE.md, TASKS.md, and backlog.md updated.
+N/A — no Rust files modified.
 
 ## Docs sync
-- ARCHITECTURE.md §8 now contains the retirement decision callout. Consistent with existing comparison narrative.
-- TASKS.md and backlog.md marked done.
+- `backlog.md` and `TASKS.md` updated to reflect duplication.
 
 ## Verdict
-**APPROVE** — documentation-only decision record with zero behavioral impact.
+**APPROVE** — documentation-only backlog cleanup.

@@ -1,6 +1,7 @@
-# Verifier report — WL-010
+# Verifier report — WL-011
 
 ## Gate results
+All checks green (same run as WL-010; no code changes since then):
 
 | check | sqlite | libsql |
 |---|---|---|
@@ -11,9 +12,7 @@
 | `cargo test --no-default-features --features libsql` | N/A | ✅ 377 passed, 0 failed, 1 ignored |
 
 ## Cross-boundary checks
-- No Rust source files modified — drift scan not applicable.
-- No Store/model/inject/MCP changes — invariants not in scope.
-- Doc-only change; ARCHITECTURE.md renders correctly in plain text.
+- No source files modified.
 
 ## Verdict
-**GREEN** — zero code drift, both backends pass.
+**GREEN** — duplicate item, backlog updated only.
