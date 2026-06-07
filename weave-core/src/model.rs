@@ -1114,6 +1114,32 @@ pub struct Peer {
     pub description_ts: i64,
 }
 
+/// Daemon-tier liveness classification (v0.2 presence seam).  Three tiers:
+/// - `Live`    — a fresh daemon heartbeat exists (≤ 30 s).
+/// - `Likely`  — no fresh heartbeat, but `last_seen` is within the 900 s TTL.
+/// - `Offline` — neither heartbeat nor TTL recency.
+///
+/// This is intentionally simpler than [`crate::store::Liveness`], which carries
+/// host-aware local/remote/stale nuance.  The daemon tier is what display surfaces
+/// consult when the optional presence daemon is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    Likely,
+    Offline,
+}
+
+impl Liveness {
+    /// Canonical lowercase label for JSON / MCP output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Liveness::Live => "live",
+            Liveness::Likely => "likely",
+            Liveness::Offline => "offline",
+        }
+    }
+}
+
 /// Hard upper bound on the number of rows a single `delivery_log` (delivery-trace)
 /// read returns. The trace is append-only and bounded by retention (`gc()`), but a
 /// read is additionally capped so a pathological ref can never return an unbounded

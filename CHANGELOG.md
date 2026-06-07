@@ -26,6 +26,53 @@
 - `WorktreeTags` moved into `weave-core::model` so the `Injector` trait can expose
   git-tag capture without adding an `mcp → git` dependency.
 
+## [Unreleased] — presence daemon (v0.2, WL-002 Phase A)
+
+> **Optional background heartbeat daemon + three-tier liveness.**  The daemon
+> (`weave daemon start|stop|status|run`) writes periodic heartbeats to a new
+> `presence` table every 15 s and evicts stale rows every 60 s.  Display surfaces
+> gain a `peer_liveness` resolver: **Live** (fresh heartbeat ≤ 30 s) beats
+> **Likely** (last_seen within 900 s TTL) beats **Offline**.  When the daemon is
+> stopped the system degrades transparently to the existing TTL heuristic.  No
+> new dependency; mirrored across both storage backends with a guarded additive
+> migration.
+
+### Added
+- **model:** `Liveness` enum (`Live`/`Likely`/`Offline`) with `as_str()`; the
+  daemon-tier classifier distinct from the host-aware `store::Liveness`.
+- **store (both backends):** `presence` table (`name` PK, `host`, `pid`,
+  `heartbeat_ts`) via a guarded idempotent additive migration; `heartbeat`
+  (upsert), `presence` (fresh read), `evict_stale_presence(cutoff_secs)`
+  (parameterized delete), and `peer_liveness` (default trait method, three-tier
+  fallback) on the `Store` trait.
+- **CLI:** `weave daemon` subcommand with `start`, `stop`, `status`, and
+  `run --me`.  PID file defaults to `$XDG_RUNTIME_DIR/weave/weaved.pid` or
+  temp fallback; overridable via `WEAVE_PIDFILE` for test parallel safety.
+  argv-only `kill -0` / `kill -TERM` probes (no shell).
+- **Tests:** unit tests for heartbeat/query/evict/tier logic in both sqlite and
+  libsql backends; black-box integration test `daemon_lifecycle_start_stop_status`
+  driving the compiled binary.
+
+## [Unreleased] — presence daemon MCP tools (WL-002 Phase B)
+
+> **MCP tooling for the optional presence daemon.** Three new MCP tools expose the
+> daemon lifecycle over JSON-RPC: `weave_daemon_start` (idempotent start, returns pid),
+> `weave_daemon_stop` (SIGTERM + cleanup), and `weave_daemon_status` (running or stopped).
+> The tools duplicate the small pidfile logic directly (no dependency on the `weave` bin
+> crate, respecting the layer DAG). When the daemon is absent, presence degrades
+> transparently to the TTL heuristic unchanged.
+
+### Added
+- **MCP tools (`weave-mcp`):** `weave_daemon_start`, `weave_daemon_stop`,
+  `weave_daemon_status` — each returns JSON-shaped text (`{"started":bool,"pid":u32}` /
+  `{"stopped":bool}` / `{"running":bool,"pid"?:u32}`). The tools use argv-only `kill -0` /
+  `kill -TERM` and honour the `WEAVE_PIDFILE` env override for test parallel safety.
+- **Integration test:** `mcp_daemon_start_stop_status_roundtrip` — start via MCP,
+  status confirms running, stop via MCP, status confirms stopped, using a temp-scoped
+  `WEAVE_PIDFILE`.
+- **Docs:** README daemon subsection; ARCHITECTURE.md optional-daemon section;
+  docs/TESTING.md daemon lifecycle test notes.
+
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
 
 > **A fire-and-forget notify primitive + a transport-side delivery trace, both pure-DB

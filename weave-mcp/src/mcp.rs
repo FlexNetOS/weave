@@ -23,6 +23,25 @@ pub fn log(msg: &str) {
     eprintln!("[weave-mcp] {msg}");
 }
 
+/// PID file for the optional presence daemon.  Overridable via `WEAVE_PIDFILE`
+/// so integration tests can use temp-scoped paths for parallel safety.
+fn daemon_pidfile() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("WEAVE_PIDFILE") {
+        return std::path::PathBuf::from(p);
+    }
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| std::path::PathBuf::from(d).join("weave").join("weaved.pid"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("weaved.pid"))
+}
+
+/// argv-only probe: `kill -0 <pid>` returns success iff the process exists.
+fn daemon_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Run the server loop until stdin closes. `me_default` seeds the identity for
 /// tools when the caller omits `me`/`from` (e.g. from $WEAVE_SESSION).
 ///
@@ -371,6 +390,9 @@ fn call_tool(
         "weave_job_cancel" => tool_job_cancel(store, me_default, args),
         "weave_claim_orchestrator" => tool_claim_orchestrator(store, me_default, args),
         "weave_orchestrator_status" => tool_orchestrator_status(store, args),
+        "weave_daemon_start" => tool_daemon_start(me_default, args),
+        "weave_daemon_stop" => tool_daemon_stop(),
+        "weave_daemon_status" => tool_daemon_status(),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -2806,8 +2828,89 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "circle":{"type":"string","description":"Circle to query (defaults to your own circle)."}
             },"required":[]}
+        },
+        {
+            "name": "weave_daemon_start",
+            "description": "Start the optional presence daemon in the background. Idempotent: if the daemon is already running, returns the existing PID. The daemon writes periodic heartbeats to the presence table so peers show live status; when stopped, the system degrades transparently to the TTL heuristic.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_daemon_stop",
+            "description": "Stop the optional presence daemon. Sends SIGTERM to the recorded PID and cleans up the pidfile. Safe to call even if the daemon is not running.",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_daemon_status",
+            "description": "Show whether the optional presence daemon is running. Returns running:true + pid when active, or running:false when stopped. A stale pidfile is automatically cleaned up.",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
         }
     ])
+}
+
+fn tool_daemon_start(me_default: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", me_default)?;
+    let pidfile = daemon_pidfile();
+    if let Some(parent) = pidfile.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if pidfile.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if daemon_running(pid) {
+                    return Ok(format!(r#"{{"started":false,"pid":{pid}}}"#));
+                }
+            }
+        }
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not resolve current executable: {e}"))?;
+    let child = std::process::Command::new(&exe)
+        .args(["daemon", "run", "--me", &me])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+    let pid = child.id();
+    if let Err(e) = std::fs::write(&pidfile, pid.to_string()) {
+        return Err(format!("daemon spawned but pidfile write failed: {e}"));
+    }
+    Ok(format!(r#"{{"started":true,"pid":{pid}}}"#))
+}
+
+fn tool_daemon_stop() -> Result<String, String> {
+    let pidfile = daemon_pidfile();
+    if !pidfile.exists() {
+        return Ok(r#"{"stopped":false}"#.to_string());
+    }
+    let pid_str =
+        std::fs::read_to_string(&pidfile).map_err(|e| format!("could not read pidfile: {e}"))?;
+    let pid = pid_str
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "pidfile contains invalid pid".to_string())?;
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let _ = std::fs::remove_file(&pidfile);
+    Ok(r#"{"stopped":true}"#.to_string())
+}
+
+fn tool_daemon_status() -> Result<String, String> {
+    let pidfile = daemon_pidfile();
+    if !pidfile.exists() {
+        return Ok(r#"{"running":false}"#.to_string());
+    }
+    let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
+    let pid = pid_str.trim().parse::<u32>().unwrap_or(0);
+    if daemon_running(pid) {
+        Ok(format!(r#"{{"running":true,"pid":{pid}}}"#))
+    } else {
+        let _ = std::fs::remove_file(&pidfile);
+        Ok(r#"{"running":false}"#.to_string())
+    }
 }
 
 #[cfg(test)]
