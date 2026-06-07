@@ -279,6 +279,13 @@ Coverage:
   `not injectable (mux=none)` verdict strings and **exits 0** for a queued
   (non-injectable) peer, non-zero for a non-existent one.
 
+- **Daemon lifecycle (CLI + MCP).** `weave daemon start` spawns a background
+  heartbeat process; `weave daemon status` reports `running` with the PID;
+  `weave daemon stop` sends `SIGTERM` and cleans up the pidfile. The MCP mirrors
+  (`weave_daemon_start|stop|status`) return JSON-shaped text and are tested in
+  the same roundtrip: start → status confirms running → stop → status confirms
+  stopped. Both use a temp-scoped `WEAVE_PIDFILE` so parallel tests never collide.
+
 - **Scan remote-host surfacing.** Extending the proven foreign-store fixture
   (forced `HOSTNAME` + `WEAVE_PEER_DBS`), a federated peer registered on a
   *different* host with a recent `last_seen` surfaces in `weave scan --json` with

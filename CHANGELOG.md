@@ -53,6 +53,26 @@
   libsql backends; black-box integration test `daemon_lifecycle_start_stop_status`
   driving the compiled binary.
 
+## [Unreleased] — presence daemon MCP tools (WL-002 Phase B)
+
+> **MCP tooling for the optional presence daemon.** Three new MCP tools expose the
+> daemon lifecycle over JSON-RPC: `weave_daemon_start` (idempotent start, returns pid),
+> `weave_daemon_stop` (SIGTERM + cleanup), and `weave_daemon_status` (running or stopped).
+> The tools duplicate the small pidfile logic directly (no dependency on the `weave` bin
+> crate, respecting the layer DAG). When the daemon is absent, presence degrades
+> transparently to the TTL heuristic unchanged.
+
+### Added
+- **MCP tools (`weave-mcp`):** `weave_daemon_start`, `weave_daemon_stop`,
+  `weave_daemon_status` — each returns JSON-shaped text (`{"started":bool,"pid":u32}` /
+  `{"stopped":bool}` / `{"running":bool,"pid"?:u32}`). The tools use argv-only `kill -0` /
+  `kill -TERM` and honour the `WEAVE_PIDFILE` env override for test parallel safety.
+- **Integration test:** `mcp_daemon_start_stop_status_roundtrip` — start via MCP,
+  status confirms running, stop via MCP, status confirms stopped, using a temp-scoped
+  `WEAVE_PIDFILE`.
+- **Docs:** README daemon subsection; ARCHITECTURE.md optional-daemon section;
+  docs/TESTING.md daemon lifecycle test notes.
+
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
 
 > **A fire-and-forget notify primitive + a transport-side delivery trace, both pure-DB

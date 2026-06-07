@@ -7580,6 +7580,74 @@ fn mcp_notify_and_delivery_lifecycle_and_failures() {
 // Daemon lifecycle (v0.2)
 // ---------------------------------------------------------------------------
 
+/// MCP daemon tools roundtrip: start via MCP, status confirms running, stop via
+/// MCP, status confirms stopped. Uses a test-scoped PID file for parallel safety.
+#[test]
+fn mcp_daemon_start_stop_status_roundtrip() {
+    let db = TestDb::new();
+    let pidfile = db.path.with_extension("pid");
+    let pidfile_str = pidfile.to_string_lossy().into_owned();
+
+    let mut mcp = McpServer::spawn_env(&db, &[("WEAVE_PIDFILE", &pidfile_str)]);
+
+    // tools/list advertises the three daemon tools.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools/list returns a tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in [
+        "weave_daemon_start",
+        "weave_daemon_stop",
+        "weave_daemon_status",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "tools/list missing {expected}; got {names:?}"
+        );
+    }
+
+    // Start the daemon.
+    let (err, text) = mcp.call_tool("weave_daemon_start", serde_json::json!({}));
+    assert!(!err, "weave_daemon_start should not error: {text}");
+    assert!(
+        text.contains("\"started\":true"),
+        "daemon start should report started=true: {text}"
+    );
+
+    // Give the child a moment to write the pidfile and start its loop.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Status should report running.
+    let (err2, text2) = mcp.call_tool("weave_daemon_status", serde_json::json!({}));
+    assert!(!err2, "weave_daemon_status should not error: {text2}");
+    assert!(
+        text2.contains("\"running\":true"),
+        "daemon status should report running=true: {text2}"
+    );
+
+    // Stop the daemon.
+    let (err3, text3) = mcp.call_tool("weave_daemon_stop", serde_json::json!({}));
+    assert!(!err3, "weave_daemon_stop should not error: {text3}");
+    assert!(
+        text3.contains("\"stopped\":true"),
+        "daemon stop should report stopped=true: {text3}"
+    );
+
+    // Status should now report stopped.
+    let (err4, text4) = mcp.call_tool("weave_daemon_status", serde_json::json!({}));
+    assert!(!err4, "weave_daemon_status should not error: {text4}");
+    assert!(
+        text4.contains("\"running\":false"),
+        "daemon status after stop should report running=false: {text4}"
+    );
+
+    mcp.shutdown();
+}
+
 #[test]
 fn daemon_lifecycle_start_stop_status() {
     let db = TestDb::new();
