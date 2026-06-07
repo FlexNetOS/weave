@@ -38,3 +38,27 @@ and the open gaps the user flagged.
 - [ ] WL-025: Stop-boundary wake — blocking `Stop`/`SubagentStop` hook that returns `additionalContext` to drive the next turn without polling (ROADMAP-v0.3 §1).
 - [ ] WL-026: Idempotency keys & trace IDs — per-message idempotency keys and distributed trace IDs for end-to-end debugging across stores (ROADMAP-v0.3 §3).
 - [ ] WL-027: Broadcast notify / broadcast ask — fan-out notifications and asks to all online peers in the caller's circle, not just `--to all` store broadcast (repowire parity).
+
+## Gaps from mcp_agent_mail cross-reference (2026-06-07)
+- [ ] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity).
+- [ ] WL-029: Advisory file leases with TTL expiry and conflict detection (mcp_agent_mail parity).
+- [ ] WL-030: Pre-commit Git hook for file reservation guard (mcp_agent_mail parity).
+- [ ] WL-031: Message importance / priority levels with urgent filtering (mcp_agent_mail parity).
+- [ ] WL-032: Per-peer contact policies (open / auto / contacts_only / block_all) with explicit request/respond handshake (mcp_agent_mail parity).
+- [ ] WL-033: Thread summarization via LLM integration (mcp_agent_mail parity).
+- [ ] WL-034: Static mailbox export — self-contained portable HTML bundle with search (mcp_agent_mail parity).
+
+## Gaps from atm-core cross-reference (2026-06-07)
+- [ ] WL-035: Mailbox backup / restore — ZIP snapshot of SQLite + config + hooks (atm-core parity).
+- [ ] WL-036: Post-send hooks — trigger external commands on send/ack with wildcard recipient matching (atm-core parity).
+- [ ] WL-037: Message supersede / successor chains — replace prior messages with updated context (atm-core parity).
+- [ ] WL-038: Ephemeral messages with TTL and auto-sweep (atm-core parity).
+- [ ] WL-039: Idle notification deduplication — replace older unread idle pings from same sender (atm-core parity).
+
+## Gaps from cross_agent_session_resumer cross-reference (2026-06-07)
+- [ ] WL-040: Session export/import in canonical format (JSON/IR) for portability across weave instances (casr parity).
+- [ ] WL-041: Read-back verification for destructive operations — verify config/hook rewrites before declaring success (casr parity).
+- [ ] WL-042: Multi-provider lifecycle hook templates — Codex CLI, Gemini CLI, Aider hook scaffolding (casr parity).
+
+## Gaps from claude-code-router / cc-mirror cross-reference (2026-06-07)
+- No direct gaps identified — these are model-routing / launcher tools orthogonal to weave's messaging mesh scope. Potential integration note: `weave setup --variant` could support per-variant MCP registration if cc-mirror is detected.

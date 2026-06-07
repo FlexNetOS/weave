@@ -53,4 +53,23 @@ Each gap links back to the source repo(s) where it was observed.
 
 | File | Repo | Language | Status | Last Scanned |
 |------|------|----------|--------|--------------|
-| `prassanna-ravishankar--repowire.md` | prassanna-ravishankar/repowire | Python | active | 2026-06-07 |
+| `prassanna-ravishankar--repowire.md` | prassanna-ravishankar/repowire | Python | scanned | 2026-06-07 |
+| `Dicklesworthstone--mcp_agent_mail.md` | Dicklesworthstone/mcp_agent_mail | Python/Rust | scanned | 2026-06-07 |
+| `randlee--atm-core.md` | randlee/atm-core | Rust | scanned | 2026-06-07 |
+| `Dicklesworthstone--cross_agent_session_resumer.md` | Dicklesworthstone/cross_agent_session_resumer | Rust | scanned | 2026-06-07 |
+| `musistudio--claude-code-router.md` | musistudio/claude-code-router | TypeScript | scanned | 2026-06-07 |
+| `numman-ali--cc-mirror.md` | numman-ali/cc-mirror | TypeScript/Shell | scanned | 2026-06-07 |
+
+## Secondary / suggested repos (not yet queued)
+
+| Repo | Why |
+|------|-----|
+| `anthropics/anthropic-cookbook` | MCP patterns, agent orchestration recipes |
+| `cline/cline` | VS Code agent with task execution |
+| `aider-ai/aider` | Multi-file editing, git integration, architect mode |
+| `codex-cli/codex` | OpenAI's agent CLI — hook patterns, sandboxing |
+| `continuedev/continue` | IDE-native agent — context management |
+| `supermaven/sm-agent` | Agentic IDE features |
+| `e2b-dev/e2b` | Sandboxed code execution — reservation leases |
+| `langchain-ai/langchain` | Orchestration primitives |
+| `tmux/tmux` | Native multiplexer features — injector parity |
