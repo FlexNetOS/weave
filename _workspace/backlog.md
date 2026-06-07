@@ -8,7 +8,7 @@ and the open gaps the user flagged.
 - [x] WL-002 Phase A: presence daemon store + CLI — merged via PR #32.
 - [x] WL-002 Phase B: MCP daemon tools (`weave_daemon_start`/`stop`/`status`) — PR #33 auto-merging.
 - [x] WL-003: zellij pane targeting — capture `ZELLIJ_PANE_ID` at registration, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one (TASKS.md M1).
-- [ ] WL-004: Integration tests for daemon lifecycle.
+- [x] WL-004: Integration tests for daemon lifecycle — env-configurable heartbeat/evict intervals; idempotency + stale-pidfile coverage.
 - [ ] WL-005: Harden / execute `ralph-weave.sh` unified loop in anger.
 
 ## M1 — Make it real on the box
