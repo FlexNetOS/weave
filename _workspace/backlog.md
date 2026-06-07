@@ -20,5 +20,5 @@ and the open gaps the user flagged.
 
 ## M3 — Robustness & reach
 - [x] WL-011: Optional `weaved` presence daemon — online/offline, lifecycle eviction (TASKS.md M3). **Duplicate:** fully implemented in WL-002 Phase A/B (heartbeat + evict + liveness + MCP tools). No additional work required.
-- [ ] WL-012: More mux adapters — kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (TASKS.md M3).
+- [x] WL-012: More mux adapters — kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (TASKS.md M3). **Duplicate:** fully implemented in inject.rs with detect_target, commands_for, liveness probes, id validation, and unit tests for each backend.
 - [ ] WL-013: Config file — `~/.config/weave/config.toml` with default identity, nudge template, mux preference (TASKS.md M3).

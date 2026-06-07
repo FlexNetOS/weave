@@ -1,7 +1,7 @@
-# Verifier report — WL-011
+# Verifier report — WL-012
 
 ## Gate results
-All checks green (same run as WL-010; no code changes since then):
+All checks green (no code changes since prior cycle):
 
 | check | sqlite | libsql |
 |---|---|---|
