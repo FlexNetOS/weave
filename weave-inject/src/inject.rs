@@ -452,7 +452,7 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
         Mux::Tmux => Some(argv(&["tmux", "has-session", "-t", id])),
         // zellij has no per-session "exists" verb; `list-sessions` enumerates them
         // and we scan stdout for the name in `target_alive`.
-        Mux::Zellij => Some(argv(&["zellij", "list-sessions"])),
+        Mux::Zellij => Some(argv(&["zellij", "list-sessions", "--no-formatting"])),
         // wezterm: `cli list` prints all panes; we scan stdout for the pane id.
         Mux::Wezterm => Some(argv(&["wezterm", "cli", "list"])),
         // kitty: `kitten @ ls` (honoring --to) reports the window tree as JSON; a
@@ -1440,7 +1440,7 @@ mod tests {
         );
         assert_eq!(
             liveness_probe(&t(Mux::Zellij, "envctl")),
-            Some(argv(&["zellij", "list-sessions"]))
+            Some(argv(&["zellij", "list-sessions", "--no-formatting"]))
         );
         assert_eq!(
             liveness_probe(&t(Mux::Wezterm, "2")),
