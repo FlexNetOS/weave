@@ -21,6 +21,11 @@ Inputs (passed by the orchestrator):
 - cycles_total (from `loop_state.md`)
 - last_item (the WL-NNN just committed, or `(none — discovery only)`)
 - next_item (first `- [ ]` in `backlog.md`, or `(none)`)
+- orchestrator_phase (e.g. `plan`, `implement`, `verify`, `guard`, `deliver`, or `complete`)
+- last_agent (the agent that last acted: `weave-planner`, `weave-implementer`, `weave-verifier`, `minimax-guardian`, `delivery`)
+- verifier_status (`GREEN`, `RED`, or `n/a`)
+- guardian_verdict (`APPROVE`, `BLOCK`, or `n/a`)
+- pr_url (if delivery has opened one)
 - list of landed-this-session commits (run `git log --oneline -n 10` in the worktree)
 - any open findings / decisions / dead-ends the orchestrator wants preserved
 
@@ -38,6 +43,11 @@ cycle_budget: <N>
 cycles_total: <N>
 last_item: <WL-NNN or "(none — discovery only)">
 next_item: <WL-MMM or "(none — backlog clear)">
+orchestrator_phase: <plan|implement|verify|guard|deliver|complete>
+last_agent: <agent-name>
+verifier_status: <GREEN|RED|n/a>
+guardian_verdict: <APPROVE|BLOCK|n/a>
+pr_url: <url or "(none)">
 landed_this_session:
   - <sha> <subject>
   - ...

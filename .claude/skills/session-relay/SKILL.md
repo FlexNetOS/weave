@@ -18,8 +18,9 @@ Two entry points, both idempotent.
 1. **Stop-checks first.** If `STOP` or `NEEDS-HUMAN` already exists under `_workspace/`,
    skip — the previous run already terminated. Just exit.
 2. Spawn the **`continuity-steward` agent** with the worktree path + the current cycle's
-   items (see `.claude/agents/continuity-steward.md`). It produces the cold-start
-   `HANDOFF.md` body in a single pass — keep the orchestrator's context lean.
+   items **+ the current orchestrator pipeline state** (`orchestrator_phase`, `last_agent`,
+   `verifier_status`, `guardian_verdict`, `pr_url`) (see `.claude/agents/continuity-steward.md`).
+   It produces the cold-start `HANDOFF.md` body in a single pass — keep the orchestrator's context lean.
 3. **Write `_workspace/HANDOFF.md`** (overwrite — the steward body is authoritative).
 4. **Commit** it: `weave-loop: handoff (at WL-NNN)`. The committed file is the resume signal.
 5. **Best-effort weave heartbeat** — broadcast `to:"all"`:
@@ -70,6 +71,11 @@ cycle_budget: 3
 cycles_total: <N>
 last_item: WL-NNN
 next_item: WL-MMM
+orchestrator_phase: <plan|implement|verify|guard|deliver|complete>
+last_agent: <agent-name>
+verifier_status: <GREEN|RED|n/a>
+guardian_verdict: <APPROVE|BLOCK|n/a>
+pr_url: <url or "(none)">
 landed_this_session:
   - <sha> <subject>
   - ...

@@ -3141,9 +3141,7 @@ async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Mes
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
     );
-    let mut it = conn
-        .query(&sql, params(vec![me.into()]))
-        .await?;
+    let mut it = conn.query(&sql, params(vec![me.into()])).await?;
     match it.next().await? {
         Some(r) => Ok(Some(row_to_message(&r)?)),
         None => Ok(None),

@@ -68,20 +68,22 @@ observable cross-identity heartbeat. The external runner is
    order matters, prepend the dependency list. Items already `[!]` are surfaced and skipped.
 3. **Dry-run first** for anything destructive (file moves, hook rewrites, branch protection,
    pubspec-level changes). The default is SAFE; `WEAVE_APPLY=1` opts in to apply.
-4. **Do the work** — declared, idempotent, one cohesive change per cycle. Smaller is better.
-   If a cycle grows, **split the backlog item** mid-cycle and commit the split first.
-5. **VERIFY across the boundary.** Not existence-only — run a real check in a fresh shell:
-   - `cargo fmt --all -- --check`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test --quiet`
-   - Plus, for the item: a feature-specific smoke test (e.g. `weave doctor` returns
-     sane JSON; `weave setup --dry-run` shows the right hook merge; `weave_inbox` round-trips
-     a test message via the local DB).
-6. **Update state** — flip the line to `- [x]` (or `- [!] blocked: <reason>`). Bump
+4. **Run the weave-orchestrator pipeline (phases 1-3).**
+   - **Phase 1 — Plan:** invoke `weave-planner`. It writes `_workspace/01_planner_plan.md`.
+   - **Phase 2 — Implement:** invoke `weave-implementer`. It edits `src/`, mirrors Store changes across both backends, confirms both compile. Writes `_workspace/02_implementer_changes.md`.
+   - **Phase 3 — Verify:** invoke `weave-verifier`. It adds matching test layers and runs the full gate on **both** backends (fmt, clippy `-D warnings`, test). Writes `_workspace/03_verifier_report.md`.
+   - Do **not** commit the diff yet. Stop before Phase 4.
+   - If verifier is **RED**, route findings back to the implementer and retry. Do not proceed.
+5. **Guardian review + approve (Phase 4) — MiniMax is the external guardian.**
+   Spawn MiniMax (`minimax-m3:cloud` via the configured guardian command) with the uncommitted diff, the plan, the change log, and the verifier report. MiniMax audits against `weave-invariants`, runs the `weave-drift-guard` scan, checks docs sync, and writes `_workspace/04_guardian_review.md` with **APPROVE** or **BLOCK**.
+   - If **BLOCK**, preserve the specific findings and route back to the implementer on the next iteration. Do not mark the backlog item as done.
+6. **Delivery (Phase 5-6) — on APPROVE only.**
+   - Commit with Conventional Commits: `weave: WL-NNN <one-line summary>`. Include updated `backlog.md` + `loop_state.md`.
+   - Push the branch: `git push origin HEAD`.
+   - Open a PR: `gh pr create --fill`.
+   - Enable auto-merge: `gh pr merge --auto`.
+7. **Update state** — flip the line to `- [x]` (or `- [!] blocked: <reason>`). Bump
    `cycles_this_session` and `cycles_total` by 1. Set `last_item=WL-NNN`, `last_update=<UTC>`.
-7. **Commit** with an area-prefixed subject:
-   `weave-loop: WL-NNN <one-line summary>`. The commit must include the updated
-   `backlog.md` + `loop_state.md`.
 8. **Self-pace.** Pick the next delay from what you're actually waiting on:
    - No external wait, no work remaining that needs a human → `ScheduleWakeup` 60–270s
      (cache-warm window) to re-enter CYCLE.

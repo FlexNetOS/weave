@@ -2582,9 +2582,8 @@ impl Store for SqliteStore {
 
     fn clear_all(&self) -> Result<i64> {
         let n = self.total_messages()?;
-        self.conn.execute_batch(
-            "DELETE FROM messages; DELETE FROM reads; DELETE FROM wake_acks;",
-        )?;
+        self.conn
+            .execute_batch("DELETE FROM messages; DELETE FROM reads; DELETE FROM wake_acks;")?;
         Ok(n)
     }
 

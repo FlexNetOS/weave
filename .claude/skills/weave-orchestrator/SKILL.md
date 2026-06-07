@@ -53,9 +53,25 @@ Invoke **weave-verifier** (`model: "opus"`) with the change log. It adds the mat
 
 Once GREEN, invoke **weave-guardian** (`model: "opus"`). It audits the diff against `weave-invariants`, runs the `weave-drift-guard` procedure on the change, and checks docs sync, writing `_workspace/04_guardian_review.md` with an **APPROVE** or **BLOCK**. On BLOCK, route findings to the implementer and re-run Phases 3–4 for the touched files. Only on APPROVE is the change done.
 
+**Autonomous loop mode:** When running under `weave-loop`, Phase 4 is delegated to **MiniMax** (`minimax-m3:cloud`) as the external guardian. MiniMax performs the same invariant/drift/docs audit and writes `_workspace/04_guardian_review.md`. The loop waits for APPROVE before proceeding to delivery.
+
 ## Phase 5 — Synthesize
 
-Summarize for the user: what changed, the both-backends gate result, invariants verified, drift verdict, docs synced, and the `_workspace/` artifact paths. Remind them to update `CHANGELOG.md [Unreleased]` if the agents didn't, and (if they want) to commit on the worktree branch using Conventional Commits. Then **clean up the team** (`TeamDelete`).
+Summarize for the user (or the loop): what changed, the both-backends gate result, invariants verified, drift verdict, docs synced, and the `_workspace/` artifact paths. Remind them to update `CHANGELOG.md [Unreleased]` if the agents didn't.
+
+**When running under `weave-loop`:** Do **not** clean up the team and do **not** commit yet. Return control to the loop. The loop will invoke MiniMax for Phase 4 (if not already done) and handle delivery in Phase 6.
+
+**When running standalone:** Commit on the worktree branch using Conventional Commits, then **clean up the team** (`TeamDelete`).
+
+## Phase 6 — Delivery (PR + auto-merge)
+
+**Only in autonomous loop mode** (after guardian APPROVE):
+
+1. **Commit** the diff with Conventional Commits: `weave: <summary>`.
+2. **Push** the branch: `git push origin HEAD`.
+3. **Open a PR** (`gh pr create --fill` or equivalent). The PR body should reference the `_workspace/` artifacts and the backlog item.
+4. **Enable auto-merge** (`gh pr merge --auto`). This closes the loop — the construction crew delivers without human gating.
+5. If `gh` is unavailable or auto-merge fails, write `_workspace/NEEDS-HUMAN` with the specific error and halt.
 
 ## Data transfer protocol
 

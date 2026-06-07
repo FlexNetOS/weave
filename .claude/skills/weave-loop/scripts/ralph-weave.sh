@@ -1,77 +1,144 @@
 #!/usr/bin/env bash
-# ralph-weave.sh — external Ralph loop for weave-loop.
-# Self-restarts weave-loop with a FRESH context each iteration
-# (each `claude -p` process is a clean session = the /new effect)
-# until a terminal sentinel.
+# ralph-weave.sh — unified weave-loop runner.
+# One agent per iteration drives plan→implement→verify.
+# MiniMax is the external guardian (review + approve).
+# On APPROVE: commit, push, PR create, auto-merge.
+# On BLOCK: preserve findings, retry next iteration.
 #
-# Sourced from ~/Desktop/meta/HARNESS-UPGRADE-KIT.md §8, tailored to weave.
+# This merges the 3 parts into one closed auto-loop:
+#   1) Local agent = planner + implementer + verifier
+#   2) MiniMax    = guardian (review + approve)
+#   3) Local agent = delivery (commit + PR + auto-merge)
 set -euo pipefail
 
-WORKTREE="${WEAVE_WORKTREE:-/home/drdave/Desktop/meta/weave-harness-loop}"
+WORKTREE="${WEAVE_WORKTREE:-/home/drdave/Desktop/meta/weave}"
 BUDGET="${WEAVE_BUDGET:-3}"
 MAX_ITERS="${WEAVE_MAX_ITERS:-50}"
 SLEEP_BETWEEN="${WEAVE_SLEEP:-5}"
 MODEL="${WEAVE_MODEL:-minimax-m3:cloud}"
-AGENT_CMD="${WEAVE_AGENT_CMD:-ollama launch claude --model minimax-m3:cloud --}"
+GUARDIAN_CMD="${WEAVE_GUARDIAN_CMD:-ollama launch claude --model minimax-m3:cloud --}"
+AGENT_CMD="${WEAVE_AGENT_CMD:-claude}"
 AGENT_MODEL_ARGS="${WEAVE_AGENT_MODEL_ARGS:-}"
-KIMI_PLAN="${WEAVE_KIMI_PLAN:-1}"
-KIMI_REVIEW="${WEAVE_KIMI_REVIEW:-1}"
-KIMI_CMD="${WEAVE_KIMI_CMD:-kimi-legacy}"
-KIMI_MODEL="${WEAVE_KIMI_MODEL:-kimi-code/kimi-for-coding}"
-KIMI_SESSION="${WEAVE_KIMI_SESSION:-3c6e42cf-090d-4553-a84b-e63fb9c511c1}"
-KIMI_SESSION_FLAG="${WEAVE_KIMI_SESSION_FLAG:--r}"
-KIMI_EXTRA_ARGS="${WEAVE_KIMI_EXTRA_ARGS:---quiet}"
+APPLY="${WEAVE_APPLY:-0}"
 
 WS="$WORKTREE/_workspace"
 mkdir -p "$WS"
 
 log(){ printf '[ralph-weave %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
+read -r -a GUARDIAN_CMD_ARY <<<"$GUARDIAN_CMD"
 read -r -a AGENT_CMD_ARY <<<"$AGENT_CMD"
 read -r -a AGENT_MODEL_ARGS_ARY <<<"$AGENT_MODEL_ARGS"
-read -r -a KIMI_EXTRA_ARGS_ARY <<<"$KIMI_EXTRA_ARGS"
 command -v "${AGENT_CMD_ARY[0]}" >/dev/null || { log "FATAL: ${AGENT_CMD_ARY[0]} not on PATH"; exit 1; }
+command -v "${GUARDIAN_CMD_ARY[0]}" >/dev/null || { log "FATAL: ${GUARDIAN_CMD_ARY[0]} not on PATH"; exit 1; }
 [ -d "$WORKTREE" ]   || { log "FATAL: worktree $WORKTREE not found"; exit 1; }
-[ -f "$WORKTREE/Cargo.toml" ] || { log "FATAL: $WORKTREE/Cargo.toml missing — wrong worktree?"; exit 1; }
-
-if [ -z "$KIMI_SESSION_FLAG" ] && command -v "$KIMI_CMD" >/dev/null; then
-  if "$KIMI_CMD" --help 2>/dev/null | grep -q -- '-r,'; then
-    KIMI_SESSION_FLAG="-r"
-  else
-    KIMI_SESSION_FLAG="-S"
-  fi
-fi
-
-run_kimi_code() {
-  local prompt="$1"
-  local out="$2"
-  local err="$3"
-  local args=()
-
-  [ -n "$KIMI_SESSION" ] && args+=("$KIMI_SESSION_FLAG" "$KIMI_SESSION")
-  [ -n "$KIMI_MODEL" ] && args+=("-m" "$KIMI_MODEL")
-  "$KIMI_CMD" "${args[@]}" "${KIMI_EXTRA_ARGS_ARY[@]}" -p "$prompt" >"$out" 2>"$err"
-}
+[ -f "$WORKTREE/Cargo.toml" ] || { log "FATAL: $WORKTREE/Cargo.toml missing"; exit 1; }
 
 APPLY_ARGS=()
-if [ "${WEAVE_APPLY:-0}" = "1" ]; then
+if [ "$APPLY" = "1" ]; then
   APPLY_ARGS=(--dangerously-skip-permissions)
   log "APPLY MODE — will modify the live system unattended."
 else
   log "SAFE mode (default): destructive applies refused. Set WEAVE_APPLY=1 to act."
 fi
 
-read -r -d '' PROMPT <<EOF || true
-/weave-loop resume from _workspace/HANDOFF.md (external Ralph runner, fresh context). Worktree: $WORKTREE.
+# ---------------------------------------------------------------------------
+# Phase A prompt — construction crew: plan → implement → verify
+# ---------------------------------------------------------------------------
+read -r -d '' PROMPT_PHASE_A <<'EOF' || true
+You are the weave-loop construction crew (phases 1-3). Worktree: WORKTREE_PLACEHOLDER.
 
-1. If _workspace/HANDOFF.md exists, follow session-relay RESUME from it (authoritative signal); else DISCOVER and build _workspace/backlog.md from TASKS.md M1/M3.
-2. Run up to $BUDGET cycles: one item each, dry-run -> apply for destructive steps, VERIFY across the boundary in a FRESH shell (cargo fmt + clippy + test), commit per cycle with subject 'weave-loop: WL-NNN <summary>'. Fail-closed; never weaken a guard.
-3. Bootstrap hazard: if a cycle mutates weave's own wire/mux (mcp.rs / store.rs / inject.rs / setup.rs), do NOT depend on the live 'weave' binary for the handoff heartbeat that cycle. Committed HANDOFF.md is the authoritative resume signal.
-4. If _workspace/kimi-plan-latest.md or _workspace/kimi-review-latest.md exists, read it before selecting the next backlog item. Treat Kimi Code as a planning/review partner: use concrete risks and verification gaps, but you own the implementation and build result.
-5. Then write EXACTLY ONE sentinel under _workspace/ and stop (do not ScheduleWakeup):
-   - DONE (with evidence in the file: cycles_total, items_closed, cargo fmt/clippy/test exits)
-   - NEEDS-HUMAN (reason + captured artifact path; human wall only — not a spin)
-   - else HANDOFF.md (spawn continuity-steward, commit, broadcast relay:handoff if safe)
+1. Read _workspace/HANDOFF.md if present and RESUME; else DISCOVER from TASKS.md M1/M3, seed _workspace/backlog.md, write _workspace/loop_state.md, and stop.
+2. Pick the top uncompleted backlog item (first `- [ ]` in _workspace/backlog.md).
+3. Run the weave-orchestrator phases 1-3 for this item:
+   - Phase 1 (planner): write _workspace/01_planner_plan.md
+   - Phase 2 (implementer): edit src/, mirror Store changes across both backends, confirm both `cargo build` and `cargo build --no-default-features --features libsql` compile. Write _workspace/02_implementer_changes.md.
+   - Phase 3 (verifier): add matching test layers, run the full gate on BOTH backends (fmt, clippy -D warnings, test). Write _workspace/03_verifier_report.md with GREEN or RED.
+4. STOP before Phase 4 (Guardian). Do NOT commit. The diff must remain uncommitted.
+5. If verifier is RED, do not proceed. Write the failures to _workspace/03_verifier_report.md and stop this iteration.
+6. If verifier is GREEN, write a one-line summary of the diff to _workspace/03_verifier_report.md and stop.
+EOF
+
+# ---------------------------------------------------------------------------
+# Phase B prompt — MiniMax guardian: review + approve
+# ---------------------------------------------------------------------------
+read -r -d '' PROMPT_PHASE_B <<'EOF' || true
+You are the weave-guardian (Phase 4). You are MiniMax, the external review and approval authority for the weave-loop.
+
+Worktree: WORKTREE_PLACEHOLDER.
+
+Inputs:
+- The uncommitted diff in src/ and tests/
+- _workspace/01_planner_plan.md
+- _workspace/02_implementer_changes.md
+- _workspace/03_verifier_report.md (must be GREEN)
+
+Your job:
+1. Read the diff, the plan, the change log, and the verifier report.
+2. Audit against weave-invariants:
+   - No shell (argv-only spawning)
+   - Parameterized SQL (bound params! only)
+   - Layer DAG intact (no upward deps)
+   - Paste-safe injection (exact argv tests)
+   - Input caps enforced (MAX_IDENT_LEN, MAX_BODY, MAX_INJECT_CHARS, id_valid)
+   - Destructive ops gated (confirm)
+   - MCP stdout discipline
+   - No new heavyweight default dependency
+3. Run the weave-drift-guard scan (check for non-Rust build intrusions).
+4. Check docs sync (CHANGELOG.md [Unreleased], README.md, ARCHITECTURE.md if surface changed).
+
+Output:
+Write _workspace/04_guardian_review.md with exactly this structure:
+
+```
+# Guardian Review
+## Invariants
+- <file:line> <rule> <PASS/BLOCK>
+...
+
+## Drift
+- <file> <category> <PASS/BLOCK>
+...
+
+## Docs
+- <doc> <PASS/BLOCK>
+...
+
+## Verdict
+APPROVE
+```
+
+or
+
+```
+## Verdict
+BLOCK
+
+## Findings
+- <file:line> <specific finding>
+...
+```
+
+Be strict. A single invariant violation or unaddressed drift is a BLOCK.
+EOF
+
+# ---------------------------------------------------------------------------
+# Phase C prompt — delivery: commit + PR + auto-merge
+# ---------------------------------------------------------------------------
+read -r -d '' PROMPT_PHASE_C <<'EOF' || true
+You are the weave-loop delivery crew (Phase 5-6). Worktree: WORKTREE_PLACEHOLDER.
+
+1. Read _workspace/04_guardian_review.md. If it does not contain APPROVE, STOP.
+2. If APPROVE:
+   a. Stage and commit with Conventional Commits subject: `weave: WL-NNN <one-line summary>`.
+      Include updated _workspace/backlog.md (flip item to `- [x]`) and _workspace/loop_state.md.
+   b. Push the branch: `git push origin HEAD`.
+   c. Open a PR: `gh pr create --fill` (or equivalent).
+   d. Enable auto-merge: `gh pr merge --auto`.
+   e. Update _workspace/loop_state.md: bump cycles_this_session and cycles_total.
+   f. If backlog has more items, write _workspace/HANDOFF.md (spawn continuity-steward pattern) for the next session.
+   g. If backlog is complete, write _workspace/DONE with evidence.
+3. Stop. Do not ScheduleWakeup.
 EOF
 
 cd "$WORKTREE"
@@ -83,63 +150,46 @@ while :; do
   [ -f "$WS/DONE" ]        && { log "DONE."; exit 0; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
-  if [ "$KIMI_PLAN" = "1" ]; then
-    if command -v "$KIMI_CMD" >/dev/null; then
-      log "iter $i — running Kimi Code preflight (cmd=$KIMI_CMD, model=$KIMI_MODEL, session=$KIMI_SESSION, flag=$KIMI_SESSION_FLAG)"
-      run_kimi_code "You are Kimi Code coordinating with Ollama MiniMax for the weave project build loop in $WORKTREE.
+  # --- Phase A: plan → implement → verify ---
+  log "iter $i/$MAX_ITERS — Phase A: plan→implement→verify"
+  PHASE_A_PROMPT="${PROMPT_PHASE_A//WORKTREE_PLACEHOLDER/$WORKTREE}"
+  "${AGENT_CMD_ARY[@]}" -p "$PHASE_A_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
+    >>"$WS/ralph-phaseA-$i.log" 2>&1 || log "iter $i Phase A nonzero (continuing from durable state)"
 
-Do not edit files. Read _workspace/backlog.md, _workspace/HANDOFF.md if present, _workspace/kimi-review-latest.md if present, TASKS.md if present, and the current git status.
+  [ -f "$WS/STOP" ]        && { log "STOP — halting."; exit 2; }
+  [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
-Return a concise preflight for the next MiniMax implementation pass:
-- the next backlog/build item to attempt
-- correctness risks MiniMax should handle
-- exact verification expected, including cargo fmt, cargo clippy, and cargo test
-- anything MiniMax must avoid because of the weave bootstrap hazard" \
-        "$WS/kimi-plan-$i.md" "$WS/kimi-plan-$i.err" && cp "$WS/kimi-plan-$i.md" "$WS/kimi-plan-latest.md" || log "iter $i Kimi preflight failed (continuing; see $WS/kimi-plan-$i.err)"
-    else
-      log "iter $i Kimi preflight skipped: $KIMI_CMD not on PATH"
-    fi
+  if ! grep -q "GREEN" "$WS/03_verifier_report.md" 2>/dev/null; then
+    log "iter $i — verifier RED or missing. Will retry on next iteration."
+    sleep "$SLEEP_BETWEEN"
+    continue
   fi
 
-  ITER_PROMPT="$PROMPT"
-  if [ -s "$WS/kimi-plan-latest.md" ]; then
-    ITER_PROMPT="$ITER_PROMPT
+  # --- Phase B: MiniMax guardian (review + approve) ---
+  log "iter $i — Phase B: MiniMax guardian review+approve"
+  PHASE_B_PROMPT="${PROMPT_PHASE_B//WORKTREE_PLACEHOLDER/$WORKTREE}"
+  "${GUARDIAN_CMD_ARY[@]}" -p "$PHASE_B_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
+    >>"$WS/ralph-phaseB-$i.log" 2>&1 || log "iter $i Phase B nonzero (continuing from durable state)"
 
-Kimi Code K2.6 preflight for this MiniMax pass:
-$(sed -n '1,180p' "$WS/kimi-plan-latest.md")"
+  [ -f "$WS/STOP" ]        && { log "STOP — halting."; exit 2; }
+  [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
+
+  if ! grep -q "APPROVE" "$WS/04_guardian_review.md" 2>/dev/null; then
+    log "iter $i — guardian BLOCK. Routing findings to implementer on next iteration."
+    sleep "$SLEEP_BETWEEN"
+    continue
   fi
-  if [ -s "$WS/kimi-review-latest.md" ]; then
-    ITER_PROMPT="$ITER_PROMPT
 
-Kimi Code K2.6 review from the previous pass:
-$(sed -n '1,180p' "$WS/kimi-review-latest.md")"
-  fi
-
-  log "iter $i/$MAX_ITERS — spawning fresh MiniMax agent (budget=$BUDGET, model=$MODEL, cmd=$AGENT_CMD)"
-  # Best-effort: nonzero exit is logged but does not abort the runner — durable
-  # state on disk is the truth, not the per-iter exit code.
-  "${AGENT_CMD_ARY[@]}" -p "$ITER_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
-    >>"$WS/ralph-run-$i.log" 2>&1 || log "iter $i nonzero (continuing from durable state)"
-
-  if [ "$KIMI_REVIEW" = "1" ]; then
-    if command -v "$KIMI_CMD" >/dev/null; then
-      log "iter $i — running Kimi Code review (cmd=$KIMI_CMD, model=$KIMI_MODEL, session=$KIMI_SESSION, flag=$KIMI_SESSION_FLAG)"
-      run_kimi_code "Review the completed MiniMax weave-loop iteration in $WORKTREE.
-
-Do not edit files. Inspect _workspace/HANDOFF.md if present, _workspace/ralph-run-$i.log, git status, the latest commit, and any changed files. Report only:
-- concrete correctness risks
-- missing or weak verification
-- whether the weave project build loop should continue, stop DONE, or write NEEDS-HUMAN
-- the next action MiniMax should take on the following iteration" \
-        "$WS/kimi-review-$i.md" "$WS/kimi-review-$i.err" && cp "$WS/kimi-review-$i.md" "$WS/kimi-review-latest.md" || log "iter $i Kimi review failed (continuing; see $WS/kimi-review-$i.err)"
-    else
-      log "iter $i Kimi review skipped: $KIMI_CMD not on PATH"
-    fi
-  fi
+  # --- Phase C: delivery (commit + push + PR + auto-merge) ---
+  log "iter $i — Phase C: APPROVE — delivering (commit + PR + auto-merge)"
+  PHASE_C_PROMPT="${PROMPT_PHASE_C//WORKTREE_PLACEHOLDER/$WORKTREE}"
+  "${AGENT_CMD_ARY[@]}" -p "$PHASE_C_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
+    >>"$WS/ralph-phaseC-$i.log" 2>&1 || log "iter $i Phase C nonzero (continuing from durable state)"
 
   [ -f "$WS/DONE" ]        && { log "DONE."; exit 0; }
-  [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
   [ -f "$WS/STOP" ]        && { log "STOP — halting."; exit 2; }
+  [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
+  log "iter $i — cycle complete. Next iteration."
   sleep "$SLEEP_BETWEEN"
 done

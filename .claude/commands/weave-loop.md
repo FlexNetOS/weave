@@ -37,7 +37,10 @@ The committed file is the **authoritative** resume signal — not the weave inbo
 
 - It does not start a new `claude` process. The Ralph runner
   (`.claude/skills/weave-loop/scripts/ralph-weave.sh`) is what spawns fresh
-  processes. This command is the entry point a *human* (or a runner prompt) uses
+  processes. In each iteration the runner drives a unified pipeline:
+  local agent does plan→implement→verify, MiniMax is the external guardian
+  (review + approve), then local agent delivers (commit + PR + auto-merge).
+  This command is the entry point a *human* (or a runner prompt) uses
   to tell a session "you are a resume".
 - It does not depend on the weave inbox. Don't `weave_inbox` for the resume
   signal — read the file.
