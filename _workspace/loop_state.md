@@ -7,5 +7,5 @@ worktree: /home/drdave/Desktop/meta/weave
 branch: feat/mcp-daemon-tools-phase-b
 last_item: WL-002 Phase B
 last_update: 2026-06-07T15:50:05Z
-status: DELIVERED — WL-002 Phase B complete; PR pending
+status: DELIVERED — WL-002 Phase B complete (PR #37, auto-merge enabled); next item WL-003
 ---
