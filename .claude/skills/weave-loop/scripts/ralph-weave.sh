@@ -34,8 +34,8 @@ read -r -d '' PROMPT <<EOF || true
 /weave-loop resume from _workspace/HANDOFF.md (external Ralph runner, fresh context). Worktree: $WORKTREE.
 
 1. If _workspace/HANDOFF.md exists, follow session-relay RESUME from it (authoritative signal); else DISCOVER and build _workspace/backlog.md from TASKS.md M1/M3.
-2. Run up to $BUDGET cycles: one item each, dry-run -> apply for destructive steps, VERIFY across the boundary in a FRESH shell (cargo fmt + clippy + test), commit per cycle with subject `weave-loop: WL-NNN <summary>`. Fail-closed; never weaken a guard.
-3. Bootstrap hazard: if a cycle mutates weave's own wire/mux (mcp.rs / store.rs / inject.rs / setup.rs), do NOT depend on the live \`weave\` binary for the handoff heartbeat that cycle. Committed HANDOFF.md is the authoritative resume signal.
+2. Run up to $BUDGET cycles: one item each, dry-run -> apply for destructive steps, VERIFY across the boundary in a FRESH shell (cargo fmt + clippy + test), commit per cycle with subject 'weave-loop: WL-NNN <summary>'. Fail-closed; never weaken a guard.
+3. Bootstrap hazard: if a cycle mutates weave's own wire/mux (mcp.rs / store.rs / inject.rs / setup.rs), do NOT depend on the live 'weave' binary for the handoff heartbeat that cycle. Committed HANDOFF.md is the authoritative resume signal.
 4. Then write EXACTLY ONE sentinel under _workspace/ and stop (do not ScheduleWakeup):
    - DONE (with evidence in the file: cycles_total, items_closed, cargo fmt/clippy/test exits)
    - NEEDS-HUMAN (reason + captured artifact path; human wall only — not a spin)
