@@ -1,0 +1,11 @@
+[package]
+name = "weave-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native multi-mux injector for weave (tmux, zellij, kitty, wezterm, screen)"
+
+[dependencies]
+weave-core = { path = "../weave-core", default-features = false }
+anyhow = "1.0.102"

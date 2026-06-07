@@ -733,7 +733,7 @@ fn binary_rejects_unknown_subcommand() {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle hooks (weave hook session|prompt|stop) — the Claude Code integration.
+// Lifecycle hooks (weave hook session|prompt|stop|wake) — the Claude Code integration.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -808,6 +808,60 @@ fn hook_stop_peeks_and_does_not_consume() {
     assert!(outp.contains("stoppayload"));
     let (_o, outp2, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/beta"}"#);
     assert!(!outp2.contains("stoppayload"), "prompt consumed it");
+}
+
+#[test]
+fn hook_wake_blocks_once_then_rearms_after_drain() {
+    let db = TestDb::new();
+    run_hook(&db, "session", r#"{"cwd":"/proj/gamma"}"#);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "x",
+            "--to",
+            "gamma",
+            "--body",
+            "wakepayload",
+        ],
+    );
+
+    // Wake emits a structured block response the first time.
+    let (_o1, out1, _e1) = run_hook(&db, "wake", r#"{"cwd":"/proj/gamma"}"#);
+    assert!(
+        out1.contains("\"decision\":\"block\"") && out1.contains("wakepayload"),
+        "wake should block and include the unread body: {out1}"
+    );
+
+    // Repeated wake is silent until the unread backlog is drained.
+    let (_o2, out2, _e2) = run_hook(&db, "wake", r#"{"cwd":"/proj/gamma"}"#);
+    assert!(
+        out2.trim().is_empty(),
+        "second wake should be silent after the ack: {out2}"
+    );
+
+    // Prompt drains and marks read, so a newer message can wake again.
+    let (_op, prompt_out, _ep) = run_hook(&db, "prompt", r#"{"cwd":"/proj/gamma"}"#);
+    assert!(prompt_out.contains("wakepayload"));
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "x",
+            "--to",
+            "gamma",
+            "--body",
+            "wakepayload2",
+        ],
+    );
+    let (_o3, out3, _e3) = run_hook(&db, "wake", r#"{"cwd":"/proj/gamma"}"#);
+    assert!(
+        out3.contains("\"decision\":\"block\"") && out3.contains("wakepayload2"),
+        "wake should re-arm for newer unread work: {out3}"
+    );
 }
 
 #[test]

@@ -75,6 +75,10 @@ const SCHEMA: &[&str] = &[
         ts         INTEGER NOT NULL,
         PRIMARY KEY (message_id, reader)
     )",
+    "CREATE TABLE IF NOT EXISTS wake_acks (
+        reader  TEXT PRIMARY KEY,
+        last_id INTEGER NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS peers (
         name        TEXT PRIMARY KEY,
         mux         TEXT NOT NULL,
@@ -562,6 +566,19 @@ impl LibsqlStore {
                     .context("adding description_ts column")?;
                 }
             }
+            // Migration (P5): the wake-hook watermark table. Tracks the last
+            // unread message id that triggered a block for each reader. Created
+            // via SCHEMA above for a fresh DB; also created idempotently here for
+            // a DB that predates wake. Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS wake_acks (
+                    reader  TEXT PRIMARY KEY,
+                    last_id INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating wake_acks table")?;
             // Migration (#7): the multi-key `identity_keys` registry. A DB created
             // before multi-key support lacks the table; create it idempotently
             // (mirrors SqliteStore::migrate) and one-time-copy the legacy single-key
@@ -1343,8 +1360,32 @@ impl Store for LibsqlStore {
             };
             tx.execute("DELETE FROM messages", ()).await?;
             tx.execute("DELETE FROM reads", ()).await?;
+            tx.execute("DELETE FROM wake_acks", ()).await?;
             tx.commit().await?;
             Ok(n)
+        })
+    }
+
+    fn peek_oldest_unread(&self, me: &str) -> Result<Option<Message>> {
+        self.block_on_bounded(async { peek_oldest_unread_on(&self.conn, me).await })
+    }
+
+    fn wake_last_acked(&self, me: &str) -> Result<i64> {
+        self.block_on_bounded(async { wake_last_acked_on(&self.conn, me).await })
+    }
+
+    fn set_wake_ack(&self, me: &str, id: i64) -> Result<()> {
+        self.guard_writable()?;
+        check_ident("peer name", me)?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO wake_acks (reader, last_id) VALUES (?1,?2)
+                     ON CONFLICT(reader) DO UPDATE SET last_id=?2",
+                    params(vec![me.into(), id.into()]),
+                )
+                .await?;
+            Ok(())
         })
     }
 
@@ -3086,6 +3127,34 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
         bc = BROADCAST_SQL
     );
     let mut it = conn.query(&sql, params(vec![me.into()])).await?;
+    match it.next().await? {
+        Some(r) => Ok(r.get::<i64>(0)?),
+        None => Ok(0),
+    }
+}
+
+async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
+    let sql = format!(
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages m
+         WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
+         ORDER BY m.id ASC LIMIT 1",
+        bc = BROADCAST_SQL
+    );
+    let mut it = conn.query(&sql, params(vec![me.into()])).await?;
+    match it.next().await? {
+        Some(r) => Ok(Some(row_to_message(&r)?)),
+        None => Ok(None),
+    }
+}
+
+async fn wake_last_acked_on(conn: &Connection, me: &str) -> Result<i64> {
+    let mut it = conn
+        .query(
+            "SELECT COALESCE(last_id, 0) FROM wake_acks WHERE reader = ?1",
+            params(vec![me.into()]),
+        )
+        .await?;
     match it.next().await? {
         Some(r) => Ok(r.get::<i64>(0)?),
         None => Ok(0),

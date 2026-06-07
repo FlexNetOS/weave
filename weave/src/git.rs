@@ -13,7 +13,7 @@
 //!    `.git` *directory* → the canonical id is the literal `"(main)"` sentinel.
 //!
 //! 2. **argv `git` FALLBACK** for branch + repo name: spawn the TRUSTED absolute
-//!    `git` (resolved via [`crate::inject::resolve_trusted`], the same trusted-dir
+//!    `git` (resolved via [`weave_inject::resolve_trusted`], the same trusted-dir
 //!    discipline the injector uses) with an **explicit argv** vector, a wall-clock
 //!    timeout, and `Stdio::null()` stderr — exactly like `inject::run_capture`.
 //!    NEVER `sh -c`, never a built command string: cwd/repo/branch text never
@@ -32,20 +32,7 @@ use std::time::Duration;
 /// injector's bounded-probe discipline.
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The three descriptive session tags captured from a cwd's git state. Pure data
-/// (no I/O); the store bounds each field on write.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorktreeTags {
-    /// Repo name = basename of the git toplevel. Empty when non-git / unknown.
-    pub repo: String,
-    /// Current branch (`rev-parse --abbrev-ref HEAD`). Empty when detached /
-    /// non-git / unknown.
-    pub branch: String,
-    /// Canonical worktree id: the `<name>` of `.git/worktrees/<name>` for a linked
-    /// worktree, the `"(main)"` sentinel for a main worktree, or `""` when the cwd
-    /// is not a git repo at all.
-    pub worktree_id: String,
-}
+pub use weave_core::model::WorktreeTags;
 
 /// Extract the canonical worktree id `<name>` from the contents of a *linked*
 /// worktree's `.git` FILE, which git writes as a single line:
@@ -214,7 +201,7 @@ fn git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
 
     // Resolve `git` to a trusted absolute path (never ambient $PATH); also how
     // tests point at a fake git via WEAVE_MUX_DIR. Absent ⇒ skip the subprocess.
-    let git = crate::inject::resolve_trusted("git")?;
+    let git = weave_inject::resolve_trusted("git")?;
     let mut child = Command::new(&git)
         .args(args)
         .current_dir(cwd)
@@ -323,7 +310,7 @@ branch refs/heads/feat/session-scan-tag
         let dir = std::env::temp_dir().join(format!(
             "weave-git-nongit-{}-{}",
             std::process::id(),
-            crate::model::now()
+            weave_core::model::now()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let tags = capture_worktree_tags(&dir);
@@ -338,7 +325,7 @@ branch refs/heads/feat/session-scan-tag
         let dir = std::env::temp_dir().join(format!(
             "weave-git-linked-{}-{}",
             std::process::id(),
-            crate::model::now()
+            weave_core::model::now()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -357,7 +344,7 @@ branch refs/heads/feat/session-scan-tag
         let dir = std::env::temp_dir().join(format!(
             "weave-git-main-{}-{}",
             std::process::id(),
-            crate::model::now()
+            weave_core::model::now()
         ));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let tags = capture_worktree_tags(&dir);

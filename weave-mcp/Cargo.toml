@@ -1,0 +1,20 @@
+[package]
+name = "weave-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP stdio JSON-RPC server and tool table for weave"
+
+[features]
+default = ["sqlite"]
+sqlite = ["weave-core/sqlite"]
+libsql = ["weave-core/libsql"]
+sign = ["weave-core/sign"]
+
+[dependencies]
+weave-core = { path = "../weave-core", default-features = false }
+weave-inject = { path = "../weave-inject" }
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }

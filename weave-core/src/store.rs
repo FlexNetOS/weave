@@ -84,6 +84,12 @@ pub trait Store: Send {
     fn total_messages(&self) -> Result<i64>;
     fn clear_inbox(&self, me: &str) -> Result<usize>;
     fn clear_all(&self) -> Result<i64>;
+    /// Oldest unread message for `me`, or `None` if the inbox is empty.
+    fn peek_oldest_unread(&self, me: &str) -> Result<Option<Message>>;
+    /// Last unread-message id that triggered a wake block for `me`.
+    fn wake_last_acked(&self, me: &str) -> Result<i64>;
+    /// Advance the wake watermark for `me` to `id`.
+    fn set_wake_ack(&self, me: &str, id: i64) -> Result<()>;
     /// Delete messages (and their read-markers) older than `older_than_secs`.
     /// Returns how many messages were removed. Retention / disk-bound guard.
     fn gc(&self, older_than_secs: i64) -> Result<i64>;
@@ -1095,6 +1101,10 @@ CREATE TABLE IF NOT EXISTS reads (
     ts         INTEGER NOT NULL,
     PRIMARY KEY (message_id, reader)
 );
+CREATE TABLE IF NOT EXISTS wake_acks (
+    reader  TEXT PRIMARY KEY,
+    last_id INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS peers (
     name        TEXT PRIMARY KEY,
     mux         TEXT NOT NULL,
@@ -1383,6 +1393,38 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
     Ok(conn.query_row(&sql, params![me], |r| r.get(0))?)
 }
 
+/// The oldest unread message for `me`, if any. Used by the wake hook to surface
+/// the unread backlog without consuming it.
+#[cfg(feature = "sqlite")]
+fn peek_oldest_unread_conn(conn: &Connection, me: &str) -> Result<Option<Message>> {
+    let sql = format!(
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages m
+         WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
+         ORDER BY m.id ASC LIMIT 1",
+        bc = BROADCAST_SQL
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![me])?;
+    match rows.next()? {
+        Some(r) => Ok(Some(row_to_message(r)?)),
+        None => Ok(None),
+    }
+}
+
+/// Highest unread message id the wake hook has already acknowledged for `me`.
+#[cfg(feature = "sqlite")]
+fn wake_last_acked_conn(conn: &Connection, me: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(last_id, 0) FROM wake_acks WHERE reader = ?1",
+            params![me],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
 #[cfg(feature = "sqlite")]
 fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
     Ok(Peer {
@@ -1505,6 +1547,16 @@ fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE peers ADD COLUMN description_ts INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    // Wake-hook watermark table (P5): tracks the last unread message id that
+    // caused a block for each reader. Created here for legacy DBs that predate
+    // wake; `CREATE TABLE IF NOT EXISTS` is idempotent and the identifiers are
+    // constant.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS wake_acks (
+            reader  TEXT PRIMARY KEY,
+            last_id INTEGER NOT NULL
+        );",
+    )?;
     // Tier-2 tables: present on fresh DBs via SCHEMA, created here for DBs made
     // before cross-store delivery existed. `CREATE TABLE IF NOT EXISTS` is itself
     // idempotent, so this is a clean additive upgrade for a legacy store; the
@@ -2531,8 +2583,26 @@ impl Store for SqliteStore {
     fn clear_all(&self) -> Result<i64> {
         let n = self.total_messages()?;
         self.conn
-            .execute_batch("DELETE FROM messages; DELETE FROM reads;")?;
+            .execute_batch("DELETE FROM messages; DELETE FROM reads; DELETE FROM wake_acks;")?;
         Ok(n)
+    }
+
+    fn peek_oldest_unread(&self, me: &str) -> Result<Option<Message>> {
+        peek_oldest_unread_conn(&self.conn, me)
+    }
+
+    fn wake_last_acked(&self, me: &str) -> Result<i64> {
+        wake_last_acked_conn(&self.conn, me)
+    }
+
+    fn set_wake_ack(&self, me: &str, id: i64) -> Result<()> {
+        check_ident("peer name", me)?;
+        self.conn.execute(
+            "INSERT INTO wake_acks (reader, last_id) VALUES (?1,?2)
+             ON CONFLICT(reader) DO UPDATE SET last_id=?2",
+            params![me, id],
+        )?;
+        Ok(())
     }
 
     fn gc(&self, older_than_secs: i64) -> Result<i64> {
