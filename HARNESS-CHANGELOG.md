@@ -11,6 +11,7 @@ git-tracked commit on `harness/weave-loop`. (Per HARNESS-UPGRADE-KIT §9.)
 | 2026-06-06 | (this) | `.claude/agents/continuity-steward.md` | Offload cold-start `HANDOFF.md` to a fresh agent. |
 | 2026-06-06 | (this) | `.claude/commands/weave-loop.md` | `/weave-loop resume from _workspace/HANDOFF.md` slash command. |
 | 2026-06-06 | (this) | `.claude/skills/weave-loop/scripts/ralph-weave.sh` + `README.md` | External `/new` runner; SAFE default, `WEAVE_APPLY=1` opt-in, `STOP`/`MAX_ITERS` backstops. |
+| 2026-06-07 | (this) | `.claude/skills/weave-loop/scripts/ralph-weave.sh` + `README.md` | Coordinated logged-in Kimi Code K2.6 session (`kimi-legacy -r 3c6e...`) preflight/review around Ollama Cloud MiniMax implementation passes. |
 
 ## Bootstrap hazard (single rule, repeated)
 

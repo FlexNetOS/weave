@@ -5,6 +5,11 @@ target/
 # Note: backlog.md / loop_state.md / HANDOFF.md are git-tracked — they're the
 # durable on-disk truth. Only the per-run artifacts are ignored.
 _workspace/*.log
+_workspace/kimi-plan-*.md
+_workspace/kimi-plan-latest.md
+_workspace/kimi-review-*.md
+_workspace/kimi-review-latest.md
+_workspace/kimi-*.err
 _workspace/STOP
 _workspace/DONE
 _workspace/NEEDS-HUMAN
