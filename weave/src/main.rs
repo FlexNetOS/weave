@@ -92,7 +92,11 @@ fn long_version() -> &'static str {
 fn parse_mux_preference(cfg: &Config) -> Option<weave_inject::Mux> {
     cfg.mux_preference().and_then(|s| {
         let m = inject::Mux::parse(s);
-        if m == inject::Mux::None { None } else { Some(m) }
+        if m == inject::Mux::None {
+            None
+        } else {
+            Some(m)
+        }
     })
 }
 
