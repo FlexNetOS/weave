@@ -19,7 +19,8 @@ use std::process::Command;
 const HOOKS: &[(&str, &str)] = &[
     ("SessionStart", "session"),
     ("UserPromptSubmit", "prompt"),
-    ("Stop", "stop"),
+    ("Stop", "wake"),
+    ("SubagentStop", "wake"),
 ];
 
 fn home() -> PathBuf {
@@ -270,12 +271,12 @@ fn hook_command(exe: &str, arg: &str) -> String {
 
 /// True iff `prefix` (the text that precedes `weave hook <event>` in an UNQUOTED
 /// command) names weave's binary via a clean path component, i.e. either:
-///   * empty            → bare `weave hook stop`, or
-///   * a clean absolute path ending in `/` → `/home/u/.cargo/bin/weave hook stop`.
+///   * empty            → bare `weave hook wake`, or
+///   * a clean absolute path ending in `/` → `/home/u/.cargo/bin/weave hook wake`.
 ///
 /// We reject anything containing shell operators (`&&`, `;`, `|`) or interior
-/// whitespace runs so a crafted hook like `echo x && /weave hook stop` or
-/// `: ;/weave hook stop` is never mistaken for ours. A clean absolute path starts
+/// whitespace runs so a crafted hook like `echo x && /weave hook wake` or
+/// `: ;/weave hook wake` is never mistaken for ours. A clean absolute path starts
 /// with `/`, ends with `/`, and contains no whitespace or shell metacharacters.
 fn is_clean_unquoted_prefix(prefix: &str) -> bool {
     if prefix.is_empty() {
@@ -314,7 +315,7 @@ fn is_shellish(c: char) -> bool {
 }
 
 /// True if this command string is one of weave's own hooks, i.e. exactly
-/// `<exe> hook <session|prompt|stop>` where `<exe>`'s basename is `weave`.
+/// `<exe> hook <session|prompt|stop|wake>` where `<exe>`'s basename is `weave`.
 ///
 /// Two installed shapes are recognized so uninstall/idempotency keep working
 /// across versions:
@@ -328,7 +329,7 @@ fn is_shellish(c: char) -> bool {
 /// a shell-operator-free absolute path. See [`is_clean_unquoted_prefix`].
 fn is_weave_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
-    ["session", "prompt", "stop"].iter().any(|event| {
+    ["session", "prompt", "stop", "wake"].iter().any(|event| {
         // Quoted form: '<exe>' hook <event>, where <exe> ends in (…/)weave.
         let quoted_suffix = format!("weave' hook {event}");
         if let Some(prefix) = cmd.strip_suffix(&quoted_suffix) {
@@ -353,7 +354,7 @@ fn is_weave_command(cmd: &str) -> bool {
 
 /// Validate the path that appears inside the single quotes of the quoted hook
 /// form, i.e. the text between the opening `'` and the literal `weave` token
-/// (e.g. `/home/u/.cargo/bin/` or `` for a bare `'weave' hook stop`). It must be
+/// (e.g. `/home/u/.cargo/bin/` or `` for a bare `'weave' hook wake`). It must be
 /// empty or an absolute path ending in `/`, with no embedded single quote (an
 /// unescaped `'` would have closed the quoting, so a `'\''` escape inside a real
 /// exe path is intentionally not recognized here — such a path cannot be a clean
@@ -518,7 +519,7 @@ mod tests {
     fn matches_only_real_weave_hooks() {
         // Legacy UNQUOTED form (written by older weave) still recognized.
         assert!(is_weave_command("weave hook session"));
-        assert!(is_weave_command("/home/u/.cargo/bin/weave hook stop"));
+        assert!(is_weave_command("/home/u/.cargo/bin/weave hook wake"));
         assert!(is_weave_command("/usr/local/bin/weave hook prompt"));
         // must NOT match look-alikes
         assert!(!is_weave_command("/usr/bin/myweave hook session"));
@@ -531,10 +532,10 @@ mod tests {
     fn matches_current_quoted_form() {
         // Current QUOTED form (T2): '<exe>' hook <event>.
         assert!(is_weave_command("'weave' hook session"));
-        assert!(is_weave_command("'/home/u/.cargo/bin/weave' hook stop"));
+        assert!(is_weave_command("'/home/u/.cargo/bin/weave' hook wake"));
         assert!(is_weave_command("'/usr/local/bin/weave' hook prompt"));
         // A path with a space is legitimate INSIDE the quotes.
-        assert!(is_weave_command("'/home/u/My Projects/weave' hook stop"));
+        assert!(is_weave_command("'/home/u/My Projects/weave' hook wake"));
         // Quoted look-alikes must NOT match.
         assert!(!is_weave_command("'/usr/bin/myweave' hook session"));
         assert!(!is_weave_command("'weave' mcp"));
@@ -545,17 +546,17 @@ mod tests {
     fn rejects_unquoted_prefixes_with_shell_operators_or_whitespace() {
         // T3: an unquoted prefix containing shell operators or whitespace must be
         // rejected even though it ends in `weave hook <event>`.
-        assert!(!is_weave_command("echo x && /weave hook stop"));
-        assert!(!is_weave_command(": ;/weave hook stop"));
-        assert!(!is_weave_command("a | /usr/bin/weave hook stop"));
-        assert!(!is_weave_command("/usr/bin/ weave hook stop")); // interior whitespace
-        assert!(!is_weave_command("rm -rf /; weave hook stop"));
-        assert!(!is_weave_command("/opt/$X/weave hook stop")); // variable expansion
-        assert!(!is_weave_command("/opt//weave hook stop")); // empty path component
-        assert!(!is_weave_command("relative/path/weave hook stop")); // not absolute
+        assert!(!is_weave_command("echo x && /weave hook wake"));
+        assert!(!is_weave_command(": ;/weave hook wake"));
+        assert!(!is_weave_command("a | /usr/bin/weave hook wake"));
+        assert!(!is_weave_command("/usr/bin/ weave hook wake")); // interior whitespace
+        assert!(!is_weave_command("rm -rf /; weave hook wake"));
+        assert!(!is_weave_command("/opt/$X/weave hook wake")); // variable expansion
+        assert!(!is_weave_command("/opt//weave hook wake")); // empty path component
+        assert!(!is_weave_command("relative/path/weave hook wake")); // not absolute
                                                                      // The bare and clean-absolute forms remain accepted.
-        assert!(is_weave_command("weave hook stop"));
-        assert!(is_weave_command("/opt/bin/weave hook stop"));
+        assert!(is_weave_command("weave hook wake"));
+        assert!(is_weave_command("/opt/bin/weave hook wake"));
     }
 
     #[test]
@@ -569,8 +570,8 @@ mod tests {
     #[test]
     fn hook_command_quotes_and_round_trips() {
         // Plain path.
-        let cmd = hook_command("/home/u/.cargo/bin/weave", "stop");
-        assert_eq!(cmd, "'/home/u/.cargo/bin/weave' hook stop");
+        let cmd = hook_command("/home/u/.cargo/bin/weave", "wake");
+        assert_eq!(cmd, "'/home/u/.cargo/bin/weave' hook wake");
         assert!(is_weave_command(&cmd));
 
         // Path with a space — the whole point of quoting.

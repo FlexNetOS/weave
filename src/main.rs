@@ -21,7 +21,7 @@
 //!   weave config init    scaffold a commented ~/.config/weave/config.toml
 //!   weave completions    print a shell completion script (bash|zsh|fish)
 //!   weave man            print a roff man page to stdout
-//!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|notification
+//!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|wake|notification
 
 // The MCP `tools()` registry is a single large `json!([...])` literal; each added
 // tool deepens the `serde_json::json!` macro recursion. Raising the crate recursion
@@ -507,7 +507,7 @@ enum Cmd {
         me: Option<String>,
     },
     /// Explicitly set this session's turn-state (P5). Normally hook-auto via
-    /// `weave hook session|prompt|stop|notification`; this is the manual override.
+    /// `weave hook session|prompt|stop|wake`; this is the manual override.
     /// Self-only. Valid states: pending_first_turn|working|awaiting_input|idle.
     Status {
         /// turn-state label (pending_first_turn|working|awaiting_input|idle)
@@ -515,7 +515,7 @@ enum Cmd {
         #[arg(long)]
         me: Option<String>,
     },
-    /// Claude Code lifecycle hook: session|prompt|stop|notification (reads JSON on stdin).
+    /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
     Hook { event: String },
 }
 
@@ -3969,6 +3969,39 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             };
             set_turn_state_best_effort(store, &me, next);
         }
+        "wake" => {
+            // Wake is a non-consuming guard. When we cannot trust the resolved
+            // identity, do not mutate the wake watermark for a guessed peer.
+            if !explicit_identity {
+                eprintln!(
+                    "[weave] no explicit session identity (set WEAVE_SESSION or config `session`); \
+                     skipping wake block for guessed '{me}'"
+                );
+            } else {
+                try_pull(store, cfg, &me);
+                match store.peek_oldest_unread(&me) {
+                    Ok(Some(msg)) => match store.wake_last_acked(&me) {
+                        Ok(acked) if msg.id > acked => {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "decision": "block",
+                                    "reason": wake_reason(&msg),
+                                    "suppressOutput": true,
+                                })
+                            );
+                            if let Err(e) = store.set_wake_ack(&me, msg.id) {
+                                eprintln!("[weave] wake ack update skipped (non-fatal): {e}");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[weave] wake ack lookup skipped (non-fatal): {e}"),
+                    },
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[weave] wake peek skipped (non-fatal): {e}"),
+                }
+            }
+        }
         // Notification: the agent's prompt is live + unconsumed (awaiting input).
         // This arm has no drain — just the best-effort turn_state setter.
         "notification" => {
@@ -3986,6 +4019,18 @@ fn set_turn_state_best_effort(store: &dyn Store, me: &str, state: model::TurnSta
     if let Err(e) = store.set_turn_state(me, state.as_str()) {
         eprintln!("[weave] turn_state update skipped (non-fatal): {e}");
     }
+}
+
+fn wake_reason(msg: &model::Message) -> String {
+    let subj = msg
+        .subject
+        .as_ref()
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    format!(
+        "unread message #{} from {}{}: {}",
+        msg.id, msg.sender, subj, msg.body
+    )
 }
 
 #[cfg(test)]

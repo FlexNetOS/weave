@@ -2599,7 +2599,7 @@ fn tools() -> Value {
         },
         {
             "name": "weave_set_turn_state",
-            "description": "Explicitly set YOUR OWN turn-state (P5 rich presence). Normally hook-auto via `weave hook session|prompt|stop|notification`; this is the manual override. Self-only. An invalid state is an error.",
+            "description": "Explicitly set YOUR OWN turn-state (P5 rich presence). Normally hook-auto via `weave hook session|prompt|stop|wake`; this is the manual override. Self-only. An invalid state is an error.",
             "inputSchema": {"type":"object","properties":{
                 "state":{"type":"string","enum":["pending_first_turn","working","awaiting_input","idle"],"description":"The turn-state to set."},
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
