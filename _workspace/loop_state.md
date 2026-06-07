@@ -7,5 +7,5 @@ worktree: /home/drdave/Desktop/meta/weave
 branch: feat/workspace-split
 last_item: WL-001
 last_update: 2026-06-07T05:40:54Z
-status: VERIFIER GREEN — WL-001 workspace split ready for guardian review
+status: NEEDS-HUMAN — auto-merge disabled on repo; PR #30 awaits human squash-merge
 ---
