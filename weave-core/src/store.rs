@@ -7,7 +7,7 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    now, Ask, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
+    now, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
     JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
 };
 use anyhow::Result;
@@ -373,12 +373,15 @@ pub trait Store: Send {
     /// `allow(dead_code)`: weave is a binary crate, so a `pub` trait method whose
     /// only callers are tests / CLI / MCP arms is otherwise flagged unused.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn ask(
         &self,
         asker: &str,
         askee: &str,
         subject: Option<&str>,
         body: &str,
+        kind: AskKind,
+        options: Option<&str>,
         reply_to: Option<&str>,
     ) -> Result<(String, i64)>;
 
@@ -1210,6 +1213,8 @@ CREATE TABLE IF NOT EXISTS asks (
     askee           TEXT NOT NULL,
     subject         TEXT,
     state           TEXT NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'free_text',
+    options         TEXT,
     reply_to        TEXT,
     close_note      TEXT,
     opened_ts       INTEGER NOT NULL,
@@ -1321,6 +1326,8 @@ fn row_to_ask(r: &Row) -> rusqlite::Result<Ask> {
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
         )
     })?;
+    let kind_str: String = r.get("kind")?;
+    let kind = AskKind::from_str(&kind_str);
     Ok(Ask {
         id: r.get("id")?,
         question_msg_id: r.get("question_msg_id")?,
@@ -1329,6 +1336,8 @@ fn row_to_ask(r: &Row) -> rusqlite::Result<Ask> {
         askee: r.get("askee")?,
         subject: r.get("subject")?,
         state,
+        kind,
+        options: r.get("options").unwrap_or(None),
         reply_to: r.get("reply_to")?,
         close_note: r.get("close_note")?,
         opened_ts: r.get("opened_ts")?,
@@ -1408,15 +1417,17 @@ fn insert_ask_row(
     asker: &str,
     askee: &str,
     subject: Option<&str>,
+    kind: &str,
+    options: Option<&str>,
     reply_to: Option<&str>,
     parent_id: Option<&str>,
     ts: i64,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO asks
-            (id, question_msg_id, answer_msg_id, asker, askee, subject, state,
-             reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL, ?9)",
+            (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+             options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, NULL, ?11)",
         params![
             id,
             question_msg_id,
@@ -1424,6 +1435,8 @@ fn insert_ask_row(
             askee,
             subject,
             AskState::Open.as_str(),
+            kind,
+            options,
             reply_to,
             ts,
             parent_id,
@@ -1704,6 +1717,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     // Idempotent: the `column_exists` guard makes a re-run a no-op.
     if !column_exists(conn, "asks", "parent_id")? {
         conn.execute_batch("ALTER TABLE asks ADD COLUMN parent_id TEXT;")?;
+    }
+    // WL-015: structured ask kinds + options. Guarded additive migration.
+    if !column_exists(conn, "asks", "kind")? {
+        conn.execute_batch("ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'free_text';")?;
+    }
+    if !column_exists(conn, "asks", "options")? {
+        conn.execute_batch("ALTER TABLE asks ADD COLUMN options TEXT;")?;
     }
     // ask_groups (P2): the ask-many PARENT anchor — the canonical question/opener +
     // post-dedup target_count for a fanned question. Created here for DBs that predate
@@ -3219,6 +3239,8 @@ impl Store for SqliteStore {
         askee: &str,
         subject: Option<&str>,
         body: &str,
+        kind: AskKind,
+        options: Option<&str>,
         reply_to: Option<&str>,
     ) -> Result<(String, i64)> {
         check_ident("asker", asker)?;
@@ -3325,6 +3347,8 @@ impl Store for SqliteStore {
             asker,
             askee,
             subject_owned.as_deref(),
+            kind.as_str(),
+            options,
             chained.as_ref().map(|(_, rt)| rt.as_str()),
             None,
             ts,
@@ -3434,8 +3458,8 @@ impl Store for SqliteStore {
         let ask = self
             .conn
             .query_row(
-                "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state,
-                        reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
+                "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                        options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
                  FROM asks WHERE id = ?1",
                 params![correlation_id],
                 row_to_ask,
@@ -3453,8 +3477,8 @@ impl Store for SqliteStore {
             AskRole::Any => "(asker = ?1 OR askee = ?1)",
         };
         let sql = format!(
-            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state,
-                    reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
+            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                    options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
              FROM asks WHERE {where_clause}
              ORDER BY opened_ts DESC, rowid DESC LIMIT ?2"
         );
@@ -3573,6 +3597,8 @@ impl Store for SqliteStore {
                 asker,
                 peer,
                 subject,
+                AskKind::FreeText.as_str(),
+                None,
                 None,
                 Some(&parent_id),
                 ts,
@@ -4337,7 +4363,17 @@ mod tests {
     #[test]
     fn ask_open_answer_ack_roundtrip() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", Some("help"), "what time?", None).unwrap();
+        let (cid, qid) = s
+            .ask(
+                "a",
+                "b",
+                Some("help"),
+                "what time?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(crate::model::ask_id_valid(&cid));
         // The question landed in b's inbox.
         let (b_in, _) = s.inbox("b", false, false, 50).unwrap();
@@ -4370,7 +4406,9 @@ mod tests {
     #[test]
     fn ask_lifecycle_is_monotonic() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         s.ack("b", &cid, None).unwrap();
         // Double-ack rejected.
         assert!(s.ack("b", &cid, None).is_err());
@@ -4385,15 +4423,21 @@ mod tests {
     #[test]
     fn ask_owner_checks_and_caps() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         // Only the askee can answer/ack.
         assert!(s.answer("a", &cid, "self").is_err());
         assert!(s.ack("a", &cid, None).is_err());
         // Broadcast askee rejected (point-to-point only).
-        assert!(s.ask("a", "all", None, "q", None).is_err());
+        assert!(s
+            .ask("a", "all", None, "q", AskKind::FreeText, None, None)
+            .is_err());
         // Oversized body rejected.
         let big = "x".repeat(MAX_BODY + 1);
-        assert!(s.ask("a", "b", None, &big, None).is_err());
+        assert!(s
+            .ask("a", "b", None, &big, AskKind::FreeText, None, None)
+            .is_err());
         // Invalid correlation id rejected before any DB bind.
         assert!(s.answer("b", "ask;rm -rf", "x").is_err());
         assert!(s.get_ask("bad id").is_err());
@@ -4402,10 +4446,30 @@ mod tests {
     #[test]
     fn ask_reply_to_chains_and_closes_prior() {
         let s = mem();
-        let (c1, q1) = s.ask("a", "b", Some("topic"), "first?", None).unwrap();
+        let (c1, q1) = s
+            .ask(
+                "a",
+                "b",
+                Some("topic"),
+                "first?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         s.answer("b", &c1, "first-ans").unwrap();
         // Chain a new ask off c1: it closes c1 and links to c1's last message.
-        let (c2, q2) = s.ask("a", "b", None, "second?", Some(&c1)).unwrap();
+        let (c2, q2) = s
+            .ask(
+                "a",
+                "b",
+                None,
+                "second?",
+                AskKind::FreeText,
+                None,
+                Some(&c1),
+            )
+            .unwrap();
         let prior = s.get_ask(&c1).unwrap().unwrap();
         assert_eq!(prior.state, AskState::Acked, "chaining acks the prior");
         let new_ask = s.get_ask(&c2).unwrap().unwrap();
@@ -4414,14 +4478,28 @@ mod tests {
         let thread = s.thread(q1, 50).unwrap();
         assert!(thread.iter().any(|m| m.id == q2), "q2 is in q1's thread");
         // reply_to to a nonexistent prior ask errors.
-        assert!(s.ask("a", "b", None, "x", Some("ask_404_1")).is_err());
+        assert!(s
+            .ask(
+                "a",
+                "b",
+                None,
+                "x",
+                AskKind::FreeText,
+                None,
+                Some("ask_404_1")
+            )
+            .is_err());
     }
 
     #[test]
     fn list_asks_role_filtering() {
         let s = mem();
-        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
-        let (c2, _) = s.ask("b", "a", None, "q2", None).unwrap();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
+        let (c2, _) = s
+            .ask("b", "a", None, "q2", AskKind::FreeText, None, None)
+            .unwrap();
         let as_asker = s.list_asks("a", AskRole::Asker, 50).unwrap();
         assert_eq!(as_asker.len(), 1);
         assert_eq!(as_asker[0].id, c1);
@@ -4437,7 +4515,9 @@ mod tests {
     #[test]
     fn has_open_asks_true_only_for_open_askee() {
         let s = mem();
-        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
         assert!(s.has_open_asks("b").unwrap(), "b is askee of an open ask");
         assert!(!s.has_open_asks("a").unwrap(), "a is asker, not askee");
         assert!(!s.has_open_asks("z").unwrap(), "z has no asks at all");
@@ -4454,7 +4534,8 @@ mod tests {
     fn list_asks_is_bounded() {
         let s = mem();
         for _ in 0..5 {
-            s.ask("a", "b", None, "q", None).unwrap();
+            s.ask("a", "b", None, "q", AskKind::FreeText, None, None)
+                .unwrap();
         }
         // An absurd request is clamped to MAX_LIMIT (never unbounded).
         let huge = s.list_asks("a", AskRole::Any, i64::MAX).unwrap();
@@ -4473,7 +4554,9 @@ mod tests {
     #[test]
     fn ask_for_message_resolves_both_ends() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, qid) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         let aid = s.answer("b", &cid, "a").unwrap();
         assert_eq!(
             s.ask_for_message(qid).unwrap().as_deref(),
@@ -4532,7 +4615,9 @@ mod tests {
                 s.list_asks("a", AskRole::Any, 50).unwrap().is_empty(),
                 "asks table created, empty"
             );
-            let (cid, _) = s.ask("a", "b", Some("subj"), "q?", None).unwrap();
+            let (cid, _) = s
+                .ask("a", "b", Some("subj"), "q?", AskKind::FreeText, None, None)
+                .unwrap();
             s.answer("b", &cid, "ans").unwrap();
             s.ack("b", &cid, Some("closed")).unwrap();
             assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);

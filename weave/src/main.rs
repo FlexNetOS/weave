@@ -419,6 +419,12 @@ enum Cmd {
         body: String,
         #[arg(long, allow_hyphen_values = true)]
         subject: Option<String>,
+        /// structured kind: free_text (default), choice, tool_permission
+        #[arg(long)]
+        kind: Option<String>,
+        /// kind-specific payload: newline-separated choices, or tool_name\ntool_args
+        #[arg(long, allow_hyphen_values = true)]
+        options: Option<String>,
         /// prior correlation id this ask chains/closes
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
@@ -1117,6 +1123,66 @@ fn nudge_open_asks(store: &dyn Store, me: &str) {
     match inject::inject_text(&target, "[weave] you have open ask(s) — run weave_asks") {
         Ok(_) => {}
         Err(err) => eprintln!("[weave] open-ask nudge failed (non-fatal): {err}"),
+    }
+}
+
+/// WL-015: render open asks as actionable prompts in the prompt hook stdout.
+/// Printed AFTER the message drain so the recipient sees every unanswered ask
+/// with instructions on how to reply. Best-effort: never blocks the drain.
+fn render_open_asks(store: &dyn Store, me: &str) {
+    let asks = match store.list_asks(me, model::AskRole::Askee, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[weave] open-ask render skipped (non-fatal): {e}");
+            return;
+        }
+    };
+    let open: Vec<_> = asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    for ask in &open {
+        let subj = ask.subject.as_deref().unwrap_or("(no subject)");
+        match ask.kind {
+            model::AskKind::Choice => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                if let Some(ref opts) = ask.options {
+                    for (i, line) in opts.lines().enumerate() {
+                        println!("  {}. {}", i + 1, line);
+                    }
+                }
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"<number>\"",
+                    ask.id
+                );
+            }
+            model::AskKind::ToolPermission => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                if let Some(ref opts) = ask.options {
+                    let mut lines = opts.lines();
+                    if let Some(tool) = lines.next() {
+                        println!("  Tool: {tool}");
+                    }
+                    if let Some(args) = lines.next() {
+                        println!("  Args: {args}");
+                    }
+                }
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"yes\" to approve",
+                    ask.id
+                );
+            }
+            model::AskKind::FreeText => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"<answer>\"",
+                    ask.id
+                );
+            }
+        }
     }
 }
 
@@ -2336,6 +2402,8 @@ fn main() -> Result<()> {
             to,
             body,
             subject,
+            kind,
+            options,
             reply_to,
             from,
         } => {
@@ -2346,8 +2414,19 @@ fn main() -> Result<()> {
                     "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
                 );
             }
-            let (cid, _qid) =
-                store.ask(&from, &to, subject.as_deref(), &body, reply_to.as_deref())?;
+            let ask_kind = kind
+                .as_deref()
+                .map(model::AskKind::parse)
+                .unwrap_or_default();
+            let (cid, _qid) = store.ask(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                ask_kind,
+                options.as_deref(),
+                reply_to.as_deref(),
+            )?;
             // Honest delivery verdict via the caller-side nudge (no store->inject edge).
             let verdict = ask_inject_verdict(store, &cfg, &from, &to, &body);
             println!("opened ask {cid}: {from} -> {to} ({verdict})");
@@ -4188,8 +4267,10 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             };
             set_turn_state_best_effort(store, &me, next);
             // WL-014: remind the recipient of any open asks on every prompt.
+            // WL-015: render open asks as actionable prompts.
             if event == "prompt" {
                 nudge_open_asks(store, &me);
+                render_open_asks(store, &me);
             }
         }
         "wake" => {

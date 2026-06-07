@@ -39,9 +39,9 @@ use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
-    AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job,
-    JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
-    BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    AskKind, AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace,
+    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
+    OrchestratorStatus, Peer, BROADCAST_SQL, MAX_DELIVERY_ROWS,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
@@ -137,6 +137,8 @@ const SCHEMA: &[&str] = &[
         askee           TEXT NOT NULL,
         subject         TEXT,
         state           TEXT NOT NULL,
+        kind            TEXT NOT NULL DEFAULT 'free_text',
+        options         TEXT,
         reply_to        TEXT,
         close_note      TEXT,
         opened_ts       INTEGER NOT NULL,
@@ -297,6 +299,8 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
 fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
     let state_str = r.get::<String>(6)?;
     let state = AskState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+    let kind_str = r.get::<String>(7)?;
+    let kind = AskKind::from_str(&kind_str);
     Ok(Ask {
         id: r.get::<String>(0)?,
         question_msg_id: r.get::<i64>(1)?,
@@ -305,14 +309,16 @@ fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
         askee: r.get::<String>(4)?,
         subject: r.get::<Option<String>>(5)?,
         state,
-        reply_to: r.get::<Option<String>>(7)?,
-        close_note: r.get::<Option<String>>(8)?,
-        opened_ts: r.get::<i64>(9)?,
-        updated_ts: r.get::<i64>(10)?,
-        closed_ts: r.get::<Option<i64>>(11)?,
-        // 13th projected column (P2). Every `get_ask`/`list_asks` projection now
-        // selects `parent_id` last so positional index 12 is always present.
-        parent_id: r.get::<Option<String>>(12)?,
+        kind,
+        options: r.get::<Option<String>>(8)?,
+        reply_to: r.get::<Option<String>>(9)?,
+        close_note: r.get::<Option<String>>(10)?,
+        opened_ts: r.get::<i64>(11)?,
+        updated_ts: r.get::<i64>(12)?,
+        closed_ts: r.get::<Option<i64>>(13)?,
+        // 15th projected column (P2 / WL-015). Every projection selects `parent_id`
+        // last so positional index 14 is always present.
+        parent_id: r.get::<Option<String>>(14)?,
     })
 }
 
@@ -672,6 +678,32 @@ impl LibsqlStore {
                 conn.execute("ALTER TABLE asks ADD COLUMN parent_id TEXT", ())
                     .await
                     .context("adding asks.parent_id column")?;
+            }
+            // WL-015: structured ask kinds + options.
+            let mut kind_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='kind'",
+                    (),
+                )
+                .await?;
+            if kind_it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'free_text'",
+                    (),
+                )
+                .await
+                .context("adding asks.kind column")?;
+            }
+            let mut opt_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='options'",
+                    (),
+                )
+                .await?;
+            if opt_it.next().await?.is_none() {
+                conn.execute("ALTER TABLE asks ADD COLUMN options TEXT", ())
+                    .await
+                    .context("adding asks.options column")?;
             }
             // Migration (P2): the ask-many PARENT anchor table. Created via SCHEMA above
             // for a fresh DB; also created idempotently here for a DB that predates
@@ -2174,6 +2206,8 @@ impl Store for LibsqlStore {
         askee: &str,
         subject: Option<&str>,
         body: &str,
+        kind: AskKind,
+        options: Option<&str>,
         reply_to: Option<&str>,
     ) -> Result<(String, i64)> {
         self.guard_writable()?;
@@ -2284,9 +2318,9 @@ impl Store for LibsqlStore {
             // children share this insert shape with a non-NULL parent_id.
             tx.execute(
                 "INSERT INTO asks \
-                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                     reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL, NULL)",
+                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                     options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, NULL, NULL)",
                 params(vec![
                     id.clone().into(),
                     question_msg_id.into(),
@@ -2294,6 +2328,8 @@ impl Store for LibsqlStore {
                     askee.into(),
                     subject_final.into(),
                     AskState::Open.as_str().into(),
+                    kind.as_str().into(),
+                    options.into(),
                     reply_to_owned.clone().into(),
                     ts.into(),
                 ]),
@@ -2450,8 +2486,8 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                            reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
                      FROM asks WHERE id = ?1",
                     params(vec![correlation_id.into()]),
                 )
@@ -2472,8 +2508,8 @@ impl Store for LibsqlStore {
             AskRole::Any => "(asker = ?1 OR askee = ?1)",
         };
         let sql = format!(
-            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                    reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                    options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
              FROM asks WHERE {where_clause} \
              ORDER BY opened_ts DESC, rowid DESC LIMIT ?2"
         );
@@ -2626,9 +2662,9 @@ impl Store for LibsqlStore {
                 // Same insert shape as the plain `ask`, with the parent_id stamped.
                 tx.execute(
                     "INSERT INTO asks \
-                        (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                         reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
-                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?7, NULL, ?8)",
+                        (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                         options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9, NULL, ?10)",
                     params(vec![
                         cid.clone().into(),
                         question_msg_id.into(),
@@ -2636,6 +2672,8 @@ impl Store for LibsqlStore {
                         peer.clone().into(),
                         subject_owned.clone().into(),
                         AskState::Open.as_str().into(),
+                        AskKind::FreeText.as_str().into(),
+                        Value::Null,
                         ts.into(),
                         parent_id.clone().into(),
                     ]),
@@ -3325,7 +3363,17 @@ mod tests {
     #[test]
     fn ask_open_answer_ack_roundtrip() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", Some("help"), "what time?", None).unwrap();
+        let (cid, qid) = s
+            .ask(
+                "a",
+                "b",
+                Some("help"),
+                "what time?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(crate::model::ask_id_valid(&cid));
         let (b_in, _) = s.inbox("b", false, false, 50).unwrap();
         assert!(b_in.iter().any(|m| m.id == qid && m.sender == "a"));
@@ -3351,7 +3399,9 @@ mod tests {
     #[test]
     fn ask_lifecycle_is_monotonic() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         s.ack("b", &cid, None).unwrap();
         assert!(s.ack("b", &cid, None).is_err());
         assert!(s.answer("b", &cid, "late").is_err());
@@ -3362,12 +3412,18 @@ mod tests {
     #[test]
     fn ask_owner_checks_and_caps() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         assert!(s.answer("a", &cid, "self").is_err());
         assert!(s.ack("a", &cid, None).is_err());
-        assert!(s.ask("a", "all", None, "q", None).is_err());
+        assert!(s
+            .ask("a", "all", None, "q", AskKind::FreeText, None, None)
+            .is_err());
         let big = "x".repeat(crate::store::MAX_BODY + 1);
-        assert!(s.ask("a", "b", None, &big, None).is_err());
+        assert!(s
+            .ask("a", "b", None, &big, AskKind::FreeText, None, None)
+            .is_err());
         assert!(s.answer("b", "ask;rm -rf", "x").is_err());
         assert!(s.get_ask("bad id").is_err());
     }
@@ -3375,9 +3431,29 @@ mod tests {
     #[test]
     fn ask_reply_to_chains_and_closes_prior() {
         let s = mem();
-        let (c1, q1) = s.ask("a", "b", Some("topic"), "first?", None).unwrap();
+        let (c1, q1) = s
+            .ask(
+                "a",
+                "b",
+                Some("topic"),
+                "first?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         s.answer("b", &c1, "first-ans").unwrap();
-        let (c2, q2) = s.ask("a", "b", None, "second?", Some(&c1)).unwrap();
+        let (c2, q2) = s
+            .ask(
+                "a",
+                "b",
+                None,
+                "second?",
+                AskKind::FreeText,
+                None,
+                Some(&c1),
+            )
+            .unwrap();
         assert_eq!(s.get_ask(&c1).unwrap().unwrap().state, AskState::Acked);
         assert_eq!(
             s.get_ask(&c2).unwrap().unwrap().reply_to.as_deref(),
@@ -3385,14 +3461,28 @@ mod tests {
         );
         let thread = s.thread(q1, 50).unwrap();
         assert!(thread.iter().any(|m| m.id == q2));
-        assert!(s.ask("a", "b", None, "x", Some("ask_404_1")).is_err());
+        assert!(s
+            .ask(
+                "a",
+                "b",
+                None,
+                "x",
+                AskKind::FreeText,
+                None,
+                Some("ask_404_1")
+            )
+            .is_err());
     }
 
     #[test]
     fn list_asks_role_filtering() {
         let s = mem();
-        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
-        let (c2, _) = s.ask("b", "a", None, "q2", None).unwrap();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
+        let (c2, _) = s
+            .ask("b", "a", None, "q2", AskKind::FreeText, None, None)
+            .unwrap();
         assert_eq!(s.list_asks("a", AskRole::Asker, 50).unwrap()[0].id, c1);
         assert_eq!(s.list_asks("a", AskRole::Askee, 50).unwrap()[0].id, c2);
         assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 2);
@@ -3402,7 +3492,9 @@ mod tests {
     #[test]
     fn has_open_asks_libsql() {
         let s = mem();
-        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
         assert!(s.has_open_asks("b").unwrap(), "b is askee of an open ask");
         assert!(!s.has_open_asks("a").unwrap(), "a is asker");
         s.answer("b", &c1, "ans").unwrap();
@@ -3414,7 +3506,9 @@ mod tests {
     #[test]
     fn list_asks_bounded_and_ask_for_message_libsql() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, qid) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         let aid = s.answer("b", &cid, "a").unwrap();
         assert_eq!(
             s.ask_for_message(qid).unwrap().as_deref(),
@@ -3455,7 +3549,9 @@ mod tests {
                 ..Config::default()
             };
             let rw = LibsqlStore::open(&cfg).unwrap();
-            let (cid, _) = rw.ask("a", "b", None, "q", None).unwrap();
+            let (cid, _) = rw
+                .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+                .unwrap();
             cid
         };
 
@@ -3465,7 +3561,8 @@ mod tests {
         assert_eq!(ro.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
         // All three mutating ops trap (never a silent foreign write, never a panic).
         assert!(
-            ro.ask("a", "b", None, "intruder", None).is_err(),
+            ro.ask("a", "b", None, "intruder", AskKind::FreeText, None, None)
+                .is_err(),
             "ask through a read-only handle must trap"
         );
         assert!(
@@ -3532,7 +3629,9 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            let (cid, _) = s.ask("a", "b", Some("subj"), "q?", None).unwrap();
+            let (cid, _) = s
+                .ask("a", "b", Some("subj"), "q?", AskKind::FreeText, None, None)
+                .unwrap();
             s.answer("b", &cid, "ans").unwrap();
             s.ack("b", &cid, Some("closed")).unwrap();
             assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);

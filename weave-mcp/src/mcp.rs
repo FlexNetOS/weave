@@ -1911,8 +1911,22 @@ fn tool_ask(
             return Err("'reply_to' is not a valid correlation id.".to_string());
         }
     }
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(model::AskKind::parse)
+        .unwrap_or_default();
+    let options = args.get("options").and_then(|v| v.as_str());
     let (cid, qid) = store
-        .ask(&from, &to, subject.as_deref(), body, reply_to)
+        .ask(
+            &from,
+            &to,
+            subject.as_deref(),
+            body,
+            kind,
+            options,
+            reply_to,
+        )
         .map_err(e)?;
     // P6: queued trace keyed by the QUESTION message id so `weave_delivery <qid>`
     // works uniformly. Best-effort; never sinks the ask.

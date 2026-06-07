@@ -234,6 +234,51 @@ impl AskState {
     }
 }
 
+/// The structured kind of a tracked ask (WL-015). Stored as TEXT in `asks.kind`;
+/// `FreeText` is the default for every legacy/pre-WL-015 row. New variants can be
+/// added without a schema migration because the column is free-form TEXT validated
+/// at the store seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// Plain free-text question (today's default).
+    #[default]
+    FreeText,
+    /// Multiple-choice question; options are stored newline-separated in
+    /// `asks.options`.
+    Choice,
+    /// Tool-use permission request; `options` holds `tool_name\ntool_args`.
+    ToolPermission,
+}
+
+impl AskKind {
+    /// Canonical label stored in `asks.kind`. The only inlined SQL literals are
+    /// derived from this (compile-time constants, never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskKind::FreeText => "free_text",
+            AskKind::Choice => "choice",
+            AskKind::ToolPermission => "tool_permission",
+        }
+    }
+
+    /// Parse a stored kind string. An unknown value falls back to `FreeText` so a
+    /// corrupt/foreign row degrades gracefully rather than blocking reads.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "choice" => AskKind::Choice,
+            "tool_permission" => AskKind::ToolPermission,
+            _ => AskKind::FreeText,
+        }
+    }
+
+    /// Parse a caller-supplied kind string; empty/unknown defaults to `FreeText`
+    /// (the safest superset — never narrows unexpectedly).
+    pub fn parse(s: &str) -> Self {
+        Self::from_str(s.trim().to_ascii_lowercase().as_str())
+    }
+}
+
 /// Which side of an ask a `list_asks` query filters on. `Asker` = asks I opened;
 /// `Askee` = asks addressed to me; `Any` = either. Pure data (no I/O), shared by
 /// the store + the mcp/main consumers.
@@ -279,6 +324,13 @@ pub struct Ask {
     #[serde(default)]
     pub subject: Option<String>,
     pub state: AskState,
+    /// Structured kind of this ask (WL-015). Defaults to `FreeText` for legacy rows.
+    #[serde(default)]
+    pub kind: AskKind,
+    /// Kind-specific payload: newline-separated choices for `Choice`, or
+    /// `tool_name\ntool_args` for `ToolPermission`. `None` for `FreeText`.
+    #[serde(default)]
+    pub options: Option<String>,
     /// Prior ask id this one chains/closes (`None` for a root ask).
     #[serde(default)]
     pub reply_to: Option<String>,
