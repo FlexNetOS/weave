@@ -1,9 +1,10 @@
-closed: 2026-06-07T21:27:00Z
-cycles_total: 12
-items_closed: WL-001, WL-002 Phase A, WL-002 Phase B, WL-003, WL-004, WL-005, WL-006, WL-007, WL-010, WL-011, WL-012, WL-013
+closed: 2026-06-07T22:15:00Z
+cycles_total: 13
+items_closed: WL-001, WL-002 Phase A, WL-002 Phase B, WL-003, WL-004, WL-005, WL-006, WL-007, WL-008, WL-010, WL-011, WL-012, WL-013
 evidence:
   - cargo fmt --all -- --check   -> exit 0
   - cargo clippy --all-targets -- -D warnings     -> exit 0
-  - cargo test --all-targets                   -> 193 passed, 0 failed (sqlite)
+  - cargo test --all-targets                   -> 411 passed, 0 failed (sqlite)
   - cargo clippy --no-default-features --features libsql --all-targets -- -D warnings -> exit 0
-  - cargo test --no-default-features --features libsql -> 379 passed, 0 failed, 1 ignored (libsql)
+  - cargo test --no-default-features --features libsql -> 385 passed, 0 failed, 1 ignored (libsql)
+  - WL-008 feature smoke: connect -> Live, inject/notify/send -> injected/ok delivery trace on live zellij target box
