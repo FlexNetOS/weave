@@ -1,33 +1,14 @@
-# Guardian Review — WL-002 Phase B (MCP daemon tools)
+# Guardian review — WL-010
 
-Reviewer: guardian audit (invariants + drift-guard + docs sync)
-Inputs: uncommitted diff for Phase B, `_workspace/01_planner_plan.md`, Phase B implementer changes, verification report.
+## Invariants audit
+N/A — no source code changes. No shell, no SQL, no store→inject edge, no stdout discipline, no input caps touched.
 
-## Invariants
+## Drift scan
+N/A — no Rust files modified. Only ARCHITECTURE.md, TASKS.md, and backlog.md updated.
 
-| File:line | Rule | Verdict |
-|-----------|------|---------|
-| `weave-mcp/src/mcp.rs` daemon tools | No shell — `kill -0` / `kill -TERM` are argv-only `Command::new("kill")` | PASS |
-| `weave-mcp/src/mcp.rs` | MCP stdout discipline: JSON-RPC responses only; logs via `eprintln!` | PASS |
-| `weave-mcp/src/mcp.rs` | Layering: pidfile logic duplicated in `weave-mcp`; no upward dep on `weave` bin | PASS |
-| All crates | No new default dependency | PASS |
-
-## Drift
-
-No drift — all changes are Rust-native.
-
-## Docs
-
-| Doc | Verdict |
-|-----|---------|
-| `README.md` | PASS — new "Presence daemon" subsection |
-| `ARCHITECTURE.md` | PASS — daemon/presence section added |
-| `docs/TESTING.md` | PASS — daemon lifecycle coverage noted |
-| `CHANGELOG.md` | PASS — Phase B entry present |
+## Docs sync
+- ARCHITECTURE.md §8 now contains the retirement decision callout. Consistent with existing comparison narrative.
+- TASKS.md and backlog.md marked done.
 
 ## Verdict
-
-APPROVE
-
-Phase B preserves all invariants, introduces no drift, and passes the full
-dual-backend gate. Ready for delivery.
+**APPROVE** — documentation-only decision record with zero behavioral impact.

@@ -16,7 +16,7 @@
 - [x] zellij injection: capture `ZELLIJ_PANE_ID`, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one
 - [ ] **Validate live injection on the zellij target box** (no mux on the build host)
 - [ ] Wizard integration: build `weave` in the RTX-5090 image, run `weave setup`
-- [ ] Decide retirement of `mcp-broker` / `repowire` once weave is proven
+- [x] Decide retirement of `mcp-broker` / `repowire` once weave is proven
 
 ## M2 — Storage backend (DONE ✅)
 - [x] Extract a `Store` trait (backend-agnostic; app holds `Box<dyn Store>`)
