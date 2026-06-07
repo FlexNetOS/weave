@@ -3973,18 +3973,30 @@ fn handle_daemon(store: &dyn Store, cfg: &Config, cmd: DaemonCmd) -> Result<()> 
             store::check_ident("name", &name)?;
             let host = config::this_host();
             let pid = std::process::id() as i64;
+            let heartbeat_secs = std::env::var("WEAVE_DAEMON_HEARTBEAT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(15);
+            let evict_secs = std::env::var("WEAVE_DAEMON_EVICT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            let evict_cutoff_secs = std::env::var("WEAVE_DAEMON_EVICT_CUTOFF_SECS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(30);
             let mut last_evict = std::time::Instant::now();
             loop {
                 if let Err(e) = store.heartbeat(&name, &host, Some(pid)) {
                     eprintln!("[weaved] heartbeat error: {e}");
                 }
-                if last_evict.elapsed().as_secs() >= 60 {
-                    if let Err(e) = store.evict_stale_presence(30) {
+                if last_evict.elapsed().as_secs() >= evict_secs {
+                    if let Err(e) = store.evict_stale_presence(evict_cutoff_secs) {
                         eprintln!("[weaved] evict error: {e}");
                     }
                     last_evict = std::time::Instant::now();
                 }
-                std::thread::sleep(std::time::Duration::from_secs(15));
+                std::thread::sleep(std::time::Duration::from_secs(heartbeat_secs));
             }
         }
     }
