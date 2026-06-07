@@ -16,7 +16,7 @@ and the open gaps the user flagged.
 - [!] WL-009: Wizard integration — build `weave` in RTX-5090 image, run `weave setup` (TASKS.md M1). **Blocked:** needs RTX-5090 build environment / image access.
 
 ## M1 — Make it real on the box
-- [ ] WL-010: Decide retirement of `mcp-broker` / `repowire` (TASKS.md M1).
+- [x] WL-010: Decide retirement of `mcp-broker` / `repowire` (TASKS.md M1). Decision recorded in ARCHITECTURE.md §8.
 
 ## M3 — Robustness & reach
 - [ ] WL-011: Optional `weaved` presence daemon — online/offline, lifecycle eviction (TASKS.md M3).

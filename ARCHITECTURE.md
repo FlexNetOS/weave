@@ -1048,6 +1048,12 @@ keep what worked and drop the operational weight.
   **dual-backend additive migration**, **no `store → inject` edge**, and **no new dependency**
   (a `#![recursion_limit = "256"]` compile-time attribute was added for the larger MCP tool
   registry — an attribute, not a crate). Local-mesh only.
+- **Retirement decision (2026-06).** weave has achieved functional parity with repowire
+  (P1–P5) and subsumes mcp-broker's core mailbox semantics. On this box,
+  **mcp-broker and repowire are considered retired**. New work and active automation
+  should target weave exclusively. Runtime coexistence is preserved only where
+  `weave setup` merges hooks rather than clobbering them, so legacy hooks continue to
+  function until manually removed.
 
 ---
 
