@@ -1,2 +1,10 @@
 target/
 /.weave-test/
+
+# weave-loop runtime state (per-run logs, sentinels).
+# Note: backlog.md / loop_state.md / HANDOFF.md are git-tracked — they're the
+# durable on-disk truth. Only the per-run artifacts are ignored.
+_workspace/*.log
+_workspace/STOP
+_workspace/DONE
+_workspace/NEEDS-HUMAN
