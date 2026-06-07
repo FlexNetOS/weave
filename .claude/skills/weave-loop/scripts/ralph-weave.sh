@@ -16,7 +16,7 @@ BUDGET="${WEAVE_BUDGET:-3}"
 MAX_ITERS="${WEAVE_MAX_ITERS:-50}"
 SLEEP_BETWEEN="${WEAVE_SLEEP:-5}"
 MODEL="${WEAVE_MODEL:-minimax-m3:cloud}"
-GUARDIAN_CMD="${WEAVE_GUARDIAN_CMD:-ollama launch claude --model minimax-m3:cloud --}"
+GUARDIAN_CMD="${WEAVE_GUARDIAN_CMD:-}"
 AGENT_CMD="${WEAVE_AGENT_CMD:-claude}"
 AGENT_MODEL_ARGS="${WEAVE_AGENT_MODEL_ARGS:-}"
 APPLY="${WEAVE_APPLY:-0}"
@@ -29,10 +29,22 @@ log(){ printf '[ralph-weave %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 read -r -a GUARDIAN_CMD_ARY <<<"$GUARDIAN_CMD"
 read -r -a AGENT_CMD_ARY <<<"$AGENT_CMD"
 read -r -a AGENT_MODEL_ARGS_ARY <<<"$AGENT_MODEL_ARGS"
-command -v "${AGENT_CMD_ARY[0]}" >/dev/null || { log "FATAL: ${AGENT_CMD_ARY[0]} not on PATH"; exit 1; }
-command -v "${GUARDIAN_CMD_ARY[0]}" >/dev/null || { log "FATAL: ${GUARDIAN_CMD_ARY[0]} not on PATH"; exit 1; }
+command -v "${AGENT_CMD_ARY[0]}" >/dev/null || { log "FATAL: agent '${AGENT_CMD_ARY[0]}' not on PATH"; exit 1; }
 [ -d "$WORKTREE" ]   || { log "FATAL: worktree $WORKTREE not found"; exit 1; }
 [ -f "$WORKTREE/Cargo.toml" ] || { log "FATAL: $WORKTREE/Cargo.toml missing"; exit 1; }
+
+if [ "${WEAVE_SKIP_GUARDIAN:-0}" != "1" ]; then
+  if [ -z "$GUARDIAN_CMD" ]; then
+    log "FATAL: WEAVE_GUARDIAN_CMD is not set."
+    log "       Example: WEAVE_GUARDIAN_CMD='claude --agent guardian'"
+    log "       Or disable the guardian phase by setting WEAVE_SKIP_GUARDIAN=1"
+    exit 1
+  fi
+  command -v "${GUARDIAN_CMD_ARY[0]}" >/dev/null || { log "FATAL: guardian '${GUARDIAN_CMD_ARY[0]}' not on PATH"; exit 1; }
+fi
+
+# Phase C needs `gh` for PR creation / auto-merge.
+command -v gh >/dev/null || { log "FATAL: gh (GitHub CLI) not on PATH"; exit 1; }
 
 APPLY_ARGS=()
 if [ "$APPLY" = "1" ]; then
@@ -150,6 +162,19 @@ while :; do
   [ -f "$WS/DONE" ]        && { log "DONE."; exit 0; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
+  # --- Preflight: ensure a clean slate for this iteration ---
+  # Remove stale reports so a prior iteration's GREEN/APPROVE cannot bleed through
+  # if the current iteration fails to write new ones.
+  rm -f "$WS/03_verifier_report.md" "$WS/04_guardian_review.md"
+
+  # Sanity-check git state: uncommitted changes from a prior crash would confuse Phase A.
+  if [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null | grep -v '^??')" ]; then
+    log "WARNING: worktree has uncommitted changes. Phase A assumes a clean tree."
+    log "         Review manually or stash before continuing."
+    sleep "$SLEEP_BETWEEN"
+    continue
+  fi
+
   # --- Phase A: plan → implement → verify ---
   log "iter $i/$MAX_ITERS — Phase A: plan→implement→verify"
   PHASE_A_PROMPT="${PROMPT_PHASE_A//WORKTREE_PLACEHOLDER/$WORKTREE}"
@@ -159,22 +184,27 @@ while :; do
   [ -f "$WS/STOP" ]        && { log "STOP — halting."; exit 2; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
-  if ! grep -q "GREEN" "$WS/03_verifier_report.md" 2>/dev/null; then
+  if ! grep -qE '^\*\*GREEN\*\*|^GREEN$' "$WS/03_verifier_report.md" 2>/dev/null; then
     log "iter $i — verifier RED or missing. Will retry on next iteration."
     sleep "$SLEEP_BETWEEN"
     continue
   fi
 
   # --- Phase B: MiniMax guardian (review + approve) ---
-  log "iter $i — Phase B: MiniMax guardian review+approve"
-  PHASE_B_PROMPT="${PROMPT_PHASE_B//WORKTREE_PLACEHOLDER/$WORKTREE}"
-  "${GUARDIAN_CMD_ARY[@]}" -p "$PHASE_B_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
-    >>"$WS/ralph-phaseB-$i.log" 2>&1 || log "iter $i Phase B nonzero (continuing from durable state)"
+  if [ "${WEAVE_SKIP_GUARDIAN:-0}" = "1" ]; then
+    log "iter $i — Phase B: SKIP (WEAVE_SKIP_GUARDIAN=1)"
+    echo -e '# Guardian Review\n\n## Verdict\nAPPROVE\n\n(skipped via WEAVE_SKIP_GUARDIAN)' > "$WS/04_guardian_review.md"
+  else
+    log "iter $i — Phase B: MiniMax guardian review+approve"
+    PHASE_B_PROMPT="${PROMPT_PHASE_B//WORKTREE_PLACEHOLDER/$WORKTREE}"
+    "${GUARDIAN_CMD_ARY[@]}" -p "$PHASE_B_PROMPT" "${AGENT_MODEL_ARGS_ARY[@]}" --add-dir "$WORKTREE" "${APPLY_ARGS[@]}" \
+      >>"$WS/ralph-phaseB-$i.log" 2>&1 || log "iter $i Phase B nonzero (continuing from durable state)"
+  fi
 
   [ -f "$WS/STOP" ]        && { log "STOP — halting."; exit 2; }
   [ -f "$WS/NEEDS-HUMAN" ] && { log "NEEDS-HUMAN: $(cat "$WS/NEEDS-HUMAN")"; exit 2; }
 
-  if ! grep -q "APPROVE" "$WS/04_guardian_review.md" 2>/dev/null; then
+  if ! grep -qE '^APPROVE$' "$WS/04_guardian_review.md" 2>/dev/null; then
     log "iter $i — guardian BLOCK. Routing findings to implementer on next iteration."
     sleep "$SLEEP_BETWEEN"
     continue

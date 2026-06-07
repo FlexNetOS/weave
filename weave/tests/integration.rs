@@ -7694,3 +7694,94 @@ fn daemon_lifecycle_start_stop_status() {
         "daemon status after stop: {status2}"
     );
 }
+
+#[test]
+fn daemon_start_is_idempotent() {
+    let db = TestDb::new();
+    let pidfile = db.path.with_extension("pid");
+    let pidfile_str = pidfile.to_string_lossy().into_owned();
+
+    // First start should spawn the daemon.
+    let out1 = run_ok_env(
+        &db,
+        &["daemon", "start"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        out1.contains("started") || out1.contains("running"),
+        "first daemon start: {out1}"
+    );
+
+    // Give the child a moment to write the pidfile.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Second start should be a no-op.
+    let out2 = run_ok_env(
+        &db,
+        &["daemon", "start"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        out2.contains("already running"),
+        "second daemon start should be idempotent: {out2}"
+    );
+
+    // Clean up.
+    let _ = run_ok_env(&db, &["daemon", "stop"], &[("WEAVE_PIDFILE", &pidfile_str)]);
+}
+
+#[test]
+fn daemon_stop_is_idempotent() {
+    let db = TestDb::new();
+    let pidfile = db.path.with_extension("pid");
+    let pidfile_str = pidfile.to_string_lossy().into_owned();
+
+    // Stop when not running is safe.
+    let out1 = run_ok_env(&db, &["daemon", "stop"], &[("WEAVE_PIDFILE", &pidfile_str)]);
+    assert!(
+        out1.contains("not running"),
+        "daemon stop with no pidfile: {out1}"
+    );
+
+    // Start, stop, stop again.
+    run_ok_env(
+        &db,
+        &["daemon", "start"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out2 = run_ok_env(&db, &["daemon", "stop"], &[("WEAVE_PIDFILE", &pidfile_str)]);
+    assert!(out2.contains("stopped"), "daemon stop after start: {out2}");
+
+    let out3 = run_ok_env(&db, &["daemon", "stop"], &[("WEAVE_PIDFILE", &pidfile_str)]);
+    assert!(
+        out3.contains("not running"),
+        "daemon stop after already stopped: {out3}"
+    );
+}
+
+#[test]
+fn daemon_status_cleans_stale_pidfile() {
+    let db = TestDb::new();
+    let pidfile = db.path.with_extension("pid");
+    let pidfile_str = pidfile.to_string_lossy().into_owned();
+
+    // Write a pidfile pointing to a non-existent process.
+    std::fs::write(&pidfile, "999999\n").expect("write fake pidfile");
+
+    // Status should detect the stale pidfile, report stopped, and remove it.
+    let out = run_ok_env(
+        &db,
+        &["daemon", "status"],
+        &[("WEAVE_PIDFILE", &pidfile_str)],
+    );
+    assert!(
+        out.contains("stopped (stale pidfile)"),
+        "daemon status with stale pidfile: {out}"
+    );
+    assert!(
+        !pidfile.exists(),
+        "stale pidfile should be removed after status"
+    );
+}

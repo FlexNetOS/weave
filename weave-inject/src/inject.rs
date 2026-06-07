@@ -123,11 +123,16 @@ impl Mux {
 
 /// Where a session can be injected.
 ///
-/// `socket` is an OPTIONAL kitty remote-control socket address (the value of
-/// `KITTY_LISTEN_ON`, e.g. `unix:/tmp/mykitty` or `tcp:localhost:12345`). It is
-/// empty for every other backend and ignored by them; only kitty's `commands_for`
-/// arm consults it, passing `--to <socket>` so `kitten @` reaches a kitty that was
-/// launched with `--listen-on` rather than relying on the default control path.
+/// `socket` is an OPTIONAL backend-specific auxiliary identifier:
+///   - kitty: remote-control socket address (`KITTY_LISTEN_ON`, e.g.
+///     `unix:/tmp/mykitty` or `tcp:localhost:12345`). Only kitty's `commands_for`
+///     arm consults it, passing `--to <socket>` so `kitten @` reaches a kitty
+///     launched with `--listen-on`.
+///   - zellij: pane id (`ZELLIJ_PANE_ID`, e.g. `13` or `terminal_1`). When
+///     present, `commands_for` passes `--pane-id <socket>` so `write-chars`
+///     hits the correct pane instead of the currently focused one.
+///   - every other backend: empty and ignored.
+///
 /// Defaulting it to empty keeps every existing constructor/caller working unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct Target {
@@ -154,11 +159,10 @@ impl Target {
         Target {
             mux: Mux::parse(&p.mux),
             id: p.target.clone(),
-            // Carry the peer's stored kitty remote-control socket (the value of
-            // KITTY_LISTEN_ON captured at register time) so a cross-session inject
-            // can reach a kitty launched with `--listen-on`. Empty for every other
-            // backend (and for a kitty on its default control path), which keeps the
-            // legacy `kitten @` shaping byte-for-byte unchanged.
+            // Carry the peer's stored auxiliary identifier:
+            //   - kitty: remote-control socket (`KITTY_LISTEN_ON`)
+            //   - zellij: pane id (`ZELLIJ_PANE_ID`)
+            //   - every other backend: empty (ignored).
             socket: p.socket.clone(),
         }
     }
@@ -180,7 +184,9 @@ pub fn detect_target() -> Target {
         return Target {
             mux: Mux::Zellij,
             id,
-            socket: String::new(),
+            // Capture the pane id so injection targets the right pane within
+            // the session; absent it we fall back to the focused pane.
+            socket: nonempty_env("ZELLIJ_PANE_ID").unwrap_or_default(),
         };
     }
     if let Some(id) = nonempty_env("WEZTERM_PANE") {
@@ -300,18 +306,26 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
         // zellij: write the literal chars, then write byte 13 (carriage return).
         // `--` ends option parsing so a body beginning with `-`/`--` is treated as
         // content, not as a flag to `write-chars`.
-        Mux::Zellij => vec![
-            argv(&[
-                "zellij",
-                "--session",
-                id,
-                "action",
-                "write-chars",
-                "--",
-                text,
-            ]),
-            argv(&["zellij", "--session", id, "action", "write", "13"]),
-        ],
+        // When a pane id was captured at registration, pass `--pane-id` so the
+        // text reaches the correct pane instead of whichever pane happens to be
+        // focused in the target session.
+        Mux::Zellij => {
+            let pane = &target.socket;
+            let mut wc = vec!["zellij", "--session", id, "action", "write-chars"];
+            if !pane.is_empty() {
+                wc.push("--pane-id");
+                wc.push(pane);
+            }
+            wc.push("--");
+            wc.push(text);
+            let mut wr = vec!["zellij", "--session", id, "action", "write"];
+            if !pane.is_empty() {
+                wr.push("--pane-id");
+                wr.push(pane);
+            }
+            wr.push("13");
+            vec![argv(&wc), argv(&wr)]
+        }
         // kitty: requires remote control. Match the target window by id; send the
         // text, then a carriage return as a separate send-text. `--` guards against
         // a body beginning with `-` being parsed as a `send-text` option.
@@ -939,6 +953,7 @@ mod tests {
 
     #[test]
     fn zellij_writes_cr() {
+        // No pane-id captured: falls back to the focused pane.
         let c = commands_for(&t(Mux::Zellij, "envctl"), "hi");
         assert_eq!(
             c[0],
@@ -955,6 +970,40 @@ mod tests {
         assert_eq!(
             c[1],
             argv(&["zellij", "--session", "envctl", "action", "write", "13"])
+        );
+    }
+
+    #[test]
+    fn zellij_targets_pane_when_socket_set() {
+        let mut target = t(Mux::Zellij, "envctl");
+        target.socket = "13".into();
+        let c = commands_for(&target, "hi");
+        assert_eq!(
+            c[0],
+            argv(&[
+                "zellij",
+                "--session",
+                "envctl",
+                "action",
+                "write-chars",
+                "--pane-id",
+                "13",
+                "--",
+                "hi"
+            ])
+        );
+        assert_eq!(
+            c[1],
+            argv(&[
+                "zellij",
+                "--session",
+                "envctl",
+                "action",
+                "write",
+                "--pane-id",
+                "13",
+                "13"
+            ])
         );
     }
 
@@ -1276,6 +1325,37 @@ mod tests {
                 "hi"
             ])
         );
+    }
+
+    /// `from_peer` copies a peer's stored zellij pane id (held in `socket`)
+    /// into the Target so cross-session injection targets the correct pane.
+    #[test]
+    fn from_peer_carries_zellij_pane_id() {
+        let p = Peer {
+            name: "z".into(),
+            mux: "zellij".into(),
+            target: "wise-tomato".into(),
+            cwd: None,
+            socket: "terminal_3".into(),
+            last_seen: 0,
+            pid: None,
+            host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: weave_core::model::DEFAULT_CIRCLE.to_string(),
+            role: weave_core::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+        };
+        let target = Target::from_peer(&p);
+        assert_eq!(target.socket, "terminal_3");
+        assert_eq!(target.mux, Mux::Zellij);
+        assert_eq!(target.id, "wise-tomato");
+        let c = commands_for(&target, "hi");
+        assert!(c[0].contains(&"--pane-id".to_string()));
+        assert!(c[0].contains(&"terminal_3".to_string()));
     }
 
     /// `Nudge::Full` injects the body verbatim; `Nudge::Nudge` injects only the

@@ -4119,17 +4119,18 @@ mod federation_tests {
     /// newer row win.
     #[test]
     fn merge_collapses_same_name_host_newer_wins() {
+        let t = now();
         let local = PeerView {
-            peer: peer("prompt_hub", "boxA", now() - 100, None),
+            peer: peer("prompt_hub", "boxA", t - 100, None),
             origin: Origin::Local,
         };
         let foreign = PeerView {
-            peer: peer("prompt_hub", "boxA", now() - 5, None),
+            peer: peer("prompt_hub", "boxA", t - 5, None),
             origin: Origin::Foreign("other.db".to_string()),
         };
         let merged = merge_peer_views(vec![local, foreign]);
         assert_eq!(merged.len(), 1, "same (name,host) collapses to one");
-        assert_eq!(merged[0].peer.last_seen, now() - 5, "newer last_seen wins");
+        assert_eq!(merged[0].peer.last_seen, t - 5, "newer last_seen wins");
     }
 
     /// Different hosts are NOT collapsed: the same name on two machines is two

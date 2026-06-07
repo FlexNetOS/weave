@@ -13,7 +13,7 @@
 ## M1 — Make it real on the box
 - [ ] `weave setup` — auto-register the MCP server (`claude mcp add`) + write Claude hooks (SessionStart→`weave hook session`, UserPromptSubmit→`weave hook prompt`, Stop→`weave hook stop`), merging with existing hooks (rtk, etc.)
 - [ ] Bracketed-paste hardening for tmux: close paste mode with hex `ESC[201~` instead of bare Enter, so injection never triggers a TUI cancel mid-tool-call (repowire's documented bug)
-- [ ] zellij injection: verify `--session <name> action write-chars` targets the right pane (vs focused pane); add `--pane`/focus handling if needed
+- [x] zellij injection: capture `ZELLIJ_PANE_ID`, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one
 - [ ] **Validate live injection on the zellij target box** (no mux on the build host)
 - [ ] Wizard integration: build `weave` in the RTX-5090 image, run `weave setup`
 - [ ] Decide retirement of `mcp-broker` / `repowire` once weave is proven
