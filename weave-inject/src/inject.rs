@@ -171,6 +171,49 @@ impl Target {
 /// Detect the *current* process's injectable target from environment variables
 /// set by the multiplexer/terminal. Probed most- to least-specific.
 pub fn detect_target() -> Target {
+    detect_target_with_preference(None)
+}
+
+/// Detect the current multiplexer target, with an optional preference override.
+///
+/// If `preferred` is `Some(mux)`, check ONLY that mux's env var and return the
+/// corresponding target (or `Target::none()` if the env var is absent).
+/// If `preferred` is `None`, use the normal auto-detection order:
+/// tmux → zellij → wezterm → kitty → screen.
+pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
+    // When a preference is set, check only that mux.
+    if let Some(mux) = preferred {
+        return match mux {
+            Mux::Tmux => nonempty_env("TMUX_PANE").map(|id| Target {
+                mux: Mux::Tmux,
+                id,
+                socket: String::new(),
+            }),
+            Mux::Zellij => nonempty_env("ZELLIJ_SESSION_NAME").map(|id| Target {
+                mux: Mux::Zellij,
+                id,
+                socket: nonempty_env("ZELLIJ_PANE_ID").unwrap_or_default(),
+            }),
+            Mux::Wezterm => nonempty_env("WEZTERM_PANE").map(|id| Target {
+                mux: Mux::Wezterm,
+                id,
+                socket: String::new(),
+            }),
+            Mux::Kitty => nonempty_env("KITTY_WINDOW_ID").map(|id| Target {
+                mux: Mux::Kitty,
+                id,
+                socket: nonempty_env("KITTY_LISTEN_ON").unwrap_or_default(),
+            }),
+            Mux::Screen => nonempty_env("STY").map(|id| Target {
+                mux: Mux::Screen,
+                id,
+                socket: String::new(),
+            }),
+            Mux::None => Some(Target::none()),
+        }
+        .unwrap_or_else(Target::none);
+    }
+
     // Order matters: a process can be inside tmux *and* a terminal; prefer the
     // multiplexer that owns the input line.
     if let Some(id) = nonempty_env("TMUX_PANE") {
@@ -184,8 +227,6 @@ pub fn detect_target() -> Target {
         return Target {
             mux: Mux::Zellij,
             id,
-            // Capture the pane id so injection targets the right pane within
-            // the session; absent it we fall back to the focused pane.
             socket: nonempty_env("ZELLIJ_PANE_ID").unwrap_or_default(),
         };
     }
@@ -200,10 +241,6 @@ pub fn detect_target() -> Target {
         return Target {
             mux: Mux::Kitty,
             id,
-            // kitty only answers remote-control requests when launched with
-            // `--listen-on`; it then exports the address as KITTY_LISTEN_ON.
-            // Capture it so we can pass `--to <socket>`; absent it, `kitten @`
-            // falls back to kitty's default control path (unchanged behavior).
             socket: nonempty_env("KITTY_LISTEN_ON").unwrap_or_default(),
         };
     }
@@ -1620,6 +1657,36 @@ mod tests {
     /// mutation against `trusted_dirs()` reads. N threads × K iterations each take
     /// `weave_core::testenv::lock_env()`, set a UNIQUE `WEAVE_MUX_DIR` via `EnvVarGuard`,
     /// then assert the dir they just set is the FIRST entry of `trusted_dirs()`. With
+    #[test]
+    fn detect_target_with_preference_honors_kitty_over_tmux() {
+        let _lock = weave_core::testenv::lock_env();
+        let _t = weave_core::testenv::EnvVarGuard::set("TMUX_PANE", "%0");
+        let _k = weave_core::testenv::EnvVarGuard::set("KITTY_WINDOW_ID", "42");
+        // Without preference, tmux wins (higher priority).
+        let auto = detect_target_with_preference(None);
+        assert_eq!(auto.mux, Mux::Tmux);
+        // With kitty preference, kitty wins.
+        let pref = detect_target_with_preference(Some(Mux::Kitty));
+        assert_eq!(pref.mux, Mux::Kitty);
+        assert_eq!(pref.id, "42");
+        // With tmux preference, tmux wins.
+        let pref_tmux = detect_target_with_preference(Some(Mux::Tmux));
+        assert_eq!(pref_tmux.mux, Mux::Tmux);
+        assert_eq!(pref_tmux.id, "%0");
+    }
+
+    #[test]
+    fn detect_target_with_preference_returns_none_when_missing() {
+        let _lock = weave_core::testenv::lock_env();
+        std::env::remove_var("WEZTERM_PANE");
+        std::env::remove_var("TMUX_PANE");
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("KITTY_WINDOW_ID");
+        std::env::remove_var("STY");
+        let pref = detect_target_with_preference(Some(Mux::Wezterm));
+        assert_eq!(pref.mux, Mux::None);
+    }
+
     /// the unified lock every critical section is exclusive, so the read always sees
     /// the writer's own value; without it, another thread's set/remove could
     /// interleave and the assertion would observe the wrong (or no) leading dir —
