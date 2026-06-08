@@ -676,11 +676,15 @@ pub fn default_db_path() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// The weave configuration directory (`$XDG_CONFIG_HOME/weave/`, else `~/.config/weave/`).
+pub fn config_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".config"))
         .join("weave")
-        .join("config.toml")
 }
 
 /// Upper bound (chars) on a derived host identifier. A host label is persisted on

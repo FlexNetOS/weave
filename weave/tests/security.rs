@@ -3292,3 +3292,162 @@ fn cli_schedule_non_positive_at_is_rejected() {
         "rejection should mention positive: stdout={out}\nstderr={err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Memory security (WL-017)
+// ---------------------------------------------------------------------------
+
+/// CLI: memory write with a path-traversal key is rejected.
+#[test]
+fn cli_memory_path_traversal_key_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+
+    for bad_key in ["../etc", "foo/bar", "foo\\bar", "..", ""] {
+        let (ok, out, err) = run_env(
+            &db,
+            &[
+                "memory", "write", "--scope", "global", "--key", bad_key, "--title", "T", "--body",
+                "B",
+            ],
+            &[("XDG_CONFIG_HOME", cfg_s)],
+        );
+        assert!(
+            !ok,
+            "memory write with key '{bad_key}' must fail: {out}\n{err}"
+        );
+        assert!(
+            (out.to_lowercase().contains("traversal")
+                || err.to_lowercase().contains("traversal")
+                || out.to_lowercase().contains("key")
+                || err.to_lowercase().contains("key")),
+            "rejection should mention key/traversal: stdout={out}\nstderr={err}"
+        );
+    }
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// CLI: memory write with an oversized key is rejected.
+#[test]
+fn cli_memory_oversized_key_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let huge_key = "x".repeat(200);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "memory", "write", "--scope", "global", "--key", &huge_key, "--title", "T", "--body",
+            "B",
+        ],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        !ok,
+        "memory write with oversized key must fail: {out}\n{err}"
+    );
+    assert!(
+        (out.to_lowercase().contains("key") || err.to_lowercase().contains("key")),
+        "rejection should mention key: stdout={out}\nstderr={err}"
+    );
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// CLI: memory write with an oversized body is rejected.
+#[test]
+fn cli_memory_oversized_body_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let huge_body = "x".repeat(70_000);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "memory", "write", "--scope", "global", "--key", "k", "--title", "T", "--body",
+            &huge_body,
+        ],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        !ok,
+        "memory write with oversized body must fail: {out}\n{err}"
+    );
+    assert!(
+        (out.to_lowercase().contains("body") || err.to_lowercase().contains("body")),
+        "rejection should mention body: stdout={out}\nstderr={err}"
+    );
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory write with a path-traversal key returns isError.
+#[test]
+fn mcp_memory_path_traversal_key_is_error() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-mcp-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+
+    for bad_key in ["../etc", "foo/bar", "foo\\bar", ".."] {
+        let (err, text) = mcp.call_tool(
+            "weave_memory_write",
+            serde_json::json!({
+                "me": "alice",
+                "scope": "global",
+                "key": bad_key,
+                "title": "T",
+                "body": "B",
+            }),
+        );
+        assert!(
+            err,
+            "mcp memory write with key '{bad_key}' must be isError: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("traversal") || text.to_lowercase().contains("key"),
+            "mcp rejection should mention traversal/key: {text}"
+        );
+    }
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory write with an oversized body returns isError.
+#[test]
+fn mcp_memory_oversized_body_is_error() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-mcp-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+    let huge_body = "x".repeat(70_000);
+
+    let (err, text) = mcp.call_tool(
+        "weave_memory_write",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "k",
+            "title": "T",
+            "body": huge_body,
+        }),
+    );
+    assert!(
+        err,
+        "mcp memory write with oversized body must be isError: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("body"),
+        "mcp rejection should mention body: {text}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
+}

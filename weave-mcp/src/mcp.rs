@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use weave_core::config::StoreSource;
+use weave_core::memory;
 use weave_core::model::{self, fmt_ts};
 #[cfg(feature = "sign")]
 use weave_core::sign;
@@ -397,6 +398,11 @@ fn call_tool(
         "weave_schedules" => tool_schedules(store, me_default, args),
         "weave_cancel_schedule" => tool_cancel_schedule(store, args),
         "weave_tick" => tool_tick(store, me_default, args),
+        "weave_memory_write" => tool_memory_write(me_default, args),
+        "weave_memory_read" => tool_memory_read(me_default, args),
+        "weave_memory_search" => tool_memory_search(me_default, args),
+        "weave_memory_list" => tool_memory_list(me_default, args),
+        "weave_memory_delete" => tool_memory_delete(me_default, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -445,11 +451,16 @@ fn tool_send(
         .ok_or("'to' is required (session name, or 'all' to broadcast).")?;
     let to = bound_ident("to", to_raw)?;
     let to = to.as_str();
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let subject = subject.as_deref();
 
@@ -478,16 +489,16 @@ fn tool_send(
         // Signed identity (2d): sign the canonical (from,to,body) with this
         // session's key when one is configured (and the `sign` feature is built),
         // so the receiver can verify `from` is unforgeable. "" otherwise (advisory).
-        let sig = sign_intent_if_keyed(&from, to, body);
+        let sig = sign_intent_if_keyed(&from, to, &body);
         let id = store
-            .enqueue_intent(to, to_host, &from, subject, body, &sig)
+            .enqueue_intent(to, to_host, &from, subject, &body, &sig)
             .map_err(e)?;
         return Ok(format!(
             "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
         ));
     }
 
-    let mid = store.send(&from, to, subject, body).map_err(e)?;
+    let mid = store.send(&from, to, subject, &body).map_err(e)?;
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
@@ -512,7 +523,7 @@ fn tool_send(
             // Record the post-inject stage AFTER the inject attempt (no store→inject
             // edge — the store records the outcome we pass it).
             let (stage, outcome) = if target.injectable() {
-                let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                let (nudge, mode) = build_nudge(nudge_template, &from, &body);
                 match injector.inject_mode(&target, &nudge, mode) {
                     Ok(true) => {
                         out.push_str(&format!(
@@ -1310,13 +1321,18 @@ fn tool_reply(
     if in_reply_to <= 0 {
         return Err("'in_reply_to' must be a positive message id.".into());
     }
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
 
-    let mid = store.reply(&from, in_reply_to, body).map_err(e)?;
+    let mid = store.reply(&from, in_reply_to, &body).map_err(e)?;
     let mut out = format!("Replied to #{in_reply_to} as message #{mid} from '{from}'.");
 
     // Native push: nudge the reply's recipient if it resolved to a registered
@@ -1328,7 +1344,7 @@ fn tool_reply(
             if let Ok(Some(peer)) = store.get_peer(&to) {
                 let target = Target::from_peer(&peer);
                 if target.injectable() {
-                    let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                    let (nudge, mode) = build_nudge(nudge_template, &from, &body);
                     match injector.inject_mode(&target, &nudge, mode) {
                         Ok(true) => out.push_str(&format!(
                             " Injected live nudge into {} target '{}'.",
@@ -1899,11 +1915,16 @@ fn tool_ask(
                 .to_string(),
         );
     }
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the question).")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let reply_to = args
         .get("reply_to")
@@ -1926,7 +1947,7 @@ fn tool_ask(
             &from,
             &to,
             subject.as_deref(),
-            body,
+            &body,
             kind,
             options,
             reply_to,
@@ -1942,7 +1963,7 @@ fn tool_ask(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body, injector);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, &body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(store, qid, model::DeliveryRefKind::Ask, &to, stage, outcome);
     Ok(format!(
@@ -1961,18 +1982,23 @@ fn tool_answer(
     injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the answer).")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let cid = resolve_correlation_id(store, args)?;
     let ask = store
         .get_ask(&cid)
         .map_err(e)?
         .ok_or_else(|| format!("No tracked ask '{cid}'."))?;
     let asker = ask.asker.clone();
-    let ans_id = store.answer(&from, &cid, body).map_err(e)?;
+    let ans_id = store.answer(&from, &cid, &body).map_err(e)?;
     record_delivery_best_effort(
         store,
         ans_id,
@@ -1981,7 +2007,7 @@ fn tool_answer(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, body, injector);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, &body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(
         store,
@@ -2545,7 +2571,8 @@ fn tools() -> Value {
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
                 "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
-                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."}
+                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["to","body"]}
         },
         {
@@ -2626,7 +2653,8 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "in_reply_to":{"type":"integer","description":"The message id you're replying to."},
-                "body":{"type":"string"}
+                "body":{"type":"string"},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["in_reply_to","body"]}
         },
         {
@@ -2692,7 +2720,8 @@ fn tools() -> Value {
                 "to":{"type":"string","description":"The peer session name to ask."},
                 "body":{"type":"string","description":"The question."},
                 "subject":{"type":"string"},
-                "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."}
+                "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["to","body"]}
         },
         {
@@ -2702,7 +2731,8 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (must be the askee)."},
                 "correlation_id":{"type":"string","description":"The ask's correlation_id."},
                 "in_reply_to":{"type":"integer","description":"Alternatively, a message id belonging to the ask."},
-                "body":{"type":"string","description":"The answer."}
+                "body":{"type":"string","description":"The answer."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["body"]}
         },
         {
@@ -2898,6 +2928,54 @@ fn tools() -> Value {
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "all":{"type":"boolean","description":"Fire schedules for all senders, not just yourself."}
             },"required":[]}
+        },
+        {
+            "name": "weave_memory_write",
+            "description": "Write a memory entry to a scope. Scopes: global, project (derived from cwd), persona (derived from identity), orchestrator (derived from circle). Optional 'name' overrides derivation.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"],"description":"Scope kind."},
+                "name":{"type":"string","description":"Optional explicit scope name (overrides derivation)."},
+                "key":{"type":"string","description":"Entry key (alphanumeric, hyphen, underscore; max 128)."},
+                "title":{"type":"string","description":"Entry title (max 256 chars)."},
+                "tags":{"type":"array","items":{"type":"string"},"description":"Optional tags (max 16, each max 64 chars)."},
+                "body":{"type":"string","description":"Entry body (max 64KiB)."}
+            },"required":["scope","key","title","body"]}
+        },
+        {
+            "name": "weave_memory_read",
+            "description": "Read a memory entry by scope and key.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "key":{"type":"string","description":"Entry key."}
+            },"required":["scope","key"]}
+        },
+        {
+            "name": "weave_memory_search",
+            "description": "Search memory entries. Simple substring search over tags, title, and body. Omit scope to search across all scopes with entries.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "query":{"type":"string","description":"Search substring."},
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":["query"]}
+        },
+        {
+            "name": "weave_memory_list",
+            "description": "List all memory entries in a scope.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."}
+            },"required":["scope"]}
+        },
+        {
+            "name": "weave_memory_delete",
+            "description": "Delete a memory entry by scope and key.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "key":{"type":"string","description":"Entry key."}
+            },"required":["scope","key"]}
         }
     ])
 }
@@ -3100,6 +3178,213 @@ fn tool_tick(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<St
     Ok(format!(
         "Tick: {fired} schedule(s) fired, {skipped} skipped."
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Memory helpers (WL-017)
+// ---------------------------------------------------------------------------
+
+/// Optionally prepend memory context to a body. Non-fatal: any problem returns the original body.
+fn maybe_prefix_body_mcp(identity: &str, body: &str, no_memory: bool) -> String {
+    if no_memory {
+        return body.to_string();
+    }
+    let circle = weave_core::config::Config::load().circle();
+    let prefix = memory::build_context_prefix(identity, &circle, body, 3);
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
+fn parse_memory_scope_mcp(
+    scope: &str,
+    name: Option<&str>,
+    identity: &str,
+) -> Result<memory::MemoryScope, String> {
+    match scope {
+        "global" => Ok(memory::MemoryScope::Global),
+        "project" => {
+            if let Some(n) = name {
+                Ok(memory::MemoryScope::Project(n.to_string()))
+            } else {
+                memory::project_scope_from_cwd().ok_or_else(|| {
+                    "not in a git repo; specify 'name' or run inside a git repo".to_string()
+                })
+            }
+        }
+        "persona" => {
+            let id = name.unwrap_or(identity);
+            Ok(memory::MemoryScope::Persona(id.to_string()))
+        }
+        "orchestrator" => {
+            let circle = name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| weave_core::config::Config::load().circle());
+            Ok(memory::MemoryScope::Orchestrator(circle))
+        }
+        other => Err(format!(
+            "unknown scope '{other}'; must be global, project, persona, or orchestrator"
+        )),
+    }
+}
+
+fn tool_memory_write(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required (global, project, persona, orchestrator).")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or("'title' is required.")?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or("'body' is required.")?;
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    memory::memory_write(&scope, key, title, &tags, body).map_err(|e| e.to_string())?;
+    Ok(format!("wrote {}/{key}", scope.label()))
+}
+
+fn tool_memory_read(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    let entry = memory::memory_read(&scope, key).map_err(|e| e.to_string())?;
+    let tags = if entry.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" | tags={:?}", entry.tags)
+    };
+    Ok(format!(
+        "scope: {} | key: {} | title: {} | updated: {}{}\n---\n{}",
+        entry.scope.label(),
+        entry.key,
+        entry.title,
+        fmt_ts(entry.updated_ts),
+        tags,
+        entry.body
+    ))
+}
+
+fn tool_memory_search(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            parse_memory_scope_mcp(s, name, &me)
+        })
+        .transpose()?;
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("'query' is required.")?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50) as usize;
+    let hits = memory::memory_search(scope.as_ref(), query).map_err(|e| e.to_string())?;
+    if hits.is_empty() {
+        return Ok("No memory entries matched.".to_string());
+    }
+    let mut out = format!("{} memory entr(y/ies) matched:\n", hits.len().min(limit));
+    for e in hits.iter().take(limit) {
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | tags={:?}", e.tags)
+        };
+        out.push_str(&format!(
+            "{} | {} | {}{}\n",
+            e.scope.label(),
+            e.key,
+            e.title,
+            tags
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_memory_list(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let list = memory::memory_list(&scope).map_err(|e| e.to_string())?;
+    if list.is_empty() {
+        return Ok(format!("no entries in {}", scope.label()));
+    }
+    let mut out = format!("Entries in {}:\n", scope.label());
+    for e in &list {
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | tags={:?}", e.tags)
+        };
+        out.push_str(&format!("{} | {}{}\n", e.key, e.title, tags));
+    }
+    Ok(out)
+}
+
+fn tool_memory_delete(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    if memory::memory_delete(&scope, key).map_err(|e| e.to_string())? {
+        Ok(format!("deleted {}/{key}", scope.label()))
+    } else {
+        Ok(format!("not found: {}/{key}", scope.label()))
+    }
 }
 
 #[cfg(test)]

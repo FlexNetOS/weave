@@ -51,6 +51,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
 use weave_core::config::Config;
+use weave_core::memory::{self, MemoryScope};
 use weave_core::store::{is_alive, Store};
 use weave_core::{config, model, store};
 use weave_inject::{self as inject, inject_text, Injector};
@@ -196,6 +197,9 @@ enum Cmd {
         /// --to-store). Disambiguates the same recipient name across machines.
         #[arg(long)]
         to_host: Option<String>,
+        /// Skip automatic memory context prefixing for this message.
+        #[arg(long)]
+        no_memory: bool,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -236,6 +240,9 @@ enum Cmd {
         from: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
+        /// Skip automatic memory context prefixing for this reply.
+        #[arg(long)]
+        no_memory: bool,
     },
     /// Print a message thread (a root message and everything chained to it).
     Thread {
@@ -430,6 +437,9 @@ enum Cmd {
         reply_to: Option<String>,
         #[arg(long)]
         from: Option<String>,
+        /// Skip automatic memory context prefixing for this ask.
+        #[arg(long)]
+        no_memory: bool,
     },
     /// Answer a tracked ask, replying back to whoever opened it (open -> answered).
     /// Reference the thread by --id (correlation id) OR --in-reply-to (a message id).
@@ -607,6 +617,11 @@ enum Cmd {
     },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
     Hook { event: String },
+    /// Filesystem-backed scoped memory (global, project, persona, orchestrator).
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Presence daemon (v0.2): start, stop, status, or run the heartbeat loop.
     Daemon {
         #[command(subcommand)]
@@ -633,6 +648,54 @@ enum DaemonCmd {
         #[arg(long)]
         me: Option<String>,
     },
+}
+
+/// `weave memory` subcommands — filesystem-backed scoped memory.
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Write a memory entry.
+    Write {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, allow_hyphen_values = true)]
+        title: String,
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+    },
+    /// Read a memory entry.
+    Read {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// Search memory entries.
+    Search {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// List memory entries in a scope.
+    List {
+        #[arg(long)]
+        scope: String,
+    },
+    /// Delete a memory entry.
+    Delete {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// Show available scopes and their resolved paths.
+    Scopes,
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -964,6 +1027,46 @@ fn resolve_me_explicit(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> 
         .map(|s| s.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     (name, false)
+}
+
+/// Parse a CLI `--scope` string into a `MemoryScope`.
+fn parse_memory_scope(
+    scope: &str,
+    cfg: &Config,
+    from: Option<&str>,
+) -> anyhow::Result<MemoryScope> {
+    match scope {
+        "global" => Ok(MemoryScope::Global),
+        "project" => {
+            let cwd = std::env::current_dir()?;
+            let tags = git::capture_worktree_tags(&cwd);
+            if tags.repo.is_empty() {
+                anyhow::bail!("not in a git repo; specify 'global' or run inside a git repo");
+            }
+            Ok(MemoryScope::Project(tags.repo))
+        }
+        "persona" => {
+            let me = resolve_me(from.map(|s| s.to_string()), None, cfg);
+            Ok(MemoryScope::Persona(me))
+        }
+        "orchestrator" => Ok(MemoryScope::Orchestrator(cfg.circle())),
+        other => anyhow::bail!(
+            "scope must be one of: global, project, persona, orchestrator (got '{other}')"
+        ),
+    }
+}
+
+/// Optionally prepend memory context to a body. Non-fatal: any problem returns the original body.
+fn maybe_prefix_body(cfg: &Config, from: &str, body: &str, no_memory: bool) -> String {
+    if no_memory {
+        return body.to_string();
+    }
+    let prefix = memory::build_context_prefix(from, &cfg.circle(), body, 3);
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}{body}")
+    }
 }
 
 /// Resolve the effective circle for a `peers`/`sessions`/`scan` listing (P4),
@@ -2282,9 +2385,11 @@ fn main() -> Result<()> {
             body,
             to_store,
             to_host,
+            no_memory,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             match to_store {
                 // Cross-store (Tier-2): the recipient lives in a FOREIGN store, so
                 // we deposit an intent into OUR OWN outbox rather than attempt any
@@ -2419,9 +2524,11 @@ fn main() -> Result<()> {
             in_reply_to,
             from,
             body,
+            no_memory,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             // The store looks up the parent's sender/recipient to address the reply
             // and stores the in_reply_to link; it returns the new message id.
             let mid = store.reply(&from, in_reply_to, &body)?;
@@ -2445,6 +2552,7 @@ fn main() -> Result<()> {
             options,
             reply_to,
             from,
+            no_memory,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2453,6 +2561,7 @@ fn main() -> Result<()> {
                     "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
                 );
             }
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             let ask_kind = kind
                 .as_deref()
                 .map(model::AskKind::parse)
@@ -3439,6 +3548,8 @@ fn main() -> Result<()> {
             println!("turn_state set for '{me}': {state}");
         }
 
+        Cmd::Memory { cmd } => dispatch_memory(&cfg, cmd)?,
+
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
         Cmd::Schedule {
@@ -3595,6 +3706,107 @@ fn dispatch_orchestrator(store: &dyn Store, cfg: &Config, cmd: OrchestratorCmd) 
         }
     }
     Ok(())
+}
+
+/// `weave memory` handler (WL-017). Filesystem-backed scoped memory with no store
+/// involvement; each subcommand validates its scope and delegates to `memory::`.
+fn dispatch_memory(cfg: &Config, cmd: MemoryCmd) -> Result<()> {
+    match cmd {
+        MemoryCmd::Write {
+            scope,
+            key,
+            title,
+            tag,
+            body,
+        } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            memory::memory_write(&scope, &key, &title, &tag, &body)?;
+            println!("wrote {}/{key}", scope.label());
+        }
+        MemoryCmd::Read { scope, key } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            let e = memory::memory_read(&scope, &key)?;
+            println!("{}\n---\n{}", format_entry_human(&e), e.body);
+        }
+        MemoryCmd::Search {
+            scope,
+            query,
+            limit,
+        } => {
+            let scope = scope
+                .as_deref()
+                .map(|s| parse_memory_scope(s, cfg, None))
+                .transpose()?;
+            let hits = memory::memory_search(scope.as_ref(), &query)?;
+            for e in hits.iter().take(limit) {
+                println!(
+                    "{} | {} | {} | tags={:?}",
+                    e.scope.label(),
+                    e.key,
+                    e.title,
+                    e.tags
+                );
+            }
+        }
+        MemoryCmd::List { scope } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            let list = memory::memory_list(&scope)?;
+            if list.is_empty() {
+                println!("no entries in {}", scope.label());
+            } else {
+                for e in &list {
+                    println!("{} | {} | tags={:?}", e.key, e.title, e.tags);
+                }
+            }
+        }
+        MemoryCmd::Delete { scope, key } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            if memory::memory_delete(&scope, &key)? {
+                println!("deleted {}/{key}", scope.label());
+            } else {
+                println!("not found: {}/{key}", scope.label());
+            }
+        }
+        MemoryCmd::Scopes => {
+            let scopes = memory::memory_scopes()?;
+            println!(
+                "global: {}",
+                memory::memory_dir(&MemoryScope::Global).display()
+            );
+            if let Some(ps) = memory::project_scope_from_cwd() {
+                println!("project: {} (from cwd)", memory::memory_dir(&ps).display());
+            } else {
+                println!("project: <not in a git repo>");
+            }
+            let me = resolve_me(None, None, cfg);
+            println!(
+                "persona: {} (resolved as '{me}')",
+                memory::memory_dir(&MemoryScope::Persona(me.clone())).display()
+            );
+            let circle = cfg.circle();
+            println!(
+                "orchestrator: {} (circle='{circle}')",
+                memory::memory_dir(&MemoryScope::Orchestrator(circle.clone())).display()
+            );
+            if !scopes.is_empty() {
+                println!("\nscopes with entries:");
+                for s in scopes {
+                    println!("  - {}", s.label());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_entry_human(e: &memory::MemoryEntry) -> String {
+    format!(
+        "title: {}\ntags: {:?}\ncreated: {}\nupdated: {}",
+        e.title,
+        e.tags,
+        model::fmt_ts(e.created_ts),
+        model::fmt_ts(e.updated_ts)
+    )
 }
 
 /// `weave job` handler (P3 poll-only board). Routes the 8 subcommands through the

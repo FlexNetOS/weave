@@ -8139,3 +8139,261 @@ fn mcp_cancel_schedule_idempotent() {
 
     mcp.shutdown();
 }
+
+/// CLI: memory write/read/search/list/delete roundtrip.
+#[test]
+fn cli_memory_roundtrip() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-it-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+
+    // Write
+    let w = run_ok_env(
+        &db,
+        &[
+            "memory",
+            "write",
+            "--scope",
+            "global",
+            "--key",
+            "patterns",
+            "--title",
+            "Patterns",
+            "--tag",
+            "rust",
+            "--body",
+            "Use strong types.",
+        ],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        w.contains("wrote global/patterns"),
+        "write should confirm: {w}"
+    );
+
+    // Read
+    let r = run_ok_env(
+        &db,
+        &["memory", "read", "--scope", "global", "--key", "patterns"],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(r.contains("Patterns"), "read should show title: {r}");
+    assert!(
+        r.contains("Use strong types."),
+        "read should show body: {r}"
+    );
+
+    // Search
+    let s = run_ok_env(
+        &db,
+        &["memory", "search", "--query", "strong"],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(s.contains("patterns"), "search should find the entry: {s}");
+
+    // List
+    let l = run_ok_env(
+        &db,
+        &["memory", "list", "--scope", "global"],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(l.contains("patterns"), "list should contain the key: {l}");
+
+    // Delete
+    let d = run_ok_env(
+        &db,
+        &["memory", "delete", "--scope", "global", "--key", "patterns"],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        d.contains("deleted global/patterns"),
+        "delete should confirm: {d}"
+    );
+
+    // List is now empty
+    let l2 = run_ok_env(
+        &db,
+        &["memory", "list", "--scope", "global"],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        l2.contains("no entries"),
+        "list after delete should be empty: {l2}"
+    );
+
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory write/read/search/list/delete roundtrip.
+#[test]
+fn mcp_memory_roundtrip() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-mcp-it-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+
+    // Write
+    let (err, w) = mcp.call_tool(
+        "weave_memory_write",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "patterns",
+            "title": "Patterns",
+            "tags": ["rust"],
+            "body": "Use strong types.",
+        }),
+    );
+    assert!(!err, "mcp memory write should succeed: {w}");
+    assert!(
+        w.contains("wrote global/patterns"),
+        "mcp write should confirm: {w}"
+    );
+
+    // Read
+    let (err, r) = mcp.call_tool(
+        "weave_memory_read",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "patterns",
+        }),
+    );
+    assert!(!err, "mcp memory read should succeed: {r}");
+    assert!(r.contains("Patterns"), "mcp read should show title: {r}");
+    assert!(
+        r.contains("Use strong types."),
+        "mcp read should show body: {r}"
+    );
+
+    // Search
+    let (err, s) = mcp.call_tool(
+        "weave_memory_search",
+        serde_json::json!({
+            "me": "alice",
+            "query": "strong",
+        }),
+    );
+    assert!(!err, "mcp memory search should succeed: {s}");
+    assert!(
+        s.contains("patterns"),
+        "mcp search should find the entry: {s}"
+    );
+
+    // List
+    let (err, l) = mcp.call_tool(
+        "weave_memory_list",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+        }),
+    );
+    assert!(!err, "mcp memory list should succeed: {l}");
+    assert!(
+        l.contains("patterns"),
+        "mcp list should contain the key: {l}"
+    );
+
+    // Delete
+    let (err, d) = mcp.call_tool(
+        "weave_memory_delete",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "patterns",
+        }),
+    );
+    assert!(!err, "mcp memory delete should succeed: {d}");
+    assert!(
+        d.contains("deleted global/patterns"),
+        "mcp delete should confirm: {d}"
+    );
+
+    // List is now empty
+    let (err, l2) = mcp.call_tool(
+        "weave_memory_list",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+        }),
+    );
+    assert!(!err, "mcp memory list after delete should succeed: {l2}");
+    assert!(
+        l2.contains("no entries"),
+        "mcp list after delete should be empty: {l2}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory search with explicit scope filters correctly.
+#[test]
+fn mcp_memory_search_scoped() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-scoped-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+
+    // Write two entries in different scopes
+    let (err, _) = mcp.call_tool(
+        "weave_memory_write",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "alpha",
+            "title": "Alpha",
+            "body": "Global content.",
+        }),
+    );
+    assert!(!err, "write global alpha");
+
+    let (err, _) = mcp.call_tool(
+        "weave_memory_write",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "persona",
+            "name": "alice",
+            "key": "beta",
+            "title": "Beta",
+            "body": "Persona content.",
+        }),
+    );
+    assert!(!err, "write persona beta");
+
+    // Search all scopes finds both
+    let (err, s1) = mcp.call_tool(
+        "weave_memory_search",
+        serde_json::json!({"me": "alice", "query": "content"}),
+    );
+    assert!(!err, "search all scopes: {s1}");
+    assert!(
+        s1.contains("alpha") && s1.contains("beta"),
+        "all-scope search should find both: {s1}"
+    );
+
+    // Search scoped to global finds only alpha
+    let (err, s2) = mcp.call_tool(
+        "weave_memory_search",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "query": "content",
+        }),
+    );
+    assert!(!err, "search global scope: {s2}");
+    assert!(
+        s2.contains("alpha"),
+        "global search should find alpha: {s2}"
+    );
+    assert!(
+        !s2.contains("beta"),
+        "global search should not find beta: {s2}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
+}

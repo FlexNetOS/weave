@@ -26,7 +26,7 @@ and the open gaps the user flagged.
 ## Gaps discovered from repowire cross-reference (2026-06-07)
 - [x] WL-014: Reminder injection for open asks — unacked asks resurface as a content-free nudge at the start of every subsequent prompt on the recipient side (repowire parity).
 - [x] WL-015: Structured question types — extend `ask` to support choice, free-text, and tool-permission envelopes; render as actionable prompts in the recipient's pane (repowire parity). Schema + Store trait + both backends + CLI + MCP call sites done. kind/options columns added; AskKind enum with FreeText/Choice/ToolPermission.
-- [ ] WL-016: Scheduler / cron for messages — one-shot and recurring scheduled deliveries (`@daily`, `@hourly`, etc.) with SQLite-backed persistence and drift-safe execution (repowire parity).
+- [x] WL-016: Scheduler / cron for messages — one-shot and recurring scheduled deliveries (`@daily`, `@hourly`, etc.) with SQLite-backed persistence and drift-safe execution (repowire parity). Schema + Store trait + both backends + CLI + MCP + tick mechanism (prompt hook + explicit `weave tick`) + tests. 442 passed (sqlite), 412 passed + 1 ignored (libsql).
 - [ ] WL-017: Mesh memory system — filesystem-backed scoped memory under `~/.config/weave/memory/` (global, project, persona, orchestrator) with CLI read/write/search and automatic context prefixing on ask delivery (repowire parity).
 - [ ] WL-018: Birth certificates / runtime identity envelopes — mint unguessable nonces at `SessionStart` to prevent path-based identity takeover during lazy MCP registration (repowire parity).
 - [ ] WL-019: Co-orchestrator support — allow multiple live orchestrators to coexist in the same circle for resilience against rate limits or credit caps (repowire parity).
