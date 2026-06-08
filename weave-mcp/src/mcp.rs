@@ -471,6 +471,7 @@ fn call_tool(
         "weave_lease_reserve" => tool_lease_reserve(store, me_default, args),
         "weave_lease_release" => tool_lease_release(store, me_default, args),
         "weave_lease_list" => tool_lease_list(store, args),
+        "weave_lease_sweep" => tool_lease_sweep(store),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -3350,6 +3351,11 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "limit":{"type":"integer","description":"Max results (bounded by server)."}
             },"required":[]}
+        },
+        {
+            "name": "weave_lease_sweep",
+            "description": "Remove all expired leases and return the count swept.",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
         }
     ])
 }
@@ -4013,6 +4019,11 @@ fn tool_lease_list(store: &dyn Store, args: &Value) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+fn tool_lease_sweep(store: &dyn Store) -> Result<String, String> {
+    let n = store.sweep_expired_leases().map_err(|e| e.to_string())?;
+    Ok(format!("swept {} expired lease(s)", n))
 }
 
 #[cfg(test)]

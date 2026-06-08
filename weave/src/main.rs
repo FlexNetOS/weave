@@ -884,6 +884,8 @@ enum LeaseCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Remove all expired leases. Returns the count swept.
+    Sweep,
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -4505,6 +4507,10 @@ fn dispatch_lease(store: &dyn Store, cfg: &Config, cmd: LeaseCmd) -> Result<()> 
                     );
                 }
             }
+        }
+        LeaseCmd::Sweep => {
+            let n = store.sweep_expired_leases()?;
+            println!("swept {} expired lease(s)", n);
         }
     }
     Ok(())

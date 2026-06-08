@@ -703,6 +703,11 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn list_leases(&self, limit: i64) -> Result<Vec<crate::model::Lease>>;
 
+    /// WL-029: delete all expired leases (expires <= now). Returns the count
+    /// removed. Write path.
+    #[allow(dead_code)]
+    fn sweep_expired_leases(&self) -> Result<usize>;
+
     /// WL-021: resolve the permission status of a ToolPermission ask by its
     /// correlation id. Returns the answer body when available so callers can log
     /// or audit the exact response. `timeout_secs` defaults to
@@ -4668,7 +4673,9 @@ impl Store for SqliteStore {
         ttl_secs: i64,
         note: Option<&str>,
     ) -> Result<Lease> {
-        use crate::model::{lease_resource_valid, lease_ttl_valid};
+        use crate::model::{
+            lease_path_conflicts, lease_path_normalize, lease_resource_valid, lease_ttl_valid,
+        };
         if !lease_resource_valid(resource) {
             anyhow::bail!("invalid resource string");
         }
@@ -4682,11 +4689,61 @@ impl Store for SqliteStore {
         if note.len() > crate::model::MAX_LEASE_NOTE_LEN {
             anyhow::bail!("note exceeds {} chars", crate::model::MAX_LEASE_NOTE_LEN);
         }
+        let resource_norm = lease_path_normalize(resource);
+        if resource_norm.is_empty() {
+            anyhow::bail!("invalid resource path");
+        }
         let acquired = now();
         let expires = acquired + ttl_secs;
 
-        // Try atomic upsert: succeed if no row OR existing lease expired.
-        let n = self.conn.execute(
+        let _ = self.sweep_expired_leases()?;
+
+        // Check for path conflicts (exact, parent, child) with any *other* holder.
+        let mut stmt = self.conn.prepare(
+            "SELECT resource, holder, expires FROM leases
+             WHERE expires > ?1
+               AND (resource = ?2
+                    OR resource || '/' = SUBSTR(?2, 1, LENGTH(resource) + 1)
+                    OR ?2 || '/' = SUBSTR(resource, 1, LENGTH(?2) + 1))",
+        )?;
+        let conflicts: Vec<(String, String, i64)> = stmt
+            .query_map(params![now(), &resource_norm], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (existing_res, existing_holder, existing_expires) in conflicts {
+            if existing_holder == holder && existing_res == resource_norm {
+                // Same holder re-reserving exact same resource: allow (extend).
+                self.conn.execute(
+                    "UPDATE leases SET acquired = ?1, expires = ?2, note = ?3
+                     WHERE resource = ?4 AND holder = ?5",
+                    params![acquired, expires, note, &resource_norm, holder],
+                )?;
+                return Ok(Lease {
+                    resource: resource_norm,
+                    holder: holder.to_string(),
+                    acquired,
+                    expires,
+                    note: note.to_string(),
+                });
+            }
+            if lease_path_conflicts(&existing_res, &resource_norm) {
+                anyhow::bail!(
+                    "resource '{}' conflicts with '{}' held by '{}' until {}",
+                    resource,
+                    existing_res,
+                    existing_holder,
+                    existing_expires
+                );
+            }
+        }
+
+        // No conflicts: insert fresh.
+        self.conn.execute(
             "INSERT INTO leases (resource, holder, acquired, expires, note)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(resource) DO UPDATE SET
@@ -4695,26 +4752,11 @@ impl Store for SqliteStore {
                  expires = excluded.expires,
                  note = excluded.note
              WHERE leases.expires < ?6",
-            params![resource, holder, acquired, expires, note, now()],
+            params![&resource_norm, holder, acquired, expires, note, now()],
         )?;
 
-        if n == 0 {
-            // Conflict — existing lease is still alive. Return its details in the error.
-            let row: (String, i64) = self.conn.query_row(
-                "SELECT holder, expires FROM leases WHERE resource = ?1",
-                params![resource],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            anyhow::bail!(
-                "resource '{}' is held by '{}' until {}",
-                resource,
-                row.0,
-                row.1
-            );
-        }
-
         Ok(Lease {
-            resource: resource.to_string(),
+            resource: resource_norm,
             holder: holder.to_string(),
             acquired,
             expires,
@@ -4731,6 +4773,7 @@ impl Store for SqliteStore {
     }
 
     fn list_leases(&self, limit: i64) -> Result<Vec<Lease>> {
+        let _ = self.sweep_expired_leases()?;
         let now = now();
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
@@ -4752,6 +4795,14 @@ impl Store for SqliteStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    fn sweep_expired_leases(&self) -> Result<usize> {
+        let now = now();
+        let n = self
+            .conn
+            .execute("DELETE FROM leases WHERE expires <= ?1", params![now])?;
+        Ok(n)
     }
 
     fn permission_verdict(

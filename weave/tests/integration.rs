@@ -9066,8 +9066,8 @@ fn cli_lease_roundtrip() {
     );
     assert!(list.contains("working"), "list should show note: {list}");
 
-    // Conflict from another holder.
-    let (ok, _out, _err) = run(
+    // Same holder re-reserving exact resource succeeds (extends TTL).
+    let ext = run_ok(
         &db,
         &[
             "lease",
@@ -9075,10 +9075,12 @@ fn cli_lease_roundtrip() {
             "--resource",
             "crates/foo",
             "--ttl",
-            "3600",
+            "7200",
+            "--note",
+            "extended",
         ],
     );
-    assert!(!ok, "should fail when already held");
+    assert!(ext.contains("leased crates/foo"), "extend should succeed: {ext}");
 
     // Release.
     let rel = run_ok(&db, &["lease", "release", "--resource", "crates/foo"]);
@@ -9128,6 +9130,143 @@ fn mcp_lease_roundtrip() {
     );
     assert!(!err, "release: {rel}");
     assert!(rel.contains("released crates/foo"), "release output: {rel}");
+
+    mcp.shutdown();
+}
+
+#[test]
+fn cli_lease_path_conflict_parent_child() {
+    let db = TestDb::new();
+    // Reserve parent path.
+    let out = run_ok(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/core",
+            "--ttl",
+            "3600",
+        ],
+    );
+    assert!(out.contains("leased src/core"), "reserve parent: {out}");
+
+    // Child path should conflict.
+    let (ok, out, _err) = run(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/core/mod.rs",
+            "--ttl",
+            "3600",
+        ],
+    );
+    assert!(!ok, "child should conflict with parent");
+    assert!(
+        out.contains("conflicts with") || out.contains("src/core"),
+        "error should mention conflict: {out}"
+    );
+
+    // Release parent.
+    run_ok(&db, &["lease", "release", "--resource", "src/core"]);
+
+    // Now reserve child first.
+    run_ok(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/core/mod.rs",
+            "--ttl",
+            "3600",
+        ],
+    );
+
+    // Parent should conflict with child.
+    let (ok2, out2, _err2) = run(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/core",
+            "--ttl",
+            "3600",
+        ],
+    );
+    assert!(!ok2, "parent should conflict with child");
+    assert!(
+        out2.contains("conflicts with") || out2.contains("src/core/mod.rs"),
+        "error should mention conflict: {out2}"
+    );
+
+    // Sibling should NOT conflict.
+    run_ok(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/utils",
+            "--ttl",
+            "3600",
+        ],
+    );
+}
+
+#[test]
+fn cli_lease_sweep_removes_expired() {
+    let db = TestDb::new();
+    // Reserve with 1-second TTL.
+    run_ok(
+        &db,
+        &["lease", "reserve", "--resource", "tmp/file", "--ttl", "1"],
+    );
+
+    // List shows it.
+    let list1 = run_ok(&db, &["lease", "list"]);
+    assert!(list1.contains("tmp/file"), "list before expiry: {list1}");
+
+    // Wait for expiry.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Sweep removes it.
+    let sweep = run_ok(&db, &["lease", "sweep"]);
+    assert!(
+        sweep.contains("1"),
+        "sweep should report 1 removed: {sweep}"
+    );
+
+    // List is empty.
+    let list2 = run_ok(&db, &["lease", "list"]);
+    assert!(
+        list2.contains("no active leases"),
+        "list after sweep: {list2}"
+    );
+}
+
+#[test]
+fn mcp_lease_sweep_roundtrip() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // Reserve with 1s TTL.
+    let (err, _) = mcp.call_tool(
+        "weave_lease_reserve",
+        serde_json::json!({"resource": "tmp/file", "ttl": 1, "me": "alice"}),
+    );
+    assert!(!err, "reserve should succeed");
+
+    // Wait for expiry.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Sweep via MCP.
+    let (err, sweep) = mcp.call_tool("weave_lease_sweep", serde_json::json!({}));
+    assert!(!err, "sweep should succeed: {sweep}");
+    assert!(sweep.contains("1"), "sweep should report 1: {sweep}");
 
     mcp.shutdown();
 }

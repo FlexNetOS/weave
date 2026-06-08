@@ -1,72 +1,55 @@
-# Plan: WL-028 — FTS5 full-text search on messages
+# Plan: WL-029 — Advisory file leases with TTL expiry and conflict detection
 
 ## Objective
-Enable fast full-text search across message body, subject, and sender fields using
-SQLite FTS5. Provide CLI (`weave search`) and MCP (`weave_search`) interfaces.
+Extend the WL-024 lease system with file-path-aware conflict detection (parent/child prefix matching), automatic expiry sweep, and explicit sweep tooling.
 
 ## Architecture
 
-### Schema (both backends)
-- New `messages_fts` FTS5 virtual table shadowing `messages`:
-  ```sql
-  CREATE VIRTUAL TABLE messages_fts USING fts5(
-    body, subject, sender,
-    content='messages',
-    content_rowid='id'
-  );
-  ```
-- Triggers keep `messages_fts` in sync on INSERT/UPDATE/DELETE:
-  ```sql
-  CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, body, subject, sender)
-    VALUES (new.id, new.body, new.subject, new.sender);
-  END;
-  CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
-    VALUES ('delete', old.id, old.body, old.subject, old.sender);
-  END;
-  ```
-- Guarded migration: `CREATE VIRTUAL TABLE IF NOT EXISTS` + trigger `IF NOT EXISTS`.
+### Model
+- `lease_path_normalize(r: &str) -> String` — strip trailing slashes, collapse multiple slashes, reject `..` and empty segments.
+- `lease_path_conflicts(existing: &str, candidate: &str) -> bool` — true if exact match, or one is a parent/ancestor of the other (prefix + '/').
 
 ### Store trait
-- New method: `fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>>`
-- sqlite: `SELECT * FROM messages WHERE id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2)`
-- libsql: same SQL (libsql FFI includes FTS5 constants; verified in target/debug/build/libsql-ffi-*/out/bindgen.rs)
+- `sweep_expired_leases(&self) -> Result<usize>` — delete all rows where `expires <= now()`, return count deleted.
+- `reserve_lease` already checks exact-match conflicts; extend it to check prefix conflicts via `lease_path_conflicts`.
+  - On conflict, error message includes holder name and expiry time of the conflicting lease.
+- `list_leases` should auto-sweep before listing (defensive hygiene).
+
+### Schema
+No schema change — `leases` table already has `expires` (WL-024).
+
+### sqlite backend
+- `sweep_expired_leases`: `DELETE FROM leases WHERE expires <= ?1`
+- `reserve_lease`: after exact-match check, run prefix-conflict query:
+  ```sql
+  SELECT holder, expires FROM leases WHERE expires > ?1
+    AND (resource = ?2 OR resource || '/' = SUBSTR(?2, 1, LENGTH(resource) + 1)
+         OR ?2 || '/' = SUBSTR(resource, 1, LENGTH(?2) + 1))
+  ```
+  If any row returned, bail with conflict info.
+- Auto-sweep at top of `list_leases` and `reserve_lease`.
+
+### libsql backend
+- Mirror all sqlite changes (async-over-block_on bridge).
 
 ### CLI
-- `Cmd::Search { query: String, limit: i64, json: bool }`
-- `weave search "hello world"` → human-readable list
-- `weave search "hello world" --json` → JSON array
-- `weave search "hello world" --limit 20` (default 50, capped at MAX_LIMIT)
+- New `LeaseCmd::Sweep` variant — `weave lease sweep` prints count of expired leases removed.
+- `weave lease reserve` failure already prints error; conflict info will now include holder + expiry.
 
 ### MCP
-- `weave_search` tool in `tools()` schema
-- `tool_search(store, args)` → JSON result string
+- New `weave_lease_sweep` tool in schema + dispatch.
 
 ### Test layers
-- Unit: `store.search` roundtrip in both backends
-- Integration: `cli_search_finds_sent_message` — send a message, search for its body
-- Security: oversized query rejected, hostile query sanitized
+- Unit: `lease_path_normalize` and `lease_path_conflicts` edge cases.
+- Integration:
+  - `cli_lease_path_conflict_parent_child` — reserve `/foo/bar`, fail to reserve `/foo/bar/baz`.
+  - `cli_lease_path_conflict_child_parent` — reserve `/foo/bar/baz`, fail to reserve `/foo/bar`.
+  - `cli_lease_sweep_removes_expired` — reserve with 1s TTL, wait, sweep removes it.
+  - `mcp_lease_sweep_roundtrip` — MCP tool call.
+- Full gate on both backends.
 
-## Invariants (from weave-invariants skill)
-- No shell: query text never reaches a shell
-- Parameterized SQL: `MATCH ?1`
-- Input caps: query length capped, limit clamped
-- No upward deps: `model` ← `store` ← `mcp`/`main`
-
-## Dual-backend
-- FTS5 virtual table + triggers in both `store.rs` (sqlite) and `store_libsql.rs` (libsql)
-- libsql verified: libsql-ffi build output contains `FTS5_TOKENIZE_QUERY` etc.
-
-## Files to touch
-- `weave-core/src/store.rs` — schema migration, Store trait + impl, `search` method
-- `weave-core/src/store_libsql.rs` — schema migration, async `search` impl
-- `weave/src/main.rs` — `Cmd::Search` + dispatch arm
-- `weave-mcp/src/mcp.rs` — `weave_search` tool schema + handler
-- `weave/tests/integration.rs` — integration test
-- `weave/tests/security.rs` — security test
-
-## Migration strategy
-- Additive only: `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts`
-- Triggers with `IF NOT EXISTS` guard
-- Backfill existing messages: `INSERT INTO messages_fts(rowid, body, subject, sender) SELECT id, body, subject, sender FROM messages`
+## Invariants
+- No shell: all external programs via `Command::new(bin)` with explicit argv.
+- Dual-backend: every Store trait change mirrored in sqlite + libsql.
+- Input caps: paths capped at `MAX_LEASE_RESOURCE_LEN` (512), already enforced.
+- Parameterized SQL only.

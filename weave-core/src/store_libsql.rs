@@ -3848,7 +3848,9 @@ impl Store for LibsqlStore {
         ttl_secs: i64,
         note: Option<&str>,
     ) -> Result<Lease> {
-        use crate::model::{lease_resource_valid, lease_ttl_valid};
+        use crate::model::{
+            lease_path_conflicts, lease_path_normalize, lease_resource_valid, lease_ttl_valid,
+        };
         if !lease_resource_valid(resource) {
             anyhow::bail!("invalid resource string");
         }
@@ -3862,11 +3864,78 @@ impl Store for LibsqlStore {
         if note.len() > crate::model::MAX_LEASE_NOTE_LEN {
             anyhow::bail!("note exceeds {} chars", crate::model::MAX_LEASE_NOTE_LEN);
         }
+        let resource_norm = lease_path_normalize(resource);
+        if resource_norm.is_empty() {
+            anyhow::bail!("invalid resource path");
+        }
         let acquired = now();
         let expires = acquired + ttl_secs;
 
         self.guard_writable()?;
         self.rt.block_on(async {
+            // Sweep expired leases inline (cannot call sweep_expired_leases
+            // because it also uses block_on).
+            self.conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
+
+            // Check for path conflicts (exact, parent, child) with any *other* holder.
+            let mut stmt = self
+                .conn
+                .query(
+                    "SELECT resource, holder, expires FROM leases
+                     WHERE expires > ?1
+                       AND (resource = ?2
+                            OR resource || '/' = SUBSTR(?2, 1, LENGTH(resource) + 1)
+                            OR ?2 || '/' = SUBSTR(resource, 1, LENGTH(?2) + 1))",
+                    params(vec![now().into(), resource_norm.clone().into()]),
+                )
+                .await?;
+            let mut conflicts: Vec<(String, String, i64)> = Vec::new();
+            while let Some(row) = stmt.next().await? {
+                conflicts.push((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<i64>(2)?,
+                ));
+            }
+            for (existing_res, existing_holder, existing_expires) in conflicts {
+                if existing_holder == holder && existing_res == resource_norm {
+                    self.conn
+                        .execute(
+                            "UPDATE leases SET acquired = ?1, expires = ?2, note = ?3
+                             WHERE resource = ?4 AND holder = ?5",
+                            params(vec![
+                                acquired.into(),
+                                expires.into(),
+                                note.into(),
+                                resource_norm.clone().into(),
+                                holder.into(),
+                            ]),
+                        )
+                        .await?;
+                    return Ok::<_, anyhow::Error>(Lease {
+                        resource: resource_norm,
+                        holder: holder.to_string(),
+                        acquired,
+                        expires,
+                        note: note.to_string(),
+                    });
+                }
+                if lease_path_conflicts(&existing_res, &resource_norm) {
+                    anyhow::bail!(
+                        "resource '{}' conflicts with '{}' held by '{}' until {}",
+                        resource,
+                        existing_res,
+                        existing_holder,
+                        existing_expires
+                    );
+                }
+            }
+
             let n = self
                 .conn
                 .execute(
@@ -3879,7 +3948,7 @@ impl Store for LibsqlStore {
                          note = excluded.note
                      WHERE leases.expires < ?6",
                     params(vec![
-                        resource.into(),
+                        resource_norm.into(),
                         holder.into(),
                         acquired.into(),
                         expires.into(),
@@ -3888,21 +3957,8 @@ impl Store for LibsqlStore {
                     ]),
                 )
                 .await?;
-
             if n == 0 {
-                let row = self
-                    .conn
-                    .query(
-                        "SELECT holder, expires FROM leases WHERE resource = ?1",
-                        params(vec![resource.into()]),
-                    )
-                    .await?
-                    .next()
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("lease disappeared during conflict check"))?;
-                let h: String = row.get(0)?;
-                let e: i64 = row.get(1)?;
-                anyhow::bail!("resource '{}' is held by '{}' until {}", resource, h, e);
+                anyhow::bail!("resource '{}' is already held", resource);
             }
 
             Ok::<_, anyhow::Error>(Lease {
@@ -3931,6 +3987,13 @@ impl Store for LibsqlStore {
 
     fn list_leases(&self, limit: i64) -> Result<Vec<Lease>> {
         self.rt.block_on(async {
+            // Sweep expired leases inline.
+            self.conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
             let now = now();
             let limit = clamp_limit(limit);
             let mut stmt = self
@@ -3953,6 +4016,20 @@ impl Store for LibsqlStore {
                 });
             }
             Ok::<_, anyhow::Error>(out)
+        })
+    }
+
+    fn sweep_expired_leases(&self) -> Result<usize> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n as usize)
         })
     }
 

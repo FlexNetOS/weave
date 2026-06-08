@@ -1131,6 +1131,36 @@ pub fn lease_ttl_valid(ttl: i64) -> bool {
     ttl > 0 && ttl <= MAX_LEASE_TTL_SECS
 }
 
+/// WL-029: normalize a lease resource path for conflict detection.
+/// Strips trailing slashes, collapses multiple slashes, rejects `..` and empty
+/// segments. Returns the normalized path (always without trailing slash).
+pub fn lease_path_normalize(r: &str) -> String {
+    let mut out = Vec::new();
+    for seg in r.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            out.pop();
+            continue;
+        }
+        out.push(seg);
+    }
+    out.join("/")
+}
+
+/// WL-029: check whether two normalized resource paths conflict.
+/// Conflicts are: exact match, or one is a strict ancestor of the other
+/// (prefix match followed by a path separator).
+pub fn lease_path_conflicts(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_slash = format!("{a}/");
+    let b_slash = format!("{b}/");
+    b.starts_with(&a_slash) || a.starts_with(&b_slash)
+}
+
 /// Hard upper bound (in chars) on a circle label. A circle is a small grouping
 /// tag (a visibility-scoping label), never a path or shell token, so 64 is more
 /// than enough; the cap exists to reject a hostile/oversized value before it is
@@ -2827,5 +2857,25 @@ mod tests {
         assert!(!lease_ttl_valid(0));
         assert!(!lease_ttl_valid(-1));
         assert!(!lease_ttl_valid(MAX_LEASE_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn lease_path_normalize_collapses_and_strips() {
+        assert_eq!(lease_path_normalize("/foo/bar/"), "foo/bar");
+        assert_eq!(lease_path_normalize("//foo//bar//"), "foo/bar");
+        assert_eq!(lease_path_normalize("foo/./bar"), "foo/bar");
+        assert_eq!(lease_path_normalize("foo/bar/../baz"), "foo/baz");
+        assert_eq!(lease_path_normalize("foo"), "foo");
+        assert_eq!(lease_path_normalize(""), "");
+    }
+
+    #[test]
+    fn lease_path_conflicts_detects_exact_and_ancestor() {
+        assert!(lease_path_conflicts("foo/bar", "foo/bar"));
+        assert!(lease_path_conflicts("foo/bar", "foo/bar/baz"));
+        assert!(lease_path_conflicts("foo/bar/baz", "foo/bar"));
+        assert!(!lease_path_conflicts("foo/bar", "foo/baz"));
+        assert!(!lease_path_conflicts("foo/bar", "foo/barbie"));
+        assert!(!lease_path_conflicts("foo", "foobar"));
     }
 }
