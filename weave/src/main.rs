@@ -398,6 +398,9 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Existing birth certificate for re-registering a previously-registered peer.
+        #[arg(long)]
+        cert: Option<String>,
     },
     /// Probe whether a peer can be reached by a live nudge right now, and report
     /// the verdict. A not-alive / non-injectable peer is NOT an error — its
@@ -3075,6 +3078,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    None,
                 ) {
                     eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
                 }
@@ -3266,6 +3270,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    None,
                 ) {
                     eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
                 }
@@ -3388,7 +3393,7 @@ fn main() -> Result<()> {
             // session with its repo/branch/worktree id (best-effort from cwd; a git
             // failure never sinks registration — empty tags result).
             let tags = git_tags_for(cwd_val.as_deref());
-            store.register_peer_full(
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -3400,16 +3405,21 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                None,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
             } else {
                 t.id.clone()
             };
-            println!("registered '{me}' [{}] {}", t.mux.as_str(), tgt);
+            println!(
+                "registered '{me}' [{}] {} (save birth-cert: {cert})",
+                t.mux.as_str(),
+                tgt
+            );
         }
 
-        Cmd::Attach { name, cwd } => {
+        Cmd::Attach { name, cwd, cert } => {
             // Bind the row key to OUR OWN resolved identity — attach upserts the
             // caller's own peer row only, never an arg-supplied foreign target.
             let me = resolve_me(name, cwd.as_deref(), &cfg);
@@ -3437,7 +3447,11 @@ fn main() -> Result<()> {
             // Capture this process's PID + host so the adopted peer reflects real
             // liveness (the whole point of zero-restart attach), plus the git tags.
             let tags = git_tags_for(cwd_val.as_deref());
-            store.register_peer_full(
+            // If no --cert provided, try to reuse the stored cert so re-attach is
+            // seamless for the peer owner (the common case).
+            let stored_cert = store.get_birth_cert(&me)?;
+            let cert = cert.as_deref().or(stored_cert.as_deref());
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -3449,6 +3463,7 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                cert,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -3460,7 +3475,10 @@ fn main() -> Result<()> {
             } else {
                 "no-inject"
             };
-            println!("attached '{me}' [{}] {tgt} ({inj})", t.mux.as_str());
+            println!(
+                "attached '{me}' [{}] {tgt} ({inj}) (birth-cert: {cert})",
+                t.mux.as_str()
+            );
         }
 
         Cmd::Connect { to } => {
@@ -4558,7 +4576,10 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             // primary + a timeout-bounded best-effort git fallback that never sinks
             // the hook.
             let tags = git_tags_for(cwd);
-            store.register_peer_full(
+            let env_cert = std::env::var("WEAVE_BIRTH_CERT")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -4570,8 +4591,12 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                env_cert.as_deref(),
             )?;
-            eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
+            eprintln!(
+                "[weave] registered peer '{me}' [{}] (birth-cert: {cert})",
+                t.mux.as_str()
+            );
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must
             // never sink the session hook (which also drives presence/registration),
             // so errors are reported and swallowed. A configured retention of 0

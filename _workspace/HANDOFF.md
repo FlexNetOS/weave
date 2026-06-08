@@ -3,41 +3,27 @@
 ## Current session state
 - **Branch:** `feat/zellij-pane-targeting`
 - **Worktree:** `/home/drdave/Desktop/meta/weave-mcp-daemon-tools`
-- **Last completed:** WL-016 — Scheduler / cron for messages
-- **Cycles this session:** 3 / 3 (budget exhausted — handoff required)
-- **Commit:** `558d126`
+- **Last completed:** WL-017 — Mesh memory system
+- **Cycles this session:** 1 / 3
+- **Commit:** `9998190`
 
 ## What was done (this session)
 
-### Cycle 1 — WL-014: Reminder injection for open asks
-- Added `Store::has_open_asks()` to both backends
-- Prompt-hook nudge injection for open asks on drain
-- Full gate green on both backends
-- Committed: `32c961b`
-
-### Cycle 2 — WL-015: Structured question types
-- Added `AskKind` enum (FreeText/Choice/ToolPermission)
-- Added `kind` and `options` columns to `asks` table (both backends)
-- Extended `Store::ask()` signature
-- Updated CLI, MCP, and all test call sites
-- Full gate green on both backends
-- Committed: `696b4ca`
-
-### Cycle 3 — WL-016: Scheduler / cron for messages
-- Added `schedules` table with indexes (both backends)
-- Added `Schedule`, `ScheduleKind`, `ScheduleState` types
-- Pure cron evaluator: presets `@hourly`/`@daily`/`@weekly`/`@monthly` + 5-field subset, no new deps
-- Added 5 Store methods: `schedule_message`, `list_schedules`, `cancel_schedule`, `get_due_schedules`, `mark_schedule_executed`
-- CLI: `weave schedule`, `weave schedules`, `weave cancel-schedule`, `weave tick`
-- MCP tools: `weave_schedule`, `weave_schedules`, `weave_cancel_schedule`, `weave_tick`
-- Tick wired into `prompt` hook (after drain + ask nudge)
-- GC prunes stale executed/cancelled schedule rows
-- Tests: unit (cron), store (both backends), integration (CLI + MCP), security (caps)
-- Full gate green: **442 passed** (sqlite), **412 passed + 1 ignored** (libsql)
-- Committed: `558d126`
+### Cycle 1 — WL-017: Mesh memory system
+- Added `weave-core/src/memory.rs` with `MemoryScope` (Global/Project/Persona/Orchestrator), `MemoryEntry`, full CRUD + search API
+- Added `build_context_prefix` for automatic memory context prefixing on message delivery
+- Added `config_dir()` helper in `config.rs`
+- CLI: `weave memory write/read/search/list/delete/scopes` + `--no-memory` opt-out on ask/send/reply
+- MCP: 5 memory tools (`weave_memory_write/read/search/list/delete`) with `no_memory` support
+- Context prefixing hooked into `tool_ask`, `tool_send`, `tool_reply`, `tool_answer`
+- Input caps: key ≤128 [a-zA-Z0-9_-], title ≤256, tags ≤16×64, body ≤64KiB, files ≤10k/scope, prefix ≤5 entries
+- Path traversal defense via `sanitize_key`
+- Tests: 13 unit tests in memory.rs, integration tests (CLI + MCP), security tests (path traversal + caps)
+- Full gate green: **463 passed** (sqlite), **433 passed + 1 ignored** (libsql)
+- Committed: `9998190`
 
 ## Next up
-WL-017: Mesh memory system — filesystem-backed scoped memory under `~/.config/weave/memory/` (global, project, persona, orchestrator) with CLI read/write/search and automatic context prefixing on ask delivery (repowire parity).
+WL-018: Birth certificates / runtime identity envelopes — mint unguessable nonces at `SessionStart` to prevent path-based identity takeover during lazy MCP registration (repowire parity).
 
 ## Known issues / blockers
 None. Both backends build, test, and lint clean.

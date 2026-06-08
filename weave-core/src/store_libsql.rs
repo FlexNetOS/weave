@@ -45,13 +45,13 @@ use crate::model::{
     MAX_DELIVERY_ROWS,
 };
 use crate::store::{
-    append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
-    clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view, merge_peer_views,
-    merge_session_views, remote_scheme_host, reply_subject, sanitize_tag, store_label,
-    validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
-    RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
-    MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN,
-    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
+    append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
+    check_job_text, clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view,
+    merge_peer_views, merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject,
+    sanitize_tag, store_label, validate_job_patch, validate_job_spec, AskManyOutcome, Origin,
+    PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo, SessionView, Store,
+    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
+    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -96,7 +96,8 @@ const SCHEMA: &[&str] = &[
         role        TEXT NOT NULL DEFAULT 'peer',
         turn_state     TEXT NOT NULL DEFAULT '',
         description    TEXT NOT NULL DEFAULT '',
-        description_ts INTEGER NOT NULL DEFAULT 0
+        description_ts INTEGER NOT NULL DEFAULT 0,
+        birth_cert     TEXT
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -616,6 +617,23 @@ impl LibsqlStore {
                     .await
                     .context("adding description_ts column")?;
                 }
+            }
+            // WL-018: birth certificate for identity takeover protection. Nullable;
+            // NULL means "not yet enrolled" (backward-compat). Existing peers without
+            // a cert get one minted on their next re-registration.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='birth_cert'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN birth_cert TEXT",
+                    (),
+                )
+                .await
+                .context("adding birth_cert column")?;
             }
             // Migration (P5): the wake-hook watermark table. Tracks the last
             // unread message id that triggered a block for each reader. Created
@@ -1720,47 +1738,138 @@ impl Store for LibsqlStore {
         branch: &str,
         worktree_id: &str,
         circle: &str,
-    ) -> Result<()> {
+        birth_cert: Option<&str>,
+    ) -> Result<String> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
-        // Bound + control-strip the descriptive git tags at the store seam
-        // (lossy-but-total), mirroring the sqlite backend.
+        if let Some(cert) = birth_cert {
+            check_birth_cert(cert)?;
+        }
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
-        // Re-validate the circle at the store seam (defense-in-depth, mirroring
-        // the sqlite backend): an invalid value falls back to the default circle.
         let circle = if crate::model::circle_valid(circle) {
             circle.to_string()
         } else {
             crate::model::DEFAULT_CIRCLE.to_string()
         };
         self.rt.block_on(async {
-            // `role` is INTENTIONALLY omitted from both the column list and the
-            // ON CONFLICT SET: a NEW row gets the table default ('peer'); an upsert
-            // leaves `role` untouched so a re-register never demotes an orchestrator.
-            self.conn
-                .execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11, circle=?12",
-                    params(vec![
-                        name.into(),
-                        mux.into(),
-                        target.into(),
-                        socket.into(),
-                        cwd.map(|s| s.to_string()).into(),
-                        now().into(),
-                        pid.into(),
-                        host.into(),
-                        repo.into(),
-                        branch.into(),
-                        worktree_id.into(),
-                        circle.into(),
-                    ]),
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let existing_cert: Option<Option<String>> = {
+                let mut it = tx
+                    .query(
+                        "SELECT birth_cert FROM peers WHERE name = ?1",
+                        params(vec![name.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(r.get::<Option<String>>(0)?),
+                    None => None,
+                }
+            };
+            let cert = match existing_cert {
+                None => {
+                    let new_cert = mint_birth_cert()?;
+                    tx.execute(
+                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        params(vec![
+                            name.into(),
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            new_cert.clone().into(),
+                        ]),
+                    )
+                    .await?;
+                    new_cert
+                }
+                Some(None) => {
+                    let new_cert = mint_birth_cert()?;
+                    tx.execute(
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
+                         WHERE name=?13",
+                        params(vec![
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            new_cert.clone().into(),
+                            name.into(),
+                        ]),
+                    )
+                    .await?;
+                    new_cert
+                }
+                Some(Some(stored_cert)) => {
+                    if let Some(supplied) = birth_cert {
+                        if supplied != stored_cert {
+                            anyhow::bail!("birth certificate mismatch for peer '{name}'");
+                        }
+                    } else {
+                        anyhow::bail!("peer '{name}' already registered; provide --cert to re-register");
+                    }
+                    tx.execute(
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
+                         WHERE name=?12",
+                        params(vec![
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            name.into(),
+                        ]),
+                    )
+                    .await?;
+                    stored_cert
+                }
+            };
+            tx.commit().await?;
+            Ok(cert)
+        })
+    }
+
+    fn get_birth_cert(&self, name: &str) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT birth_cert FROM peers WHERE name=?1",
+                    params(vec![name.into()]),
                 )
                 .await?;
-            Ok(())
+            match it.next().await? {
+                Some(r) => {
+                    let cert: Option<String> = r.get(0)?;
+                    Ok(cert)
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -4434,20 +4543,22 @@ mod tests {
     #[test]
     fn register_peer_full_roundtrips_pid_and_host() {
         let s = mem();
-        s.register_peer_full(
-            "p",
-            "tmux",
-            "%3",
-            "",
-            Some("/w"),
-            Some(4321),
-            "boxA",
-            "weave",
-            "main",
-            "(main)",
-            "default",
-        )
-        .unwrap();
+        let cert = s
+            .register_peer_full(
+                "p",
+                "tmux",
+                "%3",
+                "",
+                Some("/w"),
+                Some(4321),
+                "boxA",
+                "weave",
+                "main",
+                "(main)",
+                "default",
+                None,
+            )
+            .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p.pid, Some(4321));
         assert_eq!(p.repo, "weave");
@@ -4470,6 +4581,7 @@ mod tests {
             "",
             "",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -4556,6 +4668,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
@@ -4628,13 +4741,29 @@ mod tests {
     #[test]
     fn register_roundtrips_circle_and_preserves_role() {
         let s = mem();
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+        let cert = s
+            .register_peer_full(
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+            )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
         s.claim_orchestrator_role("p", None, false).unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().role, "orchestrator");
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%1",
+            "",
+            None,
+            None,
+            "h",
+            "",
+            "",
+            "",
+            "team-a",
+            Some(&cert),
+        )
+        .unwrap();
         assert_eq!(
             s.get_peer("p").unwrap().unwrap().role,
             "orchestrator",
@@ -4647,10 +4776,14 @@ mod tests {
     #[test]
     fn claim_refuses_live_holder_then_force_steals() {
         let s = mem();
-        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
-        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
+        s.register_peer_full(
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         assert!(matches!(
             s.claim_orchestrator_role("a", None, false).unwrap(),
             crate::model::ClaimOutcome::Claimed { .. }
@@ -4675,8 +4808,10 @@ mod tests {
     #[test]
     fn orchestrator_status_present_and_absent() {
         let s = mem();
-        s.register_peer_full("o", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
         let st = s.orchestrator_status(Some("c1")).unwrap();
         assert!(st.present);
@@ -4770,6 +4905,7 @@ mod tests {
             "feat/x",
             "wt-9",
             "default",
+            None,
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -4823,6 +4959,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -4843,6 +4980,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -4865,6 +5003,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -4886,6 +5025,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -4927,6 +5067,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let local = s.get_peer("local").unwrap().unwrap();
@@ -4934,7 +5075,7 @@ mod tests {
 
         // same-host + null pid + recent => AliveLocal (TTL fallback).
         s.register_peer_full(
-            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default",
+            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None,
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -4954,6 +5095,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -4972,6 +5114,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let empty = s.get_peer("empty").unwrap().unwrap();
@@ -4998,6 +5141,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -5076,6 +5220,7 @@ mod tests {
                 "",
                 "",
                 "default",
+                None,
             )
             .unwrap();
         }
@@ -5094,7 +5239,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
         );
         assert!(
             wr.is_err(),
@@ -5171,6 +5316,7 @@ mod tests {
                 "",
                 "",
                 "default",
+                None,
             )
             .unwrap();
             rw.send("seed", "seed", None, "hi").unwrap();
@@ -5208,8 +5354,9 @@ mod tests {
         assert_trapped(
             "register_peer_full",
             ro.register_peer_full(
-                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
-            ),
+                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            )
+            .map(|_| ()),
         );
         assert_trapped(
             "enqueue_intent",
@@ -5259,7 +5406,7 @@ mod tests {
         };
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default",
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
             )
             .unwrap();
         {
@@ -5271,7 +5418,7 @@ mod tests {
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
                 )
                 .unwrap();
         }
@@ -6113,6 +6260,7 @@ mod tests {
         s.set_turn_state("a", "working").unwrap();
         s.set_description("a", "deep work").unwrap();
         let ts_before = s.get_peer("a").unwrap().unwrap().description_ts;
+        let cert = s.get_birth_cert("a").unwrap().unwrap();
         s.register_peer_full(
             "a",
             "tmux",
@@ -6125,6 +6273,7 @@ mod tests {
             "br",
             "wt",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();

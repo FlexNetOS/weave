@@ -1169,6 +1169,7 @@ fn tool_scan(
                 &tags.branch,
                 &tags.worktree_id,
                 &weave_core::config::Config::load().circle(),
+                None,
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -1725,7 +1726,7 @@ fn tool_attach(
     // real liveness (this is the agent's own process), plus the git session tags
     // derived from the server's cwd (best-effort; a git failure ⇒ empty tags).
     let tags = injector.git_tags_here();
-    store
+    let cert = store
         .register_peer_full(
             &me,
             t.mux.as_str(),
@@ -1738,6 +1739,9 @@ fn tool_attach(
             &tags.branch,
             &tags.worktree_id,
             &weave_core::config::Config::load().circle(),
+            args.get("cert")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -1747,7 +1751,7 @@ fn tool_attach(
         "no-inject"
     };
     Ok(format!(
-        "Attached '{me}' to the store [{}] {tgt} ({inj}). It is now visible to other sessions.",
+        "Attached '{me}' to the store [{}] {tgt} ({inj}). birth-cert: {cert}",
         t.mux.as_str()
     ))
 }

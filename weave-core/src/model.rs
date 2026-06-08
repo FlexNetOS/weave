@@ -869,6 +869,11 @@ pub struct JobResultView {
 /// bound into a query or stored (the `MAX_IDENT`/`MAX_ASK_ID_LEN` analog).
 pub const MAX_CIRCLE_LEN: usize = 64;
 
+/// Hard upper bound (in chars) on a birth certificate nonce. The cert is 32
+/// random bytes hex-encoded = exactly 64 chars. The cap rejects a hostile or
+/// pasted oversized value before it is bound into a query.
+pub const MAX_BIRTH_CERT_LEN: usize = 64;
+
 /// The semantic default circle. Legacy rows, empty values, and any peer that
 /// never set `WEAVE_CIRCLE`/`config.circle` classify here, so a single-circle
 /// (pre-P4) deployment behaves byte-identically.

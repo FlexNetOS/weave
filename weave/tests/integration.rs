@@ -1128,7 +1128,13 @@ fn attach_flips_no_inject_peer_to_injectable_under_fake_mux() {
     let db = TestDb::new();
 
     // 1. Register 'p' with no mux env present -> a non-injectable (mux=none) peer.
-    run_ok(&db, &["register", "--name", "p"]);
+    let reg_out = run_ok(&db, &["register", "--name", "p"]);
+    let cert_raw = reg_out
+        .split("save birth-cert: ")
+        .nth(1)
+        .expect("register should print birth-cert");
+    let cert = cert_raw.trim().trim_end_matches(')').to_string();
+    assert_eq!(cert.len(), 64, "birth-cert should be 64 hex chars: {cert}");
     let before = run_ok(&db, &["peers", "--json"]);
     let bv: serde_json::Value = serde_json::from_str(&before).expect("peers --json parses");
     let p_before = bv
@@ -1152,7 +1158,7 @@ fn attach_flips_no_inject_peer_to_injectable_under_fake_mux() {
         &db,
         &fake_dir,
         &[("TMUX_PANE", "%9")],
-        &["attach", "--name", "p"],
+        &["attach", "--name", "p", "--cert", &cert],
     )
     .stdin(Stdio::null())
     .output()

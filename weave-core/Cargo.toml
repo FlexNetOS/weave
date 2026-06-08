@@ -9,12 +9,12 @@ description = "Core types, storage backends, and configuration for weave"
 [features]
 sqlite = ["dep:rusqlite"]
 libsql = ["dep:libsql", "dep:tokio"]
-sign = ["dep:ed25519-dalek", "dep:getrandom", "dep:sha2"]
+sign = ["dep:ed25519-dalek", "dep:sha2"]
 
 [dependencies]
 anyhow = "1.0.102"
 ed25519-dalek = { version = "2", optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = "0.2"
 libsql = { version = "0.9.30", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }

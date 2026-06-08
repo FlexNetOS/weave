@@ -1,386 +1,288 @@
-# WL-017 Implementation Plan: Mesh Memory System
+# WL-018 Implementation Plan: Birth Certificates / Runtime Identity Envelopes
 
 ## Goal
-Filesystem-backed scoped memory under `~/.config/weave/memory/` with CLI read/write/search and automatic context prefixing on ask delivery (repowire parity). Single-cycle scope: plain markdown files, simple substring search, no SQLite/FTS, no async.
+Prevent path-based identity takeover by minting unguessable nonces at peer registration. A peer's first registration generates a birth certificate; subsequent registrations for the same identity must present the matching cert. Backward-compatible: existing peers without a cert are upgraded on first re-registration.
+
+## Attack Vector
+Bob knows Alice's identity name. Bob runs `weave attach --name alice` or registers via MCP. The store's UPSERT blindly overwrites Alice's peer row. Messages to Alice now route to Bob's pane. There is currently no proof-of-ownership.
 
 ---
 
-## 1. Directory Structure
+## 1. Schema Changes
 
-```
-$XDG_CONFIG_HOME/weave/memory/          # fallback ~/.config/weave/memory/
-├── global/
-│   ├── onboarding.md
-│   └── conventions.md
-├── project/
-│   └── weave/
-│       └── agent-patterns.md
-├── persona/
-│   └── drdave/
-│       └── preferences.md
-└── orchestrator/
-    └── default/
-        └── runbook.md
+### peers table: add `birth_cert` column
+
+Following the existing additive migration pattern (socket, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts all use `TEXT NOT NULL DEFAULT ''`):
+
+```sql
+ALTER TABLE peers ADD COLUMN birth_cert TEXT NOT NULL DEFAULT '';
 ```
 
-- **Base dir**: `weave-core::config::config_dir()` (new helper returning the parent of `config_path()`).
-- **Scopes**:
-  - `global/` — no resolution needed.
-  - `project/<repo_name>/` — resolved from cwd via `git::capture_worktree_tags` or `git::repo_name_from_toplevel`.
-  - `persona/<identity>/` — resolved from `resolve_me()` / `cfg.session`.
-  - `orchestrator/<circle>/` — resolved from `cfg.circle()`.
+- Added to `SCHEMA` constant in both backends (`store.rs` for sqlite, `store_libsql.rs` for libsql) immediately after `description_ts`.
+- Added to `migrate()` in both backends with `column_exists` / `pragma_table_info` guard (sqlite) or `SELECT 1 FROM pragma_table_info('peers')` guard (libsql).
+- Empty string `''` means "not yet enrolled" (backward-compat), matching the precedent of `host`, `repo`, `socket`, etc.
 
----
-
-## 2. File Format
-
-Each memory entry is a markdown file with YAML frontmatter:
-
-```markdown
----
-title: "Agent coding patterns"
-tags: ["rust", "invariants", "mcp"]
-created_ts: 1717785600
-updated_ts: 1717872000
----
-
-# Agent coding patterns
-
-Always parameterize SQL…
-```
-
-- **Key → filename**: key `agent-patterns` → `agent-patterns.md`.
-- **Frontmatter fields**: `title` (string), `tags` (array of strings), `created_ts` (i64 epoch), `updated_ts` (i64 epoch).
-- **Body**: everything after the closing `---` of the frontmatter.
-- **Encoding**: UTF-8 only.
-
----
-
-## 3. Core Module (`weave-core/src/memory.rs`)
-
-### 3.1 Types
+### New constant
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemoryScope {
-    Global,
-    Project(String),
-    Persona(String),
-    Orchestrator(String),
-}
+pub const MAX_BIRTH_CERT_LEN: usize = 64;
+```
 
-#[derive(Debug, Clone)]
-pub struct MemoryEntry {
-    pub scope: MemoryScope,
-    pub key: String,
-    pub title: String,
-    pub tags: Vec<String>,
-    pub created_ts: i64,
-    pub updated_ts: i64,
-    pub body: String,
+Add to `weave-core/src/model.rs` alongside `MAX_REPO_LEN`, `MAX_BRANCH_LEN`, etc.
+
+---
+
+## 2. Nonce Generation
+
+Use `getrandom` (already in `weave-core/Cargo.toml` as optional for `sign`). Make it **unconditional**:
+
+```toml
+# weave-core/Cargo.toml
+[dependencies]
+getrandom = "0.2"
+```
+
+It's tiny (~1 dep, no-std) and cryptographically secure. Remove `optional = true`.
+
+**Hex encoding (zero new deps)**: 32 random bytes -> 64 hex chars = exactly at cap. Inline a small hex encoder in `weave-core/src/store.rs` since `to_hex` lives in the `sign` feature-gated module.
+
+```rust
+fn mint_birth_cert() -> Result<String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| anyhow::anyhow!("birth cert entropy failure: {e}"))?;
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in buf {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    Ok(out)
 }
 ```
 
-### 3.2 Public API
-
+Also add a validation helper:
 ```rust
-/// Return the absolute directory for a scope.
-pub fn memory_dir(scope: &MemoryScope) -> PathBuf;
-
-/// Return the absolute path for a scope + key.
-pub fn memory_path(scope: &MemoryScope, key: &str) -> PathBuf;
-
-/// Write or overwrite a memory entry. Creates parent dirs.
-pub fn memory_write(
-    scope: &MemoryScope,
-    key: &str,
-    title: &str,
-    tags: &[String],
-    body: &str,
-) -> Result<()>;
-
-/// Read a memory entry by scope + key.
-pub fn memory_read(scope: &MemoryScope, key: &str) -> Result<MemoryEntry>;
-
-/// Search memory entries in a scope (or all scopes if `scope = None`).
-/// Simple substring grep over the full file contents (frontmatter + body).
-/// Returns matches sorted by relevance (exact tag match > substring in body/title).
-pub fn memory_search(scope: Option<&MemoryScope>, query: &str) -> Result<Vec<MemoryEntry>>;
-
-/// List all entries in a scope.
-pub fn memory_list(scope: &MemoryScope) -> Result<Vec<MemoryEntry>>;
-
-/// Delete an entry. Returns true if it existed and was removed.
-pub fn memory_delete(scope: &MemoryScope, key: &str) -> Result<bool>;
-
-/// Return all available scopes that currently have at least one entry on disk.
-pub fn memory_scopes() -> Result<Vec<MemoryScope>>;
-```
-
-### 3.3 Scope Resolution Helpers (for CLI/MCP consumption)
-
-```rust
-/// Resolve the current project scope from cwd (best-effort; returns None if not in a git repo).
-pub fn project_scope_from_cwd() -> Option<MemoryScope>;
-
-/// Resolve the current persona scope from an identity string.
-pub fn persona_scope(identity: &str) -> MemoryScope;
-
-/// Resolve the current orchestrator scope from a circle string.
-pub fn orchestrator_scope(circle: &str) -> MemoryScope;
-```
-
-### 3.4 Internal Helpers
-
-- `sanitize_key(key: &str) -> Result<String>`: validates key name. Reject empty, path traversal (`..`, `/`, `\`), and chars outside `[a-zA-Z0-9_-]`. Max 128 chars.
-- `parse_entry(path: &Path) -> Result<MemoryEntry>`: reads file, splits YAML frontmatter, deserializes fields.
-- `format_entry(entry: &MemoryEntry) -> String`: serializes frontmatter + body.
-- `relevance_score(query: &str, entry: &MemoryEntry) -> u32`: exact tag match = 100, title substring = 50, body substring = 10.
-
----
-
-## 4. Integration Points
-
-### 4.1 Export from `weave-core`
-
-Add `pub mod memory;` to `weave-core/src/lib.rs`.
-
-### 4.2 CLI Commands (`weave/src/main.rs`)
-
-Add to the `Cmd` enum:
-
-```rust
-/// Filesystem-backed scoped memory (global, project, persona, orchestrator).
-Memory {
-    #[command(subcommand)]
-    cmd: MemoryCmd,
-},
-```
-
-Add `MemoryCmd` enum:
-
-```rust
-#[derive(Subcommand)]
-enum MemoryCmd {
-    /// Write a memory entry.
-    Write {
-        #[arg(long)]
-        scope: String, // "global" | "project" | "persona" | "orchestrator"
-        #[arg(long)]
-        key: String,
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
-        #[arg(long)]
-        tag: Vec<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        body: String,
-    },
-    /// Read a memory entry.
-    Read {
-        #[arg(long)]
-        scope: String,
-        #[arg(long)]
-        key: String,
-    },
-    /// Search memory entries.
-    Search {
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        query: String,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-    /// List memory entries in a scope.
-    List {
-        #[arg(long)]
-        scope: String,
-    },
-    /// Delete a memory entry.
-    Delete {
-        #[arg(long)]
-        scope: String,
-        #[arg(long)]
-        key: String,
-    },
-    /// Show available scopes and their resolved paths.
-    Scopes,
+fn check_birth_cert(cert: &str) -> Result<()> {
+    if cert.len() > MAX_BIRTH_CERT_LEN {
+        anyhow::bail!("birth certificate too long ({} chars; max {})", cert.len(), MAX_BIRTH_CERT_LEN);
+    }
+    if !cert.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("birth certificate must be hex digits only");
+    }
+    Ok(())
 }
 ```
 
-**Dispatch** (`fn main` match arm):
-- Parse `scope` string into `MemoryScope` using resolution helpers.
-- `write`: call `memory_write`, print `"wrote <scope>/<key>"`.
-- `read`: call `memory_read`, print frontmatter + body (or JSON with `--json` flag — add `json: bool` to each variant).
-- `search`: call `memory_search`, print list of `scope/key/title/tags` (respect `--limit`).
-- `list`: call `memory_list`, print table.
-- `delete`: call `memory_delete`, print `"deleted <scope>/<key>"` or `"not found"`.
-- `scopes`: print resolved paths for all 4 scope kinds (showing what project/persona/orchestrator would resolve to right now).
+---
 
-### 4.3 MCP Tools (`weave-mcp/src/mcp.rs`)
+## 3. Store Trait Changes
 
-Add to `tools()` JSON schema:
-
-- `weave_memory_write`
-- `weave_memory_read`
-- `weave_memory_search`
-- `weave_memory_list`
-- `weave_memory_delete`
-
-Add to `call_tool()` dispatcher:
+### `register_peer_full` signature change
 
 ```rust
-"weave_memory_write" => tool_memory_write(args),
-"weave_memory_read" => tool_memory_read(args),
-"weave_memory_search" => tool_memory_search(args),
-"weave_memory_list" => tool_memory_list(args),
-"weave_memory_delete" => tool_memory_delete(args),
+#[allow(clippy::too_many_arguments)]
+fn register_peer_full(
+    &self,
+    name: &str,
+    mux: &str,
+    target: &str,
+    socket: &str,
+    cwd: Option<&str>,
+    pid: Option<i64>,
+    host: &str,
+    repo: &str,
+    branch: &str,
+    worktree_id: &str,
+    circle: &str,
+    birth_cert: Option<&str>, // NEW: proof cert for re-registration
+) -> Result<String>; // NEW: returns the peer's effective birth cert
 ```
 
-Each tool function signature: `fn tool_memory_xxx(args: &Value) -> Result<String, String>`.
+**Semantics**:
+1. **Validate inputs** first: `check_ident("peer name", name)?`, sanitize tags, validate circle, `check_birth_cert(cert)?` if `Some`.
+2. **Read existing row** in a transaction:
+   - `SELECT birth_cert FROM peers WHERE name = ?`
+3. **If no existing row** (INSERT path):
+   - Mint new cert via `mint_birth_cert()`.
+   - `INSERT INTO peers (... , birth_cert) VALUES (... , ?)`
+   - Return the new cert.
+4. **If existing row with `birth_cert == ''`** (legacy upgrade path):
+   - Mint new cert via `mint_birth_cert()`.
+   - `UPDATE peers SET mux=?, target=?, ..., birth_cert=? WHERE name=?`
+   - Return the new cert.
+5. **If existing row with `birth_cert != ''`** (enforced path):
+   - If `birth_cert` arg is `None` -> **reject**: `anyhow::bail!("peer '{}' already has a birth certificate; provide it to re-register", name)`
+   - If arg provided but doesn't match stored -> **reject**: `anyhow::bail!("birth certificate mismatch for peer '{}'", name)`
+   - If matches -> `UPDATE peers SET mux=?, target=?, ... (birth_cert omitted from SET) WHERE name=?`
+   - Return the existing cert (unchanged).
 
-Tool semantics mirror CLI but accept `scope` as a string (same resolution rules). `weave_memory_search` takes optional `scope` and `query`, returns JSON array of results. `weave_memory_read` returns the full entry as JSON.
+**Important**: `role` continues to be omitted from the UPDATE SET (preserves orchestrator). `birth_cert` is also omitted from the UPDATE SET in the enforced path (the cert never changes after minting).
 
-### 4.4 Context Prefixing on Ask Delivery
-
-**Design**: Hook into the delivery path **before** `store.ask()` / `store.send()` is called. The prefixed body is what gets persisted and delivered, so the recipient sees the memory context inline.
-
-**Implementation**:
-
-1. Add a helper in `weave-core/src/memory.rs`:
+### `register_peer` wrapper update
 
 ```rust
-/// Build a memory context prefix for a given body + current scopes.
-/// Searches all resolved scopes (global, project from cwd, persona from identity,
-/// orchestrator from circle) for entries whose tags/body match keywords extracted
-/// from the body (or a dedicated `memory_query` field).
-pub fn build_context_prefix(identity: &str, circle: &str, body: &str, top_n: usize) -> String;
+fn register_peer(&self, name: &str, mux: &str, target: &str, socket: &str, cwd: Option<&str>) -> Result<String> {
+    self.register_peer_full(name, mux, target, socket, cwd, None, "", "", "", "", "default", None)
+}
 ```
 
-2. **Keyword extraction** (simple): split body on whitespace, filter out stop words (the, a, is), take first 10 words as query tokens. Perform `memory_search(None, &keyword)` for each keyword, collect unique entries, score by relevance, sort, take top N.
-
-3. **Delimiter format**:
-
-```markdown
-<weave-memory>
-- [global::onboarding] Agent coding patterns
-  Always parameterize SQL…
-- [project::weave::agent-patterns] Test discipline
-  Every change needs fmt+clippy+test…
-</weave-memory>
-
-<original body follows>
-
-<the actual ask body here>
-```
-
-4. **Hook points**:
-   - **CLI `Cmd::Ask`**: after resolving `from`, before `store.ask(...)`, call `build_context_prefix(&from, &cfg.circle(), &body, 3)` and prepend to `body`.
-   - **CLI `Cmd::Send`**: same hook before `store.send(...)`.
-   - **CLI `Cmd::Reply`**: same hook before `store.reply(...)`.
-   - **MCP `tool_ask`**: before `store.ask(...)`, prepend context.
-   - **MCP `tool_send`**: before `store.send(...)`, prepend context.
-   - **MCP `tool_answer`**: before `store.send(...)` (answer uses the default `reply` impl which calls `send`), prepend context.
-
-**Opt-out**: Add a `--no-memory` CLI flag and an `no_memory: Option<bool>` MCP arg to skip prefixing for a single call. Check in each hook; if true, pass body through unchanged.
+This preserves backward-compat for existing test call sites that create fresh peers. Tests that **re-register** the same peer will need to capture the cert from the first call and pass it on the second call.
 
 ---
 
-## 5. Input Caps & Security
+## 4. Backend Implementation Details
+
+### SqliteStore (`weave-core/src/store.rs`)
+
+- Update `SCHEMA` DDL for `peers` table: add `birth_cert TEXT NOT NULL DEFAULT ''` after `description_ts`.
+- Update `migrate()`: add idempotent `ALTER TABLE peers ADD COLUMN birth_cert TEXT NOT NULL DEFAULT ''` guarded by `column_exists`.
+- Update `register_peer_full` impl to use a `Transaction` (not a blind UPSERT):
+  - `tx.query_row` to probe existing `birth_cert`.
+  - Branch on the three cases above.
+  - `tx.execute` for INSERT or UPDATE.
+  - `tx.commit()`.
+- **Do NOT add `birth_cert` to `Peer`**. Do NOT change `row_to_peer`. Inside `register_peer_full`, run a standalone `SELECT birth_cert FROM peers WHERE name=?` before the write transaction. This avoids touching `Peer`, `row_to_peer`, `get_peer`, and `list_peers` at all.
+
+### LibsqlStore (`weave-core/src/store_libsql.rs`)
+
+Mirror every sqlite change exactly:
+- Update `SCHEMA` constant.
+- Update migration block (the `pragma_table_info` probe + `ALTER TABLE` pattern).
+- Update `register_peer_full` impl with the same transaction logic.
+- Do NOT touch `row_to_peer` or `Peer`.
+
+---
+
+## 5. Call Site Updates
+
+The following call sites invoke `register_peer_full`. All must be updated to pass `birth_cert: Option<&str>` and handle the returned `String`.
+
+### CLI `Cmd::Register` (`weave/src/main.rs` ~3119)
+
+Add `--cert` flag:
+```rust
+Cmd::Register {
+    #[arg(long)] name: Option<String>,
+    #[arg(long)] cwd: Option<String>,
+    #[arg(long)] cert: Option<String>, // NEW
+}
+```
+
+- Pass `cert.as_deref()` to `register_peer_full`.
+- On success, print: `registered '{me}' [...] (birth-cert: {cert})`
+
+### CLI `Cmd::Attach` (`weave/src/main.rs` ~3140)
+
+Add `--cert` flag (same struct pattern as Register).
+- Pass `cert.as_deref()` to `register_peer_full`.
+- On success, print: `attached '{me}' [...] (birth-cert: {cert})`
+
+### Hook `session` (`weave/src/main.rs` ~4023)
+
+- Read `WEAVE_BIRTH_CERT` env var: `std::env::var("WEAVE_BIRTH_CERT").ok()`
+- Pass as `birth_cert` to `register_peer_full`.
+- On success, if cert was newly minted (i.e. env was empty), print: `[weave] registered peer '{me}' [...] (save birth-cert: {cert})`
+- If cert was from env and matched, print the normal message (no need to print cert again).
+
+### CLI `Cmd::Scan` self-refresh (`weave/src/main.rs` ~2985)
+
+- Read `WEAVE_BIRTH_CERT` env var.
+- Pass to `register_peer_full`.
+- Error is swallowed as today (non-fatal). After cert is set, missing env -> error -> swallowed -> self-refresh silently skipped. This is acceptable.
+
+### CLI `Cmd::Sessions --watch` self-refresh (`weave/src/main.rs` ~2794)
+
+Same as Scan: read `WEAVE_BIRTH_CERT`, pass, swallow error.
+
+### MCP `tool_attach` (`weave-mcp/src/mcp.rs` ~1685)
+
+- Accept `cert` in tool JSON schema: add `"cert":{"type":"string","description":"Your birth certificate (omit on first attach)."}` to `weave_attach` inputSchema.
+- Read from args: `args.get("cert").and_then(|v| v.as_str())`
+- Pass to `register_peer_full`.
+- On success, return text: `Attached '{me}' ... (birth-cert: {cert})`
+
+### MCP `tool_scan` self-refresh (`weave-mcp/src/mcp.rs` ~1145)
+
+- Read `WEAVE_BIRTH_CERT` env var.
+- Pass to `register_peer_full`.
+- Error swallowed as today.
+
+**Note**: MCP `initialize` (JSON-RPC method) does **NOT** call `register_peer_full` -- it only returns protocol capabilities. No change needed there.
+
+---
+
+## 6. Input Caps and Validation
 
 | Surface | Limit | Enforcement |
 |---------|-------|-------------|
-| Key name | ≤ 128 chars, `[a-zA-Z0-9_-]` only | `sanitize_key` rejects invalid chars and path traversal |
-| Title | ≤ 256 chars | `sanitize_tag(title, 256)` |
-| Tags | ≤ 16 tags, each ≤ 64 chars | truncate count and length |
-| Tag chars | `[a-zA-Z0-9_-]` | strip invalid chars |
-| Body | ≤ 64 KiB | reject if over cap |
-| File per scope | ≤ 10,000 entries | `memory_list` caps traversal; reject write if over |
-| Search results | ≤ 50 entries | hard cap in `memory_search` |
-| Context prefix top-N | ≤ 5 entries | hard cap in `build_context_prefix` |
-| Memory dir | Must be under `~/.config/weave/memory/` | `memory_path` resolves via `config_dir()` only; never accept user-supplied absolute paths as scope dirs |
-
-**Path traversal defense**:
-- `sanitize_key` rejects any key containing `/`, `\`, or `..`.
-- `memory_path` builds the path by joining the resolved scope dir with `format!("{key}.md")`.
-- Never interpret user input as a directory component beyond the validated key name.
+| `birth_cert` value | <= 64 chars, hex `[0-9a-fA-F]` only | `check_birth_cert()` at store seam; rejects oversized / non-hex before any DB write |
+| `birth_cert` arg | Optional | `Option<&str>`; `None` triggers legacy-upgrade or rejection logic |
+| `name` | existing `MAX_IDENT` (64 chars, no control chars) | `check_ident` (unchanged) |
 
 ---
 
-## 6. Scope Resolution Details
+## 7. Test Plan
 
-| Scope | Resolution Rule |
-|-------|-----------------|
-| `global` | Always available. Dir = `~/.config/weave/memory/global/` |
-| `project` | `git::capture_worktree_tags(&std::env::current_dir()?).repo`. If empty (non-git cwd), return an error telling the user to specify `global` or use `--cwd` in a git repo. |
-| `persona` | `resolve_me(None, None, cfg)` (explicit > config > cwd basename). |
-| `orchestrator` | `cfg.circle()` (validated, defaults to `"default"`). |
+### Unit tests (`store.rs` / `store_libsql.rs`)
 
-For CLI/MCP `scope` argument parsing:
-- Exact values: `"global"`, `"project"`, `"persona"`, `"orchestrator"`.
-- Any other value → error: `"scope must be one of: global, project, persona, orchestrator"`.
+- **`register_peer_mints_cert`**: first `register_peer("a", ...)` returns a 64-char lowercase hex string.
+- **`register_peer_rejects_re_register_without_cert`**: register "a", then call `register_peer_full(..., None)` again -> error mentioning "birth certificate".
+- **`register_peer_accepts_matching_cert`**: register "a", capture cert, re-register with `Some(&cert)` -> success, same cert returned.
+- **`register_peer_rejects_wrong_cert`**: register "a", re-register with `Some("0000...")` -> error "mismatch".
+- **`register_peer_upgrades_legacy`**: manually INSERT a peer row with `birth_cert=''`, then call `register_peer(...)` -> success, cert minted and returned.
+- **`register_peer_full_preserves_cert_on_update`**: register, capture cert, re-register with matching cert -> `get_peer` shows updated mux/target, cert unchanged.
 
----
+**Test migration**: Update existing tests that call `register_peer` / `register_peer_full` twice for the **same** peer name to capture the cert from the first call and pass it on the second. Affected tests (from grep audit):
+- `register_peer_full_roundtrips_pid_and_host`
+- `register_peer_full_roundtrips_git_tags`
+- `register_peer_full_preserves_circle_on_upsert`
+- `turn_state_and_description_preserved_on_re_register`
+- `register_peer_rejects_bad_socket`
+- `legacy_db_without_pid_host_migrates_in_place` (re-register after migration)
+- Plus libsql mirrors of the above.
 
-## 7. File Changes
+For tests that register **different** peer names each time, no change needed (first call is always an INSERT).
 
-### New files
-- `weave-core/src/memory.rs` — core memory API
+### Integration tests
 
-### Modified files
-- `weave-core/src/lib.rs` — add `pub mod memory;`
-- `weave-core/src/config.rs` — add `pub fn config_dir() -> PathBuf` helper
-- `weave/src/main.rs` — add `MemoryCmd`, dispatch arm, context-prefix hooks in `Cmd::Send`, `Cmd::Ask`, `Cmd::Reply`
-- `weave-mcp/src/mcp.rs` — add 5 memory tools to `tools()` and `call_tool()`, context-prefix hooks in `tool_ask`, `tool_send`, `tool_answer`
-
-### No changes needed
-- `weave-core/src/store.rs` — filesystem-based; no Store trait changes
-- `weave-core/src/model.rs` — no new DB types
-
----
-
-## 8. Test Plan
-
-### Unit tests (`weave-core/src/memory.rs` inline `#[cfg(test)]`)
-
-1. **`sanitize_key_accepts_good_rejects_bad`**: accepts `foo-bar_123`, rejects `../etc`, `foo/bar`, `foo\bar`, empty, over-length.
-2. **`memory_roundtrip`**: write → read → assert equality.
-3. **`memory_search_substring`**: write two entries, search for a unique substring, assert correct entry returned.
-4. **`memory_search_tag_priority`**: write entries where one has a matching tag and the other only has body match; assert tag match ranks higher.
-5. **`memory_list_and_delete`**: list entries, delete one, list again, assert gone.
-6. **`memory_path_is_under_config_dir`**: assert all scope variants produce paths under `~/.config/weave/memory/`.
-7. **`parse_entry_handles_no_frontmatter`**: graceful error for a file missing frontmatter.
-8. **`parse_entry_handles_empty_body`**: frontmatter only, empty body is ok.
-
-### Integration tests (`weave/tests/` or inline in `weave/src/main.rs` test module)
-
-1. **`cli_memory_write_read`**: spawn `weave memory write --scope global --key test --title T --body B`, then `weave memory read --scope global --key test`, assert output contains title and body.
-2. **`cli_memory_search`**: write multiple entries, `weave memory search --scope global --query foo`, assert matching keys printed.
-3. **`cli_memory_scopes`**: run `weave memory scopes`, assert all 4 scope paths printed.
+- **`cli_attach_mints_cert`**: run `weave attach --name test1` -> stdout contains `birth-cert:` and a 64-char hex token.
+- **`cli_attach_rejects_takeover`**: attach `alice`, capture cert. In a subprocess, `weave attach --name alice` (no cert) -> error exit code + stderr about missing cert.
+- **`cli_attach_accepts_cert`**: attach `alice` with `--cert <captured>` -> success.
+- **`hook_session_mints_cert`**: run hook session with empty `WEAVE_BIRTH_CERT` -> stderr contains new cert.
+- **`hook_session_rejects_without_cert`**: run hook session again with empty env -> stderr contains error, peer row NOT updated.
 
 ### Security tests
 
-1. **`path_traversal_rejected`**: attempt write with key `../../../etc/passwd`, assert error.
-2. **`oversized_body_rejected`**: attempt write with 100 KiB body, assert error.
-3. **`bad_tag_chars_stripped`**: write tag `foo;rm -rf`, read back, assert `foorm-rf` or rejection.
-
-### Context prefixing tests
-
-1. **`ask_prefixes_memory`**: write a global memory entry, then call `tool_ask` (or CLI `weave ask`) with a body containing the keyword, inspect the persisted message body via store directly and assert the `<weave-memory>` block is present.
-2. **`no_memory_opt_out`**: pass `no_memory: true` in MCP `weave_ask`, assert the persisted body does NOT contain `<weave-memory>`.
+- **`cert_oversized_rejected`**: pass 65-char cert -> store rejects before DB touch.
+- **`cert_non_hex_rejected`**: pass `gggg...` -> store rejects.
+- **`cert_never_in_peers_list`**: register peer, call `list_peers` -> assert no `birth_cert` field in JSON (if serialized) or in output.
+- **`mcp_attach_takeover_blocked`**: MCP `tool_attach` for existing peer without cert -> error after first attach set the cert.
 
 ---
 
-## 9. Single-Cycle Checklist
+## 8. Files to Touch
 
-- [ ] `weave-core/src/memory.rs` created with full API
-- [ ] `config_dir()` helper added
-- [ ] `weave memory` CLI wired with all 6 subcommands
-- [ ] 5 MCP memory tools wired in `mcp.rs`
-- [ ] Context prefixing hooked in CLI send/ask/reply and MCP tool_send/tool_ask/tool_answer
-- [ ] Input caps enforced (key, title, tags, body, file count)
-- [ ] Unit tests for memory ops pass
-- [ ] Integration tests for CLI pass
-- [ ] Security tests for path traversal + caps pass
-- [ ] `cargo fmt && cargo clippy -D warnings` clean
-- [ ] `cargo test` passes on both sqlite and libsql backends (memory module is backend-agnostic, but verify no regressions)
+| File | Change |
+|------|--------|
+| `weave-core/Cargo.toml` | Remove `optional = true` from `getrandom` |
+| `weave-core/src/model.rs` | Add `MAX_BIRTH_CERT_LEN = 64` |
+| `weave-core/src/store.rs` | `mint_birth_cert()`, `check_birth_cert()`, trait sig, `register_peer` wrapper, schema DDL, `migrate()`, `register_peer_full` impl (transaction logic) |
+| `weave-core/src/store_libsql.rs` | Mirror all store.rs changes |
+| `weave/src/main.rs` | Add `--cert` to `Cmd::Register` and `Cmd::Attach`; pass cert from `WEAVE_BIRTH_CERT` env to hook session, scan, sessions --watch; print returned cert |
+| `weave-mcp/src/mcp.rs` | Add `cert` to `weave_attach` schema; read `WEAVE_BIRTH_CERT` in `tool_scan`; pass cert arg in `tool_attach`; return cert in tool text |
+| `weave-core/src/store.rs` (tests) | Update re-register tests to capture + pass cert; add new cert-specific tests |
+| `weave-core/src/store_libsql.rs` (tests) | Mirror all new / updated tests |
+
+---
+
+## 9. Single-Cycle Scope Confirmation
+
+- **No new heavy dependencies**: `getrandom` is already a dependency; we only remove `optional = true`.
+- **No breaking existing users on upgrade**: legacy peers (empty `birth_cert`) get a cert minted on their next re-registration automatically.
+- **No Peer struct / JSON wire changes**: `birth_cert` is **not** added to `Peer`; it never leaks in listings, serializations, or public APIs.
+- **Both backends**: sqlite + libsql migrations and implementations.
+- **All registration paths covered**: CLI register, CLI attach, hook session, scan self-refresh, sessions watch self-refresh, MCP tool_attach, MCP tool_scan self-refresh.
+- **Security invariants honored**: cert is secret, capped, validated, never exposed in read paths.
+
+**Estimated LOC**: ~500-600 lines (trait + 2 backends + 2 frontends + migrations + tests).
