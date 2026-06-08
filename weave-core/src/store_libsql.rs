@@ -41,7 +41,7 @@ use crate::model::{
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id, now,
     permission_status, pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult,
     AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch,
-    JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, PermissionStatus,
+    JobResultView, JobSpec, JobState, Lease, Message, OrchestratorStatus, Peer, PermissionStatus,
     ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind, BROADCAST_SQL,
     MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
@@ -236,6 +236,10 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS reviews (\n        id                 TEXT PRIMARY KEY,\n        pr_url             TEXT NOT NULL,\n        title              TEXT NOT NULL DEFAULT '',\n        author             TEXT NOT NULL DEFAULT '',\n        repo               TEXT NOT NULL DEFAULT '',\n        state              TEXT NOT NULL DEFAULT 'open',\n        review_requested_at INTEGER,\n        reviewed_at        INTEGER,\n        reviewed_by        TEXT,\n        created_at         INTEGER NOT NULL\n    )",
     "CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state)",
     "CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at)",
+    // WL-024: leases table
+    "CREATE TABLE IF NOT EXISTS leases (\n        resource  TEXT PRIMARY KEY,\n        holder    TEXT NOT NULL,\n        acquired  INTEGER NOT NULL,\n        expires   INTEGER NOT NULL,\n        note      TEXT NOT NULL DEFAULT ''\n    )",
+    "CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder)",
+    "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -920,6 +924,21 @@ impl LibsqlStore {
                 conn.execute(idx, ())
                     .await
                     .context("creating reviews index")?;
+            }
+            // WL-024: leases table
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS leases (\n                    resource  TEXT PRIMARY KEY,\n                    holder    TEXT NOT NULL,\n                    acquired  INTEGER NOT NULL,\n                    expires   INTEGER NOT NULL,\n                    note      TEXT NOT NULL DEFAULT ''\n                )",
+                (),
+            )
+            .await
+            .context("creating leases table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder)",
+                "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating leases index")?;
             }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
@@ -3696,6 +3715,121 @@ impl Store for LibsqlStore {
                 .execute("DELETE FROM reviews WHERE id = ?1", params(vec![id.into()]))
                 .await?;
             Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn reserve_lease(
+        &self,
+        holder: &str,
+        resource: &str,
+        ttl_secs: i64,
+        note: Option<&str>,
+    ) -> Result<Lease> {
+        use crate::model::{lease_resource_valid, lease_ttl_valid};
+        if !lease_resource_valid(resource) {
+            anyhow::bail!("invalid resource string");
+        }
+        if !lease_ttl_valid(ttl_secs) {
+            anyhow::bail!(
+                "ttl must be > 0 and <= {}s",
+                crate::model::MAX_LEASE_TTL_SECS
+            );
+        }
+        let note = note.unwrap_or("");
+        if note.len() > crate::model::MAX_LEASE_NOTE_LEN {
+            anyhow::bail!("note exceeds {} chars", crate::model::MAX_LEASE_NOTE_LEN);
+        }
+        let acquired = now();
+        let expires = acquired + ttl_secs;
+
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "INSERT INTO leases (resource, holder, acquired, expires, note)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(resource) DO UPDATE SET
+                         holder = excluded.holder,
+                         acquired = excluded.acquired,
+                         expires = excluded.expires,
+                         note = excluded.note
+                     WHERE leases.expires < ?6",
+                    params(vec![
+                        resource.into(),
+                        holder.into(),
+                        acquired.into(),
+                        expires.into(),
+                        note.into(),
+                        now().into(),
+                    ]),
+                )
+                .await?;
+
+            if n == 0 {
+                let row = self
+                    .conn
+                    .query(
+                        "SELECT holder, expires FROM leases WHERE resource = ?1",
+                        params(vec![resource.into()]),
+                    )
+                    .await?
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("lease disappeared during conflict check"))?;
+                let h: String = row.get(0)?;
+                let e: i64 = row.get(1)?;
+                anyhow::bail!("resource '{}' is held by '{}' until {}", resource, h, e);
+            }
+
+            Ok::<_, anyhow::Error>(Lease {
+                resource: resource.to_string(),
+                holder: holder.to_string(),
+                acquired,
+                expires,
+                note: note.to_string(),
+            })
+        })
+    }
+
+    fn release_lease(&self, holder: &str, resource: &str) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM leases WHERE resource = ?1 AND holder = ?2",
+                    params(vec![resource.into(), holder.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn list_leases(&self, limit: i64) -> Result<Vec<Lease>> {
+        self.rt.block_on(async {
+            let now = now();
+            let limit = clamp_limit(limit);
+            let mut stmt = self
+                .conn
+                .query(
+                    "SELECT resource, holder, acquired, expires, note
+                     FROM leases WHERE expires > ?1
+                     ORDER BY acquired DESC LIMIT ?2",
+                    params(vec![now.into(), limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = stmt.next().await? {
+                out.push(Lease {
+                    resource: row.get(0)?,
+                    holder: row.get(1)?,
+                    acquired: row.get(2)?,
+                    expires: row.get(3)?,
+                    note: row.get(4)?,
+                });
+            }
+            Ok::<_, anyhow::Error>(out)
         })
     }
 

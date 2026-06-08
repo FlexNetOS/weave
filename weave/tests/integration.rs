@@ -8650,3 +8650,97 @@ fn mcp_permission_roundtrip() {
 
     mcp.shutdown();
 }
+
+#[test]
+fn cli_lease_roundtrip() {
+    let db = TestDb::new();
+
+    // Reserve a lease.
+    let out = run_ok(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "crates/foo",
+            "--ttl",
+            "3600",
+            "--note",
+            "working",
+        ],
+    );
+    assert!(out.contains("leased crates/foo"), "reserve output: {out}");
+
+    // List should show it.
+    let list = run_ok(&db, &["lease", "list"]);
+    assert!(
+        list.contains("crates/foo"),
+        "list should show lease: {list}"
+    );
+    assert!(list.contains("working"), "list should show note: {list}");
+
+    // Conflict from another holder.
+    let (ok, _out, _err) = run(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "crates/foo",
+            "--ttl",
+            "3600",
+        ],
+    );
+    assert!(!ok, "should fail when already held");
+
+    // Release.
+    let rel = run_ok(&db, &["lease", "release", "--resource", "crates/foo"]);
+    assert!(rel.contains("released crates/foo"), "release output: {rel}");
+
+    // List should be empty.
+    let empty = run_ok(&db, &["lease", "list"]);
+    assert!(empty.contains("no active leases"), "empty list: {empty}");
+
+    // Release non-existent should fail.
+    let (ok, _out, _err) = run(&db, &["lease", "release", "--resource", "crates/foo"]);
+    assert!(!ok, "should fail on double-release");
+}
+
+#[test]
+fn mcp_lease_roundtrip() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // Reserve.
+    let (err, out) = mcp.call_tool(
+        "weave_lease_reserve",
+        serde_json::json!({"resource": "crates/foo", "ttl": 3600, "note": "working", "me": "alice"}),
+    );
+    assert!(!err, "reserve: {out}");
+    assert!(out.contains("leased crates/foo"), "reserve output: {out}");
+
+    // List.
+    let (err, list) = mcp.call_tool("weave_lease_list", serde_json::json!({}));
+    assert!(!err, "list: {list}");
+    assert!(
+        list.contains("crates/foo"),
+        "list should contain lease: {list}"
+    );
+
+    // Conflict.
+    let (err, conflict) = mcp.call_tool(
+        "weave_lease_reserve",
+        serde_json::json!({"resource": "crates/foo", "ttl": 3600, "me": "bob"}),
+    );
+    assert!(err, "should error on conflict: {conflict}");
+
+    // Release.
+    let (err, rel) = mcp.call_tool(
+        "weave_lease_release",
+        serde_json::json!({"resource": "crates/foo", "me": "alice"}),
+    );
+    assert!(!err, "release: {rel}");
+    assert!(rel.contains("released crates/foo"), "release output: {rel}");
+
+    mcp.shutdown();
+}

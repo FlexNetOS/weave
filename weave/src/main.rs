@@ -640,6 +640,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PermissionCmd,
     },
+    /// Reservation leases (WL-024): lightweight advisory file locks between agents.
+    Lease {
+        #[command(subcommand)]
+        cmd: LeaseCmd,
+    },
     /// HTTP MCP server (WL-022): localhost-only JSON-RPC endpoint for remote agents.
     Serve {
         /// Port to listen on (default 8787).
@@ -772,6 +777,37 @@ enum PermissionCmd {
     List {
         #[arg(long, default_value_t = 50)]
         limit: i64,
+    },
+}
+
+/// `weave lease` subcommands (WL-024) — advisory file reservations.
+#[derive(Subcommand)]
+enum LeaseCmd {
+    /// Reserve a lease on a resource. Succeeds only if no active lease exists.
+    Reserve {
+        /// Resource identifier (path, glob, or freeform tag).
+        #[arg(long)]
+        resource: String,
+        /// TTL in seconds (1..86400).
+        #[arg(long)]
+        ttl: i64,
+        /// Optional note.
+        #[arg(long, allow_hyphen_values = true)]
+        note: Option<String>,
+    },
+    /// Release a lease you hold.
+    Release {
+        /// Resource identifier.
+        #[arg(long)]
+        resource: String,
+    },
+    /// List active (non-expired) leases.
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -3646,6 +3682,8 @@ fn main() -> Result<()> {
 
         Cmd::Permission { cmd } => dispatch_permission(store, &cfg, cmd)?,
 
+        Cmd::Lease { cmd } => dispatch_lease(store, &cfg, cmd)?,
+
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
         Cmd::Serve {
@@ -4042,6 +4080,59 @@ fn dispatch_permission(store: &dyn Store, cfg: &Config, cmd: PermissionCmd) -> R
                         a.askee,
                         tool,
                         model::fmt_ts(a.opened_ts)
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave lease` handler (WL-024). Advisory reservations with TTL.
+fn dispatch_lease(store: &dyn Store, cfg: &Config, cmd: LeaseCmd) -> Result<()> {
+    let me = resolve_me(None, None, cfg);
+    match cmd {
+        LeaseCmd::Reserve {
+            resource,
+            ttl,
+            note,
+        } => match store.reserve_lease(&me, &resource, ttl, note.as_deref()) {
+            Ok(lease) => {
+                println!(
+                    "leased {} (expires {})",
+                    lease.resource,
+                    model::fmt_ts(lease.expires)
+                );
+            }
+            Err(e) => {
+                println!("failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        LeaseCmd::Release { resource } => {
+            let ok = store.release_lease(&me, &resource)?;
+            if ok {
+                println!("released {}", resource);
+            } else {
+                println!("no active lease for {} held by you", resource);
+                std::process::exit(1);
+            }
+        }
+        LeaseCmd::List { limit, json } => {
+            let leases = store.list_leases(limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&leases)?);
+            } else if leases.is_empty() {
+                println!("no active leases");
+            } else {
+                for l in &leases {
+                    println!(
+                        "{} | {} | acquired {} | expires {} | {}",
+                        l.resource,
+                        l.holder,
+                        model::fmt_ts(l.acquired),
+                        model::fmt_ts(l.expires),
+                        if l.note.is_empty() { "-" } else { &l.note }
                     );
                 }
             }

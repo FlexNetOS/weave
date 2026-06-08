@@ -939,6 +939,13 @@ pub const MAX_REVIEW_TITLE_LEN: usize = 256;
 /// Hard upper bound (in chars) on a review item author/repo.
 pub const MAX_REVIEW_IDENT_LEN: usize = 64;
 
+/// WL-024: max resource string length for a lease reservation.
+pub const MAX_LEASE_RESOURCE_LEN: usize = 512;
+/// WL-024: max note length for a lease reservation.
+pub const MAX_LEASE_NOTE_LEN: usize = 1024;
+/// WL-024: max TTL for a lease in seconds (≈ 24 hours).
+pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
+
 /// The lifecycle state of a PR in the review queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1037,6 +1044,30 @@ pub fn pr_url_valid(url: &str) -> bool {
 /// Mint an opaque review id.
 pub fn new_review_id(seed: i64) -> String {
     format!("review_{seed}_{}", mint_nonce(3_141_592_653))
+}
+
+/// WL-024: a lightweight advisory lease reservation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lease {
+    pub resource: String,
+    pub holder: String,
+    pub acquired: i64,
+    pub expires: i64,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// WL-024: validate a lease resource string.
+pub fn lease_resource_valid(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= MAX_LEASE_RESOURCE_LEN
+        && !r.contains('\0')
+        && r.chars().all(|c| !c.is_control())
+}
+
+/// WL-024: validate a lease TTL in seconds.
+pub fn lease_ttl_valid(ttl: i64) -> bool {
+    ttl > 0 && ttl <= MAX_LEASE_TTL_SECS
 }
 
 /// Hard upper bound (in chars) on a circle label. A circle is a small grouping
@@ -2692,5 +2723,26 @@ mod tests {
             permission_status(&ask, Some("no"), 1200, 300),
             PermissionStatus::Denied
         );
+    }
+
+    #[test]
+    fn lease_resource_valid_accepts_good_rejects_bad() {
+        assert!(lease_resource_valid("crates/foo/src/lib.rs"));
+        assert!(lease_resource_valid("migrations/"));
+        assert!(!lease_resource_valid(""));
+        assert!(!lease_resource_valid("has\0null"));
+        assert!(!lease_resource_valid("has\nnewline"));
+        let oversize = "a".repeat(MAX_LEASE_RESOURCE_LEN + 1);
+        assert!(!lease_resource_valid(&oversize));
+    }
+
+    #[test]
+    fn lease_ttl_valid_bounds() {
+        assert!(lease_ttl_valid(1));
+        assert!(lease_ttl_valid(3600));
+        assert!(lease_ttl_valid(MAX_LEASE_TTL_SECS));
+        assert!(!lease_ttl_valid(0));
+        assert!(!lease_ttl_valid(-1));
+        assert!(!lease_ttl_valid(MAX_LEASE_TTL_SECS + 1));
     }
 }

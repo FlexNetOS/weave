@@ -461,6 +461,9 @@ fn call_tool(
         }
         "weave_permission_status" => tool_permission_status(store, args),
         "weave_permission_list" => tool_permission_list(store, me_default, args),
+        "weave_lease_reserve" => tool_lease_reserve(store, me_default, args),
+        "weave_lease_release" => tool_lease_release(store, me_default, args),
+        "weave_lease_list" => tool_lease_list(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -3101,6 +3104,30 @@ fn tools() -> Value {
                 "limit":{"type":"integer","description":"Max results (bounded by server)."},
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
             },"required":[]}
+        },
+        {
+            "name": "weave_lease_reserve",
+            "description": "Reserve an advisory lease on a resource. Succeeds only if no active lease exists (or it has expired).",
+            "inputSchema": {"type":"object","properties":{
+                "resource":{"type":"string","description":"Resource identifier (path, glob, or freeform tag)."},
+                "ttl":{"type":"integer","description":"TTL in seconds (1..86400)."},
+                "note":{"type":"string","description":"Optional note."}
+            },"required":["resource","ttl"]}
+        },
+        {
+            "name": "weave_lease_release",
+            "description": "Release a lease you hold on a resource.",
+            "inputSchema": {"type":"object","properties":{
+                "resource":{"type":"string","description":"Resource identifier."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["resource"]}
+        },
+        {
+            "name": "weave_lease_list",
+            "description": "List active (non-expired) leases.",
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":[]}
         }
     ])
 }
@@ -3696,6 +3723,69 @@ fn tool_permission_list(
             a.asker,
             a.askee,
             tool
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_lease_reserve(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let resource = args
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .ok_or("resource required")?;
+    let ttl = args
+        .get("ttl")
+        .and_then(|v| v.as_i64())
+        .ok_or("ttl required")?;
+    let note = args.get("note").and_then(|v| v.as_str());
+    match store.reserve_lease(&me, resource, ttl, note) {
+        Ok(lease) => Ok(format!(
+            "leased {} (expires {})",
+            lease.resource, lease.expires
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn tool_lease_release(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let resource = args
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .ok_or("resource required")?;
+    let ok = store
+        .release_lease(&me, resource)
+        .map_err(|e| e.to_string())?;
+    if ok {
+        Ok(format!("released {}", resource))
+    } else {
+        Err(format!("no active lease for {} held by you", resource))
+    }
+}
+
+fn tool_lease_list(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let leases = store.list_leases(limit).map_err(|e| e.to_string())?;
+    if leases.is_empty() {
+        return Ok("no active leases".to_string());
+    }
+    let mut out = format!("{} lease(s):\n", leases.len());
+    for l in leases {
+        out.push_str(&format!(
+            "{} | {} | expires {} | {}\n",
+            l.resource,
+            l.holder,
+            l.expires,
+            if l.note.is_empty() { "-" } else { &l.note }
         ));
     }
     Ok(out)

@@ -26,7 +26,7 @@ pub use crate::store_libsql::{
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id,
-    permission_status, pr_url_valid, AskGroup, AskManyChildView, AskState, BROADCAST_SQL,
+    permission_status, pr_url_valid, AskGroup, AskManyChildView, AskState, Lease, BROADCAST_SQL,
     MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 #[cfg(feature = "sqlite")]
@@ -667,6 +667,28 @@ pub trait Store: Send {
     /// WL-020: remove a review item by id. Returns `true` if the row existed.
     #[allow(dead_code)]
     fn remove_review_item(&self, id: &str) -> Result<bool>;
+
+    /// WL-024: attempt to reserve a lease on `resource` for `holder`.
+    /// Succeeds only if no lease exists or the existing lease has expired.
+    /// On conflict, returns `Err` naming the current holder and expiry.
+    #[allow(dead_code)]
+    fn reserve_lease(
+        &self,
+        holder: &str,
+        resource: &str,
+        ttl_secs: i64,
+        note: Option<&str>,
+    ) -> Result<crate::model::Lease>;
+
+    /// WL-024: release a lease held by `holder` on `resource`.
+    /// Returns `true` if the row existed and matched the holder.
+    #[allow(dead_code)]
+    fn release_lease(&self, holder: &str, resource: &str) -> Result<bool>;
+
+    /// WL-024: list active (non-expired) leases, newest-first by `acquired`,
+    /// capped at `clamp_limit(limit)`. Read-only.
+    #[allow(dead_code)]
+    fn list_leases(&self, limit: i64) -> Result<Vec<crate::model::Lease>>;
 
     /// WL-021: resolve the permission status of a ToolPermission ask by its
     /// correlation id. Returns the answer body when available so callers can log
@@ -1461,6 +1483,15 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
+CREATE TABLE IF NOT EXISTS leases (
+    resource  TEXT PRIMARY KEY,
+    holder    TEXT NOT NULL,
+    acquired  INTEGER NOT NULL,
+    expires   INTEGER NOT NULL,
+    note      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder);
+CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -4518,6 +4549,99 @@ impl Store for SqliteStore {
             .conn
             .execute("DELETE FROM reviews WHERE id = ?1", params![id])?;
         Ok(n > 0)
+    }
+
+    fn reserve_lease(
+        &self,
+        holder: &str,
+        resource: &str,
+        ttl_secs: i64,
+        note: Option<&str>,
+    ) -> Result<Lease> {
+        use crate::model::{lease_resource_valid, lease_ttl_valid};
+        if !lease_resource_valid(resource) {
+            anyhow::bail!("invalid resource string");
+        }
+        if !lease_ttl_valid(ttl_secs) {
+            anyhow::bail!(
+                "ttl must be > 0 and <= {}s",
+                crate::model::MAX_LEASE_TTL_SECS
+            );
+        }
+        let note = note.unwrap_or("");
+        if note.len() > crate::model::MAX_LEASE_NOTE_LEN {
+            anyhow::bail!("note exceeds {} chars", crate::model::MAX_LEASE_NOTE_LEN);
+        }
+        let acquired = now();
+        let expires = acquired + ttl_secs;
+
+        // Try atomic upsert: succeed if no row OR existing lease expired.
+        let n = self.conn.execute(
+            "INSERT INTO leases (resource, holder, acquired, expires, note)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(resource) DO UPDATE SET
+                 holder = excluded.holder,
+                 acquired = excluded.acquired,
+                 expires = excluded.expires,
+                 note = excluded.note
+             WHERE leases.expires < ?6",
+            params![resource, holder, acquired, expires, note, now()],
+        )?;
+
+        if n == 0 {
+            // Conflict — existing lease is still alive. Return its details in the error.
+            let row: (String, i64) = self.conn.query_row(
+                "SELECT holder, expires FROM leases WHERE resource = ?1",
+                params![resource],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            anyhow::bail!(
+                "resource '{}' is held by '{}' until {}",
+                resource,
+                row.0,
+                row.1
+            );
+        }
+
+        Ok(Lease {
+            resource: resource.to_string(),
+            holder: holder.to_string(),
+            acquired,
+            expires,
+            note: note.to_string(),
+        })
+    }
+
+    fn release_lease(&self, holder: &str, resource: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM leases WHERE resource = ?1 AND holder = ?2",
+            params![resource, holder],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn list_leases(&self, limit: i64) -> Result<Vec<Lease>> {
+        let now = now();
+        let limit = clamp_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT resource, holder, acquired, expires, note
+             FROM leases WHERE expires > ?1
+             ORDER BY acquired DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, limit], |r| {
+            Ok(Lease {
+                resource: r.get(0)?,
+                holder: r.get(1)?,
+                acquired: r.get(2)?,
+                expires: r.get(3)?,
+                note: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     fn permission_verdict(
@@ -9237,5 +9361,90 @@ mod tests {
         let perms = s.list_permissions("alice", 10).unwrap();
         assert_eq!(perms.len(), 1);
         assert_eq!(perms[0].kind, crate::model::AskKind::ToolPermission);
+    }
+
+    // ---- WL-024: reservation leases ----
+
+    #[test]
+    fn lease_reserve_acquire_and_conflict() {
+        let s = mem();
+        let l = s
+            .reserve_lease("alice", "crates/foo", 3600, Some("working on it"))
+            .unwrap();
+        assert_eq!(l.resource, "crates/foo");
+        assert_eq!(l.holder, "alice");
+        assert_eq!(l.note, "working on it");
+
+        // Same resource from another holder should fail.
+        let err = s
+            .reserve_lease("bob", "crates/foo", 3600, None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("held by 'alice'"),
+            "expected holder in error: {msg}"
+        );
+
+        // Different resource should succeed.
+        let l2 = s.reserve_lease("bob", "crates/bar", 3600, None).unwrap();
+        assert_eq!(l2.holder, "bob");
+    }
+
+    #[test]
+    fn lease_expired_releases_automatically() {
+        let s = mem();
+        // Acquire with a 1-second TTL.
+        let l = s.reserve_lease("alice", "crates/foo", 1, None).unwrap();
+        assert_eq!(l.holder, "alice");
+
+        // Wait for expiry.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // bob can now acquire it.
+        let l2 = s.reserve_lease("bob", "crates/foo", 3600, None).unwrap();
+        assert_eq!(l2.holder, "bob");
+    }
+
+    #[test]
+    fn lease_release_and_list() {
+        let s = mem();
+        s.reserve_lease("alice", "crates/foo", 3600, Some("note1"))
+            .unwrap();
+        s.reserve_lease("bob", "crates/bar", 3600, Some("note2"))
+            .unwrap();
+
+        let all = s.list_leases(10).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // alice releases hers.
+        assert!(s.release_lease("alice", "crates/foo").unwrap());
+        let remaining = s.list_leases(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].resource, "crates/bar");
+
+        // Releasing non-existent or wrong holder returns false.
+        assert!(!s.release_lease("alice", "crates/foo").unwrap());
+        assert!(!s.release_lease("bob", "crates/foo").unwrap());
+    }
+
+    #[test]
+    fn lease_list_only_active() {
+        let s = mem();
+        s.reserve_lease("alice", "crates/foo", 1, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let expired = s.list_leases(10).unwrap();
+        assert_eq!(expired.len(), 0);
+    }
+
+    #[test]
+    fn lease_rejects_bad_input() {
+        let s = mem();
+        assert!(s.reserve_lease("alice", "", 3600, None).is_err());
+        assert!(s.reserve_lease("alice", "foo", 0, None).is_err());
+        assert!(s.reserve_lease("alice", "foo", 86_401, None).is_err());
+        let big_note = "x".repeat(crate::model::MAX_LEASE_NOTE_LEN + 1);
+        assert!(s
+            .reserve_lease("alice", "foo", 3600, Some(&big_note))
+            .is_err());
     }
 }
