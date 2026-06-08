@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] — scheduler (WL-016)
+
+> **Daemon-free message scheduling.** One-shot (`--at <unix_ts>`) and recurring
+> (`--every <cron>`) message deliveries, evaluated implicitly on every
+> `weave hook prompt` and explicitly via `weave tick`. No background process;
+> the tick is a cheap read of due schedules + `store.send` per row.
+> Mirrored across both storage backends with a guarded additive migration.
+
+### Added
+- **model:** `Schedule`, `ScheduleKind` (`OneShot`/`Recurring`), `ScheduleState`
+  (`Pending`/`Executed`/`Cancelled`), `MAX_CRON_EXPR_LEN = 64`,
+  `cron_valid()`, and `next_occurrence()` — a pure, dependency-free cron
+  evaluator supporting presets (`@hourly`, `@daily`, `@weekly`, `@monthly`)
+  and simple 5-field cron expressions (`min hour day month dow`).
+- **store (both backends):** `schedules` table via guarded idempotent additive
+  migration; `schedule_message`, `list_schedules`, `cancel_schedule`
+  (soft-cancel), `get_due_schedules`, and `mark_schedule_executed` on the
+  `Store` trait. GC prunes old terminal schedule rows.
+- **CLI:** `weave schedule`, `weave schedules`, `weave cancel-schedule`,
+  `weave tick`. Tick filters self-only by default; `--all` fires every due
+  schedule (admin/debug).
+- **MCP:** four new tools: `weave_schedule`, `weave_schedules`,
+  `weave_cancel_schedule`, `weave_tick`.
+- **Hook integration:** `execute_tick` is called best-effort inside
+  `handle_hook` `"prompt"` after inbox drain and open-ask nudges.
+- **Tests:** CLI roundtrip (schedule → tick → inbox), MCP tool roundtrip,
+  cancel idempotency, tick `--all`, and security tests for body/cron/at caps.
+
 ## [Unreleased] — workspace split
 
 > Mechanical refactor: the previous single crate is now a Cargo workspace with four

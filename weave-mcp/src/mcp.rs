@@ -393,6 +393,10 @@ fn call_tool(
         "weave_daemon_start" => tool_daemon_start(me_default, args),
         "weave_daemon_stop" => tool_daemon_stop(),
         "weave_daemon_status" => tool_daemon_status(),
+        "weave_schedule" => tool_schedule(store, me_default, args),
+        "weave_schedules" => tool_schedules(store, me_default, args),
+        "weave_cancel_schedule" => tool_cancel_schedule(store, args),
+        "weave_tick" => tool_tick(store, me_default, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -2859,6 +2863,41 @@ fn tools() -> Value {
             "name": "weave_daemon_status",
             "description": "Show whether the optional presence daemon is running. Returns running:true + pid when active, or running:false when stopped. A stale pidfile is automatically cleaned up.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_schedule",
+            "description": "Schedule a future message delivery (one-shot or recurring). Provide exactly one of 'at' (absolute UNIX timestamp) or 'every' (cron preset like @hourly/@daily/@weekly/@monthly or a 5-field cron expression). The scheduled message is sent to the recipient's inbox and behaves like a normal message on delivery.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "to":{"type":"string","description":"Recipient session name."},
+                "subject":{"type":"string"},
+                "body":{"type":"string","description":"Message body (required)."},
+                "at":{"type":"integer","description":"One-shot: absolute UNIX timestamp."},
+                "every":{"type":"string","description":"Recurring: cron preset (@hourly, @daily, @weekly, @monthly) or 5-field cron expression."}
+            },"required":["to","body"]}
+        },
+        {
+            "name": "weave_schedules",
+            "description": "List your scheduled messages (one-shot and recurring). Includes cancelled and executed rows so you see the full state.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "limit":{"type":"integer"}
+            },"required":[]}
+        },
+        {
+            "name": "weave_cancel_schedule",
+            "description": "Soft-cancel a scheduled message by its id. Idempotent: cancelling an already-cancelled or executed row is a no-op, not an error.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"integer","description":"The schedule id to cancel."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_tick",
+            "description": "Execute any due scheduled messages now (explicit tick). Self-only by default: only schedules you created are fired. Pass all=true to fire every due schedule (admin/debug).",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "all":{"type":"boolean","description":"Fire schedules for all senders, not just yourself."}
+            },"required":[]}
         }
     ])
 }
@@ -2925,6 +2964,142 @@ fn tool_daemon_status() -> Result<String, String> {
         let _ = std::fs::remove_file(&pidfile);
         Ok(r#"{"running":false}"#.to_string())
     }
+}
+
+fn tool_schedule(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (recipient session name).")?;
+    let to = bound_ident("to", to_raw)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let at = args.get("at").and_then(|v| v.as_i64());
+    let every = args.get("every").and_then(|v| v.as_str());
+
+    let (kind, cron_expr, next_run) = match (at, every) {
+        (Some(ts), None) => {
+            if ts <= 0 {
+                return Err("'at' must be a positive UNIX timestamp".to_string());
+            }
+            (model::ScheduleKind::OneShot, String::new(), ts)
+        }
+        (None, Some(expr)) => {
+            let expr = expr.trim();
+            if !model::cron_valid(expr) {
+                return Err("'every' is not a valid cron expression".to_string());
+            }
+            let next = model::next_occurrence(expr, model::now()).ok_or_else(|| {
+                "could not compute next occurrence from cron expression".to_string()
+            })?;
+            (model::ScheduleKind::Recurring, expr.to_string(), next)
+        }
+        (Some(_), Some(_)) => {
+            return Err("provide exactly one of 'at' or 'every', not both".to_string());
+        }
+        (None, None) => {
+            return Err("provide exactly one of 'at' or 'every'".to_string());
+        }
+    };
+
+    let id = store
+        .schedule_message(
+            &from,
+            &to,
+            subject.as_deref(),
+            body,
+            kind,
+            &cron_expr,
+            next_run,
+        )
+        .map_err(e)?;
+    Ok(format!(
+        "Scheduled message #{id}: {from} -> {to} at {next_run} ({})",
+        kind.as_str()
+    ))
+}
+
+fn tool_schedules(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let rows = store.list_schedules(&me, limit).map_err(e)?;
+    if rows.is_empty() {
+        return Ok(format!("No scheduled messages for '{me}'."));
+    }
+    let mut out = format!("Scheduled messages for '{me}':\n");
+    for s in &rows {
+        let subj = s
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        let state = if s.cancelled {
+            "cancelled"
+        } else if s.executed_ts.is_some() {
+            "executed"
+        } else {
+            "pending"
+        };
+        out.push_str(&format!(
+            "#{} [{}] {} -> {}{} ({}) next={}\n",
+            s.id,
+            state,
+            s.sender,
+            s.recipient,
+            subj,
+            s.kind.as_str(),
+            s.next_run
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_cancel_schedule(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or("'id' is required (the schedule id to cancel).")?;
+    let cancelled = store.cancel_schedule(id).map_err(e)?;
+    if cancelled {
+        Ok(format!("Cancelled schedule #{id}."))
+    } else {
+        Ok(format!(
+            "Schedule #{id} was already terminal or did not exist."
+        ))
+    }
+}
+
+fn tool_tick(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let now_ts = model::now();
+    let due = store.get_due_schedules(now_ts).map_err(e)?;
+    let mut fired = 0usize;
+    let mut skipped = 0usize;
+    for sched in &due {
+        if !all && sched.sender != me {
+            skipped += 1;
+            continue;
+        }
+        let _mid = store
+            .send(
+                &sched.sender,
+                &sched.recipient,
+                sched.subject.as_deref(),
+                &sched.body,
+            )
+            .map_err(e)?;
+        store.mark_schedule_executed(sched.id).map_err(e)?;
+        fired += 1;
+    }
+    Ok(format!(
+        "Tick: {fired} schedule(s) fired, {skipped} skipped."
+    ))
 }
 
 #[cfg(test)]

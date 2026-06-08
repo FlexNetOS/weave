@@ -8,7 +8,8 @@
 use crate::config::StoreSource;
 use crate::model::{
     now, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, Schedule,
+    ScheduleKind,
 };
 use anyhow::Result;
 
@@ -25,7 +26,7 @@ pub use crate::store_libsql::{
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, AskGroup,
-    AskManyChildView, AskState, BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    AskManyChildView, AskState, BROADCAST_SQL, MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS,
 };
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -573,6 +574,49 @@ pub trait Store: Send {
             Ok(crate::model::Liveness::Offline)
         }
     }
+
+    /// WL-016: schedule a future message delivery.
+    /// Validates sender/recipient identities and body length via `check_ident`/`check_body`.
+    /// `next_run` must be in the future (>= now() allowed; the tick uses `<= now`).
+    /// Returns the new schedule id.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_message(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        kind: ScheduleKind,
+        cron_expr: &str,
+        next_run: i64,
+    ) -> Result<i64>;
+
+    /// WL-016: list schedules created by `sender`, newest-first by `created_ts`,
+    /// capped at `clamp_limit(limit)`. Includes cancelled rows so the user sees
+    /// the full state.
+    #[allow(dead_code)]
+    fn list_schedules(&self, sender: &str, limit: i64) -> Result<Vec<Schedule>>;
+
+    /// WL-016: soft-cancel a schedule by id. Returns `true` if the row existed and
+    /// was pending (and is now cancelled). Idempotent: cancelling an already-
+    /// cancelled or executed row returns `false` without error.
+    #[allow(dead_code)]
+    fn cancel_schedule(&self, id: i64) -> Result<bool>;
+
+    /// WL-016: fetch schedules whose `next_run <= before_ts` AND `cancelled = 0`
+    /// AND (`executed_ts IS NULL` OR `kind = 'recurring'`), oldest-first by `next_run`.
+    /// The tick calls this with `before_ts = now()`.
+    #[allow(dead_code)]
+    fn get_due_schedules(&self, before_ts: i64) -> Result<Vec<Schedule>>;
+
+    /// WL-016: advance a schedule after execution.
+    /// - OneShot: sets `executed_ts = now()`.
+    /// - Recurring: computes the next occurrence via `model::next_occurrence` and
+    ///   updates `next_run`; if no next occurrence is computable (malformed cron),
+    ///   soft-cancels instead.
+    #[allow(dead_code)]
+    fn mark_schedule_executed(&self, id: i64) -> Result<()>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1286,6 +1330,21 @@ CREATE TABLE IF NOT EXISTS presence (
     pid          INTEGER,
     heartbeat_ts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS schedules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    cron_expr   TEXT NOT NULL,
+    next_run    INTEGER NOT NULL,
+    sender      TEXT NOT NULL,
+    recipient   TEXT NOT NULL,
+    subject     TEXT,
+    body        TEXT NOT NULL,
+    created_ts  INTEGER NOT NULL,
+    executed_ts INTEGER,
+    cancelled   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run);
+CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1399,6 +1458,34 @@ fn row_to_job(r: &Row) -> rusqlite::Result<Job> {
         opened_ts: r.get("opened_ts")?,
         updated_ts: r.get("updated_ts")?,
         completed_ts: r.get("completed_ts")?,
+    })
+}
+
+/// Convert a `schedules` row into our owned [`Schedule`]. Reads columns by NAME
+/// so a `SELECT *` maps cleanly. `kind` is parsed through [`ScheduleKind::from_str`];
+/// an unknown value is a hard error, never a panic or silent coercion.
+#[cfg(feature = "sqlite")]
+fn row_to_schedule(r: &Row) -> rusqlite::Result<Schedule> {
+    let kind_str: String = r.get("kind")?;
+    let kind = ScheduleKind::from_str(&kind_str).map_err(|msg| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
+        )
+    })?;
+    Ok(Schedule {
+        id: r.get("id")?,
+        kind,
+        cron_expr: r.get("cron_expr")?,
+        next_run: r.get("next_run")?,
+        sender: r.get("sender")?,
+        recipient: r.get("recipient")?,
+        subject: r.get("subject")?,
+        body: r.get("body")?,
+        created_ts: r.get("created_ts")?,
+        executed_ts: r.get("executed_ts")?,
+        cancelled: r.get::<_, i64>("cancelled")? != 0,
     })
 }
 
@@ -1817,6 +1904,26 @@ fn migrate(conn: &Connection) -> Result<()> {
             pid          INTEGER,
             heartbeat_ts INTEGER NOT NULL DEFAULT 0
         );",
+    )?;
+    // WL-016: schedules table for future message delivery.
+    // Created here for legacy DBs that predate it; `CREATE TABLE IF NOT EXISTS`
+    // is idempotent and the DDL identifiers are constant (no user data).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schedules (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind        TEXT NOT NULL,
+            cron_expr   TEXT NOT NULL,
+            next_run    INTEGER NOT NULL,
+            sender      TEXT NOT NULL,
+            recipient   TEXT NOT NULL,
+            subject     TEXT,
+            body        TEXT NOT NULL,
+            created_ts  INTEGER NOT NULL,
+            executed_ts INTEGER,
+            cancelled   INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run);
+        CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender);",
     )?;
     Ok(())
 }
@@ -2706,6 +2813,13 @@ impl Store for SqliteStore {
         // by the existing gc pass (no new sweeper). Mirrors the `messages` prune;
         // the count returned still reflects messages only (the trace is metadata).
         tx.execute("DELETE FROM delivery_log WHERE ts < ?1", params![cutoff])?;
+        // WL-016: prune terminal schedule rows (executed or cancelled) older than the
+        // retention cutoff. Non-terminal rows are preserved so pending schedules survive
+        // long retention windows. The count returned still reflects messages only.
+        tx.execute(
+            "DELETE FROM schedules WHERE created_ts < ?1 AND (cancelled = 1 OR executed_ts IS NOT NULL)",
+            params![cutoff],
+        )?;
         tx.commit()?;
         Ok(n)
     }
@@ -4007,6 +4121,109 @@ impl Store for SqliteStore {
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    // ── WL-016 scheduler ──────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_message(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        kind: ScheduleKind,
+        cron_expr: &str,
+        next_run: i64,
+    ) -> Result<i64> {
+        check_ident("sender", sender)?;
+        check_ident("recipient", recipient)?;
+        check_body(body)?;
+        if cron_expr.len() > MAX_CRON_EXPR_LEN {
+            anyhow::bail!(
+                "cron expression is too long ({} chars; max {MAX_CRON_EXPR_LEN}).",
+                cron_expr.len()
+            );
+        }
+        let ts = now();
+        self.conn.execute(
+            "INSERT INTO schedules (kind, cron_expr, next_run, sender, recipient, subject, body, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![kind.as_str(), cron_expr, next_run, sender, recipient, subject, body, ts],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn list_schedules(&self, sender: &str, limit: i64) -> Result<Vec<Schedule>> {
+        check_ident("sender", sender)?;
+        let limit = clamp_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM schedules WHERE sender = ?1 ORDER BY created_ts DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![sender, limit], row_to_schedule)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn cancel_schedule(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE schedules SET cancelled = 1 WHERE id = ?1 AND cancelled = 0 AND executed_ts IS NULL",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn get_due_schedules(&self, before_ts: i64) -> Result<Vec<Schedule>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM schedules
+             WHERE next_run <= ?1 AND cancelled = 0
+               AND (executed_ts IS NULL OR kind = 'recurring')
+             ORDER BY next_run ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![before_ts], row_to_schedule)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn mark_schedule_executed(&self, id: i64) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, cron_expr FROM schedules WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let Some((kind_str, cron_expr)) = row else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let kind = ScheduleKind::from_str(&kind_str).map_err(|m| anyhow::anyhow!(m))?;
+        match kind {
+            ScheduleKind::OneShot => {
+                tx.execute(
+                    "UPDATE schedules SET executed_ts = ?1 WHERE id = ?2",
+                    params![now(), id],
+                )?;
+            }
+            ScheduleKind::Recurring => {
+                let next = crate::model::next_occurrence(&cron_expr, now());
+                if let Some(ts) = next {
+                    tx.execute(
+                        "UPDATE schedules SET next_run = ?1 WHERE id = ?2",
+                        params![ts, id],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE schedules SET cancelled = 1 WHERE id = ?1",
+                        params![id],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -8279,5 +8496,182 @@ mod tests {
         };
         let liveness3 = s.peer_liveness(&p3).unwrap();
         assert_eq!(liveness3, crate::model::Liveness::Offline);
+    }
+
+    // ── WL-016 schedule store tests ──────────────────────────────────────────
+
+    #[test]
+    fn schedule_one_shot_roundtrip() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "alice",
+                "bob",
+                Some("hi"),
+                "hello",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        let list = s.list_schedules("alice", 50).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].kind, ScheduleKind::OneShot);
+        assert_eq!(list[0].recipient, "bob");
+        assert_eq!(list[0].body, "hello");
+        assert!(!list[0].cancelled);
+    }
+
+    #[test]
+    fn schedule_cancel() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        assert!(s.cancel_schedule(id).unwrap());
+        // Second cancel is idempotent false.
+        assert!(!s.cancel_schedule(id).unwrap());
+        let list = s.list_schedules("a", 50).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].cancelled);
+    }
+
+    #[test]
+    fn schedule_due_query() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message("a", "b", None, "x", ScheduleKind::OneShot, "@daily", past)
+            .unwrap();
+        let due = s.get_due_schedules(crate::model::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+    }
+
+    #[test]
+    fn schedule_mark_executed_one_shot() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_some());
+    }
+
+    #[test]
+    fn schedule_mark_executed_recurring() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::Recurring,
+                "@hourly",
+                past,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_none());
+        // next_run should have been advanced to a future hour.
+        assert!(list[0].next_run > past);
+    }
+
+    #[test]
+    fn schedule_double_fire_prevented() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message("a", "b", None, "x", ScheduleKind::OneShot, "@daily", past)
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        s.mark_schedule_executed(id).unwrap(); // harmless no-op
+        let due = s.get_due_schedules(crate::model::now()).unwrap();
+        assert!(
+            due.iter().all(|d| d.id != id),
+            "executed one-shot must not appear in due query"
+        );
+    }
+
+    #[test]
+    fn schedule_caps_reject_oversized_body() {
+        let s = mem();
+        let big = "x".repeat(MAX_BODY + 1);
+        assert!(s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                &big,
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn schedule_caps_reject_long_cron() {
+        let s = mem();
+        let long_cron = "x".repeat(MAX_CRON_EXPR_LEN + 1);
+        assert!(s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                &long_cron,
+                1_700_000_000
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn schedule_caps_reject_bad_identity() {
+        let s = mem();
+        assert!(s
+            .schedule_message(
+                "",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000
+            )
+            .is_err());
+        assert!(s
+            .schedule_message(
+                "a",
+                "",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000
+            )
+            .is_err());
     }
 }

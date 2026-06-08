@@ -41,7 +41,8 @@ use crate::model::{
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
     AskKind, AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace,
     Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
-    OrchestratorStatus, Peer, BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    OrchestratorStatus, Peer, Schedule, ScheduleKind, BROADCAST_SQL, MAX_CRON_EXPR_LEN,
+    MAX_DELIVERY_ROWS,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
@@ -213,6 +214,22 @@ const SCHEMA: &[&str] = &[
         pid          INTEGER,
         heartbeat_ts INTEGER NOT NULL DEFAULT 0
     )",
+    // WL-016: scheduled message delivery
+    "CREATE TABLE IF NOT EXISTS schedules (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT NOT NULL,
+        cron_expr   TEXT NOT NULL,
+        next_run    INTEGER NOT NULL,
+        sender      TEXT NOT NULL,
+        recipient   TEXT NOT NULL,
+        subject     TEXT,
+        body        TEXT NOT NULL,
+        created_ts  INTEGER NOT NULL,
+        executed_ts INTEGER,
+        cancelled   INTEGER NOT NULL DEFAULT 0
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)",
+    "CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -371,6 +388,27 @@ fn row_to_job(r: &libsql::Row) -> Result<Job> {
         opened_ts: r.get::<i64>(30)?,
         updated_ts: r.get::<i64>(31)?,
         completed_ts: r.get::<Option<i64>>(32)?,
+    })
+}
+
+/// Convert a `schedules` row into our owned [`Schedule`]. Positional order
+/// matches a `SELECT *` projection: id, kind, cron_expr, next_run, sender,
+/// recipient, subject, body, created_ts, executed_ts, cancelled.
+fn row_to_schedule(r: &libsql::Row) -> Result<Schedule> {
+    let kind_str = r.get::<String>(1)?;
+    let kind = ScheduleKind::from_str(&kind_str).map_err(|m| anyhow::anyhow!(m))?;
+    Ok(Schedule {
+        id: r.get::<i64>(0)?,
+        kind,
+        cron_expr: r.get::<String>(2)?,
+        next_run: r.get::<i64>(3)?,
+        sender: r.get::<String>(4)?,
+        recipient: r.get::<String>(5)?,
+        subject: r.get::<Option<String>>(6)?,
+        body: r.get::<String>(7)?,
+        created_ts: r.get::<i64>(8)?,
+        executed_ts: r.get::<Option<i64>>(9)?,
+        cancelled: r.get::<i64>(10)? != 0,
     })
 }
 
@@ -817,6 +855,34 @@ impl LibsqlStore {
             )
             .await
             .context("creating presence table")?;
+            // WL-016: schedules table for legacy DBs. Created via SCHEMA for fresh DBs;
+            // also created idempotently here. Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schedules (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind        TEXT NOT NULL,
+                    cron_expr   TEXT NOT NULL,
+                    next_run    INTEGER NOT NULL,
+                    sender      TEXT NOT NULL,
+                    recipient   TEXT NOT NULL,
+                    subject     TEXT,
+                    body        TEXT NOT NULL,
+                    created_ts  INTEGER NOT NULL,
+                    executed_ts INTEGER,
+                    cancelled   INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .context("creating schedules table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating schedules index")?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1478,6 +1544,12 @@ impl Store for LibsqlStore {
             // existing retention pass (no new sweeper). Mirrors SqliteStore::gc.
             tx.execute(
                 "DELETE FROM delivery_log WHERE ts < ?1",
+                params(vec![cutoff.into()]),
+            )
+            .await?;
+            // WL-016: prune terminal schedule rows older than the retention cutoff.
+            tx.execute(
+                "DELETE FROM schedules WHERE created_ts < ?1 AND (cancelled = 1 OR executed_ts IS NOT NULL)",
                 params(vec![cutoff.into()]),
             )
             .await?;
@@ -3245,6 +3317,159 @@ impl Store for LibsqlStore {
                 .await
                 .context("evict_stale_presence")?;
             Ok(n as usize)
+        })
+    }
+
+    // ── WL-016 scheduler ──────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_message(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        kind: ScheduleKind,
+        cron_expr: &str,
+        next_run: i64,
+    ) -> Result<i64> {
+        self.guard_writable()?;
+        check_ident("sender", sender)?;
+        check_ident("recipient", recipient)?;
+        check_body(body)?;
+        if cron_expr.len() > MAX_CRON_EXPR_LEN {
+            anyhow::bail!(
+                "cron expression is too long ({} chars; max {MAX_CRON_EXPR_LEN}).",
+                cron_expr.len()
+            );
+        }
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO schedules (kind, cron_expr, next_run, sender, recipient, subject, body, created_ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params(vec![
+                        kind.as_str().into(),
+                        cron_expr.into(),
+                        next_run.into(),
+                        sender.into(),
+                        recipient.into(),
+                        subject.map(|s| s.to_string()).into(),
+                        body.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok(self.conn.last_insert_rowid())
+        })
+    }
+
+    fn list_schedules(&self, sender: &str, limit: i64) -> Result<Vec<Schedule>> {
+        check_ident("sender", sender)?;
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, kind, cron_expr, next_run, sender, recipient, subject, body, created_ts, executed_ts, cancelled
+                     FROM schedules WHERE sender = ?1 ORDER BY created_ts DESC LIMIT ?2",
+                    params(vec![sender.into(), limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_schedule(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn cancel_schedule(&self, id: i64) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE schedules SET cancelled = 1 WHERE id = ?1 AND cancelled = 0 AND executed_ts IS NULL",
+                    params(vec![id.into()]),
+                )
+                .await?;
+            Ok(n > 0)
+        })
+    }
+
+    fn get_due_schedules(&self, before_ts: i64) -> Result<Vec<Schedule>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, kind, cron_expr, next_run, sender, recipient, subject, body, created_ts, executed_ts, cancelled
+                     FROM schedules
+                     WHERE next_run <= ?1 AND cancelled = 0
+                       AND (executed_ts IS NULL OR kind = 'recurring')
+                     ORDER BY next_run ASC",
+                    params(vec![before_ts.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_schedule(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn mark_schedule_executed(&self, id: i64) -> Result<()> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let row: Option<(String, String)> = {
+                let mut it = tx
+                    .query(
+                        "SELECT kind, cron_expr FROM schedules WHERE id = ?1",
+                        params(vec![id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some((r.get::<String>(0)?, r.get::<String>(1)?)),
+                    None => None,
+                }
+            };
+            let Some((kind_str, cron_expr)) = row else {
+                tx.commit().await?;
+                return Ok(());
+            };
+            let kind = ScheduleKind::from_str(&kind_str).map_err(|m| anyhow::anyhow!(m))?;
+            match kind {
+                ScheduleKind::OneShot => {
+                    tx.execute(
+                        "UPDATE schedules SET executed_ts = ?1 WHERE id = ?2",
+                        params(vec![now().into(), id.into()]),
+                    )
+                    .await?;
+                }
+                ScheduleKind::Recurring => {
+                    let next = crate::model::next_occurrence(&cron_expr, now());
+                    if let Some(ts) = next {
+                        tx.execute(
+                            "UPDATE schedules SET next_run = ?1 WHERE id = ?2",
+                            params(vec![ts.into(), id.into()]),
+                        )
+                        .await?;
+                    } else {
+                        tx.execute(
+                            "UPDATE schedules SET cancelled = 1 WHERE id = ?1",
+                            params(vec![id.into()]),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            tx.commit().await?;
+            Ok(())
         })
     }
 }
@@ -6133,5 +6358,100 @@ mod tests {
             s.peer_liveness(&p3).unwrap(),
             crate::model::Liveness::Offline
         );
+    }
+
+    // ── WL-016 schedule store tests (libsql mirror) ──────────────────────────
+
+    #[test]
+    fn schedule_one_shot_roundtrip_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "alice",
+                "bob",
+                Some("hi"),
+                "hello",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        let list = s.list_schedules("alice", 50).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].kind, ScheduleKind::OneShot);
+        assert_eq!(list[0].recipient, "bob");
+    }
+
+    #[test]
+    fn schedule_cancel_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        assert!(s.cancel_schedule(id).unwrap());
+        assert!(!s.cancel_schedule(id).unwrap());
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].cancelled);
+    }
+
+    #[test]
+    fn schedule_due_query_libsql() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message("a", "b", None, "x", ScheduleKind::OneShot, "@daily", past)
+            .unwrap();
+        let due = s.get_due_schedules(crate::model::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+    }
+
+    #[test]
+    fn schedule_mark_executed_one_shot_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_some());
+    }
+
+    #[test]
+    fn schedule_mark_executed_recurring_libsql() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::Recurring,
+                "@hourly",
+                past,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_none());
+        assert!(list[0].next_run > past);
     }
 }

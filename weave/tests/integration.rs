@@ -7887,3 +7887,255 @@ fn daemon_status_cleans_stale_pidfile() {
         "stale pidfile should be removed after status"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WL-016 scheduler tests
+// ---------------------------------------------------------------------------
+
+/// CLI roundtrip: schedule a one-shot message in the past, tick fires it,
+/// recipient receives it in their inbox.
+#[test]
+fn cli_schedule_oneshot_tick_fires_and_delivers() {
+    let db = TestDb::new();
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 10;
+
+    // Schedule a one-shot message in the past.
+    let out = run_ok(
+        &db,
+        &[
+            "schedule",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "reminder: check logs",
+            "--at",
+            &past.to_string(),
+        ],
+    );
+    assert!(
+        out.contains("scheduled #"),
+        "schedule should confirm: {out}"
+    );
+
+    // Tick should fire the due schedule.
+    let tick_out = run_ok(&db, &["tick", "--me", "alice"]);
+    assert!(
+        tick_out.contains("1 schedule(s) fired"),
+        "tick should fire 1 schedule: {tick_out}"
+    );
+
+    // Bob should see the delivered message.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--peek"]);
+    assert!(
+        inbox.contains("reminder: check logs"),
+        "bob's inbox should contain the scheduled message: {inbox}"
+    );
+}
+
+/// CLI: schedule with --every creates a recurring schedule; list shows it;
+/// cancel soft-cancels it.
+#[test]
+fn cli_schedule_recurring_list_and_cancel() {
+    let db = TestDb::new();
+
+    let out = run_ok(
+        &db,
+        &[
+            "schedule",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "daily report",
+            "--every",
+            "@daily",
+        ],
+    );
+    assert!(
+        out.contains("scheduled #"),
+        "schedule should confirm: {out}"
+    );
+
+    // List should show the pending recurring schedule.
+    let list = run_ok(&db, &["schedules", "--me", "alice"]);
+    assert!(
+        list.contains("recurring"),
+        "schedules should list the recurring entry: {list}"
+    );
+
+    // Cancel it by id = 1 (first schedule in a fresh db).
+    let cancel = run_ok(&db, &["cancel-schedule", "--id", "1"]);
+    assert!(
+        cancel.contains("cancelled schedule #1"),
+        "cancel should confirm: {cancel}"
+    );
+
+    // List should now show cancelled state.
+    let list2 = run_ok(&db, &["schedules", "--me", "alice"]);
+    assert!(
+        list2.contains("cancelled"),
+        "schedules should show cancelled state: {list2}"
+    );
+}
+
+/// CLI: tick with --all fires schedules for other senders too.
+#[test]
+fn cli_tick_all_fires_other_sender_schedules() {
+    let db = TestDb::new();
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 10;
+
+    // Alice schedules a message for bob.
+    run_ok(
+        &db,
+        &[
+            "schedule",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "from alice",
+            "--at",
+            &past.to_string(),
+        ],
+    );
+
+    // Bob runs tick --all (not just his own schedules).
+    let tick_out = run_ok(&db, &["tick", "--me", "bob", "--all"]);
+    assert!(
+        tick_out.contains("1 schedule(s) fired"),
+        "tick --all should fire alice's schedule: {tick_out}"
+    );
+
+    // Bob should have received it.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--peek"]);
+    assert!(inbox.contains("from alice"), "bob should receive: {inbox}");
+}
+
+/// MCP: schedule, list, cancel, tick roundtrip.
+#[test]
+fn mcp_schedule_tools_roundtrip() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    // tools/list advertises the scheduler tools.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools/list returns a tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in [
+        "weave_schedule",
+        "weave_schedules",
+        "weave_cancel_schedule",
+        "weave_tick",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "tools/list missing {expected}; got {names:?}"
+        );
+    }
+
+    // Schedule a one-shot message in the past.
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 10;
+    let (is_err, sched_text) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "mcp_alice",
+            "to": "mcp_bob",
+            "body": "mcp reminder",
+            "at": past
+        }),
+    );
+    assert!(!is_err, "weave_schedule should succeed: {sched_text}");
+    assert!(
+        sched_text.contains("Scheduled message #"),
+        "schedule should confirm: {sched_text}"
+    );
+
+    // List should show it.
+    let (is_err, list_text) =
+        mcp.call_tool("weave_schedules", serde_json::json!({"me": "mcp_alice"}));
+    assert!(!is_err, "weave_schedules should succeed: {list_text}");
+    assert!(
+        list_text.contains("mcp_bob"),
+        "schedules should list the recipient: {list_text}"
+    );
+
+    // Tick should fire it.
+    let (is_err, tick_text) = mcp.call_tool("weave_tick", serde_json::json!({"me": "mcp_alice"}));
+    assert!(!is_err, "weave_tick should succeed: {tick_text}");
+    assert!(
+        tick_text.contains("1 schedule(s) fired"),
+        "tick should fire 1 schedule: {tick_text}"
+    );
+
+    // Recipient inbox should show it.
+    let (is_err, inbox_text) = mcp.call_tool("weave_inbox", serde_json::json!({"me": "mcp_bob"}));
+    assert!(!is_err, "weave_inbox should succeed: {inbox_text}");
+    assert!(
+        inbox_text.contains("mcp reminder"),
+        "inbox should contain scheduled message: {inbox_text}"
+    );
+
+    mcp.shutdown();
+}
+
+/// MCP: cancel_schedule is idempotent on already-terminal rows.
+#[test]
+fn mcp_cancel_schedule_idempotent() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 10;
+    let (is_err, _) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "x",
+            "at": past
+        }),
+    );
+    assert!(!is_err, "schedule should succeed");
+
+    // Cancel once.
+    let (is_err, t1) = mcp.call_tool("weave_cancel_schedule", serde_json::json!({"id": 1}));
+    assert!(!is_err, "first cancel should succeed: {t1}");
+    assert!(
+        t1.contains("Cancelled"),
+        "first cancel should confirm: {t1}"
+    );
+
+    // Cancel again → idempotent no-op.
+    let (is_err, t2) = mcp.call_tool("weave_cancel_schedule", serde_json::json!({"id": 1}));
+    assert!(!is_err, "second cancel should be no-op, not error: {t2}");
+    assert!(
+        t2.contains("already terminal"),
+        "second cancel should report terminal: {t2}"
+    );
+
+    mcp.shutdown();
+}

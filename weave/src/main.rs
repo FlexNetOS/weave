@@ -566,6 +566,45 @@ enum Cmd {
         #[arg(long)]
         me: Option<String>,
     },
+    /// Schedule a future message delivery (one-shot or recurring).
+    Schedule {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// One-shot: absolute UNIX timestamp.
+        #[arg(long)]
+        at: Option<i64>,
+        /// Recurring: cron preset or expression.
+        #[arg(long)]
+        every: Option<String>,
+    },
+    /// List your scheduled messages.
+    Schedules {
+        #[arg(long)]
+        me: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a scheduled message.
+    CancelSchedule {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Execute any due scheduled messages now (explicit tick).
+    Tick {
+        #[arg(long)]
+        me: Option<String>,
+        /// also evaluate schedules for other senders (admin/debug)
+        #[arg(long)]
+        all: bool,
+    },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
     Hook { event: String },
     /// Presence daemon (v0.2): start, stop, status, or run the heartbeat loop.
@@ -3402,6 +3441,111 @@ fn main() -> Result<()> {
 
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
+        Cmd::Schedule {
+            from,
+            to,
+            subject,
+            body,
+            at,
+            every,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            store::check_ident("recipient", &to)?;
+            store::check_body(&body)?;
+            let (kind, cron_expr, next_run) = match (at, every) {
+                (Some(ts), None) => {
+                    if ts <= 0 {
+                        anyhow::bail!("'at' must be a positive UNIX timestamp");
+                    }
+                    (model::ScheduleKind::OneShot, String::new(), ts)
+                }
+                (None, Some(expr)) => {
+                    let expr = expr.trim();
+                    if !model::cron_valid(expr) {
+                        anyhow::bail!("'every' is not a valid cron expression");
+                    }
+                    let next = model::next_occurrence(expr, model::now()).ok_or_else(|| {
+                        anyhow::anyhow!("could not compute next occurrence from cron expression")
+                    })?;
+                    (model::ScheduleKind::Recurring, expr.to_string(), next)
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide exactly one of --at or --every, not both");
+                }
+                (None, None) => {
+                    anyhow::bail!("provide exactly one of --at or --every");
+                }
+            };
+            let id = store.schedule_message(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                kind,
+                &cron_expr,
+                next_run,
+            )?;
+            println!(
+                "scheduled #{id}: {from} -> {to} at {next_run} ({kind})",
+                kind = kind.as_str()
+            );
+        }
+
+        Cmd::Schedules { me, limit, json } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            let rows = store.list_schedules(&me, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "schedules": rows }))?
+                );
+            } else if rows.is_empty() {
+                println!("no scheduled messages for '{me}'");
+            } else {
+                for s in &rows {
+                    let subj = s
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    let state = if s.cancelled {
+                        "cancelled"
+                    } else if s.executed_ts.is_some() {
+                        "executed"
+                    } else {
+                        "pending"
+                    };
+                    println!(
+                        "#{} [{}] {} -> {}{} ({}) next={}",
+                        s.id,
+                        state,
+                        s.sender,
+                        s.recipient,
+                        subj,
+                        s.kind.as_str(),
+                        s.next_run
+                    );
+                }
+            }
+        }
+
+        Cmd::CancelSchedule { id } => {
+            let cancelled = store.cancel_schedule(id)?;
+            if cancelled {
+                println!("cancelled schedule #{id}");
+            } else {
+                println!("schedule #{id} was already terminal or did not exist");
+            }
+        }
+
+        Cmd::Tick { me, all } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            execute_tick(store, &me, all)?;
+        }
+
         Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
     }
     Ok(())
@@ -4127,6 +4271,42 @@ fn handle_daemon(store: &dyn Store, cfg: &Config, cmd: DaemonCmd) -> Result<()> 
     Ok(())
 }
 
+/// WL-016: execute all due schedules for `me` (or every sender when `all=true`).
+/// For each due schedule, fires `store.send`, advances/closes the row via
+/// `mark_schedule_executed`, and records a best-effort delivery trace.
+fn execute_tick(store: &dyn Store, me: &str, all: bool) -> Result<()> {
+    let now_ts = model::now();
+    let due = store.get_due_schedules(now_ts)?;
+    let mut fired = 0usize;
+    let mut skipped = 0usize;
+    for sched in &due {
+        if !all && sched.sender != me {
+            skipped += 1;
+            continue;
+        }
+        let mid = store.send(
+            &sched.sender,
+            &sched.recipient,
+            sched.subject.as_deref(),
+            &sched.body,
+        )?;
+        store.mark_schedule_executed(sched.id)?;
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Message,
+            &sched.recipient,
+            model::DeliveryStage::Queued,
+            model::DeliveryOutcome::Ok,
+        );
+        fired += 1;
+    }
+    if fired > 0 || skipped > 0 {
+        println!("tick: {fired} schedule(s) fired, {skipped} skipped");
+    }
+    Ok(())
+}
+
 fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -4271,6 +4451,11 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             if event == "prompt" {
                 nudge_open_asks(store, &me);
                 render_open_asks(store, &me);
+                // WL-016: daemon-free schedule tick. Best-effort: a tick failure must
+                // never sink the prompt hook's primary delivery path.
+                if let Err(e) = execute_tick(store, &me, false) {
+                    eprintln!("[weave] tick skipped (non-fatal): {e}");
+                }
             }
         }
         "wake" => {

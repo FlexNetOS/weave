@@ -54,7 +54,7 @@ pub fn fmt_ts(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -1331,6 +1331,202 @@ pub struct DeliveryTrace {
     pub ts: i64,
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// WL-016 — Scheduler / cron for messages
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Hard upper bound on a cron expression string (chars). Expressions are echoed
+/// into listings and stored per-row; an unbounded one is a token/RAM/DoS hazard.
+pub const MAX_CRON_EXPR_LEN: usize = 64;
+
+/// The lifecycle of a schedule row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleState {
+    Pending,
+    Executed,
+    Cancelled,
+}
+
+/// One-shot vs recurring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    OneShot,
+    Recurring,
+}
+
+impl ScheduleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleKind::OneShot => "one_shot",
+            ScheduleKind::Recurring => "recurring",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "one_shot" => Ok(ScheduleKind::OneShot),
+            "recurring" => Ok(ScheduleKind::Recurring),
+            other => Err(format!("unknown schedule kind '{other}'")),
+        }
+    }
+}
+
+/// A persisted scheduled message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: i64,
+    pub kind: ScheduleKind,
+    pub cron_expr: String,
+    pub next_run: i64,
+    pub sender: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub created_ts: i64,
+    pub executed_ts: Option<i64>,
+    pub cancelled: bool,
+}
+
+/// Validate a cron expression before storage. Accepts presets (`@hourly`, `@daily`,
+/// `@weekly`, `@monthly`) and a restricted 5-field subset (`min hour day month dow`).
+/// Rejects empty, over-length, control-character-bearing, or unsupported forms.
+pub fn cron_valid(expr: &str) -> bool {
+    if expr.is_empty() || expr.len() > MAX_CRON_EXPR_LEN {
+        return false;
+    }
+    if expr.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
+    match expr {
+        "@hourly" | "@daily" | "@weekly" | "@monthly" => return true,
+        _ => {}
+    }
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    for (i, part) in parts.iter().enumerate() {
+        let (min, max) = match i {
+            0 => (0, 59),
+            1 => (0, 23),
+            2 => (1, 31),
+            3 => (1, 12),
+            4 => (0, 6),
+            _ => unreachable!(),
+        };
+        if !field_valid(part, min, max) {
+            return false;
+        }
+    }
+    true
+}
+
+fn field_valid(part: &str, min: i64, max: i64) -> bool {
+    if part == "*" {
+        return true;
+    }
+    if let Some((a, b)) = part.split_once('-') {
+        let Ok(a) = a.parse::<i64>() else {
+            return false;
+        };
+        let Ok(b) = b.parse::<i64>() else {
+            return false;
+        };
+        return a >= min && b <= max && a <= b;
+    }
+    let Ok(n) = part.parse::<i64>() else {
+        return false;
+    };
+    n >= min && n <= max
+}
+
+/// Internal representation of one cron field after parsing.
+#[derive(Debug, Clone)]
+enum CronField {
+    Star,
+    Exact(i64),
+    Range(i64, i64),
+}
+
+fn parse_field(part: &str) -> Option<CronField> {
+    if part == "*" {
+        return Some(CronField::Star);
+    }
+    if let Some((a, b)) = part.split_once('-') {
+        let a = a.parse::<i64>().ok()?;
+        let b = b.parse::<i64>().ok()?;
+        return Some(CronField::Range(a, b));
+    }
+    let n = part.parse::<i64>().ok()?;
+    Some(CronField::Exact(n))
+}
+
+fn field_matches(cf: &CronField, value: i64) -> bool {
+    match cf {
+        CronField::Star => true,
+        CronField::Exact(n) => *n == value,
+        CronField::Range(a, b) => value >= *a && value <= *b,
+    }
+}
+
+/// Parse a preset or 5-field expression into five [`CronField`]s.
+fn parse_cron(expr: &str) -> Option<[CronField; 5]> {
+    let s = match expr {
+        "@hourly" => "0 * * * *",
+        "@daily" => "0 0 * * *",
+        "@weekly" => "0 0 * * 0",
+        "@monthly" => "0 0 1 * *",
+        _ => expr,
+    };
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some([
+        parse_field(parts[0])?,
+        parse_field(parts[1])?,
+        parse_field(parts[2])?,
+        parse_field(parts[3])?,
+        parse_field(parts[4])?,
+    ])
+}
+
+/// Returns the NEXT UNIX timestamp **strictly after** `after` for the given
+/// expression, or `None` if no occurrence falls within 366 days of `after`.
+///
+/// Supports presets (`@hourly`, `@daily`, `@weekly`, `@monthly`) and a
+/// restricted 5-field cron (`min hour day month dow`) with `*` and `-` ranges.
+/// Scans forward in 60-second increments — deterministic, dependency-free, and
+/// fast enough for the coarse granularity weave needs.
+pub fn next_occurrence(cron_expr: &str, after: i64) -> Option<i64> {
+    let fields = parse_cron(cron_expr)?;
+    // Start from the next whole minute strictly after `after`.
+    let mut ts = after - after.rem_euclid(60) + 60;
+    let max_ts = after + 366 * 86_400;
+
+    while ts <= max_ts {
+        let secs = ts.rem_euclid(86_400);
+        let minute = (secs / 60) % 60;
+        let hour = secs / 3_600;
+        let days = ts.div_euclid(86_400);
+        let (_y, month, day) = civil_from_days(days);
+        let dow = (days + 4).rem_euclid(7); // 1970-01-01 was Thursday = 4
+
+        if field_matches(&fields[0], minute)
+            && field_matches(&fields[1], hour)
+            && field_matches(&fields[2], day as i64)
+            && field_matches(&fields[3], month as i64)
+            && field_matches(&fields[4], dow)
+        {
+            return Some(ts);
+        }
+        ts += 60;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2007,5 +2203,145 @@ mod tests {
     fn job_ids_are_unique_per_mint() {
         assert_ne!(new_job_id(1), new_job_id(1));
         assert_ne!(new_attempt_id(1), new_attempt_id(1));
+    }
+
+    // ---- WL-016: cron evaluator ----
+
+    #[test]
+    fn schedule_kind_roundtrip() {
+        assert_eq!(
+            ScheduleKind::from_str("one_shot"),
+            Ok(ScheduleKind::OneShot)
+        );
+        assert_eq!(
+            ScheduleKind::from_str("recurring"),
+            Ok(ScheduleKind::Recurring)
+        );
+        assert!(ScheduleKind::from_str("bogus").is_err());
+        assert_eq!(ScheduleKind::OneShot.as_str(), "one_shot");
+        assert_eq!(ScheduleKind::Recurring.as_str(), "recurring");
+    }
+
+    #[test]
+    fn cron_valid_presets() {
+        assert!(cron_valid("@hourly"));
+        assert!(cron_valid("@daily"));
+        assert!(cron_valid("@weekly"));
+        assert!(cron_valid("@monthly"));
+    }
+
+    #[test]
+    fn cron_valid_5field() {
+        assert!(cron_valid("0 9 * * 1-5"));
+        assert!(cron_valid("* * * * *"));
+        assert!(cron_valid("30 12 15 * *"));
+    }
+
+    #[test]
+    fn cron_valid_rejections() {
+        assert!(!cron_valid(""));
+        assert!(!cron_valid("* * * *")); // 4 fields
+        assert!(!cron_valid("* * * * * *")); // 6 fields
+        assert!(!cron_valid("60 * * * *")); // minute out of range
+        assert!(!cron_valid("0 24 * * *")); // hour out of range
+        assert!(!cron_valid("0 0 32 * *")); // day out of range
+        assert!(!cron_valid("0 0 * 13 *")); // month out of range
+        assert!(!cron_valid("0 0 * * 7")); // dow out of range
+        assert!(!cron_valid(&"x".repeat(MAX_CRON_EXPR_LEN + 1)));
+        assert!(!cron_valid("0\t0 * * *")); // control char
+    }
+
+    /// Helper: build a UNIX timestamp from civil fields (UTC).
+    fn ts(y: i64, m: u32, d: u32, hh: i64, mm: i64) -> i64 {
+        // Simple conversion for test data only; not the production path.
+        // Parse via chrono if available in tests, otherwise approximate.
+        // weave deliberately has no date crate, so we use a naive day-count
+        // approximation for the test fixture.  This is test-only and only
+        // needs to be consistent with civil_from_days.
+        //
+        // We'll use the reverse of civil_from_days: count days from 1970-01-01.
+        // This is a test helper, not production code.
+        let mut days = 0i64;
+        for year in 1970..y {
+            days += if is_leap_year(year) { 366 } else { 365 };
+        }
+        for month in 1..m {
+            days += days_in_month(y, month);
+        }
+        days += (d as i64) - 1;
+        days * 86_400 + hh * 3_600 + mm * 60
+    }
+
+    fn is_leap_year(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    }
+
+    fn days_in_month(y: i64, m: u32) -> i64 {
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn next_occurrence_presets() {
+        let midnight = ts(2024, 1, 1, 0, 0);
+        // @daily from midnight → next day midnight
+        assert_eq!(
+            next_occurrence("@daily", midnight),
+            Some(ts(2024, 1, 2, 0, 0))
+        );
+        // @hourly from 09:00 → 10:00
+        assert_eq!(
+            next_occurrence("@hourly", ts(2024, 1, 1, 9, 0)),
+            Some(ts(2024, 1, 1, 10, 0))
+        );
+        // @weekly from Monday → next Sunday
+        assert_eq!(
+            next_occurrence("@weekly", ts(2024, 1, 1, 0, 0)),
+            Some(ts(2024, 1, 7, 0, 0))
+        );
+        // @monthly from Jan 1 → Feb 1
+        assert_eq!(
+            next_occurrence("@monthly", ts(2024, 1, 1, 0, 0)),
+            Some(ts(2024, 2, 1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_cron_ranges() {
+        // 0 9 * * 1-5  => next weekday 09:00
+        let fri_noon = ts(2024, 1, 5, 12, 0); // Fri 12:00
+        assert_eq!(
+            next_occurrence("0 9 * * 1-5", fri_noon),
+            Some(ts(2024, 1, 8, 9, 0))
+        ); // Mon
+
+        let mon_0800 = ts(2024, 1, 8, 8, 0); // Mon 08:00
+        assert_eq!(
+            next_occurrence("0 9 * * 1-5", mon_0800),
+            Some(ts(2024, 1, 8, 9, 0))
+        ); // same Mon
+    }
+
+    #[test]
+    fn next_occurrence_no_past() {
+        // A missed daily schedule advances to the NEXT future day.
+        let jan3 = ts(2024, 1, 3, 0, 0);
+        assert_eq!(next_occurrence("@daily", jan3), Some(ts(2024, 1, 4, 0, 0)));
+    }
+
+    #[test]
+    fn next_occurrence_rejects_bad_expr() {
+        assert_eq!(next_occurrence("garbage", 0), None);
+        assert_eq!(next_occurrence("* * * *", 0), None);
     }
 }
