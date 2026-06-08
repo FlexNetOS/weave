@@ -356,3 +356,49 @@ of a retry-safe, well-traced core, not before it.
 > agent hook / MCP contracts and are safe to commit to; the *reach* items (4, 6) should
 > be re-validated against current MCP-transport and iTerm2-automation docs before
 > implementation, since both target moving external contracts.
+
+---
+
+## A. JMAP as a non-MCP external protocol (design note)
+
+**Not a committed roadmap item — a recorded design seed.**
+
+weave's external surface today is **MCP-only** (stdio JSON-RPC 2.0). MCP is
+purpose-built for agent tool-calling, but it is not a general message-sync protocol.
+If weave ever needs to speak to non-agent clients — a mobile app, a web dashboard,
+a third-party orchestrator — MCP is the wrong shape.
+
+**[JMAP](https://jmap.io/)** (RFC 8620/8621) is a modern JSON-over-HTTP protocol
+originally designed for mail, calendars, and contacts. Its core primitives map
+surprisingly well to weave's data model:
+
+ | JMAP concept | weave equivalent |
+ |--------------|------------------|
+ | `Email/get`, `Email/query` | `weave_inbox`, `weave_history` |
+ | `Email/set` (create) | `weave_send`, `weave_notify` |
+ | `Thread/get` | `weave_thread` |
+ | `Mailbox` | `Peer` (session) + `circle` (scope) |
+ | `EmailSubmission` | `Intent` / outbox (Tier-2 cross-store) |
+ | `PushSubscription` / event source | stop-boundary wake (§1) + SSE stream (§4) |
+
+**Why JMAP matters for weave.**
+JMAP is **state-sync**, not RPC. A client subscribes to a mailbox and receives
+deltas, rather than polling `inbox` every turn. For a multi-agent mesh where
+messages are the primary data type, state-sync is the natural long-term shape —
+it eliminates the "did I miss a message between polls" problem that MCP's
+request-response model cannot solve.
+
+**Prior art: Stalwart.**
+[Stalwart](https://github.com/stalwartlabs/stalwart) ships a full JMAP for Mail
+and JMAP for Calendars/Contacts implementation in Rust (`crates/jmap`,
+`crates/jmap-proto`). Its design — method calls batched in a single POST,
+`Invocation` references for back-references, `StateChange` events over SSE — is
+the canonical reference. weave would *not* embed Stalwart's AGPL-3.0 code; any
+JMAP surface would be a clean-room implementation of the RFC, informed by
+Stalwart's crate boundaries (protocol vs. business logic vs. storage) as
+architectural inspiration.
+
+**When this becomes relevant.**
+Only after §4 (streamable-HTTP MCP) lands, because JMAP-over-HTTP reuses the same
+HTTP front-end seam — auth, tokio runtime, and request routing. Until then, this
+note is a bookmark, not a plan.

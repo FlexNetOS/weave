@@ -1,26 +1,28 @@
 # HANDOFF — weave-loop
 
-closed_utc: 2026-06-08T16:20:00Z
+closed_utc: 2026-06-08T16:58:00Z
 branch: feat/zellij-pane-targeting
 worktree: /home/drdave/Desktop/meta/weave-mcp-daemon-tools
 cycle_budget: 3
 cycles_total: 26
-last_item: WL-026
-next_item: WL-027
+last_item: WL-027
+next_item: WL-028
 orchestrator_phase: handoff
 last_agent: weave-loop
 verifier_status: GREEN
 guardian_verdict: APPROVE
-pr_url: https://github.com/FlexNetOS/weave/pull/57
+pr_url:
 landed_this_session:
-  - PR #57 WL-026 — idempotency keys and trace IDs (auto-merge enabled)
+  - WL-027 — broadcast notify / broadcast ask (MCP + CLI)
+  - FrankenNetworkX crate extraction — `weave graph` command
 open_findings:
 decisions:
-  - WL-026 implemented with idempotency_key + trace_id on Message/Intent, both backends, CLI --idempotency-key, MCP idempotencyKey, auto-minted trace IDs.
-  - SQLite ALTER TABLE migration uses separate CREATE UNIQUE INDEX (inline UNIQUE rejected on non-empty tables).
-  - Next: WL-027 broadcast notify/ask fan-out to online peers in circle.
+  - WL-027: `weave_broadcast_notify` + `weave_broadcast_ask` MCP tools with circle-scoped online peer enumeration and per-peer live nudge fan-out.
+  - WL-027: `weave broadcast-notify` + `weave broadcast-ask` CLI commands with `--json` output.
+  - FrankenNetworkX: extracted `fnx-classes`, `fnx-algorithms`, `fnx-runtime` via Cargo git dependencies.
+  - `weave graph` builds a communication graph from peer/message store data, runs connected_components + degree_centrality + density.
+  - All gates green: 510 tests (sqlite), 470 tests (libsql), fmt + clippy clean.
 dead_ends:
-  - Explicit SELECT projections in libsql inbox/history/thread needed updating; SELECT * in sqlite covered it automatically.
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh
   - cargo test --all-targets

@@ -368,6 +368,123 @@ fn cli_send_trace_id_in_json() {
 }
 
 #[test]
+fn cli_graph_shows_peer_communication_network() {
+    let db = TestDb::new();
+    // Register peers under a different host so they stay alive after register exits.
+    run_env(
+        &db,
+        &["register", "--name", "alice"],
+        &[("HOSTNAME", "other-host")],
+    );
+    run_env(
+        &db,
+        &["register", "--name", "bob"],
+        &[("HOSTNAME", "other-host")],
+    );
+    run_env(
+        &db,
+        &["register", "--name", "charlie"],
+        &[("HOSTNAME", "other-host")],
+    );
+    run_ok(
+        &db,
+        &["send", "--from", "alice", "--to", "bob", "--body", "hi"],
+    );
+    run_ok(
+        &db,
+        &["send", "--from", "bob", "--to", "alice", "--body", "ho"],
+    );
+    run_ok(
+        &db,
+        &[
+            "send", "--from", "alice", "--to", "charlie", "--body", "hey",
+        ],
+    );
+    let out = run_ok(&db, &["graph", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["nodes"], 3, "graph should have 3 peer nodes");
+    assert_eq!(
+        parsed["edges"], 2,
+        "graph should have 2 edges (alice-bob, alice-charlie)"
+    );
+    assert_eq!(parsed["component_count"], 1, "all peers are connected");
+    assert_eq!(
+        parsed["largest_component"], 3,
+        "largest component is all 3 peers"
+    );
+    let cent = parsed["centrality"].as_object().unwrap();
+    assert!(
+        cent["alice"].as_f64().unwrap() > cent["bob"].as_f64().unwrap(),
+        "alice should have higher centrality than bob"
+    );
+}
+
+#[test]
+fn cli_broadcast_notify_hits_online_peer() {
+    let db = TestDb::new();
+    // Register peer under a DIFFERENT host so it is remote (TTL-only, no PID probe),
+    // which keeps it alive after the register child exits.
+    run_env(
+        &db,
+        &["register", "--name", "bob"],
+        &[("HOSTNAME", "other-host")],
+    );
+    let out = run_ok(
+        &db,
+        &["broadcast-notify", "--from", "alice", "--body", "hello all"],
+    );
+    assert!(
+        out.contains("bob:"),
+        "broadcast-notify should list bob: {out:?}"
+    );
+    assert!(
+        out.contains("peer(s) notified"),
+        "broadcast-notify should report count: {out:?}"
+    );
+    // Verify bob received the message in inbox.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob"]);
+    assert!(
+        inbox.contains("hello all"),
+        "bob's inbox should contain the broadcast body: {inbox:?}"
+    );
+}
+
+#[test]
+fn cli_broadcast_ask_hits_online_peer() {
+    let db = TestDb::new();
+    run_env(
+        &db,
+        &["register", "--name", "bob"],
+        &[("HOSTNAME", "other-host")],
+    );
+    let out = run_ok(&db, &["broadcast-ask", "--from", "alice", "--body", "q?"]);
+    assert!(
+        out.contains("bob:"),
+        "broadcast-ask should list bob: {out:?}"
+    );
+    assert!(
+        out.contains("created"),
+        "broadcast-ask should report created count: {out:?}"
+    );
+    // Verify bob has a pending ask.
+    let asks_json = run_ok(&db, &["asks", "--me", "bob", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&asks_json).unwrap();
+    let asks_arr = parsed["asks"].as_array().unwrap();
+    assert!(!asks_arr.is_empty(), "bob should have a pending ask");
+    let first = &asks_arr[0];
+    assert_eq!(
+        first["asker"].as_str(),
+        Some("alice"),
+        "ask asker should be alice: {first:?}"
+    );
+    assert_eq!(
+        first["askee"].as_str(),
+        Some("bob"),
+        "ask askee should be bob: {first:?}"
+    );
+}
+
+#[test]
 fn cli_send_then_inbox_shows_body() {
     let db = TestDb::new();
 

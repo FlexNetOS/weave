@@ -223,6 +223,43 @@ enum Cmd {
         #[arg(long)]
         idempotency_key: Option<String>,
     },
+    /// Broadcast a notification to all online peers in your circle. Fan-out:
+    /// one message per online peer, plus a live nudge for each injectable peer.
+    /// Returns an aggregated delivery verdict per peer.
+    BroadcastNotify {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Scope to this circle; omit for your own configured circle.
+        #[arg(long)]
+        circle: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Broadcast an ask to all online peers in your circle. Fan-out via
+    /// ask-many: one tracked question per online peer. Returns a parent id
+    /// and per-child delivery verdicts.
+    BroadcastAsk {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Scope to this circle; omit for your own configured circle.
+        #[arg(long)]
+        circle: Option<String>,
+        /// Optional message id this broadcast ask replies to (threads the conversation).
+        #[arg(long = "reply-to")]
+        reply_to: Option<i64>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// List pending cross-store intents in your outbox (Tier-2, read-only).
     Outbox {
         #[arg(long, default_value_t = 200)]
@@ -672,6 +709,18 @@ enum Cmd {
         /// Enable dangerous/mutating tools (disabled by default for safety).
         #[arg(long)]
         dangerous: bool,
+    },
+    /// Build a communication graph from the message store and run graph analytics
+    /// (connected components, centrality). Powered by FrankenNetworkX.
+    Graph {
+        #[arg(long)]
+        me: Option<String>,
+        /// Scope to this circle; omit for mesh-wide.
+        #[arg(long)]
+        circle: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2617,6 +2666,162 @@ fn main() -> Result<()> {
             println!("notified '{to}' (#{mid}, no reply expected) [{verdict}]");
         }
 
+        Cmd::BroadcastNotify {
+            from,
+            subject,
+            body,
+            circle,
+            json,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let target_circle = resolve_list_circle(store, &cfg, &from, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let online: Vec<_> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .filter(|p| p.name != from)
+                .filter(store::is_alive)
+                .map(|p| p.name)
+                .collect();
+            if online.is_empty() {
+                if json {
+                    println!("{}", serde_json::json!({ "notified": 0, "peers": [] }));
+                } else {
+                    println!("broadcast-notify: no online peers in circle");
+                }
+            } else {
+                let mut notified = 0usize;
+                let mut child_json = Vec::new();
+                for peer in &online {
+                    let trace_id = model::mint_trace_id();
+                    let mid = store.send(
+                        &from,
+                        peer,
+                        subject.as_deref(),
+                        &body,
+                        None,
+                        Some(&trace_id),
+                    )?;
+                    let verdict = inject_and_trace(
+                        store,
+                        &cfg,
+                        mid,
+                        model::DeliveryRefKind::Notify,
+                        &from,
+                        peer,
+                        &body,
+                    )?;
+                    notified += 1;
+                    if json {
+                        child_json.push(serde_json::json!({
+                            "peer": peer, "message_id": mid, "verdict": verdict
+                        }));
+                    } else {
+                        println!("  {peer}: #{mid} [{verdict}]");
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "notified": notified,
+                            "peers": child_json,
+                        }))?
+                    );
+                } else {
+                    println!("broadcast-notify: {notified} peer(s) notified");
+                }
+            }
+        }
+
+        Cmd::BroadcastAsk {
+            from,
+            subject,
+            body,
+            circle,
+            reply_to: _,
+            json,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let target_circle = resolve_list_circle(store, &cfg, &from, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let online: Vec<String> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .filter(|p| p.name != from)
+                .filter(store::is_alive)
+                .map(|p| p.name)
+                .collect();
+            if online.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "parent_id": null, "created": 0, "peers": [] })
+                    );
+                } else {
+                    println!("broadcast-ask: no online peers in circle");
+                }
+            } else {
+                let outcome = store.create_ask_many(&from, &online, subject.as_deref(), &body)?;
+                let mut child_json = Vec::new();
+                let mut created = 0usize;
+                let mut failed = 0usize;
+                for (peer, res) in &outcome.children {
+                    match res {
+                        Ok(cid) => {
+                            created += 1;
+                            let verdict = ask_inject_verdict(store, &cfg, &from, peer, &body);
+                            if json {
+                                child_json.push(serde_json::json!({
+                                    "peer": peer, "correlation_id": cid, "verdict": verdict
+                                }));
+                            } else {
+                                println!("  {peer}: {cid} ({verdict})");
+                            }
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            if json {
+                                child_json.push(serde_json::json!({
+                                    "peer": peer, "error": err
+                                }));
+                            } else {
+                                println!("  {peer}: FAILED ({err})");
+                            }
+                        }
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "parent_id": outcome.parent_id,
+                            "created": created,
+                            "failed": failed,
+                            "peers": child_json,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "broadcast-ask {}: {created} created, {failed} failed",
+                        outcome.parent_id
+                    );
+                }
+            }
+        }
+
         Cmd::Outbox { limit, json } => {
             let intents = store.outbox_all(limit)?;
             if json {
@@ -3754,6 +3959,87 @@ fn main() -> Result<()> {
                 &token,
                 dangerous,
             )?;
+        }
+
+        Cmd::Graph { me, circle, json } => {
+            let (me, _explicit) = resolve_me_explicit(me, None, &cfg);
+            let target_circle = resolve_list_circle(store, &cfg, &me, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let peers_in_circle: Vec<_> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .map(|p| p.name)
+                .collect();
+            let peer_set: std::collections::HashSet<_> = peers_in_circle.iter().cloned().collect();
+
+            let mut g = fnx_classes::Graph::new(fnx_runtime::CompatibilityMode::Strict);
+            for peer in &peers_in_circle {
+                g.add_node(peer.clone());
+            }
+            // Collect all messages among peers in the circle.
+            let mut seen_edges = std::collections::HashSet::new();
+            for peer in &peers_in_circle {
+                let hist = store.history(peer, None, 10_000)?;
+                for msg in &hist {
+                    if peer_set.contains(&msg.sender)
+                        && peer_set.contains(&msg.recipient)
+                        && msg.sender != msg.recipient
+                    {
+                        let key = if msg.sender <= msg.recipient {
+                            (msg.sender.clone(), msg.recipient.clone())
+                        } else {
+                            (msg.recipient.clone(), msg.sender.clone())
+                        };
+                        if seen_edges.insert(key) {
+                            let _ = g.add_edge(&msg.sender, &msg.recipient);
+                        }
+                    }
+                }
+            }
+
+            let cc = fnx_algorithms::connected_components(&g);
+            let dc = fnx_algorithms::degree_centrality(&g);
+            let dens = fnx_algorithms::density(&g);
+            let comp_count = cc.components.len();
+            let largest = cc.components.iter().map(|c| c.len()).max().unwrap_or(0);
+
+            if json {
+                let components: Vec<Vec<String>> = cc.components;
+                let scores: std::collections::HashMap<String, f64> =
+                    dc.scores.into_iter().map(|s| (s.node, s.score)).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "nodes": g.node_count(),
+                        "edges": g.edge_count(),
+                        "density": dens.density,
+                        "components": components,
+                        "component_count": comp_count,
+                        "largest_component": largest,
+                        "centrality": scores,
+                    }))?
+                );
+            } else {
+                println!(
+                    "communication graph ({} nodes, {} edges)",
+                    g.node_count(),
+                    g.edge_count()
+                );
+                println!("  density: {:.4}", dens.density);
+                println!("  components: {} (largest: {} nodes)", comp_count, largest);
+                for (i, comp) in cc.components.iter().enumerate() {
+                    println!("    component {}: {}", i + 1, comp.join(", "));
+                }
+                println!("  degree centrality:");
+                for s in &dc.scores {
+                    println!("    {}: {:.4}", s.node, s.score);
+                }
+            }
         }
 
         Cmd::Schedule {

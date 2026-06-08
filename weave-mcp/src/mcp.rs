@@ -406,6 +406,12 @@ fn call_tool(
     match name {
         "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
         "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
+        "weave_broadcast_notify" => {
+            tool_broadcast_notify(store, me_default, nudge_template, args, injector)
+        }
+        "weave_broadcast_ask" => {
+            tool_broadcast_ask(store, me_default, nudge_template, args, injector)
+        }
         "weave_delivery" => tool_delivery(store, args),
         "weave_outbox" => tool_outbox(store, args),
         "weave_inbox" => tool_inbox(store, me_default, pull, args, injector),
@@ -781,6 +787,123 @@ fn tool_notify(
     Ok(format!(
         "Notified '{to}' (#{mid}, no reply expected). {} [{verdict}]",
         verdict_sentence(verdict, &to)
+    ))
+}
+
+fn tool_broadcast_notify(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let circle = args.get("circle").and_then(|v| v.as_str());
+    let peers = store.list_peers().map_err(e)?;
+    let online: Vec<String> = peers
+        .into_iter()
+        .filter(|p| {
+            circle
+                .map(|c| model::circle_or_default(&p.circle) == c)
+                .unwrap_or(true)
+        })
+        .filter(|p| p.name != from)
+        .filter(store::is_alive)
+        .map(|p| p.name)
+        .collect();
+    if online.is_empty() {
+        return Ok("No online peers in circle to notify.".to_string());
+    }
+    let mut lines = Vec::new();
+    for peer in &online {
+        let trace_id = Some(model::mint_trace_id());
+        let mid = store
+            .send(
+                &from,
+                peer,
+                subject.as_deref(),
+                body,
+                None,
+                trace_id.as_deref(),
+            )
+            .map_err(e)?;
+        let verdict = ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
+        let (stage, outcome) = verdict_to_stage(verdict);
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Notify,
+            peer,
+            stage,
+            outcome,
+        );
+        lines.push(format!("{peer}: #{mid} [{verdict}]"));
+    }
+    Ok(format!(
+        "Broadcast-notified {} peer(s):\n{}",
+        online.len(),
+        lines.join("\n")
+    ))
+}
+
+fn tool_broadcast_ask(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let circle = args.get("circle").and_then(|v| v.as_str());
+    let _reply_to = args.get("reply_to").and_then(|v| v.as_i64());
+    let peers = store.list_peers().map_err(e)?;
+    let online: Vec<String> = peers
+        .into_iter()
+        .filter(|p| {
+            circle
+                .map(|c| model::circle_or_default(&p.circle) == c)
+                .unwrap_or(true)
+        })
+        .filter(|p| p.name != from)
+        .filter(store::is_alive)
+        .map(|p| p.name)
+        .collect();
+    if online.is_empty() {
+        return Ok("No online peers in circle to ask.".to_string());
+    }
+    let outcome = store
+        .create_ask_many(&from, &online, subject.as_deref(), body)
+        .map_err(e)?;
+    let mut lines = Vec::new();
+    for (peer, res) in &outcome.children {
+        match res {
+            Ok(cid) => {
+                let verdict =
+                    ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
+                lines.push(format!("{peer}: {cid} ({verdict})"));
+            }
+            Err(err) => {
+                lines.push(format!("{peer}: FAILED ({err})"));
+            }
+        }
+    }
+    Ok(format!(
+        "Broadcast-ask {} ({} created):\n{}",
+        outcome.parent_id,
+        outcome.children.iter().filter(|(_, r)| r.is_ok()).count(),
+        lines.join("\n")
     ))
 }
 
@@ -2689,6 +2812,27 @@ fn tools() -> Value {
                 "body":{"type":"string"},
                 "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."}
             },"required":["to","body"]}
+        },
+        {
+            "name": "weave_broadcast_notify",
+            "description": "Broadcast a fire-and-forget notification to all online peers in your circle. Fan-out: one message per online peer, plus a live nudge for each injectable peer. Returns an aggregated delivery verdict per peer. Offline peers are skipped.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "subject":{"type":"string"},
+                "body":{"type":"string"},
+                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."}
+            },"required":["body"]}
+        },
+        {
+            "name": "weave_broadcast_ask",
+            "description": "Broadcast a tracked ask to all online peers in your circle. Fan-out via ask-many: one tracked question per online peer. Returns a parent id and per-child delivery verdicts. Offline peers are skipped.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "subject":{"type":"string"},
+                "body":{"type":"string"},
+                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."},
+                "reply_to":{"type":"integer","description":"Optional message id this broadcast ask replies to."}
+            },"required":["body"]}
         },
         {
             "name": "weave_delivery",

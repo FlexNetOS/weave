@@ -36,8 +36,9 @@ and the open gaps the user flagged.
 - [x] WL-023: iTerm2 injector backend — native injection support for iTerm2 terminal multiplexer (ROADMAP-v0.3 §6). AppleScript via osascript; no liveness probe (fail-open).
 - [x] WL-024: Reservation leases — lightweight advisory file locks between agents to coordinate exclusive access to shared resources (ROADMAP-v0.3 §5). `leases` table + `reserve_lease`/`release_lease`/`list_leases` Store methods, both backends, CLI `weave lease {reserve,release,list}`, 3 MCP tools, integration tests. 494 passed (sqlite), 462 passed + 1 ignored (libsql).
 - [x] WL-025: Stop-boundary wake — blocking `Stop`/`SubagentStop` hook that returns `additionalContext` to drive the next turn without polling (ROADMAP-v0.3 §1). `weave hook stop --wake` drains inbox with mark_read=true and emits `{"decision":"block","reason":...}` JSON when unread messages exist; `WEAVE_STOP_WAKE=1` env var also enables it. Default `stop` behaviour remains peek-only.
-- [x] WL-026: Idempotency keys & trace IDs — per-message idempotency keys and distributed trace IDs for end-to-end debugging across stores (ROADMAP-v0.3 §3).
-- [ ] WL-027: Broadcast notify / broadcast ask — fan-out notifications and asks to all online peers in the caller's circle, not just `--to all` store broadcast (repowire parity).
+- [x] WL-026: Idempotency keys & trace IDs — per-message idempotency keys and distributed trace IDs for end-to-end debugging across stores (ROADMAP-v0.3 §3). 507 passed (sqlite), 467 passed + 1 ignored (libsql).
+- [x] WL-027: Broadcast notify / broadcast ask — fan-out notifications and asks to all online peers in the caller's circle, not just `--to all` store broadcast (repowire parity). `weave_broadcast_notify` + `weave_broadcast_ask` MCP tools + `weave broadcast-notify` + `weave broadcast-ask` CLI. 509 passed (sqlite), 469 passed + 1 ignored (libsql).
+- [x] **FrankenNetworkX crate extraction** (bonus, not in original backlog) — `fnx-classes` + `fnx-algorithms` + `fnx-runtime` wired in via Cargo git dependencies. `weave graph` command builds peer/message communication graph and runs connected_components + degree_centrality + density. 510 passed (sqlite), 470 passed + 1 ignored (libsql).
 
 ## Gaps from mcp_agent_mail cross-reference (2026-06-07)
 - [ ] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity).

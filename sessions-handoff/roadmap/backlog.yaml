@@ -102,11 +102,11 @@ tasks:
     priority: P2
   - id: WL-026
     title: Idempotency keys and trace IDs
-    status: backlog
+    status: done
     priority: P2
   - id: WL-027
     title: Broadcast notify / broadcast ask
-    status: backlog
+    status: done
     priority: P2
   - id: WL-028
     title: FTS5 full-text search
