@@ -299,6 +299,75 @@ fn mcp_stdio_explicit_session_beats_basename_fallback() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn cli_send_idempotency_dedupes() {
+    let db = TestDb::new();
+    let sent1 = run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "hello",
+            "--idempotency-key",
+            "ik-1",
+        ],
+    );
+    let id1: i64 = sent1
+        .split('#')
+        .nth(1)
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let sent2 = run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "hello",
+            "--idempotency-key",
+            "ik-1",
+        ],
+    );
+    let id2: i64 = sent2
+        .split('#')
+        .nth(1)
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(id1, id2, "duplicate idempotency key returns same id");
+}
+
+#[test]
+fn cli_send_trace_id_in_json() {
+    let db = TestDb::new();
+    run_ok(&db, &["send", "--from", "a", "--to", "b", "--body", "hi"]);
+    let inbox_json = run_ok(&db, &["inbox", "--me", "b", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&inbox_json).unwrap();
+    let msgs = parsed["messages"].as_array().unwrap();
+    assert!(!msgs.is_empty());
+    let first = &msgs[0];
+    assert!(
+        first["trace_id"].as_str().unwrap().starts_with("trace_"),
+        "trace_id auto-minted: {first:?}"
+    );
+}
+
+#[test]
 fn cli_send_then_inbox_shows_body() {
     let db = TestDb::new();
 

@@ -63,13 +63,15 @@ use tokio::runtime::Runtime;
 /// works for local but splitting keeps both backends identical.
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS messages (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts          INTEGER NOT NULL,
-        sender      TEXT NOT NULL,
-        recipient   TEXT NOT NULL,
-        subject     TEXT,
-        body        TEXT NOT NULL,
-        in_reply_to INTEGER
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              INTEGER NOT NULL,
+        sender          TEXT NOT NULL,
+        recipient       TEXT NOT NULL,
+        subject         TEXT,
+        body            TEXT NOT NULL,
+        in_reply_to     INTEGER,
+        idempotency_key TEXT UNIQUE,
+        trace_id        TEXT
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -101,14 +103,16 @@ const SCHEMA: &[&str] = &[
         birth_cert     TEXT
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts        INTEGER NOT NULL,
-        to_peer   TEXT NOT NULL,
-        to_host   TEXT NOT NULL DEFAULT '',
-        from_peer TEXT NOT NULL,
-        subject   TEXT,
-        body      TEXT NOT NULL,
-        sig       TEXT NOT NULL DEFAULT ''
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              INTEGER NOT NULL,
+        to_peer         TEXT NOT NULL,
+        to_host         TEXT NOT NULL DEFAULT '',
+        from_peer       TEXT NOT NULL,
+        subject         TEXT,
+        body            TEXT NOT NULL,
+        sig             TEXT NOT NULL DEFAULT '',
+        idempotency_key TEXT,
+        trace_id        TEXT
     )",
     "CREATE TABLE IF NOT EXISTS pull_cursor (
         source  TEXT PRIMARY KEY,
@@ -300,6 +304,8 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         subject: r.get::<Option<String>>(4)?,
         body: r.get::<String>(5)?,
         in_reply_to: r.get::<Option<i64>>(6)?,
+        idempotency_key: r.get::<Option<String>>(7).ok().flatten(),
+        trace_id: r.get::<Option<String>>(8).ok().flatten(),
     })
 }
 
@@ -316,6 +322,8 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
         subject: r.get::<Option<String>>(5)?,
         body: r.get::<String>(6)?,
         sig: r.get::<String>(7)?,
+        idempotency_key: r.get::<Option<String>>(8).ok().flatten(),
+        trace_id: r.get::<Option<String>>(9).ok().flatten(),
     })
 }
 
@@ -940,6 +948,27 @@ impl LibsqlStore {
                     .await
                     .context("creating leases index")?;
             }
+            // WL-026: idempotency keys and trace IDs on messages and outbox.
+            // SQLite `ALTER TABLE ADD COLUMN` rejects inline UNIQUE on non-empty tables,
+            // so we add the column plain then create the unique index separately.
+            for (table, col, ddl) in [
+                ("messages", "idempotency_key", "ALTER TABLE messages ADD COLUMN idempotency_key TEXT"),
+                ("messages", "trace_id", "ALTER TABLE messages ADD COLUMN trace_id TEXT"),
+                ("outbox", "idempotency_key", "ALTER TABLE outbox ADD COLUMN idempotency_key TEXT"),
+                ("outbox", "trace_id", "ALTER TABLE outbox ADD COLUMN trace_id TEXT"),
+            ] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    conn.execute(ddl, ()).await.with_context(|| format!("adding {table}.{col} column"))?;
+                }
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_key ON messages(idempotency_key)",
+                (),
+            )
+            .await
+            .context("creating idempotency_key unique index")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1294,22 +1323,48 @@ impl Store for LibsqlStore {
         recipient: &str,
         subject: Option<&str>,
         body: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
         check_body(body)?;
+        if let Some(key) = idempotency_key {
+            if !crate::model::idempotency_key_valid(key) {
+                anyhow::bail!("idempotency_key is invalid or too long.");
+            }
+        }
+        if let Some(id) = trace_id {
+            if !crate::model::trace_id_valid(id) {
+                anyhow::bail!("trace_id is invalid or too long.");
+            }
+        }
         self.rt.block_on(async {
+            if let Some(key) = idempotency_key {
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT id FROM messages WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if let Some(r) = it.next().await? {
+                    return Ok(r.get::<i64>(0)?);
+                }
+            }
             self.conn
                 .execute(
-                    "INSERT INTO messages (ts, sender, recipient, subject, body) \
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO messages (ts, sender, recipient, subject, body, idempotency_key, trace_id) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params(vec![
                         now().into(),
                         sender.into(),
                         recipient.into(),
                         subject.map(|s| s.to_string()).into(),
                         body.into(),
+                        idempotency_key.map(|s| s.to_string()).into(),
+                        trace_id.map(|s| s.to_string()).into(),
                     ]),
                 )
                 .await?;
@@ -1333,14 +1388,14 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
@@ -1387,7 +1442,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -1402,7 +1457,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1424,7 +1479,7 @@ impl Store for LibsqlStore {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
@@ -1719,7 +1774,8 @@ impl Store for LibsqlStore {
                     UNION
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
-                SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to
+                SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
+                       m.idempotency_key, m.trace_id
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -2124,6 +2180,8 @@ impl Store for LibsqlStore {
         subject: Option<&str>,
         body: &str,
         sig: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("recipient", to)?;
@@ -2133,8 +2191,8 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params(vec![
                         now().into(),
                         to.into(),
@@ -2143,6 +2201,8 @@ impl Store for LibsqlStore {
                         subject.map(|s| s.to_string()).into(),
                         body.into(),
                         sig.into(),
+                        idempotency_key.map(|s| s.to_string()).into(),
+                        trace_id.map(|s| s.to_string()).into(),
                     ]),
                 )
                 .await?;
@@ -2158,7 +2218,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox \
                      WHERE to_peer = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
                     params(vec![for_recipient.into(), since_id.into(), limit.into()]),
                 )
@@ -2177,7 +2237,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox \
                      ORDER BY id ASC LIMIT ?1",
                     params(vec![limit.into()]),
                 )
@@ -3920,7 +3980,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
@@ -4170,7 +4230,7 @@ mod tests {
             s.ask_for_message(aid).unwrap().as_deref(),
             Some(cid.as_str())
         );
-        let mid = s.send("a", "b", None, "plain").unwrap();
+        let mid = s.send("a", "b", None, "plain", None, None).unwrap();
         assert_eq!(s.ask_for_message(mid).unwrap(), None);
         let huge = s.list_asks("a", AskRole::Any, i64::MAX).unwrap();
         assert!(
@@ -4253,7 +4313,7 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            s.send("a", "b", None, "pre-existing").unwrap();
+            s.send("a", "b", None, "pre-existing", None, None).unwrap();
             // Drop the asks table to simulate a DB that predates the migration.
             s.rt.block_on(async { s.conn.execute("DROP TABLE asks", ()).await })
                 .unwrap();
@@ -4417,7 +4477,7 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            s.send("a", "b", None, "q").unwrap();
+            s.send("a", "b", None, "q", None, None).unwrap();
             s.rt
                 .block_on(async {
                     s.conn.execute("DROP TABLE asks", ()).await?;
@@ -4468,8 +4528,9 @@ mod tests {
     #[test]
     fn send_and_read_tracking() {
         let s = mem();
-        s.send("desktop", "envctl", Some("hi"), "body1").unwrap();
-        s.send("desktop", "all", None, "bcast").unwrap();
+        s.send("desktop", "envctl", Some("hi"), "body1", None, None)
+            .unwrap();
+        s.send("desktop", "all", None, "bcast", None, None).unwrap();
 
         let (rows, remaining) = s.inbox("envctl", false, true, 50).unwrap();
         assert_eq!(rows.len(), 2);
@@ -4553,9 +4614,9 @@ mod tests {
     #[test]
     fn history_scoped() {
         let s = mem();
-        s.send("a", "b", None, "1").unwrap();
-        s.send("b", "a", None, "2").unwrap();
-        s.send("c", "d", None, "x").unwrap();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("b", "a", None, "2", None, None).unwrap();
+        s.send("c", "d", None, "x", None, None).unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
     }
@@ -4563,7 +4624,9 @@ mod tests {
     #[test]
     fn reply_addresses_back_and_links() {
         let s = mem();
-        let root = s.send("a", "b", Some("hi"), "question?").unwrap();
+        let root = s
+            .send("a", "b", Some("hi"), "question?", None, None)
+            .unwrap();
         let r1 = s.reply("b", root, "answer.").unwrap();
 
         let (a_inbox, _) = s.inbox("a", true, false, 50).unwrap();
@@ -4589,10 +4652,10 @@ mod tests {
     #[test]
     fn thread_collects_transitive_replies_in_order() {
         let s = mem();
-        let root = s.send("a", "b", Some("topic"), "m0").unwrap();
+        let root = s.send("a", "b", Some("topic"), "m0", None, None).unwrap();
         let c1 = s.reply("b", root, "m1").unwrap();
         let c2 = s.reply("a", c1, "m2").unwrap(); // nested reply-to-a-reply
-        let _other = s.send("a", "b", None, "unrelated").unwrap();
+        let _other = s.send("a", "b", None, "unrelated", None, None).unwrap();
 
         let thread = s.thread(root, 50).unwrap();
         let ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
@@ -4607,7 +4670,7 @@ mod tests {
     #[test]
     fn receipts_reports_readers() {
         let s = mem();
-        let id = s.send("a", "all", None, "ping").unwrap();
+        let id = s.send("a", "all", None, "ping", None, None).unwrap();
         assert!(s.receipts(id).unwrap().is_empty(), "nobody has read yet");
 
         s.inbox("b", false, true, 50).unwrap();
@@ -4623,9 +4686,9 @@ mod tests {
     #[test]
     fn inbox_since_pages_forward_without_dropping_backlog() {
         let s = mem();
-        let id1 = s.send("a", "b", None, "m1").unwrap();
-        let id2 = s.send("a", "b", None, "m2").unwrap();
-        let id3 = s.send("a", "all", None, "bcast").unwrap();
+        let id1 = s.send("a", "b", None, "m1", None, None).unwrap();
+        let id2 = s.send("a", "b", None, "m2", None, None).unwrap();
+        let id3 = s.send("a", "all", None, "bcast", None, None).unwrap();
 
         let all = s.inbox_since("b", 0, 50).unwrap();
         let ids: Vec<i64> = all.iter().map(|m| m.id).collect();
@@ -4646,7 +4709,7 @@ mod tests {
     #[test]
     fn gc_deletes_old_keeps_new() {
         let s = mem();
-        let id_old = s.send("a", "b", None, "old").unwrap();
+        let id_old = s.send("a", "b", None, "old", None, None).unwrap();
         // Backdate the first message well past the threshold.
         s.rt.block_on(async {
             s.conn
@@ -4658,7 +4721,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .unwrap();
-        s.send("a", "b", None, "new").unwrap();
+        s.send("a", "b", None, "new", None, None).unwrap();
         let deleted = s.gc(3600).unwrap(); // older than 1h
         assert_eq!(deleted, 1);
         assert_eq!(s.total_messages().unwrap(), 1);
@@ -4672,7 +4735,9 @@ mod tests {
     fn delivery_log_records_and_lists_oldest_first_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "SECRET-BODY-XYZ").unwrap();
+        let mid = s
+            .send("a", "b", None, "SECRET-BODY-XYZ", None, None)
+            .unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -4704,7 +4769,7 @@ mod tests {
     fn delivery_log_read_is_bounded_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
         let s = mem();
-        let mid = s.send("a", "b", None, "x").unwrap();
+        let mid = s.send("a", "b", None, "x", None, None).unwrap();
         for _ in 0..(MAX_DELIVERY_ROWS + 10) {
             s.record_delivery(
                 mid,
@@ -4726,7 +4791,7 @@ mod tests {
     fn gc_prunes_old_delivery_log_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "m").unwrap();
+        let mid = s.send("a", "b", None, "m", None, None).unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -4815,7 +4880,8 @@ mod tests {
     fn negative_limit_is_not_unbounded() {
         let s = mem();
         for i in 0..5 {
-            s.send("a", "b", None, &format!("m{i}")).unwrap();
+            s.send("a", "b", None, &format!("m{i}"), None, None)
+                .unwrap();
         }
         // A negative limit must NOT behave like SQLite's unbounded LIMIT -1.
         let (rows, _) = s.inbox("b", true, false, -1).unwrap();
@@ -4827,8 +4893,8 @@ mod tests {
     #[test]
     fn clear_inbox_and_clear_all() {
         let s = mem();
-        s.send("a", "b", None, "1").unwrap();
-        s.send("a", "b", None, "2").unwrap();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("a", "b", None, "2", None, None).unwrap();
         // clear_inbox marks b's unread read (returns the count marked).
         assert_eq!(s.clear_inbox("b").unwrap(), 2);
         let (unread, _) = s.inbox("b", false, false, 50).unwrap();
@@ -4842,16 +4908,19 @@ mod tests {
     #[test]
     fn send_rejects_invalid_idents() {
         let s = mem();
-        assert!(s.send("", "b", None, "x").is_err(), "empty sender rejected");
         assert!(
-            s.send("a", "", None, "x").is_err(),
+            s.send("", "b", None, "x", None, None).is_err(),
+            "empty sender rejected"
+        );
+        assert!(
+            s.send("a", "", None, "x", None, None).is_err(),
             "empty recipient rejected"
         );
         assert!(
-            s.send("a", "b\nc", None, "x").is_err(),
+            s.send("a", "b\nc", None, "x", None, None).is_err(),
             "control char in recipient rejected"
         );
-        assert!(s.send("a", "b", None, "x").is_ok());
+        assert!(s.send("a", "b", None, "x", None, None).is_ok());
     }
 
     // ---- A2 (real liveness): mirror of the SqliteStore store-unit tests ----
@@ -5571,7 +5640,7 @@ mod tests {
             wr.is_err(),
             "a write through a libsql read-only handle must error"
         );
-        let send = ro.send("a", "b", None, "x");
+        let send = ro.send("a", "b", None, "x", None, None);
         assert!(
             send.is_err(),
             "a send through a libsql read-only handle must error"
@@ -5645,7 +5714,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            rw.send("seed", "seed", None, "hi").unwrap();
+            rw.send("seed", "seed", None, "hi", None, None).unwrap();
         }
         let before = std::fs::read(&path).expect("read foreign DB bytes (before)");
 
@@ -5666,7 +5735,7 @@ mod tests {
             );
         };
 
-        assert_trapped("send", ro.send("a", "b", None, "x").map(|_| ()));
+        assert_trapped("send", ro.send("a", "b", None, "x", None, None).map(|_| ()));
         assert_trapped(
             "inbox(mark_read)",
             ro.inbox("seed", false, true, 10).map(|_| ()),
@@ -5686,7 +5755,7 @@ mod tests {
         );
         assert_trapped(
             "enqueue_intent",
-            ro.enqueue_intent("to", "boxB", "from", None, "body", "")
+            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None)
                 .map(|_| ()),
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
@@ -5777,12 +5846,12 @@ mod tests {
     fn enqueue_and_list_outbox_roundtrip_libsql() {
         let s = mem();
         let i1 = s
-            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "")
+            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "", None, None)
             .unwrap();
-        s.enqueue_intent("carol", "", "alice", None, "for carol", "")
+        s.enqueue_intent("carol", "", "alice", None, "for carol", "", None, None)
             .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "")
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None)
             .unwrap();
 
         let all = s.outbox_all(50).unwrap();
@@ -5956,7 +6025,7 @@ mod tests {
                 ..Config::default()
             };
             let a = LibsqlStore::open(&cfg).unwrap();
-            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "")
+            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "", None, None)
                 .unwrap();
         }
         // Snapshot A's main DB file BEFORE B pulls (WAL legitimately appears on a

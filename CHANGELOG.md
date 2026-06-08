@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased] — idempotency & tracing (WL-026)
+
+> **Per-message idempotency keys and distributed trace IDs.** Callers can supply
+> an `idempotency_key` to deduplicate retries (duplicate keys return the existing
+> message id). A `trace_id` is auto-minted for every message for end-to-end
+> debugging across stores and backends. Both fields propagate through cross-store
+> intents (Tier-2) so pulled messages retain their original trace context.
+
+### Added
+- **model:** `idempotency_key` and `trace_id` on `Message` and `Intent`;
+  `MAX_IDEMPOTENCY_KEY_LEN = 128`, `MAX_TRACE_ID_LEN = 128`,
+  `idempotency_key_valid()`, `trace_id_valid()`, and `mint_trace_id()`.
+- **store (both backends):** `idempotency_key` and `trace_id` columns on
+  `messages` and `outbox` via guarded additive migration; `Store::send` and
+  `Store::enqueue_intent` accept both fields; idempotency guard returns existing
+  `id` on duplicate key.
+- **CLI:** `--idempotency-key` on `weave send` and `weave notify`; trace ID
+  auto-minted and surfaced in JSON output.
+- **MCP:** `idempotencyKey` optional parameter on `weave_send` and
+  `weave_notify`.
+- **Tests:** idempotency dedup, trace ID roundtrip, outbox field carry,
+  integration JSON shape, and security tests for oversized/hostile keys.
+
 ## [Unreleased] — scheduler (WL-016)
 
 > **Daemon-free message scheduling.** One-shot (`--at <unix_ts>`) and recurring

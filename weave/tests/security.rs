@@ -2572,6 +2572,51 @@ fn ask_oversized_identity_is_rejected() {
     );
 }
 
+#[test]
+fn idempotency_key_oversized_is_rejected() {
+    let db = TestDb::new();
+    let giant = "x".repeat(100_000);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "x",
+            "--idempotency-key",
+            &giant,
+        ],
+    );
+    assert!(!ok, "oversized idempotency key must be rejected");
+    assert!(!err.contains("panicked"), "clean rejection: {err:?}");
+}
+
+#[test]
+fn idempotency_key_hostile_is_rejected() {
+    let db = TestDb::new();
+    for bad in ["key\nline", ""] {
+        let (ok, _out, err) = run(
+            &db,
+            &[
+                "send",
+                "--from",
+                "a",
+                "--to",
+                "b",
+                "--body",
+                "x",
+                "--idempotency-key",
+                bad,
+            ],
+        );
+        assert!(!ok, "hostile idempotency key {bad:?} must be rejected");
+        assert!(!err.contains("panicked"), "clean rejection: {err:?}");
+    }
+}
+
 /// A hostile correlation id (shell metacharacters / oversized) is rejected by
 /// `ask_id_valid` BEFORE any DB bind on every reference path
 /// (`answer`/`ack`/`ask-get`). The metachar string never reaches a `Command`

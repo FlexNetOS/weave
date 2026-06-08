@@ -200,6 +200,10 @@ enum Cmd {
         /// Skip automatic memory context prefixing for this message.
         #[arg(long)]
         no_memory: bool,
+        /// Idempotency key: if a message with this key already exists, the existing
+        /// message id is returned instead of creating a new row.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -214,6 +218,10 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
+        /// Idempotency key: if a message with this key already exists, the existing
+        /// message id is returned instead of creating a new row.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// List pending cross-store intents in your outbox (Tier-2, read-only).
     Outbox {
@@ -2506,10 +2514,12 @@ fn main() -> Result<()> {
             to_store,
             to_host,
             no_memory,
+            idempotency_key,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
             let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
+            let trace_id = model::mint_trace_id();
             match to_store {
                 // Cross-store (Tier-2): the recipient lives in a FOREIGN store, so
                 // we deposit an intent into OUR OWN outbox rather than attempt any
@@ -2530,12 +2540,27 @@ fn main() -> Result<()> {
                     // bind into the row; we sign the SAME value the store stamps so
                     // verification matches. Without the `sign` feature this is "".
                     let sig = sign_intent_if_keyed(&from, &to, &body);
-                    let id =
-                        store.enqueue_intent(&to, host, &from, subject.as_deref(), &body, &sig)?;
+                    let id = store.enqueue_intent(
+                        &to,
+                        host,
+                        &from,
+                        subject.as_deref(),
+                        &body,
+                        &sig,
+                        idempotency_key.as_deref(),
+                        Some(&trace_id),
+                    )?;
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
                 None => {
-                    let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+                    let mid = store.send(
+                        &from,
+                        &to,
+                        subject.as_deref(),
+                        &body,
+                        idempotency_key.as_deref(),
+                        Some(&trace_id),
+                    )?;
                     println!("sent #{mid}: {from} -> {to}");
                     let _ = inject_and_trace(
                         store,
@@ -2555,6 +2580,7 @@ fn main() -> Result<()> {
             to,
             subject,
             body,
+            idempotency_key,
         } => {
             // Fire-and-forget point-to-point notification. Persist via the normal send
             // path (no fork), fire the SAME caller-side nudge + trace, and print the
@@ -2567,7 +2593,15 @@ fn main() -> Result<()> {
             }
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
-            let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+            let trace_id = model::mint_trace_id();
+            let mid = store.send(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                idempotency_key.as_deref(),
+                Some(&trace_id),
+            )?;
             // Trace + nudge (best-effort trace, no store→inject edge). The honest
             // verdict is derived from the SAME inject result that drove the trace, so
             // the printed token and the recorded stage can never disagree.
@@ -4840,6 +4874,8 @@ fn execute_tick(store: &dyn Store, me: &str, all: bool) -> Result<()> {
             &sched.recipient,
             sched.subject.as_deref(),
             &sched.body,
+            None,
+            None,
         )?;
         store.mark_schedule_executed(sched.id)?;
         record_delivery_best_effort(

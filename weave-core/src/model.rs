@@ -98,6 +98,16 @@ pub struct Message {
     /// deserializable.
     #[serde(default)]
     pub in_reply_to: Option<i64>,
+    /// Per-message idempotency key. Globally unique: a duplicate key anywhere in
+    /// the store returns the existing message id instead of creating a new row.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Distributed trace id for end-to-end debugging across stores and backends.
+    /// Auto-minted by CLI/MCP when not provided by the caller.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
@@ -135,6 +145,14 @@ pub struct Intent {
     /// older JSON payloads (which omit the field) deserializable.
     #[serde(default)]
     pub sig: String,
+    /// Idempotency key carried on cross-store intents so the receiver's commit
+    /// is idempotent. `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Trace id carried on cross-store intents for end-to-end debugging.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// Hard upper bound (in chars) on a tracked-ask correlation id. The id is always
@@ -1031,6 +1049,49 @@ pub fn review_id_valid(id: &str) -> bool {
         && id.len() <= MAX_REVIEW_ID_LEN
         && id.starts_with("review_")
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Hard upper bound (in chars) on an idempotency key. 128 is generous for
+/// caller-minted keys (UUIDs, ULIDs, or namespaced application keys).
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+/// Hard upper bound (in chars) on a trace id. 128 is generous for
+/// caller-supplied correlation ids.
+pub const MAX_TRACE_ID_LEN: usize = 128;
+
+/// Validate an idempotency key: non-empty, <= MAX_IDEMPOTENCY_KEY_LEN chars,
+/// no control characters, no NUL. Rejects overly long or hostile keys before
+/// any DB bind.
+pub fn idempotency_key_valid(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
+        && !key.bytes().any(|b| b.is_ascii_control())
+        && !key.contains('\0')
+}
+
+/// Validate a trace id: non-empty, <= MAX_TRACE_ID_LEN chars, no control
+/// characters, no NUL. More permissive than idempotency keys — the format is
+/// caller-defined.
+pub fn trace_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TRACE_ID_LEN
+        && !id.bytes().any(|b| b.is_ascii_control())
+        && !id.contains('\0')
+}
+
+/// Mint a trace id for end-to-end debugging: `trace_<timestamp>_<6 random hex>`.
+pub fn mint_trace_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut buf = [0u8; 3];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        format!("trace_{ts}_{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2])
+    } else {
+        format!("trace_{ts}_000000")
+    }
 }
 
 /// Validate a GitHub PR URL (basic check: https://github.com/owner/repo/pull/N).
@@ -1991,6 +2052,28 @@ mod tests {
         ] {
             assert!(!circle_valid(bad), "must reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn idempotency_key_valid_bounds() {
+        assert!(idempotency_key_valid("uuid-123"));
+        assert!(idempotency_key_valid(&"x".repeat(MAX_IDEMPOTENCY_KEY_LEN)));
+        assert!(!idempotency_key_valid(""));
+        assert!(!idempotency_key_valid(
+            &"x".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1)
+        ));
+        assert!(!idempotency_key_valid("has\ncontrol"));
+        assert!(!idempotency_key_valid("has\0nul"));
+    }
+
+    #[test]
+    fn trace_id_valid_bounds() {
+        assert!(trace_id_valid("trace-abc"));
+        assert!(trace_id_valid(&"x".repeat(MAX_TRACE_ID_LEN)));
+        assert!(!trace_id_valid(""));
+        assert!(!trace_id_valid(&"x".repeat(MAX_TRACE_ID_LEN + 1)));
+        assert!(!trace_id_valid("has\ncontrol"));
+        assert!(!trace_id_valid("has\0nul"));
     }
 
     #[test]

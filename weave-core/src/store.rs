@@ -70,8 +70,15 @@ pub type SessionInfo = (String, i64, i64);
 /// Backend-agnostic store interface. Object-safe so the app can hold a
 /// `Box<dyn Store>` and pick the backend at runtime.
 pub trait Store: Send {
-    fn send(&self, sender: &str, recipient: &str, subject: Option<&str>, body: &str)
-        -> Result<i64>;
+    fn send(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64>;
     fn inbox(
         &self,
         me: &str,
@@ -252,7 +259,7 @@ pub trait Store: Send {
     /// only override when they want a tighter (single-transaction) version.
     fn reply(&self, sender: &str, in_reply_to: i64, body: &str) -> Result<i64> {
         let (recipient, subject) = self.reply_target(sender, in_reply_to)?;
-        let id = self.send(sender, &recipient, subject.as_deref(), body)?;
+        let id = self.send(sender, &recipient, subject.as_deref(), body, None, None)?;
         self.set_in_reply_to(id, in_reply_to)?;
         Ok(id)
     }
@@ -292,6 +299,7 @@ pub trait Store: Send {
     /// unused. This is intentional Tier-2 surface, exercised by the store unit
     /// tests, not dead code.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_intent(
         &self,
         to: &str,
@@ -300,6 +308,8 @@ pub trait Store: Send {
         subject: Option<&str>,
         body: &str,
         sig: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64>;
 
     /// Tier-2: read intents from THIS store's `outbox` addressed to `for_recipient`
@@ -1304,13 +1314,15 @@ pub fn reply_subject(parent_subject: Option<&str>) -> Option<String> {
 #[cfg(feature = "sqlite")]
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          INTEGER NOT NULL,
-    sender      TEXT NOT NULL,
-    recipient   TEXT NOT NULL,
-    subject     TEXT,
-    body        TEXT NOT NULL,
-    in_reply_to INTEGER
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    sender          TEXT NOT NULL,
+    recipient       TEXT NOT NULL,
+    subject         TEXT,
+    body            TEXT NOT NULL,
+    in_reply_to     INTEGER,
+    idempotency_key TEXT UNIQUE,
+    trace_id        TEXT
 );
 CREATE TABLE IF NOT EXISTS reads (
     message_id INTEGER NOT NULL,
@@ -1342,14 +1354,16 @@ CREATE TABLE IF NOT EXISTS peers (
     birth_cert     TEXT
 );
 CREATE TABLE IF NOT EXISTS outbox (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts        INTEGER NOT NULL,
-    to_peer   TEXT NOT NULL,
-    to_host   TEXT NOT NULL DEFAULT '',
-    from_peer TEXT NOT NULL,
-    subject   TEXT,
-    body      TEXT NOT NULL,
-    sig       TEXT NOT NULL DEFAULT ''
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    to_peer         TEXT NOT NULL,
+    to_host         TEXT NOT NULL DEFAULT '',
+    from_peer       TEXT NOT NULL,
+    subject         TEXT,
+    body            TEXT NOT NULL,
+    sig             TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT,
+    trace_id        TEXT
 );
 CREATE TABLE IF NOT EXISTS pull_cursor (
     source  TEXT PRIMARY KEY,
@@ -1514,6 +1528,8 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
         // explicit `SELECT id, ts, ...` thread CTE adds it deliberately) supply
         // it themselves rather than calling this helper.
         in_reply_to: r.get("in_reply_to").unwrap_or(None),
+        idempotency_key: r.get("idempotency_key").unwrap_or(None),
+        trace_id: r.get("trace_id").unwrap_or(None),
     })
 }
 
@@ -1760,6 +1776,8 @@ fn row_to_intent(r: &Row) -> rusqlite::Result<Intent> {
         subject: r.get(5)?,
         body: r.get(6)?,
         sig: r.get(7)?,
+        idempotency_key: r.get(8).unwrap_or(None),
+        trace_id: r.get(9).unwrap_or(None),
     })
 }
 
@@ -1870,14 +1888,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     // outbox migration.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS outbox (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts        INTEGER NOT NULL,
-            to_peer   TEXT NOT NULL,
-            to_host   TEXT NOT NULL DEFAULT '',
-            from_peer TEXT NOT NULL,
-            subject   TEXT,
-            body      TEXT NOT NULL,
-            sig       TEXT NOT NULL DEFAULT ''
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              INTEGER NOT NULL,
+            to_peer         TEXT NOT NULL,
+            to_host         TEXT NOT NULL DEFAULT '',
+            from_peer       TEXT NOT NULL,
+            subject         TEXT,
+            body            TEXT NOT NULL,
+            sig             TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT,
+            trace_id        TEXT
         );
         CREATE TABLE IF NOT EXISTS pull_cursor (
             source  TEXT PRIMARY KEY,
@@ -2095,6 +2115,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
         CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);",
     )?;
+    // WL-026: idempotency keys and trace IDs on messages and outbox.
+    // SQLite `ALTER TABLE ADD COLUMN` rejects inline UNIQUE on non-empty tables,
+    // so we add the column plain then create the unique index separately.
+    if !column_exists(conn, "messages", "idempotency_key")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN idempotency_key TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_key ON messages(idempotency_key);",
+    )?;
+    if !column_exists(conn, "messages", "trace_id")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN trace_id TEXT;")?;
+    }
+    if !column_exists(conn, "outbox", "idempotency_key")? {
+        conn.execute_batch("ALTER TABLE outbox ADD COLUMN idempotency_key TEXT;")?;
+    }
+    if !column_exists(conn, "outbox", "trace_id")? {
+        conn.execute_batch("ALTER TABLE outbox ADD COLUMN trace_id TEXT;")?;
+    }
     Ok(())
 }
 
@@ -2524,7 +2562,14 @@ pub fn commit_pulled(
         #[cfg(not(feature = "sign"))]
         let ok = valid;
         if ok {
-            match local.send(&intent.from, me, intent.subject.as_deref(), &intent.body) {
+            match local.send(
+                &intent.from,
+                me,
+                intent.subject.as_deref(),
+                &intent.body,
+                intent.idempotency_key.as_deref(),
+                intent.trace_id.as_deref(),
+            ) {
                 Ok(_) => committed += 1,
                 Err(e) => {
                     eprintln!(
@@ -2764,13 +2809,35 @@ impl Store for SqliteStore {
         recipient: &str,
         subject: Option<&str>,
         body: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
         check_body(body)?;
+        if let Some(key) = idempotency_key {
+            if !crate::model::idempotency_key_valid(key) {
+                anyhow::bail!("idempotency_key is invalid or too long.");
+            }
+        }
+        if let Some(id) = trace_id {
+            if !crate::model::trace_id_valid(id) {
+                anyhow::bail!("trace_id is invalid or too long.");
+            }
+        }
+        if let Some(key) = idempotency_key {
+            if let Ok(id) = self.conn.query_row(
+                "SELECT id FROM messages WHERE idempotency_key = ?1",
+                params![key],
+                |r| r.get::<_, i64>(0),
+            ) {
+                return Ok(id);
+            }
+        }
         self.conn.execute(
-            "INSERT INTO messages (ts, sender, recipient, subject, body) VALUES (?1,?2,?3,?4,?5)",
-            params![now(), sender, recipient, subject, body],
+            "INSERT INTO messages (ts, sender, recipient, subject, body, idempotency_key, trace_id) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![now(), sender, recipient, subject, body, idempotency_key, trace_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -3342,7 +3409,8 @@ impl Store for SqliteStore {
                 UNION
                 SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
             )
-            SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to
+            SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
+                   m.idempotency_key, m.trace_id
             FROM messages m JOIN t ON m.id = t.id
             ORDER BY m.id ASC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
@@ -3356,6 +3424,8 @@ impl Store for SqliteStore {
                     subject: r.get(4)?,
                     body: r.get(5)?,
                     in_reply_to: r.get(6)?,
+                    idempotency_key: r.get(7).unwrap_or(None),
+                    trace_id: r.get(8).unwrap_or(None),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3389,15 +3459,17 @@ impl Store for SqliteStore {
         subject: Option<&str>,
         body: &str,
         sig: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
         check_body(body)?;
         self.conn.execute(
-            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![now(), to, to_host, from, subject, body, sig],
+            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![now(), to, to_host, from, subject, body, sig, idempotency_key, trace_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -3405,7 +3477,7 @@ impl Store for SqliteStore {
     fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox
              WHERE to_peer = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
         )?;
@@ -3418,7 +3490,7 @@ impl Store for SqliteStore {
     fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox
              ORDER BY id ASC LIMIT ?1",
         )?;
         let rows = stmt
@@ -5257,7 +5329,7 @@ mod tests {
             Some(cid.as_str())
         );
         // An ordinary (non-ask) message belongs to no tracked ask.
-        let mid = s.send("a", "b", None, "plain").unwrap();
+        let mid = s.send("a", "b", None, "plain", None, None).unwrap();
         assert_eq!(s.ask_for_message(mid).unwrap(), None);
     }
 
@@ -5533,8 +5605,9 @@ mod tests {
     #[test]
     fn send_and_read_tracking() {
         let s = mem();
-        s.send("desktop", "envctl", Some("hi"), "body1").unwrap();
-        s.send("desktop", "all", None, "bcast").unwrap();
+        s.send("desktop", "envctl", Some("hi"), "body1", None, None)
+            .unwrap();
+        s.send("desktop", "all", None, "bcast", None, None).unwrap();
 
         let (rows, remaining) = s.inbox("envctl", false, true, 50).unwrap();
         assert_eq!(rows.len(), 2);
@@ -5580,9 +5653,9 @@ mod tests {
     #[test]
     fn history_scoped() {
         let s = mem();
-        s.send("a", "b", None, "1").unwrap();
-        s.send("b", "a", None, "2").unwrap();
-        s.send("c", "d", None, "x").unwrap();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("b", "a", None, "2", None, None).unwrap();
+        s.send("c", "d", None, "x", None, None).unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
     }
@@ -5604,7 +5677,8 @@ mod tests {
     fn negative_limit_is_not_unbounded() {
         let s = mem();
         for i in 0..5 {
-            s.send("a", "b", None, &format!("m{i}")).unwrap();
+            s.send("a", "b", None, &format!("m{i}"), None, None)
+                .unwrap();
         }
         // A negative limit must NOT behave like SQLite's unbounded LIMIT -1.
         let (rows, _) = s.inbox("b", true, false, -1).unwrap();
@@ -5615,7 +5689,7 @@ mod tests {
     #[test]
     fn gc_deletes_old_keeps_new() {
         let s = mem();
-        let id_old = s.send("a", "b", None, "old").unwrap();
+        let id_old = s.send("a", "b", None, "old", None, None).unwrap();
         // Backdate the first message well past the threshold.
         s.conn
             .execute(
@@ -5623,7 +5697,7 @@ mod tests {
                 params![id_old],
             )
             .unwrap();
-        s.send("a", "b", None, "new").unwrap();
+        s.send("a", "b", None, "new", None, None).unwrap();
         let deleted = s.gc(3600).unwrap(); // older than 1h
         assert_eq!(deleted, 1);
         assert_eq!(s.total_messages().unwrap(), 1);
@@ -5637,7 +5711,9 @@ mod tests {
     fn delivery_log_records_and_lists_oldest_first() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "SECRET-BODY-XYZ").unwrap();
+        let mid = s
+            .send("a", "b", None, "SECRET-BODY-XYZ", None, None)
+            .unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -5677,7 +5753,7 @@ mod tests {
     fn delivery_log_read_is_bounded() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
         let s = mem();
-        let mid = s.send("a", "b", None, "x").unwrap();
+        let mid = s.send("a", "b", None, "x", None, None).unwrap();
         for _ in 0..(MAX_DELIVERY_ROWS + 25) {
             s.record_delivery(
                 mid,
@@ -5702,7 +5778,7 @@ mod tests {
     fn gc_prunes_old_delivery_log() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "m").unwrap();
+        let mid = s.send("a", "b", None, "m", None, None).unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -5783,7 +5859,9 @@ mod tests {
         let s = mem();
         // a -> b "hi". b replies; the reply must go back to a, carry "Re: hi",
         // and link to the parent via in_reply_to.
-        let root = s.send("a", "b", Some("hi"), "question?").unwrap();
+        let root = s
+            .send("a", "b", Some("hi"), "question?", None, None)
+            .unwrap();
         let r1 = s.reply("b", root, "answer.").unwrap();
 
         let (a_inbox, _) = s.inbox("a", true, false, 50).unwrap();
@@ -5809,10 +5887,10 @@ mod tests {
     #[test]
     fn thread_collects_transitive_replies_in_order() {
         let s = mem();
-        let root = s.send("a", "b", Some("topic"), "m0").unwrap();
+        let root = s.send("a", "b", Some("topic"), "m0", None, None).unwrap();
         let c1 = s.reply("b", root, "m1").unwrap();
         let c2 = s.reply("a", c1, "m2").unwrap(); // nested reply-to-a-reply
-        let _other = s.send("a", "b", None, "unrelated").unwrap();
+        let _other = s.send("a", "b", None, "unrelated", None, None).unwrap();
 
         let thread = s.thread(root, 50).unwrap();
         let ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
@@ -5828,7 +5906,7 @@ mod tests {
     #[test]
     fn receipts_reports_readers() {
         let s = mem();
-        let id = s.send("a", "all", None, "ping").unwrap();
+        let id = s.send("a", "all", None, "ping", None, None).unwrap();
         assert!(s.receipts(id).unwrap().is_empty(), "nobody has read yet");
 
         // Two recipients read the broadcast (mark_read), creating receipts.
@@ -5903,17 +5981,67 @@ mod tests {
     #[test]
     fn send_rejects_invalid_idents() {
         let s = mem();
-        assert!(s.send("", "b", None, "x").is_err(), "empty sender rejected");
         assert!(
-            s.send("a", "", None, "x").is_err(),
+            s.send("", "b", None, "x", None, None).is_err(),
+            "empty sender rejected"
+        );
+        assert!(
+            s.send("a", "", None, "x", None, None).is_err(),
             "empty recipient rejected"
         );
         assert!(
-            s.send("a", "b\nc", None, "x").is_err(),
+            s.send("a", "b\nc", None, "x", None, None).is_err(),
             "control char in recipient rejected"
         );
         // A valid send still works (no regression).
-        assert!(s.send("a", "b", None, "x").is_ok());
+        assert!(s.send("a", "b", None, "x", None, None).is_ok());
+    }
+
+    #[test]
+    fn send_idempotency_returns_existing_id() {
+        let s = mem();
+        let id1 = s.send("a", "b", None, "x", Some("key-1"), None).unwrap();
+        let id2 = s.send("a", "b", None, "x", Some("key-1"), None).unwrap();
+        assert_eq!(id1, id2, "duplicate idempotency_key returns existing id");
+        // A different key mints a new row.
+        let id3 = s.send("a", "b", None, "x", Some("key-2"), None).unwrap();
+        assert_ne!(id1, id3);
+        // No key still mints a new row.
+        let id4 = s.send("a", "b", None, "x", None, None).unwrap();
+        assert_ne!(id1, id4);
+        assert_ne!(id3, id4);
+    }
+
+    #[test]
+    fn send_trace_id_roundtrips() {
+        let s = mem();
+        let id = s
+            .send("a", "b", Some("sub"), "body", None, Some("trace-42"))
+            .unwrap();
+        let (msgs, _) = s.inbox("b", true, false, 10).unwrap();
+        let m = msgs.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(m.trace_id.as_deref(), Some("trace-42"));
+    }
+
+    #[test]
+    fn send_idempotency_key_and_trace_id_on_outbox() {
+        let s = mem();
+        let id = s
+            .enqueue_intent(
+                "bob",
+                "host",
+                "alice",
+                None,
+                "hi",
+                "",
+                Some("ik"),
+                Some("tk"),
+            )
+            .unwrap();
+        let intents = s.outbox_all(10).unwrap();
+        let intent = intents.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(intent.idempotency_key.as_deref(), Some("ik"));
+        assert_eq!(intent.trace_id.as_deref(), Some("tk"));
     }
 
     #[test]
@@ -6154,9 +6282,9 @@ mod tests {
     #[test]
     fn inbox_since_pages_forward_without_dropping_backlog() {
         let s = mem();
-        let id1 = s.send("a", "b", None, "m1").unwrap();
-        let id2 = s.send("a", "b", None, "m2").unwrap();
-        let id3 = s.send("a", "all", None, "bcast").unwrap();
+        let id1 = s.send("a", "b", None, "m1", None, None).unwrap();
+        let id2 = s.send("a", "b", None, "m2", None, None).unwrap();
+        let id3 = s.send("a", "all", None, "bcast", None, None).unwrap();
 
         // From 0: everything addressed to b, oldest-first, sender != b.
         let all = s.inbox_since("b", 0, 50).unwrap();
@@ -6922,7 +7050,7 @@ mod tests {
             "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
         );
         assert!(wr.is_err(), "a write through a read-only handle must error");
-        let send = ro.send("a", "b", None, "x");
+        let send = ro.send("a", "b", None, "x", None, None);
         assert!(
             send.is_err(),
             "a send through a read-only handle must error"
@@ -6988,13 +7116,13 @@ mod tests {
     fn enqueue_and_list_outbox_roundtrip() {
         let s = mem();
         let i1 = s
-            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "")
+            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "", None, None)
             .unwrap();
         let _i2 = s
-            .enqueue_intent("carol", "", "alice", None, "for carol", "")
+            .enqueue_intent("carol", "", "alice", None, "for carol", "", None, None)
             .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "")
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None)
             .unwrap();
 
         // Self-inspection sees all three, oldest-first.
@@ -7025,15 +7153,24 @@ mod tests {
     #[test]
     fn enqueue_intent_enforces_caps() {
         let s = mem();
-        assert!(s.enqueue_intent("", "", "a", None, "x", "").is_err());
-        assert!(s.enqueue_intent("b", "", "", None, "x", "").is_err());
+        assert!(s
+            .enqueue_intent("", "", "a", None, "x", "", None, None)
+            .is_err());
+        assert!(s
+            .enqueue_intent("b", "", "", None, "x", "", None, None)
+            .is_err());
         assert!(
-            s.enqueue_intent("b", "h\nx", "a", None, "x", "").is_err(),
+            s.enqueue_intent("b", "h\nx", "a", None, "x", "", None, None)
+                .is_err(),
             "control char in to_host rejected"
         );
         let big = "x".repeat(MAX_BODY + 1);
-        assert!(s.enqueue_intent("b", "", "a", None, &big, "").is_err());
-        assert!(s.enqueue_intent("b", "", "a", None, "ok", "").is_ok());
+        assert!(s
+            .enqueue_intent("b", "", "a", None, &big, "", None, None)
+            .is_err());
+        assert!(s
+            .enqueue_intent("b", "", "a", None, "ok", "", None, None)
+            .is_ok());
     }
 
     /// The per-source pull cursor defaults to 0 and round-trips through set/get.
@@ -7071,7 +7208,7 @@ mod tests {
         {
             let a = SqliteStore::open(&a_path).unwrap();
             for n in 0..3 {
-                a.enqueue_intent("bob", "", "alice", None, &format!("m{n}"), "")
+                a.enqueue_intent("bob", "", "alice", None, &format!("m{n}"), "", None, None)
                     .unwrap();
             }
         }
@@ -7129,7 +7266,7 @@ mod tests {
         // A enqueues an intent addressed to "bob" (B's identity).
         {
             let a = SqliteStore::open(&a_path).unwrap();
-            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "")
+            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "", None, None)
                 .unwrap();
         }
         // Snapshot A's bytes BEFORE B pulls.
@@ -7172,7 +7309,7 @@ mod tests {
         {
             let a = SqliteStore::open(&a_path).unwrap();
             // Addressed to carol, NOT to bob — must never reach bob's inbox.
-            a.enqueue_intent("carol", "", "alice", None, "not for bob", "")
+            a.enqueue_intent("carol", "", "alice", None, "not for bob", "", None, None)
                 .unwrap();
         }
         let b = SqliteStore::open(&b_path).unwrap();
@@ -7208,7 +7345,9 @@ mod tests {
         }
         let s = SqliteStore::open(&path).unwrap();
         // The new tables exist and work.
-        let id = s.enqueue_intent("bob", "", "alice", None, "x", "").unwrap();
+        let id = s
+            .enqueue_intent("bob", "", "alice", None, "x", "", None, None)
+            .unwrap();
         assert!(id > 0);
         assert_eq!(s.pull_cursor_get("src").unwrap(), 0);
         s.pull_cursor_set("src", 7).unwrap();
@@ -7392,7 +7531,8 @@ mod tests {
         ) -> StoreSource {
             let p = dir.join(format!("{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+                .unwrap();
             StoreSource::Local(p)
         }
 
@@ -7525,7 +7665,8 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+                .unwrap();
             StoreSource::Local(p)
         };
         // Fresh receiver B with alice's key registered.
@@ -7729,7 +7870,8 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+                .unwrap();
             StoreSource::Local(p)
         };
         // Receiver B with BOTH alice keys registered (rotation overlap window).
@@ -7815,7 +7957,8 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig).unwrap();
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+                .unwrap();
             StoreSource::Local(p)
         };
         // Receiver with EXACTLY ONE registered key (== old single-key world).
@@ -7888,7 +8031,7 @@ mod tests {
             let p = dir.join(format!("r{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
             let sig = sign_intent(pk_signer, "alice", "bob", body);
-            a.enqueue_intent("bob", "", "alice", None, body, &sig)
+            a.enqueue_intent("bob", "", "alice", None, body, &sig, None, None)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8232,7 +8375,7 @@ mod tests {
         let src_path = dir.join("src.db");
         let sa = SqliteStore::open(&src_path).unwrap();
         let sig = sign_intent(&alice, "alice", "bob", "revoked-hello");
-        sa.enqueue_intent("bob", "", "alice", None, "revoked-hello", &sig)
+        sa.enqueue_intent("bob", "", "alice", None, "revoked-hello", &sig, None, None)
             .unwrap();
         let source = StoreSource::Local(src_path);
 
@@ -8286,7 +8429,7 @@ mod tests {
         let src_path = dir.join("src.db");
         let sa = SqliteStore::open(&src_path).unwrap();
         let sig = sign_intent(&alice, "alice", "bob", "clean-hello");
-        sa.enqueue_intent("bob", "", "alice", None, "clean-hello", &sig)
+        sa.enqueue_intent("bob", "", "alice", None, "clean-hello", &sig, None, None)
             .unwrap();
         let source = StoreSource::Local(src_path);
 

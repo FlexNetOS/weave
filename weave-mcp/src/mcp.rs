@@ -524,6 +524,11 @@ fn tool_send(
     let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let subject = subject.as_deref();
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
     // lives in a FOREIGN store, so deposit an intent into OUR OWN outbox rather
@@ -552,14 +557,32 @@ fn tool_send(
         // so the receiver can verify `from` is unforgeable. "" otherwise (advisory).
         let sig = sign_intent_if_keyed(&from, to, &body);
         let id = store
-            .enqueue_intent(to, to_host, &from, subject, &body, &sig)
+            .enqueue_intent(
+                to,
+                to_host,
+                &from,
+                subject,
+                &body,
+                &sig,
+                idempotency_key,
+                trace_id.as_deref(),
+            )
             .map_err(e)?;
         return Ok(format!(
             "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
         ));
     }
 
-    let mid = store.send(&from, to, subject, &body).map_err(e)?;
+    let mid = store
+        .send(
+            &from,
+            to,
+            subject,
+            &body,
+            idempotency_key,
+            trace_id.as_deref(),
+        )
+        .map_err(e)?;
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
@@ -710,13 +733,25 @@ fn tool_notify(
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let trace_id = Some(model::mint_trace_id());
 
     // Persist via the EXISTING send path (no new persistence — notify is a normal
     // stored message; "no reply" is a caller-intent label, not a schema distinction).
     // `store.send` enforces MAX_BODY via check_body, so an oversized body is a clean
     // error (never a panic / partial persist).
     let mid = store
-        .send(&from, &to, subject.as_deref(), body)
+        .send(
+            &from,
+            &to,
+            subject.as_deref(),
+            body,
+            idempotency_key,
+            trace_id.as_deref(),
+        )
         .map_err(e)?;
 
     // Trace: queued after persist (best-effort, never sinks the path).
@@ -2640,7 +2675,8 @@ fn tools() -> Value {
                 "body":{"type":"string"},
                 "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
                 "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
-                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."}
             },"required":["to","body"]}
         },
         {
@@ -2650,7 +2686,8 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"Recipient session name (point-to-point; broadcast is not supported)."},
                 "subject":{"type":"string"},
-                "body":{"type":"string"}
+                "body":{"type":"string"},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."}
             },"required":["to","body"]}
         },
         {
@@ -3322,6 +3359,8 @@ fn tool_tick(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<St
                 &sched.recipient,
                 sched.subject.as_deref(),
                 &sched.body,
+                None,
+                None,
             )
             .map_err(e)?;
         store.mark_schedule_executed(sched.id).map_err(e)?;
