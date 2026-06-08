@@ -78,6 +78,10 @@ pub enum Mux {
     Kitty,
     Wezterm,
     Screen,
+    /// iTerm2 (macOS). Uses AppleScript `osascript`; injection targets the
+    /// current session of the current window. `id` is a placeholder (the
+    /// `TERM_SESSION_ID` when available); pane-level targeting is not supported.
+    ITerm2,
     /// The absence of an injectable multiplexer — also the `Default`, so a
     /// `Target::default()` is the same inert, non-injectable target as
     /// `Target::none()`.
@@ -93,6 +97,7 @@ impl Mux {
             Mux::Kitty => "kitty",
             Mux::Wezterm => "wezterm",
             Mux::Screen => "screen",
+            Mux::ITerm2 => "iterm2",
             Mux::None => "none",
         }
     }
@@ -104,6 +109,7 @@ impl Mux {
             "kitty" => Mux::Kitty,
             "wezterm" => Mux::Wezterm,
             "screen" => Mux::Screen,
+            "iterm2" | "iterm" => Mux::ITerm2,
             _ => Mux::None,
         }
     }
@@ -116,6 +122,7 @@ impl Mux {
             Mux::Kitty => "kitten",
             Mux::Wezterm => "wezterm",
             Mux::Screen => "screen",
+            Mux::ITerm2 => "osascript",
             Mux::None => "",
         }
     }
@@ -209,6 +216,18 @@ pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
                 id,
                 socket: String::new(),
             }),
+            Mux::ITerm2 => {
+                // iTerm2 sets TERM_PROGRAM to "iTerm.app". The session id comes from
+                // TERM_SESSION_ID (e.g. "w0t0p0:ABC123"); when absent we still register
+                // as injectable so the peer can receive next-turn delivery even though
+                // we can't target a specific pane.
+                let id = nonempty_env("TERM_SESSION_ID").unwrap_or_else(|| "iterm2".to_string());
+                Some(Target {
+                    mux: Mux::ITerm2,
+                    id,
+                    socket: String::new(),
+                })
+            }
             Mux::None => Some(Target::none()),
         }
         .unwrap_or_else(Target::none);
@@ -247,6 +266,14 @@ pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
     if let Some(id) = nonempty_env("STY") {
         return Target {
             mux: Mux::Screen,
+            id,
+            socket: String::new(),
+        };
+    }
+    if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("iTerm.app") {
+        let id = nonempty_env("TERM_SESSION_ID").unwrap_or_else(|| "iterm2".to_string());
+        return Target {
+            mux: Mux::ITerm2,
             id,
             socket: String::new(),
         };
@@ -420,6 +447,19 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
             "stuff",
             &format!("{text}{CR}"),
         ])],
+        // iTerm2: AppleScript `write text` sends the literal string followed by Enter.
+        // We escape backslashes and double quotes so the AppleScript string is safe.
+        // The text is already sanitized (control chars stripped) before reaching here.
+        Mux::ITerm2 => {
+            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+            vec![argv(&[
+                "osascript",
+                "-e",
+                &format!(
+                    "tell application \"iTerm2\" to tell current session of current window to write text \"{escaped}\""
+                ),
+            ])]
+        }
         Mux::None => vec![],
     }
 }
@@ -466,8 +506,8 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
             a.extend_from_slice(&["@", "ls"]);
             Some(argv(&a))
         }
-        // screen has no cheap, scriptable existence check we trust here.
-        Mux::Screen | Mux::None => None,
+        // screen and iTerm2 have no cheap, scriptable existence check we trust here.
+        Mux::Screen | Mux::ITerm2 | Mux::None => None,
     }
 }
 
@@ -504,7 +544,7 @@ pub fn target_alive(target: &Target) -> bool {
             }
         }
         // Unreachable (liveness_probe returned None for these), but be explicit.
-        Mux::Screen | Mux::None => true,
+        Mux::Screen | Mux::ITerm2 | Mux::None => true,
     }
 }
 
@@ -580,7 +620,7 @@ fn id_present(mux: Mux, out: &str, id: &str) -> bool {
                 .any(|tok| tok.trim_matches(|c| c == ',' || c == ':') == id)
         }
         // The remaining backends never reach here (target_alive handles them).
-        Mux::Tmux | Mux::Screen | Mux::None => out.contains(id),
+        Mux::Tmux | Mux::Screen | Mux::ITerm2 | Mux::None => out.contains(id),
     }
 }
 
@@ -747,6 +787,13 @@ pub fn id_valid(mux: Mux, id: &str) -> bool {
                 && pid.bytes().all(|b| b.is_ascii_digit())
                 && !rest.is_empty()
                 && rest.chars().all(|c| word(c) || c == '.')
+        }
+        // iTerm2 session ids are of the form "w0t0p0:ABC123" (window, tab, pane).
+        Mux::ITerm2 => {
+            id.len() <= 128
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':')
         }
         Mux::None => false,
     }
@@ -1685,6 +1732,51 @@ mod tests {
         std::env::remove_var("STY");
         let pref = detect_target_with_preference(Some(Mux::Wezterm));
         assert_eq!(pref.mux, Mux::None);
+    }
+
+    #[test]
+    fn iterm2_commands_use_osascript() {
+        let c = commands_for(&t(Mux::ITerm2, "w0t0p0"), "hello world");
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0],
+            argv(&[
+                "osascript",
+                "-e",
+                "tell application \"iTerm2\" to tell current session of current window to write text \"hello world\"",
+            ])
+        );
+    }
+
+    #[test]
+    fn iterm2_escapes_quotes_and_backslashes() {
+        let c = commands_for(&t(Mux::ITerm2, "x"), "say \"hi\"");
+        assert_eq!(c.len(), 1);
+        let script = &c[0][2];
+        assert!(script.contains("\\\"hi\\\""), "quotes escaped: {script}");
+    }
+
+    #[test]
+    fn iterm2_detect_target_from_term_program() {
+        let _lock = weave_core::testenv::lock_env();
+        std::env::remove_var("TMUX_PANE");
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("WEZTERM_PANE");
+        std::env::remove_var("KITTY_WINDOW_ID");
+        std::env::remove_var("STY");
+        let _g = weave_core::testenv::EnvVarGuard::set("TERM_PROGRAM", "iTerm.app");
+        let _g2 = weave_core::testenv::EnvVarGuard::set("TERM_SESSION_ID", "w0t0p0:ABC123");
+        let target = detect_target();
+        assert_eq!(target.mux, Mux::ITerm2);
+        assert_eq!(target.id, "w0t0p0:ABC123");
+    }
+
+    #[test]
+    fn iterm2_no_probe_so_always_alive() {
+        let target = t(Mux::ITerm2, "x");
+        assert!(liveness_probe(&target).is_none());
+        assert!(target_alive(&target));
+        assert_eq!(capability(&target), Capability::Live);
     }
 
     /// the unified lock every critical section is exclusive, so the read always sees
