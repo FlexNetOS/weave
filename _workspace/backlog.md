@@ -32,7 +32,7 @@ and the open gaps the user flagged.
 - [x] WL-019: Co-orchestrator support — allow multiple live orchestrators to coexist in the same circle for resilience against rate limits or credit caps (repowire parity). Non-force claims additive, force claims still steal. orchestrator_status returns all live holders. 463 passed (sqlite), 433 passed + 1 ignored (libsql).
 - [x] WL-020: GitHub review queue integration — track PR review state across peers (`review_queue`, `mark_reviewed(pr_url)`) via CLI and MCP tools (repowire parity).
 - [x] WL-021: PreToolUse tool approval — gate mutating tools (Bash, Edit, Write) behind blocking approval questions from human surfaces/peers, denying by default on timeout (repowire parity).
-- [ ] WL-022: Streamable-HTTP MCP transport — localhost-only opt-in endpoint for remote agents, bearer-authenticated, dangerous tools disabled by default (ROADMAP-v0.3 §4; repowire parity).
+- [x] WL-022: Streamable-HTTP MCP transport — localhost-only opt-in endpoint for remote agents, bearer-authenticated, dangerous tools disabled by default (ROADMAP-v0.3 §4; repowire parity).
 - [ ] WL-023: iTerm2 injector backend — native injection support for iTerm2 terminal multiplexer (ROADMAP-v0.3 §6).
 - [ ] WL-024: Reservation leases — lightweight advisory file locks between agents to coordinate exclusive access to shared resources (ROADMAP-v0.3 §5).
 - [ ] WL-025: Stop-boundary wake — blocking `Stop`/`SubagentStop` hook that returns `additionalContext` to drive the next turn without polling (ROADMAP-v0.3 §1).

@@ -173,7 +173,7 @@ pub fn serve<I: Injector>(
                 continue;
             }
         };
-        if let Some(resp) = handle(
+        if let Some(resp) = dispatch_request(
             store,
             &me_default,
             nudge_template,
@@ -181,6 +181,7 @@ pub fn serve<I: Injector>(
             &pull,
             &req,
             injector as &dyn Injector,
+            true,
         ) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
@@ -266,7 +267,45 @@ fn ident(args: &Value, key: &str, def: &Option<String>) -> Result<String, String
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle(
+/// Dangerous/mutating tools that are disabled by default in HTTP transport mode.
+const DANGEROUS_TOOLS: &[&str] = &[
+    "weave_send",
+    "weave_notify",
+    "weave_reply",
+    "weave_ask",
+    "weave_answer",
+    "weave_ack",
+    "weave_clear",
+    "weave_schedule",
+    "weave_schedules",
+    "weave_tick",
+    "weave_job_create",
+    "weave_job_claim",
+    "weave_job_update",
+    "weave_job_cancel",
+    "weave_claim_orchestrator",
+    "weave_review_add",
+    "weave_review_mark",
+    "weave_review_remove",
+    "weave_ask_permission",
+    "weave_permission_resolve",
+    "weave_memory_write",
+    "weave_memory_delete",
+    "weave_setup",
+    "weave_uninstall",
+    "weave_daemon_start",
+    "weave_daemon_stop",
+];
+
+/// True if `name` is a dangerous tool that should be filtered in safe mode.
+pub fn is_dangerous_tool(name: &str) -> bool {
+    DANGEROUS_TOOLS.contains(&name)
+}
+
+/// Dispatch a single JSON-RPC request and return the JSON response string.
+/// Notifications (no id) return `None`. Used by both stdio and HTTP transports.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_request(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
@@ -274,6 +313,7 @@ fn handle(
     pull: &PullConsent,
     req: &Value,
     injector: &dyn Injector,
+    dangerous: bool,
 ) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").cloned();
@@ -315,6 +355,15 @@ fn handle(
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            if !dangerous && is_dangerous_tool(name) {
+                return Some(reply_err(
+                    &id,
+                    -32603,
+                    &format!(
+                        "Tool '{name}' is disabled in safe HTTP mode. Start with --dangerous to enable."
+                    ),
+                ));
+            }
             match call_tool(
                 store,
                 me_default,

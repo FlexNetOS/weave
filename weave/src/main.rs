@@ -640,6 +640,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PermissionCmd,
     },
+    /// HTTP MCP server (WL-022): localhost-only JSON-RPC endpoint for remote agents.
+    Serve {
+        /// Port to listen on (default 8787).
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Bearer token for authentication. If omitted, a random token is generated
+        /// and printed to stderr.
+        #[arg(long)]
+        token: Option<String>,
+        /// Enable dangerous/mutating tools (disabled by default for safety).
+        #[arg(long)]
+        dangerous: bool,
+    },
 }
 
 /// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
@@ -3634,6 +3647,35 @@ fn main() -> Result<()> {
         Cmd::Permission { cmd } => dispatch_permission(store, &cfg, cmd)?,
 
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
+
+        Cmd::Serve {
+            port,
+            token,
+            dangerous,
+        } => {
+            let token = token.unwrap_or_default();
+            let extra_dbs = cfg.peer_db_sources();
+            let pull = mcp::PullConsent {
+                from: cfg.pull_from_sources(),
+                inject_pulled: cfg.inject_pulled(),
+                allow_inject_from: cfg.allow_inject_from_sources(),
+                policy: verify_policy(&cfg),
+            };
+            let nudge_tpl = cfg.nudge_template().map(str::to_owned);
+            weave_mcp::serve_http(
+                store,
+                cfg.session.clone(),
+                nudge_tpl.as_deref(),
+                extra_dbs,
+                pull,
+                &RealInjector {
+                    preferred_mux: parse_mux_preference(&cfg),
+                },
+                port,
+                &token,
+                dangerous,
+            )?;
+        }
 
         Cmd::Schedule {
             from,
