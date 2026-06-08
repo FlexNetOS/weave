@@ -15,12 +15,14 @@ pr_url: (none)
 landed_this_session:
   - 84ba88c resume: clippy fixes for WL-020/021 unused imports & vec_init_then_push
   - 94c2102 WL-023: iTerm2 injector backend
+  - 29b3175 fix(store): move sqlite-only imports behind cfg flag
 open_findings:
 decisions:
   - WL-023 completed in cycle 1/3.
   - iTerm2 uses osascript (always on macOS) rather than a dedicated binary.
   - No liveness probe for iTerm2 (fail-open); always treated as alive.
   - Session ID from TERM_SESSION_ID env var (e.g. w0t0p0:ABC123).
+  - CLI and MCP automatically support ITerm2 via generic Mux::parse/as_str.
 dead_ends:
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh

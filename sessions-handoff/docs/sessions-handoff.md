@@ -147,15 +147,15 @@ bash _workspace/verify-on-resume.sh
 
 ---
 
-## 8. Current backlog snapshot (2026-06-07)
+## 8. Current backlog snapshot (2026-06-08)
 
-**Completed:** WL-001..WL-013 (all M1/M3 items)
+**Completed:** WL-001..WL-023 (all M1/M3 items through ROADMAP-v0.3 §6)
 
-**Next recommended:** WL-014 (Reminder injection for open asks)
+**Next recommended:** WL-024 (Reservation leases)
 
 **High-impact gaps:**
-- WL-014 — Reminder injection for open asks
-- WL-015 — Structured question types
+- WL-024 — Reservation leases
+- WL-025 — Stop-boundary wake
 - WL-028 — FTS5 full-text search
 - WL-029 — Advisory file leases
 

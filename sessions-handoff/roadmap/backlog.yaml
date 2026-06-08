@@ -54,43 +54,43 @@ tasks:
     priority: P1
   - id: WL-014
     title: Reminder injection for open asks
-    status: backlog
+    status: done
     priority: P0
   - id: WL-015
     title: Structured question types
-    status: backlog
+    status: done
     priority: P0
   - id: WL-016
     title: Scheduler / cron for messages
-    status: backlog
+    status: done
     priority: P1
   - id: WL-017
     title: Mesh memory system
-    status: backlog
+    status: done
     priority: P1
   - id: WL-018
     title: Birth certificates / runtime identity envelopes
-    status: backlog
+    status: done
     priority: P1
   - id: WL-019
     title: Co-orchestrator support
-    status: backlog
+    status: done
     priority: P1
   - id: WL-020
     title: GitHub review queue integration
-    status: backlog
+    status: done
     priority: P2
   - id: WL-021
     title: PreToolUse tool approval
-    status: backlog
+    status: done
     priority: P2
   - id: WL-022
     title: Streamable-HTTP MCP transport
-    status: backlog
+    status: done
     priority: P2
   - id: WL-023
     title: iTerm2 injector backend
-    status: backlog
+    status: done
     priority: P2
   - id: WL-024
     title: Reservation leases
