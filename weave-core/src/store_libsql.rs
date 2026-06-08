@@ -3637,13 +3637,11 @@ impl Store for LibsqlStore {
         let (where_clause, binds): (&str, Vec<Value>) = match filter {
             ReviewQueueFilter::All => ("", Vec::new()),
             ReviewQueueFilter::Open => {
-                let mut p: Vec<Value> = Vec::new();
-                p.push("open".into());
+                let p: Vec<Value> = vec!["open".into()];
                 ("WHERE state = ?1", p)
             }
             ReviewQueueFilter::Pending => {
-                let mut p: Vec<Value> = Vec::new();
-                p.push("open".into());
+                let p: Vec<Value> = vec!["open".into()];
                 ("WHERE state = ?1 AND reviewed_at IS NULL", p)
             }
             ReviewQueueFilter::Reviewed => ("WHERE reviewed_at IS NOT NULL", Vec::new()),
