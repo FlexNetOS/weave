@@ -101,14 +101,23 @@ pub trait Store: Send {
     /// process's `pid` and `host` for real process-liveness, and the visibility
     /// `circle` (P4). This is the full primitive each backend implements; the
     /// [`Store::register_peer`] wrapper forwards here with `pid=None, host=""`,
-    /// empty git tags, and `circle="default"` so legacy call sites keep working
-    /// unchanged.
+    /// empty git tags, `circle="default"`, and no cert so legacy call sites keep
+    /// working unchanged.
     ///
     /// **Role is NOT a parameter.** A registration NEVER asserts a role: a new
     /// row inserts `role='peer'` and an upsert of an existing row PRESERVES its
     /// current role (so a re-register can never silently demote an orchestrator).
     /// The only path to `role='orchestrator'` is
     /// [`Store::claim_orchestrator_role`].
+    ///
+    /// **Birth certificate (WL-018):** Returns the peer's birth cert on success.
+    /// - New peer: mints a fresh 64-hex cert, INSERTs it, returns it.
+    /// - Existing peer with `birth_cert IS NULL`: mints a fresh cert, UPDATEs it,
+    ///   returns it (backward-compat upgrade).
+    /// - Existing peer with `birth_cert IS NOT NULL`:
+    ///   - `birth_cert` arg is `None` → rejects (must provide cert to re-register).
+    ///   - `birth_cert` arg mismatches → rejects (identity takeover protection).
+    ///   - `birth_cert` arg matches → UPDATEs other fields, returns existing cert.
     #[allow(clippy::too_many_arguments)]
     fn register_peer_full(
         &self,
@@ -123,13 +132,14 @@ pub trait Store: Send {
         branch: &str,
         worktree_id: &str,
         circle: &str,
-    ) -> Result<()>;
+        birth_cert: Option<&str>,
+    ) -> Result<String>;
 
     /// Register (upsert) a peer without PID/host liveness info or git tags.
     /// Additive backward-compatible wrapper over [`Store::register_peer_full`]:
     /// forwards with `pid=None, host=""` (== liveness unknown ⇒ presence falls
-    /// back to the TTL recency guess) and empty git tags. Keeps existing 5-arg
-    /// call sites/tests compiling.
+    /// back to the TTL recency guess), empty git tags, and no cert. Keeps existing
+    /// 5-arg call sites/tests compiling.
     ///
     /// `allow(dead_code)`: weave is a binary crate, so a `pub` trait method with
     /// only test callers is otherwise flagged unused. This is intentional
@@ -142,12 +152,25 @@ pub trait Store: Send {
         target: &str,
         socket: &str,
         cwd: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let cert = self.get_birth_cert(name).ok().flatten();
         self.register_peer_full(
-            name, mux, target, socket, cwd, None, "", "", "", "", "default",
+            name,
+            mux,
+            target,
+            socket,
+            cwd,
+            None,
+            "",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
         )
     }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
+    fn get_birth_cert(&self, name: &str) -> Result<Option<String>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
 
     /// List peers scoped to `circle`. `None` (or the literal `"*"`) ⇒ all
@@ -910,6 +933,41 @@ pub fn check_ident(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mint a fresh birth certificate: 32 random bytes from `getrandom`, hex-encoded
+/// to a 64-char string. Tiny (~1 dep, no-std) and cryptographically secure.
+pub fn mint_birth_cert() -> Result<String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| anyhow::anyhow!("birth cert entropy failure: {e}"))?;
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in buf {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    Ok(out)
+}
+
+/// Validate a caller-supplied birth certificate before it is bound into a query.
+/// Rejects empty, over-length (> [`MAX_BIRTH_CERT_LEN`] chars), or non-hex values.
+/// Shared by both backends so CLI/MCP/hook are all covered at the store layer.
+pub fn check_birth_cert(cert: &str) -> Result<()> {
+    if cert.is_empty() {
+        anyhow::bail!("birth certificate must not be empty.");
+    }
+    if cert.len() > crate::model::MAX_BIRTH_CERT_LEN {
+        anyhow::bail!(
+            "birth certificate is too long ({} chars; max {}).",
+            cert.len(),
+            crate::model::MAX_BIRTH_CERT_LEN
+        );
+    }
+    if !cert.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("birth certificate must be hexadecimal [0-9a-fA-F].");
+    }
+    Ok(())
+}
+
 /// Validate an optional cross-store host hint before it is stored on an intent.
 /// Empty is allowed (== unspecified). A non-empty host is bounded to
 /// [`crate::config::MAX_HOST_LEN`] chars and must be control-character-free, the
@@ -1163,7 +1221,8 @@ CREATE TABLE IF NOT EXISTS peers (
     role        TEXT NOT NULL DEFAULT 'peer',
     turn_state     TEXT NOT NULL DEFAULT '',
     description    TEXT NOT NULL DEFAULT '',
-    description_ts INTEGER NOT NULL DEFAULT 0
+    description_ts INTEGER NOT NULL DEFAULT 0,
+    birth_cert     TEXT
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1594,6 +1653,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE peers ADD COLUMN description_ts INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+    // peers.birth_cert (WL-018) — present on fresh DBs via SCHEMA, added here for
+    // DBs created before birth certificates. Nullable TEXT; defaults to NULL for
+    // existing rows (== no cert yet), which triggers a backward-compat mint on the
+    // next register_peer_full call.
+    if !column_exists(conn, "peers", "birth_cert")? {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN birth_cert TEXT;")?;
     }
     // Wake-hook watermark table (P5): tracks the last unread message id that
     // caused a block for each reader. Created here for legacy DBs that predate
@@ -2742,8 +2808,12 @@ impl Store for SqliteStore {
         branch: &str,
         worktree_id: &str,
         circle: &str,
-    ) -> Result<()> {
+        birth_cert: Option<&str>,
+    ) -> Result<String> {
         check_ident("peer name", name)?;
+        if let Some(cert) = birth_cert {
+            check_birth_cert(cert)?;
+        }
         // Descriptive git tags are bounded + control-free at this single store
         // seam (lossy-but-total), so every capture path is covered identically.
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
@@ -2757,17 +2827,71 @@ impl Store for SqliteStore {
         } else {
             crate::model::DEFAULT_CIRCLE
         };
-        // `role` is INTENTIONALLY omitted from both the column list and the
-        // ON CONFLICT SET: a NEW row gets the table default ('peer'); an upsert of
-        // an EXISTING row leaves `role` untouched, so a re-register can never
-        // demote an orchestrator.
-        self.conn.execute(
-            "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-             ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11, circle=?12",
-            params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle],
-        )?;
-        Ok(())
+        let tx = self.conn.unchecked_transaction()?;
+        let existing_cert: Option<Option<String>> = tx
+            .query_row(
+                "SELECT birth_cert FROM peers WHERE name = ?1",
+                params![name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let cert = match existing_cert {
+            None => {
+                // New peer: mint a fresh cert and INSERT.
+                let new_cert = mint_birth_cert()?;
+                tx.execute(
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert],
+                )?;
+                new_cert
+            }
+            Some(None) => {
+                // Existing peer without a cert (backward-compat): mint one and UPDATE.
+                let new_cert = mint_birth_cert()?;
+                tx.execute(
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
+                     WHERE name=?13",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, name],
+                )?;
+                new_cert
+            }
+            Some(Some(stored_cert)) => {
+                // Existing peer WITH a cert: verify before allowing re-register.
+                if let Some(supplied) = birth_cert {
+                    if supplied != stored_cert {
+                        anyhow::bail!("birth certificate mismatch for peer '{name}'");
+                    }
+                } else {
+                    anyhow::bail!(
+                        "peer '{name}' already registered; provide --cert to re-register"
+                    );
+                }
+                // Cert matches: UPDATE fields, preserve stored cert.
+                tx.execute(
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
+                     WHERE name=?12",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, name],
+                )?;
+                stored_cert
+            }
+        };
+        tx.commit()?;
+        Ok(cert)
+    }
+
+    fn get_birth_cert(&self, name: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT birth_cert FROM peers WHERE name=?1")?;
+        let mut it = stmt.query_map(params![name], |r| {
+            let cert: Option<String> = r.get(0)?;
+            Ok(cert)
+        })?;
+        match it.next() {
+            Some(r) => Ok(r?),
+            None => Ok(None),
+        }
     }
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
@@ -5275,20 +5399,22 @@ mod tests {
     #[test]
     fn git_tags_roundtrip_and_sanitize_through_upsert() {
         let s = mem();
-        s.register_peer_full(
-            "p",
-            "tmux",
-            "%1",
-            "",
-            Some("/w"),
-            None,
-            "h",
-            "weave",
-            "feat/x",
-            "wt-1",
-            "default",
-        )
-        .unwrap();
+        let cert = s
+            .register_peer_full(
+                "p",
+                "tmux",
+                "%1",
+                "",
+                Some("/w"),
+                None,
+                "h",
+                "weave",
+                "feat/x",
+                "wt-1",
+                "default",
+                None,
+            )
+            .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(
             (p.repo.as_str(), p.branch.as_str(), p.worktree_id.as_str()),
@@ -5309,6 +5435,7 @@ mod tests {
             "bad\nbranch",
             "(main)",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -5367,20 +5494,22 @@ mod tests {
     #[test]
     fn register_peer_full_roundtrips_pid_and_host() {
         let s = mem();
-        s.register_peer_full(
-            "p",
-            "tmux",
-            "%3",
-            "",
-            Some("/w"),
-            Some(4321),
-            "boxA",
-            "weave",
-            "main",
-            "(main)",
-            "default",
-        )
-        .unwrap();
+        let cert = s
+            .register_peer_full(
+                "p",
+                "tmux",
+                "%3",
+                "",
+                Some("/w"),
+                Some(4321),
+                "boxA",
+                "weave",
+                "main",
+                "(main)",
+                "default",
+                None,
+            )
+            .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p.pid, Some(4321));
         assert_eq!(p.repo, "weave");
@@ -5404,6 +5533,7 @@ mod tests {
             "",
             "",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -5475,6 +5605,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let n = s2.get_peer("new").unwrap().unwrap();
@@ -5556,6 +5687,7 @@ mod tests {
             "feat/x",
             "wt-9",
             "default",
+            None,
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -5646,15 +5778,31 @@ mod tests {
     #[test]
     fn register_roundtrips_circle_and_preserves_role() {
         let s = mem();
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+        let cert = s
+            .register_peer_full(
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+            )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
         // Promote, then re-register: the role must survive the upsert.
         let out = s.claim_orchestrator_role("p", None, false).unwrap();
         assert!(matches!(out, crate::model::ClaimOutcome::Claimed { .. }));
         assert_eq!(s.get_peer("p").unwrap().unwrap().role, "orchestrator");
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%1",
+            "",
+            None,
+            None,
+            "h",
+            "",
+            "",
+            "",
+            "team-a",
+            Some(&cert),
+        )
+        .unwrap();
         assert_eq!(
             s.get_peer("p").unwrap().unwrap().role,
             "orchestrator",
@@ -5662,7 +5810,7 @@ mod tests {
         );
         // An invalid circle at the seam falls back to the default circle.
         s.register_peer_full(
-            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm",
+            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm", None,
         )
         .unwrap();
         assert_eq!(s.get_peer("q").unwrap().unwrap().circle, "default");
@@ -5673,10 +5821,14 @@ mod tests {
     #[test]
     fn claim_refuses_live_holder_then_force_steals() {
         let s = mem();
-        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
-        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
+        s.register_peer_full(
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         // a claims (no contest) ⇒ Claimed.
         assert!(matches!(
             s.claim_orchestrator_role("a", None, false).unwrap(),
@@ -5709,10 +5861,14 @@ mod tests {
     #[test]
     fn list_peers_in_circle_scopes() {
         let s = mem();
-        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
-        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c2")
-            .unwrap();
+        s.register_peer_full(
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
+        s.register_peer_full(
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c2", None,
+        )
+        .unwrap();
         assert_eq!(s.list_peers_in_circle(Some("c1")).unwrap().len(), 1);
         assert_eq!(s.list_peers_in_circle(Some("c2")).unwrap().len(), 1);
         assert_eq!(s.list_peers_in_circle(None).unwrap().len(), 2);
@@ -5732,8 +5888,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("orch.db");
         let s = SqliteStore::open(&path).unwrap();
-        s.register_peer_full("o", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
         // Fresh holder ⇒ present.
         let st = s.orchestrator_status(Some("c1")).unwrap();
@@ -6040,6 +6198,7 @@ mod tests {
                 "",
                 "",
                 "default",
+                None,
             )
             .unwrap();
         }
@@ -6052,7 +6211,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
         );
         assert!(wr.is_err(), "a write through a read-only handle must error");
         let send = ro.send("a", "b", None, "x");
@@ -6083,14 +6242,14 @@ mod tests {
         let local = SqliteStore::open(&local_path).unwrap();
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default",
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
             )
             .unwrap();
         {
             let foreign = SqliteStore::open(&foreign_path).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
                 )
                 .unwrap();
         }
@@ -7933,7 +8092,7 @@ mod tests {
     #[test]
     fn reregister_preserves_self_set_turn_state_and_description() {
         let s = mem();
-        s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
+        let cert = s.register_peer("a", "tmux", "%1", "", Some("/x")).unwrap();
         s.set_turn_state("a", "working").unwrap();
         s.set_description("a", "deep in the weeds").unwrap();
         let ts_before = s.get_peer("a").unwrap().unwrap().description_ts;
@@ -7950,6 +8109,7 @@ mod tests {
             "br",
             "wt",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();

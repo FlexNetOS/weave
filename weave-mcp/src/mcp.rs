@@ -1142,6 +1142,7 @@ fn tool_scan(
         if let Ok(me) = bound_ident("me", me) {
             let t = injector.detect_target();
             let tags = injector.git_tags_here();
+            let stored_cert = store.get_birth_cert(&me).ok().flatten();
             if let Err(err) = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -1154,6 +1155,7 @@ fn tool_scan(
                 &tags.branch,
                 &tags.worktree_id,
                 &weave_core::config::Config::load().circle(),
+                stored_cert.as_deref(),
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -1705,6 +1707,7 @@ fn tool_attach(
     // real liveness (this is the agent's own process), plus the git session tags
     // derived from the server's cwd (best-effort; a git failure ⇒ empty tags).
     let tags = injector.git_tags_here();
+    let stored_cert = store.get_birth_cert(&me).ok().flatten();
     store
         .register_peer_full(
             &me,
@@ -1718,6 +1721,7 @@ fn tool_attach(
             &tags.branch,
             &tags.worktree_id,
             &weave_core::config::Config::load().circle(),
+            stored_cert.as_deref(),
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };

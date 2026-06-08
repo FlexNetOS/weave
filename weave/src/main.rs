@@ -2809,6 +2809,7 @@ fn main() -> Result<()> {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
                 let tags = git_tags_for(cwd_val.as_deref());
+                let stored_cert = store.get_birth_cert(&me).ok().flatten();
                 if let Err(e) = store.register_peer_full(
                     &me,
                     t.mux.as_str(),
@@ -2821,6 +2822,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    stored_cert.as_deref(),
                 ) {
                     eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
                 }
@@ -3000,6 +3002,7 @@ fn main() -> Result<()> {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
                 let tags = git_tags_for(cwd_val.as_deref());
+                let stored_cert = store.get_birth_cert(&me).ok().flatten();
                 if let Err(e) = store.register_peer_full(
                     &me,
                     t.mux.as_str(),
@@ -3012,6 +3015,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    stored_cert.as_deref(),
                 ) {
                     eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
                 }
@@ -3134,6 +3138,8 @@ fn main() -> Result<()> {
             // session with its repo/branch/worktree id (best-effort from cwd; a git
             // failure never sinks registration — empty tags result).
             let tags = git_tags_for(cwd_val.as_deref());
+            // Re-attach must pass the stored birth cert so the upsert succeeds.
+            let stored_cert = store.get_birth_cert(&me)?;
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -3146,6 +3152,7 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                stored_cert.as_deref(),
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -3183,6 +3190,7 @@ fn main() -> Result<()> {
             // Capture this process's PID + host so the adopted peer reflects real
             // liveness (the whole point of zero-restart attach), plus the git tags.
             let tags = git_tags_for(cwd_val.as_deref());
+            let stored_cert = store.get_birth_cert(&me)?;
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -3195,6 +3203,7 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                stored_cert.as_deref(),
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -4060,6 +4069,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             // primary + a timeout-bounded best-effort git fallback that never sinks
             // the hook.
             let tags = git_tags_for(cwd);
+            let stored_cert = store.get_birth_cert(&me)?;
             store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -4072,6 +4082,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                stored_cert.as_deref(),
             )?;
             eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must

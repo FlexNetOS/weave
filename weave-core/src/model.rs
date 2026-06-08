@@ -954,6 +954,11 @@ impl TurnState {
 /// store seam (lossy-but-total, internal spaces preserved).
 pub const MAX_DESC_LEN: usize = 200;
 
+/// Hard upper bound on a birth certificate string (chars). A cert is 32 random bytes
+/// hex-encoded to exactly 64 chars, so this cap rejects any hostile/oversized value
+/// before it is bound into a query (the [`MAX_IDENT`]/[`MAX_ASK_ID_LEN`] analog).
+pub const MAX_BIRTH_CERT_LEN: usize = 64;
+
 /// Read-time TTL (seconds) after which a peer's free-form description ages out and
 /// reads as absent (P5). Equal to [`crate::store::ONLINE_TTL_SECS`] (900s) by
 /// value but kept as its own named constant so the description ages out
