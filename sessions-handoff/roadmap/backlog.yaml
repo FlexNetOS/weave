@@ -94,11 +94,11 @@ tasks:
     priority: P2
   - id: WL-024
     title: Reservation leases
-    status: backlog
+    status: done
     priority: P2
   - id: WL-025
     title: Stop-boundary wake
-    status: backlog
+    status: done
     priority: P2
   - id: WL-026
     title: Idempotency keys and trace IDs

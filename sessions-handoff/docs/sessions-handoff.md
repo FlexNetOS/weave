@@ -149,13 +149,12 @@ bash _workspace/verify-on-resume.sh
 
 ## 8. Current backlog snapshot (2026-06-08)
 
-**Completed:** WL-001..WL-023 (all M1/M3 items through ROADMAP-v0.3 §6)
+**Completed:** WL-001..WL-025 (all M1/M3 items through ROADMAP-v0.3 §1)
 
-**Next recommended:** WL-024 (Reservation leases)
+**Next recommended:** WL-026 (Idempotency keys & trace IDs)
 
 **High-impact gaps:**
-- WL-024 — Reservation leases
-- WL-025 — Stop-boundary wake
+- WL-026 — Idempotency keys & trace IDs
 - WL-028 — FTS5 full-text search
 - WL-029 — Advisory file leases
 
