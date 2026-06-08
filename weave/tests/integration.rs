@@ -13,7 +13,10 @@
 
 mod common;
 
-use common::{run, run_env, run_hook, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
+use common::{
+    run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_ok, run_ok_env, McpServer,
+    TestDb,
+};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -809,6 +812,87 @@ fn hook_stop_peeks_and_does_not_consume() {
     assert!(outp.contains("stoppayload"));
     let (_o, outp2, _e) = run_hook(&db, "prompt", r#"{"cwd":"/proj/beta"}"#);
     assert!(!outp2.contains("stoppayload"), "prompt consumed it");
+}
+
+#[test]
+fn hook_stop_wake_blocks_and_consumes() {
+    let db = TestDb::new();
+    run_hook(&db, "session", r#"{"cwd":"/proj/delta"}"#);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "x",
+            "--to",
+            "delta",
+            "--body",
+            "stopwakepayload",
+        ],
+    );
+
+    // stop --wake emits structured JSON and marks messages read.
+    let (_o1, out1, _e1) = run_hook(&db, "stop", r#"{"cwd":"/proj/delta"}"#);
+    // Without --wake, stop should just peek (the existing behavior).
+    assert!(
+        out1.contains("stopwakepayload"),
+        "stop without --wake should peek: {out1}"
+    );
+    assert!(
+        !out1.contains("decision\""),
+        "stop without --wake should not block: {out1}"
+    );
+
+    // stop --wake should block and consume.
+    let (_o2, out2, _e2) = run_hook_args(&db, "stop", r#"{"cwd":"/proj/delta"}"#, &["--wake"]);
+    assert!(
+        out2.contains("\"decision\":\"block\""),
+        "stop --wake should block: {out2}"
+    );
+    assert!(
+        out2.contains("stopwakepayload"),
+        "stop --wake should include body: {out2}"
+    );
+
+    // After --wake, a plain stop should find nothing (consumed).
+    let (_o3, out3, _e3) = run_hook(&db, "stop", r#"{"cwd":"/proj/delta"}"#);
+    assert!(
+        !out3.contains("stopwakepayload"),
+        "stop after --wake should be empty: {out3}"
+    );
+}
+
+#[test]
+fn hook_stop_wake_env_var() {
+    let db = TestDb::new();
+    run_hook(&db, "session", r#"{"cwd":"/proj/epsilon"}"#);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "x",
+            "--to",
+            "epsilon",
+            "--body",
+            "envwakepayload",
+        ],
+    );
+
+    let (_o, out, _e) = run_hook_env(
+        &db,
+        "stop",
+        r#"{"cwd":"/proj/epsilon"}"#,
+        &[("WEAVE_STOP_WAKE", "1")],
+    );
+    assert!(
+        out.contains("\"decision\":\"block\""),
+        "WEAVE_STOP_WAKE=1 should block: {out}"
+    );
+    assert!(
+        out.contains("envwakepayload"),
+        "WEAVE_STOP_WAKE=1 should include body: {out}"
+    );
 }
 
 #[test]

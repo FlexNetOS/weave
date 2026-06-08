@@ -619,7 +619,14 @@ enum Cmd {
         all: bool,
     },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
-    Hook { event: String },
+    Hook {
+        event: String,
+        /// Enable blocking wake on stop: drain inbox, mark read, and emit a
+        /// structured JSON block if unread messages exist. Overrides the default
+        /// peek-only stop behaviour. Also enabled by WEAVE_STOP_WAKE=1.
+        #[arg(long)]
+        wake: bool,
+    },
     /// Filesystem-backed scoped memory (global, project, persona, orchestrator).
     Memory {
         #[command(subcommand)]
@@ -3820,7 +3827,7 @@ fn main() -> Result<()> {
             execute_tick(store, &me, all)?;
         }
 
-        Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
+        Cmd::Hook { event, wake } => handle_hook(store, &cfg, &event, wake)?,
     }
     Ok(())
 }
@@ -4851,7 +4858,7 @@ fn execute_tick(store: &dyn Store, me: &str, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
+fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
         eprintln!("[weave] hook stdin read error: {e}");
@@ -4943,12 +4950,19 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
         // (mark_read=false) so the messages remain unread and the next
         // UserPromptSubmit drain re-surfaces and marks them. Marking them read here
         // would silently consume them — concrete message loss.
+        //
+        // WL-025: with --wake (or WEAVE_STOP_WAKE=1), the stop hook switches to
+        // blocking mode: it drains the inbox with mark_read=true and, if messages
+        // exist, emits a structured JSON block that Claude Code uses as the next
+        // turn's input. The wake IS the delivery, so marking read is correct.
         "prompt" | "stop" => {
             // Tier-2: opportunistically pull cross-store intents into the local
             // inbox BEFORE draining, so a freshly-pulled message is delivered in
             // this same turn. Best-effort: a pull failure never sinks the drain.
             try_pull(store, cfg, &me);
-            let mut mark_read = event == "prompt";
+            let is_wake_stop = event == "stop"
+                && (wake_flag || std::env::var("WEAVE_STOP_WAKE").ok().as_deref() == Some("1"));
+            let mut mark_read = event == "prompt" || is_wake_stop;
             // Never mark messages read under a guessed identity: if we had to fall
             // back to basename(current_dir()) (no config session, no payload cwd),
             // peek instead so we cannot permanently consume another session's inbox.
@@ -4961,14 +4975,39 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             }
             let (rows, _) = store.inbox(&me, false, mark_read, 50)?;
             if !rows.is_empty() {
-                println!("[weave] {} new message(s) for '{me}':", rows.len());
-                for m in &rows {
-                    let subj = m
-                        .subject
-                        .as_ref()
-                        .map(|s| format!(" ({s})"))
-                        .unwrap_or_default();
-                    println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
+                if is_wake_stop {
+                    // WL-025: blocking wake — render all unread messages into the
+                    // structured JSON that Claude Code uses as the next turn input.
+                    let reason = rows
+                        .iter()
+                        .map(|m| {
+                            let subj = m
+                                .subject
+                                .as_ref()
+                                .map(|s| format!(" ({s})"))
+                                .unwrap_or_default();
+                            format!("#{} from {}{}: {}", m.id, m.sender, subj, m.body)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "decision": "block",
+                            "reason": format!("[weave] {} new message(s) for '{me}':\n{reason}", rows.len()),
+                            "suppressOutput": true,
+                        })
+                    );
+                } else {
+                    println!("[weave] {} new message(s) for '{me}':", rows.len());
+                    for m in &rows {
+                        let subj = m
+                            .subject
+                            .as_ref()
+                            .map(|s| format!(" ({s})"))
+                            .unwrap_or_default();
+                        println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
+                    }
                 }
                 // P6 drain trace: ONLY on the marking-read branch (a peek/Stop does not
                 // "drain"). This is the transport-side proof the message actually landed

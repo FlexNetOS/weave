@@ -210,6 +210,28 @@ pub fn run_hook(db: &TestDb, event: &str, payload: &str) -> (bool, String, Strin
     run_stdin_full(db, &["hook", event], payload, None, &[])
 }
 
+/// Convenience: feed a JSON hook payload to `weave hook <event> --wake`.
+pub fn run_hook_args(
+    db: &TestDb,
+    event: &str,
+    payload: &str,
+    extra: &[&str],
+) -> (bool, String, String) {
+    let mut args = vec!["hook", event];
+    args.extend_from_slice(extra);
+    run_stdin_full(db, &args, payload, None, &[])
+}
+
+/// Convenience: feed a JSON hook payload to `weave hook <event>` with env vars.
+pub fn run_hook_env(
+    db: &TestDb,
+    event: &str,
+    payload: &str,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    run_stdin_full(db, &["hook", event], payload, None, env)
+}
+
 /// Run a `weave <args...>` subcommand with the child's working directory pinned to
 /// `cwd` (no stdin), capturing output. This is the seam that exercises cwd-derived
 /// git session tagging: point `cwd` at a temp dir containing a crafted `.git` file
