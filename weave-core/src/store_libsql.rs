@@ -38,11 +38,12 @@
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
-    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
-    AskKind, AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace,
-    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
-    OrchestratorStatus, Peer, Schedule, ScheduleKind, BROADCAST_SQL, MAX_CRON_EXPR_LEN,
-    MAX_DELIVERY_ROWS,
+    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id, now,
+    pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult, AskRole, AskState,
+    ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec,
+    JobState, Message, OrchestratorStatus, Peer, ReviewItem, ReviewItemState, ReviewQueueFilter,
+    Schedule, ScheduleKind, BROADCAST_SQL, MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS,
+    MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
@@ -231,6 +232,10 @@ const SCHEMA: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)",
     "CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender)",
+    // WL-020: reviews table
+    "CREATE TABLE IF NOT EXISTS reviews (\n        id                 TEXT PRIMARY KEY,\n        pr_url             TEXT NOT NULL,\n        title              TEXT NOT NULL DEFAULT '',\n        author             TEXT NOT NULL DEFAULT '',\n        repo               TEXT NOT NULL DEFAULT '',\n        state              TEXT NOT NULL DEFAULT 'open',\n        review_requested_at INTEGER,\n        reviewed_at        INTEGER,\n        reviewed_by        TEXT,\n        created_at         INTEGER NOT NULL\n    )",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state)",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -900,6 +905,21 @@ impl LibsqlStore {
                 conn.execute(idx, ())
                     .await
                     .context("creating schedules index")?;
+            }
+            // WL-020: reviews table
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reviews (\n                    id                 TEXT PRIMARY KEY,\n                    pr_url             TEXT NOT NULL,\n                    title              TEXT NOT NULL DEFAULT '',\n                    author             TEXT NOT NULL DEFAULT '',\n                    repo               TEXT NOT NULL DEFAULT '',\n                    state              TEXT NOT NULL DEFAULT 'open',\n                    review_requested_at INTEGER,\n                    reviewed_at        INTEGER,\n                    reviewed_by        TEXT,\n                    created_at         INTEGER NOT NULL\n                )",
+                (),
+            )
+            .await
+            .context("creating reviews table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state)",
+                "CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating reviews index")?;
             }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
@@ -3563,6 +3583,121 @@ impl Store for LibsqlStore {
             }
             tx.commit().await?;
             Ok(())
+        })
+    }
+
+    fn add_review_item(
+        &self,
+        pr_url: &str,
+        title: &str,
+        author: &str,
+        repo: &str,
+        state: ReviewItemState,
+        review_requested_at: Option<i64>,
+    ) -> Result<String> {
+        self.guard_writable()?;
+        if !pr_url_valid(pr_url) {
+            anyhow::bail!("pr_url must be a valid GitHub pull request URL");
+        }
+        if title.len() > MAX_REVIEW_TITLE_LEN {
+            anyhow::bail!("title exceeds {} chars", MAX_REVIEW_TITLE_LEN);
+        }
+        if author.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("author exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        if repo.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("repo exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        let id = new_review_id(now());
+        let created_at = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO reviews (id, pr_url, title, author, repo, state, review_requested_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params(vec![
+                        id.clone().into(),
+                        pr_url.into(),
+                        title.into(),
+                        author.into(),
+                        repo.into(),
+                        state.as_str().into(),
+                        review_requested_at.into(),
+                        created_at.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(id)
+    }
+
+    fn review_queue(&self, filter: ReviewQueueFilter, limit: i64) -> Result<Vec<ReviewItem>> {
+        let limit = clamp_limit(limit);
+        let (where_clause, binds): (&str, Vec<Value>) = match filter {
+            ReviewQueueFilter::All => ("", Vec::new()),
+            ReviewQueueFilter::Open => {
+                let mut p: Vec<Value> = Vec::new();
+                p.push("open".into());
+                ("WHERE state = ?1", p)
+            }
+            ReviewQueueFilter::Pending => {
+                let mut p: Vec<Value> = Vec::new();
+                p.push("open".into());
+                ("WHERE state = ?1 AND reviewed_at IS NULL", p)
+            }
+            ReviewQueueFilter::Reviewed => ("WHERE reviewed_at IS NOT NULL", Vec::new()),
+        };
+        let sql = format!(
+            "SELECT id, pr_url, title, author, repo, state, review_requested_at, reviewed_at, reviewed_by, created_at
+             FROM reviews {} ORDER BY created_at DESC LIMIT {}",
+            where_clause, limit
+        );
+        self.rt.block_on(async {
+            let mut it = self.conn.query(&sql, params(binds)).await?;
+            let mut items = Vec::new();
+            while let Some(r) = it.next().await? {
+                items.push(ReviewItem {
+                    id: r.get(0)?,
+                    pr_url: r.get(1)?,
+                    title: r.get(2)?,
+                    author: r.get(3)?,
+                    repo: r.get(4)?,
+                    state: ReviewItemState::from_str(&r.get::<String>(5)?)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    review_requested_at: r.get(6)?,
+                    reviewed_at: r.get(7)?,
+                    reviewed_by: r.get(8)?,
+                    created_at: r.get(9)?,
+                });
+            }
+            Ok::<_, anyhow::Error>(items)
+        })
+    }
+
+    fn mark_reviewed(&self, id: &str, reviewer: &str) -> Result<bool> {
+        self.guard_writable()?;
+        check_ident("reviewer", reviewer)?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE reviews SET reviewed_at = ?1, reviewed_by = ?2 WHERE id = ?3",
+                    params(vec![now().into(), reviewer.into(), id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn remove_review_item(&self, id: &str) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute("DELETE FROM reviews WHERE id = ?1", params(vec![id.into()]))
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
         })
     }
 }
@@ -6594,5 +6729,62 @@ mod tests {
         let list = s.list_schedules("a", 50).unwrap();
         assert!(list[0].executed_ts.is_none());
         assert!(list[0].next_run > past);
+    }
+
+    // ---- WL-020: review queue ----
+
+    #[test]
+    fn review_add_list_mark_remove_roundtrip_libsql() {
+        let s = mem();
+        let id = s
+            .add_review_item(
+                "https://github.com/owner/repo/pull/1",
+                "fix bug",
+                "alice",
+                "owner/repo",
+                crate::model::ReviewItemState::Open,
+                None,
+            )
+            .unwrap();
+        assert!(id.starts_with("review_"));
+
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].pr_url, "https://github.com/owner/repo/pull/1");
+
+        let pending = s
+            .review_queue(crate::model::ReviewQueueFilter::Pending, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
+        assert!(s.mark_reviewed(&id, "bob").unwrap());
+        let reviewed = s
+            .review_queue(crate::model::ReviewQueueFilter::Reviewed, 10)
+            .unwrap();
+        assert_eq!(reviewed.len(), 1);
+        assert_eq!(reviewed[0].reviewed_by, Some("bob".to_string()));
+
+        assert!(s.remove_review_item(&id).unwrap());
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn review_rejects_bad_url_libsql() {
+        let s = mem();
+        assert!(s
+            .add_review_item(
+                "not-a-url",
+                "t",
+                "a",
+                "r",
+                crate::model::ReviewItemState::Open,
+                None
+            )
+            .is_err());
     }
 }

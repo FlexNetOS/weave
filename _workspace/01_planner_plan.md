@@ -1,41 +1,41 @@
-# WL-019 Implementation Plan: Co-orchestrator Support
+# WL-020 Implementation Plan: GitHub Review Queue Integration
 
 ## Goal
-Allow multiple live orchestrators to coexist in the same circle for resilience against rate limits or credit caps. Non-force claims are additive (become a co-orchestrator); force claims still steal (demote all others).
+Track PR review state across peers via `review_queue`, `mark_reviewed(pr_url)` through CLI and MCP tools (repowire parity).
 
 ## Current State
-- `claim_orchestrator_role`: non-force claim is REFUSED if a live orchestrator exists; force claim demotes all existing orchestrators
-- `orchestrator_status`: returns a SINGLE `holder` (the most-recently-seen live orchestrator)
-- `OrchestratorStatus`: has `holder: Option<Peer>`
+- weave has no concept of PR review queue
+- No store tables or models for tracking external PR state
+- No CLI subcommands or MCP tools for review management
 
 ## Changes
 
 ### 1. Model (`model.rs`)
-- Change `OrchestratorStatus.holder: Option<Peer>` → `holders: Vec<Peer>`
-- `present` stays (true if any live orchestrator exists)
+- New `ReviewItem` struct: `id`, `pr_url`, `title`, `author`, `repo`, `state` (open/merged/closed), `review_requested_at`, `reviewed_at`, `reviewed_by`, `created_at`
+- New `ReviewQueueFilter` enum: `All`, `Open`, `Pending` (unreviewed), `Reviewed`
 
 ### 2. Store trait + both backends
-- `claim_orchestrator_role`: remove the "refuse if live orchestrator exists" check for non-force claims. Non-force claims always succeed and do NOT demote existing orchestrators. Force claims still demote all existing orchestrators.
-- `orchestrator_status`: collect ALL live orchestrators into `holders`, not just the most recent one
-- Update `OrchestratorStatus` construction
+- `review_queue(&self, filter: ReviewQueueFilter, limit: usize) -> Result<Vec<ReviewItem>>`
+- `add_review_item(&self, item: &ReviewItem) -> Result<()>`
+- `mark_reviewed(&self, id: &str, reviewer: &str) -> Result<()>`
+- `remove_review_item(&self, id: &str) -> Result<()>`
+- Schema migration: new `reviews` table with columns matching `ReviewItem`
 
 ### 3. CLI (`main.rs`)
-- `orchestrator status`: print all live orchestrators (comma-separated or multi-line)
-- `orchestrator claim`: success message updated for co-orchestrator
+- `weave review queue [--filter open|pending|reviewed] [--limit N]` — list review items
+- `weave review add <pr_url> [--title <title>] [--author <author>] [--repo <repo>]` — add item
+- `weave review mark <id>` — mark as reviewed (self as reviewer)
+- `weave review remove <id>` — remove item
 
 ### 4. MCP (`mcp.rs`)
-- `weave_orchestrator_status`: JSON returns `holders` array instead of single `holder`
-- `weave_orchestrator_claim`: non-force no longer returns "refused", always returns success unless error
+- `weave_review_queue(filter?, limit?)` — returns JSON array of ReviewItems
+- `weave_review_add(pr_url, title?, author?, repo?)` — adds item
+- `weave_review_mark(id)` — marks reviewed
+- `weave_review_remove(id)` — removes item
 
 ### 5. Tests
-- Update store unit tests for co-orchestrator behavior
-- Update integration tests for CLI/MCP
-- Add tests: two orchestrators coexist, force still demotes all, status lists all live ones
-
-### 6. Backward compat
-- `OrchestratorStatus` JSON changes from `holder` to `holders` — this is a breaking API change for consumers. Add `#[serde(rename = "holder")]`? No, better to just change it and update consumers. The consumers are CLI and MCP which we control.
-
-## Single-cycle scope
-- No schema changes (uses existing `role` column)
-- No new dependencies
-- Focused: change claim logic, status query, status struct, CLI/MCP output, tests
+- Unit tests for model validation (id format, url format, cap enforcement)
+- Store roundtrip tests for both backends (add, list, mark, remove)
+- CLI integration tests for all subcommands
+- MCP tool tests for JSON shapes and error paths
+- Security tests: cap enforcement on title/author/repo, URL validation rejects non-GitHub URLs

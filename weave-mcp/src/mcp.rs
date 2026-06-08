@@ -403,6 +403,10 @@ fn call_tool(
         "weave_memory_search" => tool_memory_search(me_default, args),
         "weave_memory_list" => tool_memory_list(me_default, args),
         "weave_memory_delete" => tool_memory_delete(me_default, args),
+        "weave_review_queue" => tool_review_queue(store, args),
+        "weave_review_add" => tool_review_add(store, args),
+        "weave_review_mark" => tool_review_mark(store, me_default, args),
+        "weave_review_remove" => tool_review_remove(store, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -2983,6 +2987,39 @@ fn tools() -> Value {
                 "name":{"type":"string","description":"Optional explicit scope name."},
                 "key":{"type":"string","description":"Entry key."}
             },"required":["scope","key"]}
+        },
+        {
+            "name": "weave_review_queue",
+            "description": "List PR review items. Filter by all, open, pending (unreviewed), or reviewed.",
+            "inputSchema": {"type":"object","properties":{
+                "filter":{"type":"string","enum":["all","open","pending","reviewed"],"description":"Filter by review state."},
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_review_add",
+            "description": "Add a GitHub PR to the review queue.",
+            "inputSchema": {"type":"object","properties":{
+                "pr_url":{"type":"string","description":"GitHub pull request URL."},
+                "title":{"type":"string","description":"PR title."},
+                "author":{"type":"string","description":"PR author."},
+                "repo":{"type":"string","description":"Repository name (owner/repo)."}
+            },"required":["pr_url"]}
+        },
+        {
+            "name": "weave_review_mark",
+            "description": "Mark a review item as reviewed.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Review item id."},
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_review_remove",
+            "description": "Remove a review item from the queue.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Review item id."}
+            },"required":["id"]}
         }
     ])
 }
@@ -3391,6 +3428,84 @@ fn tool_memory_delete(def: &Option<String>, args: &Value) -> Result<String, Stri
         Ok(format!("deleted {}/{key}", scope.label()))
     } else {
         Ok(format!("not found: {}/{key}", scope.label()))
+    }
+}
+
+fn tool_review_queue(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let filter_str = args.get("filter").and_then(|v| v.as_str()).unwrap_or("all");
+    let filter = model::ReviewQueueFilter::from_str(filter_str)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let items = store
+        .review_queue(filter, limit)
+        .map_err(|e| e.to_string())?;
+    if items.is_empty() {
+        return Ok("no review items".to_string());
+    }
+    let mut out = format!("{} review item(s):\n", items.len());
+    for item in items {
+        let status = if let Some(ref by) = item.reviewed_by {
+            format!("reviewed by {by}")
+        } else {
+            "pending".to_string()
+        };
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {}\n",
+            item.id, item.repo, item.author, status, item.pr_url
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_review_add(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let pr_url = args
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .ok_or("'pr_url' is required.")?;
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let author = args.get("author").and_then(|v| v.as_str()).unwrap_or("");
+    let repo = args.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+    let id = store
+        .add_review_item(
+            pr_url,
+            title,
+            author,
+            repo,
+            model::ReviewItemState::Open,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!("added review item {id}"))
+}
+
+fn tool_review_mark(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    let reviewer = ident(args, "from", def)?;
+    if store
+        .mark_reviewed(id, &reviewer)
+        .map_err(|e| e.to_string())?
+    {
+        Ok(format!("marked {id} as reviewed"))
+    } else {
+        Ok(format!("not found: {id}"))
+    }
+}
+
+fn tool_review_remove(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    if store.remove_review_item(id).map_err(|e| e.to_string())? {
+        Ok(format!("removed {id}"))
+    } else {
+        Ok(format!("not found: {id}"))
     }
 }
 

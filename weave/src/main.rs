@@ -630,6 +630,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// PR review queue (WL-020): track, list, and mark GitHub PRs as reviewed.
+    Review {
+        #[command(subcommand)]
+        cmd: ReviewCmd,
+    },
 }
 
 /// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
@@ -699,6 +704,39 @@ enum MemoryCmd {
     },
     /// Show available scopes and their resolved paths.
     Scopes,
+}
+
+/// `weave review` subcommands (WL-020) — PR review queue.
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// List review items.
+    Queue {
+        #[arg(long, default_value = "all")]
+        filter: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Add a PR to the review queue.
+    Add {
+        #[arg(long)]
+        pr_url: String,
+        #[arg(long, allow_hyphen_values = true)]
+        title: Option<String>,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Mark a review item as reviewed.
+    Mark {
+        #[arg(long)]
+        id: String,
+    },
+    /// Remove a review item.
+    Remove {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -3568,6 +3606,8 @@ fn main() -> Result<()> {
 
         Cmd::Memory { cmd } => dispatch_memory(&cfg, cmd)?,
 
+        Cmd::Review { cmd } => dispatch_review(store, &cfg, cmd)?,
+
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
         Cmd::Schedule {
@@ -3826,6 +3866,74 @@ fn format_entry_human(e: &memory::MemoryEntry) -> String {
         model::fmt_ts(e.created_ts),
         model::fmt_ts(e.updated_ts)
     )
+}
+
+/// `weave review` handler (WL-020).
+fn dispatch_review(store: &dyn Store, _cfg: &Config, cmd: ReviewCmd) -> Result<()> {
+    match cmd {
+        ReviewCmd::Queue { filter, limit } => {
+            let filter =
+                model::ReviewQueueFilter::from_str(&filter).map_err(|e| anyhow::anyhow!(e))?;
+            let items = store.review_queue(filter, limit)?;
+            if items.is_empty() {
+                println!("no review items");
+            } else {
+                for item in items {
+                    let status = if let Some(ts) = item.reviewed_at {
+                        format!(
+                            "reviewed by {} at {}",
+                            item.reviewed_by.unwrap_or_default(),
+                            model::fmt_ts(ts)
+                        )
+                    } else {
+                        "pending".to_string()
+                    };
+                    println!(
+                        "{} | {} | {} | {} | {}",
+                        item.id, item.repo, item.author, status, item.pr_url
+                    );
+                    if !item.title.is_empty() {
+                        println!("  title: {}", item.title);
+                    }
+                }
+            }
+        }
+        ReviewCmd::Add {
+            pr_url,
+            title,
+            author,
+            repo,
+        } => {
+            let title = title.unwrap_or_default();
+            let author = author.unwrap_or_default();
+            let repo = repo.unwrap_or_default();
+            let id = store.add_review_item(
+                &pr_url,
+                &title,
+                &author,
+                &repo,
+                model::ReviewItemState::Open,
+                None,
+            )?;
+            println!("added review item {}", id);
+        }
+        ReviewCmd::Mark { id } => {
+            let me = resolve_me(None, None, _cfg);
+            if store.mark_reviewed(&id, &me)? {
+                println!("marked {} as reviewed", id);
+            } else {
+                println!("not found: {}", id);
+            }
+        }
+        ReviewCmd::Remove { id } => {
+            if store.remove_review_item(&id)? {
+                println!("removed {}", id);
+            } else {
+                println!("not found: {}", id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `weave job` handler (P3 poll-only board). Routes the 8 subcommands through the

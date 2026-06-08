@@ -863,6 +863,117 @@ pub struct JobResultView {
     pub completed_ts: Option<i64>,
 }
 
+// ---- WL-020: review queue ----
+
+/// Hard upper bound (in chars) on a review item id. `review_<seed>_<nonce>`.
+pub const MAX_REVIEW_ID_LEN: usize = 80;
+
+/// Hard upper bound (in chars) on a review item title.
+pub const MAX_REVIEW_TITLE_LEN: usize = 256;
+
+/// Hard upper bound (in chars) on a review item author/repo.
+pub const MAX_REVIEW_IDENT_LEN: usize = 64;
+
+/// The lifecycle state of a PR in the review queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewItemState {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+}
+
+impl ReviewItemState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewItemState::Open => "open",
+            ReviewItemState::Merged => "merged",
+            ReviewItemState::Closed => "closed",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "open" => Ok(ReviewItemState::Open),
+            "merged" => Ok(ReviewItemState::Merged),
+            "closed" => Ok(ReviewItemState::Closed),
+            other => Err(format!("unknown review state '{other}'")),
+        }
+    }
+}
+
+/// Filter for review queue listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewQueueFilter {
+    #[default]
+    All,
+    Open,
+    Pending,
+    Reviewed,
+}
+
+impl ReviewQueueFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewQueueFilter::All => "all",
+            ReviewQueueFilter::Open => "open",
+            ReviewQueueFilter::Pending => "pending",
+            ReviewQueueFilter::Reviewed => "reviewed",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "all" => Ok(ReviewQueueFilter::All),
+            "open" => Ok(ReviewQueueFilter::Open),
+            "pending" => Ok(ReviewQueueFilter::Pending),
+            "reviewed" => Ok(ReviewQueueFilter::Reviewed),
+            other => Err(format!("unknown review filter '{other}'")),
+        }
+    }
+}
+
+/// A single PR review item tracked across peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewItem {
+    pub id: String,
+    pub pr_url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub repo: String,
+    pub state: ReviewItemState,
+    #[serde(default)]
+    pub review_requested_at: Option<i64>,
+    #[serde(default)]
+    pub reviewed_at: Option<i64>,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    pub created_at: i64,
+}
+
+/// Validate a review id: `review_<seed>_<nonce>`.
+pub fn review_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REVIEW_ID_LEN
+        && id.starts_with("review_")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Validate a GitHub PR URL (basic check: https://github.com/owner/repo/pull/N).
+pub fn pr_url_valid(url: &str) -> bool {
+    !url.is_empty()
+        && url.len() <= crate::store::MAX_BODY
+        && url.starts_with("https://github.com/")
+        && url.contains("/pull/")
+}
+
+/// Mint an opaque review id.
+pub fn new_review_id(seed: i64) -> String {
+    format!("review_{seed}_{}", mint_nonce(3_141_592_653))
+}
+
 /// Hard upper bound (in chars) on a circle label. A circle is a small grouping
 /// tag (a visibility-scoping label), never a path or shell token, so 64 is more
 /// than enough; the cap exists to reject a hostile/oversized value before it is
@@ -2348,5 +2459,63 @@ mod tests {
     fn next_occurrence_rejects_bad_expr() {
         assert_eq!(next_occurrence("garbage", 0), None);
         assert_eq!(next_occurrence("* * * *", 0), None);
+    }
+
+    // ---- WL-020: review queue ----
+
+    #[test]
+    fn review_item_state_roundtrip() {
+        assert_eq!(ReviewItemState::Open.as_str(), "open");
+        assert_eq!(ReviewItemState::Merged.as_str(), "merged");
+        assert_eq!(ReviewItemState::Closed.as_str(), "closed");
+        assert_eq!(ReviewItemState::from_str("open"), Ok(ReviewItemState::Open));
+        assert_eq!(
+            ReviewItemState::from_str("merged"),
+            Ok(ReviewItemState::Merged)
+        );
+        assert_eq!(
+            ReviewItemState::from_str("closed"),
+            Ok(ReviewItemState::Closed)
+        );
+        assert!(ReviewItemState::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn review_queue_filter_roundtrip() {
+        assert_eq!(ReviewQueueFilter::All.as_str(), "all");
+        assert_eq!(
+            ReviewQueueFilter::from_str("all"),
+            Ok(ReviewQueueFilter::All)
+        );
+        assert_eq!(
+            ReviewQueueFilter::from_str("pending"),
+            Ok(ReviewQueueFilter::Pending)
+        );
+        assert_eq!(
+            ReviewQueueFilter::from_str("reviewed"),
+            Ok(ReviewQueueFilter::Reviewed)
+        );
+        assert!(ReviewQueueFilter::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn pr_url_valid_accepts_github_rejects_others() {
+        assert!(pr_url_valid("https://github.com/owner/repo/pull/1"));
+        assert!(pr_url_valid("https://github.com/owner/repo/pull/123"));
+        assert!(!pr_url_valid("https://example.com/pull/1"));
+        assert!(!pr_url_valid("not-a-url"));
+        assert!(!pr_url_valid(""));
+    }
+
+    #[test]
+    fn review_id_valid_shape() {
+        assert!(review_id_valid("review_1_123"));
+        assert!(!review_id_valid("bad_1_123"));
+        assert!(!review_id_valid(""));
+    }
+
+    #[test]
+    fn new_review_id_is_unique() {
+        assert_ne!(new_review_id(1), new_review_id(1));
     }
 }

@@ -7,9 +7,10 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    now, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, Schedule,
-    ScheduleKind,
+    new_review_id, now, pr_url_valid, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome,
+    DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
+    OrchestratorStatus, Peer, ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule,
+    ScheduleKind, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use anyhow::Result;
 
@@ -640,6 +641,32 @@ pub trait Store: Send {
     ///   soft-cancels instead.
     #[allow(dead_code)]
     fn mark_schedule_executed(&self, id: i64) -> Result<()>;
+
+    /// WL-020: add a PR to the review queue. Returns the new review id.
+    #[allow(dead_code)]
+    fn add_review_item(
+        &self,
+        pr_url: &str,
+        title: &str,
+        author: &str,
+        repo: &str,
+        state: ReviewItemState,
+        review_requested_at: Option<i64>,
+    ) -> Result<String>;
+
+    /// WL-020: list review items matching filter, newest-first by `created_at`,
+    /// capped at `clamp_limit(limit)`. Read-only.
+    #[allow(dead_code)]
+    fn review_queue(&self, filter: ReviewQueueFilter, limit: i64) -> Result<Vec<ReviewItem>>;
+
+    /// WL-020: mark a review item as reviewed by `reviewer` at `now()`.
+    /// Returns `true` if the row existed and was updated.
+    #[allow(dead_code)]
+    fn mark_reviewed(&self, id: &str, reviewer: &str) -> Result<bool>;
+
+    /// WL-020: remove a review item by id. Returns `true` if the row existed.
+    #[allow(dead_code)]
+    fn remove_review_item(&self, id: &str) -> Result<bool>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1404,6 +1431,20 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run);
 CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender);
+CREATE TABLE IF NOT EXISTS reviews (
+    id                 TEXT PRIMARY KEY,
+    pr_url             TEXT NOT NULL,
+    title              TEXT NOT NULL DEFAULT '',
+    author             TEXT NOT NULL DEFAULT '',
+    repo               TEXT NOT NULL DEFAULT '',
+    state              TEXT NOT NULL DEFAULT 'open',
+    review_requested_at INTEGER,
+    reviewed_at        INTEGER,
+    reviewed_by        TEXT,
+    created_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1989,6 +2030,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run);
         CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender);",
+    )?;
+    // WL-020: reviews table for PR review queue.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reviews (
+            id                 TEXT PRIMARY KEY,
+            pr_url             TEXT NOT NULL,
+            title              TEXT NOT NULL DEFAULT '',
+            author             TEXT NOT NULL DEFAULT '',
+            repo               TEXT NOT NULL DEFAULT '',
+            state              TEXT NOT NULL DEFAULT 'open',
+            review_requested_at INTEGER,
+            reviewed_at        INTEGER,
+            reviewed_by        TEXT,
+            created_at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state);
+        CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);",
     )?;
     Ok(())
 }
@@ -4339,9 +4397,115 @@ impl Store for SqliteStore {
         tx.commit()?;
         Ok(())
     }
+
+    fn add_review_item(
+        &self,
+        pr_url: &str,
+        title: &str,
+        author: &str,
+        repo: &str,
+        state: ReviewItemState,
+        review_requested_at: Option<i64>,
+    ) -> Result<String> {
+        if !pr_url_valid(pr_url) {
+            anyhow::bail!("pr_url must be a valid GitHub pull request URL");
+        }
+        if title.len() > MAX_REVIEW_TITLE_LEN {
+            anyhow::bail!("title exceeds {} chars", MAX_REVIEW_TITLE_LEN);
+        }
+        if author.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("author exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        if repo.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("repo exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        let id = new_review_id(now());
+        let created_at = now();
+        self.conn.execute(
+            "INSERT INTO reviews (id, pr_url, title, author, repo, state, review_requested_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &id,
+                pr_url,
+                title,
+                author,
+                repo,
+                state.as_str(),
+                review_requested_at,
+                created_at,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    fn review_queue(&self, filter: ReviewQueueFilter, limit: i64) -> Result<Vec<ReviewItem>> {
+        let limit = clamp_limit(limit);
+        let (where_clause, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match filter {
+            ReviewQueueFilter::All => ("", Vec::new()),
+            ReviewQueueFilter::Open => {
+                let p: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new("open".to_string())];
+                ("WHERE state = ?1", p)
+            }
+            ReviewQueueFilter::Pending => {
+                let p: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new("open".to_string())];
+                ("WHERE state = ?1 AND reviewed_at IS NULL", p)
+            }
+            ReviewQueueFilter::Reviewed => {
+                let p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                ("WHERE reviewed_at IS NOT NULL", p)
+            }
+        };
+        let sql = format!(
+            "SELECT id, pr_url, title, author, repo, state, review_requested_at, reviewed_at, reviewed_by, created_at
+             FROM reviews {} ORDER BY created_at DESC LIMIT {}",
+            where_clause, limit
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok(ReviewItem {
+                id: r.get(0)?,
+                pr_url: r.get(1)?,
+                title: r.get(2)?,
+                author: r.get(3)?,
+                repo: r.get(4)?,
+                state: ReviewItemState::from_str(&r.get::<_, String>(5)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                })?,
+                review_requested_at: r.get(6)?,
+                reviewed_at: r.get(7)?,
+                reviewed_by: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for r in rows {
+            items.push(r?);
+        }
+        Ok(items)
+    }
+
+    fn mark_reviewed(&self, id: &str, reviewer: &str) -> Result<bool> {
+        check_ident("reviewer", reviewer)?;
+        let n = self.conn.execute(
+            "UPDATE reviews SET reviewed_at = ?1, reviewed_by = ?2 WHERE id = ?3",
+            params![now(), reviewer, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn remove_review_item(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM reviews WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
 }
 
-/// Validate a [`JobSpec`] (and `creator`) before any insert: identity shapes for
+/// Validate a [`JobSpec"] (and `creator`) before any insert: identity shapes for
 /// creator/owner/assignee/circle, length caps on every free-text field. Returns the
 /// (placeholder) ok marker; the id is minted by the caller. Shared discipline so
 /// CLI + MCP both inherit it (the validation lives in the store). Backend-agnostic.
@@ -8849,5 +9013,87 @@ mod tests {
                 1_700_000_000
             )
             .is_err());
+    }
+
+    // ---- WL-020: review queue ----
+
+    #[test]
+    fn review_add_list_mark_remove_roundtrip() {
+        let s = mem();
+        let id = s
+            .add_review_item(
+                "https://github.com/owner/repo/pull/1",
+                "fix bug",
+                "alice",
+                "owner/repo",
+                crate::model::ReviewItemState::Open,
+                None,
+            )
+            .unwrap();
+        assert!(id.starts_with("review_"));
+
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].pr_url, "https://github.com/owner/repo/pull/1");
+        assert_eq!(all[0].title, "fix bug");
+        assert_eq!(all[0].author, "alice");
+        assert_eq!(all[0].repo, "owner/repo");
+
+        let pending = s
+            .review_queue(crate::model::ReviewQueueFilter::Pending, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
+        let reviewed = s
+            .review_queue(crate::model::ReviewQueueFilter::Reviewed, 10)
+            .unwrap();
+        assert_eq!(reviewed.len(), 0);
+
+        assert!(s.mark_reviewed(&id, "bob").unwrap());
+        let reviewed = s
+            .review_queue(crate::model::ReviewQueueFilter::Reviewed, 10)
+            .unwrap();
+        assert_eq!(reviewed.len(), 1);
+        assert_eq!(reviewed[0].reviewed_by, Some("bob".to_string()));
+
+        assert!(s.remove_review_item(&id).unwrap());
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn review_rejects_bad_url() {
+        let s = mem();
+        assert!(s
+            .add_review_item(
+                "not-a-url",
+                "t",
+                "a",
+                "r",
+                crate::model::ReviewItemState::Open,
+                None
+            )
+            .is_err());
+        assert!(s
+            .add_review_item(
+                "https://example.com/pr/1",
+                "t",
+                "a",
+                "r",
+                crate::model::ReviewItemState::Open,
+                None
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn review_mark_remove_not_found() {
+        let s = mem();
+        assert!(!s.mark_reviewed("review_999_999", "bob").unwrap());
+        assert!(!s.remove_review_item("review_999_999").unwrap());
     }
 }

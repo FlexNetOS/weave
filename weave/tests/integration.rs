@@ -8351,6 +8351,130 @@ fn mcp_memory_roundtrip() {
     std::fs::remove_dir_all(&cfg).ok();
 }
 
+#[test]
+fn cli_review_roundtrip() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "review",
+            "add",
+            "--pr-url",
+            "https://github.com/owner/repo/pull/42",
+            "--title",
+            "fix bug",
+            "--author",
+            "alice",
+            "--repo",
+            "owner/repo",
+        ],
+    );
+    assert!(out.contains("review_"), "add should print review id: {out}");
+    let id = out
+        .trim()
+        .strip_prefix("added review item ")
+        .unwrap()
+        .to_string();
+
+    let list = run_ok(&db, &["review", "queue", "--filter", "pending"]);
+    assert!(list.contains(&id), "queue should list the item: {list}");
+    assert!(
+        list.contains("owner/repo"),
+        "queue should show repo: {list}"
+    );
+
+    let mark = run_ok(&db, &["review", "mark", "--id", &id]);
+    assert!(mark.contains("marked"), "mark should succeed: {mark}");
+
+    let reviewed = run_ok(&db, &["review", "queue", "--filter", "reviewed"]);
+    assert!(
+        reviewed.contains(&id),
+        "reviewed filter should find it: {reviewed}"
+    );
+
+    let remove = run_ok(&db, &["review", "remove", "--id", &id]);
+    assert!(
+        remove.contains("removed"),
+        "remove should succeed: {remove}"
+    );
+
+    let empty = run_ok(&db, &["review", "queue"]);
+    assert!(
+        empty.contains("no review items"),
+        "queue should be empty: {empty}"
+    );
+}
+
+#[test]
+fn cli_review_rejects_bad_url() {
+    let db = TestDb::new();
+    let (ok, _stdout, stderr) = run_env(
+        &db,
+        &["review", "add", "--pr-url", "https://example.com/pr/1"],
+        &[],
+    );
+    assert!(!ok, "should error on non-GitHub URL");
+    assert!(
+        stderr.contains("GitHub"),
+        "should reject non-GitHub URL: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_review_roundtrip() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (err, add_out) = mcp.call_tool(
+        "weave_review_add",
+        serde_json::json!({
+            "pr_url": "https://github.com/owner/repo/pull/99",
+            "title": "feature",
+            "author": "bob",
+            "repo": "owner/repo",
+        }),
+    );
+    assert!(!err, "add: {add_out}");
+    assert!(
+        add_out.contains("review_"),
+        "add should return id: {add_out}"
+    );
+
+    let (err, list_out) = mcp.call_tool(
+        "weave_review_queue",
+        serde_json::json!({"filter": "pending"}),
+    );
+    assert!(!err, "queue: {list_out}");
+    assert!(
+        list_out.contains("owner/repo"),
+        "queue should contain repo: {list_out}"
+    );
+
+    let id = add_out
+        .trim()
+        .strip_prefix("added review item ")
+        .unwrap()
+        .to_string();
+    let (err, mark_out) = mcp.call_tool(
+        "weave_review_mark",
+        serde_json::json!({"id": id, "from": "alice"}),
+    );
+    assert!(!err, "mark: {mark_out}");
+    assert!(
+        mark_out.contains("marked"),
+        "mark should succeed: {mark_out}"
+    );
+
+    let (err, remove_out) = mcp.call_tool("weave_review_remove", serde_json::json!({"id": id}));
+    assert!(!err, "remove: {remove_out}");
+    assert!(
+        remove_out.contains("removed"),
+        "remove should succeed: {remove_out}"
+    );
+
+    mcp.shutdown();
+}
+
 /// MCP: memory search with explicit scope filters correctly.
 #[test]
 fn mcp_memory_search_scoped() {
