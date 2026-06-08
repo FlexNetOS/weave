@@ -480,6 +480,71 @@ pub struct AskManyResult {
     pub children: Vec<AskManyChildView>,
 }
 
+/// The resolved status of a ToolPermission ask (WL-021). Derived at read time
+/// from the ask state, answer body, and age. Pure; no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionStatus {
+    /// Awaiting an answer; within the timeout window.
+    Pending,
+    /// The askee answered with body "approve" (case-insensitive, trimmed).
+    Approved,
+    /// The askee answered with anything other than "approve", or the ask was
+    /// explicitly denied.
+    Denied,
+    /// Still open but older than the timeout — treated as denied by default.
+    Timeout,
+}
+
+impl PermissionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionStatus::Pending => "pending",
+            PermissionStatus::Approved => "approved",
+            PermissionStatus::Denied => "denied",
+            PermissionStatus::Timeout => "timeout",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "pending" => Ok(PermissionStatus::Pending),
+            "approved" => Ok(PermissionStatus::Approved),
+            "denied" => Ok(PermissionStatus::Denied),
+            "timeout" => Ok(PermissionStatus::Timeout),
+            other => Err(format!("unknown permission status '{other}'")),
+        }
+    }
+}
+
+/// Default timeout for ToolPermission asks (seconds). After this window an
+/// unanswered permission ask is treated as [`PermissionStatus::Timeout`].
+pub const PERMISSION_TIMEOUT_SECS: i64 = 300;
+
+/// Resolve the permission status of an ask at read time. Requires the answer
+/// body (when present) and the current wall-clock time. Totality: never panics.
+pub fn permission_status(
+    ask: &Ask,
+    answer_body: Option<&str>,
+    now: i64,
+    timeout_secs: i64,
+) -> PermissionStatus {
+    // Terminal states (answered or acked) → inspect the answer body.
+    if ask.state == AskState::Answered || ask.state == AskState::Acked {
+        if let Some(body) = answer_body {
+            if body.trim().eq_ignore_ascii_case("approve") {
+                return PermissionStatus::Approved;
+            }
+        }
+        return PermissionStatus::Denied;
+    }
+    // Still open → check age against timeout.
+    if now.saturating_sub(ask.opened_ts) >= timeout_secs {
+        PermissionStatus::Timeout
+    } else {
+        PermissionStatus::Pending
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // P3 — Job board (poll-only, daemon-free). A durable work queue: a creator mints
 // a `queued` job, a worker CLAIMS it (minting an `attempt_id` claim token),
@@ -2517,5 +2582,115 @@ mod tests {
     #[test]
     fn new_review_id_is_unique() {
         assert_ne!(new_review_id(1), new_review_id(1));
+    }
+
+    // ---- WL-021: permission status ----
+
+    #[test]
+    fn permission_status_pending_open_within_timeout() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: None,
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Open,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1000,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, None, 1200, 300),
+            PermissionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn permission_status_timeout_open_expired() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: None,
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Open,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1000,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, None, 2000, 300),
+            PermissionStatus::Timeout
+        );
+    }
+
+    #[test]
+    fn permission_status_approved_on_approve_body() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: Some(2),
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Answered,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1200,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, Some("approve"), 1200, 300),
+            PermissionStatus::Approved
+        );
+        assert_eq!(
+            permission_status(&ask, Some("Approve"), 1200, 300),
+            PermissionStatus::Approved
+        );
+    }
+
+    #[test]
+    fn permission_status_denied_on_non_approve() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: Some(2),
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Answered,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1200,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, Some("deny"), 1200, 300),
+            PermissionStatus::Denied
+        );
+        assert_eq!(
+            permission_status(&ask, Some("no"), 1200, 300),
+            PermissionStatus::Denied
+        );
     }
 }

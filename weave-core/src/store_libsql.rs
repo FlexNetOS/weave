@@ -39,11 +39,11 @@ use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id, now,
-    pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult, AskRole, AskState,
-    ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec,
-    JobState, Message, OrchestratorStatus, Peer, ReviewItem, ReviewItemState, ReviewQueueFilter,
-    Schedule, ScheduleKind, BROADCAST_SQL, MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS,
-    MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
+    permission_status, pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult,
+    AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch,
+    JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, PermissionStatus,
+    ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind, BROADCAST_SQL,
+    MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
@@ -3700,6 +3700,73 @@ impl Store for LibsqlStore {
             Ok::<_, anyhow::Error>(n > 0)
         })
     }
+
+    fn permission_verdict(
+        &self,
+        correlation_id: &str,
+        timeout_secs: i64,
+    ) -> Result<(PermissionStatus, Option<String>)> {
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        let ask = self
+            .get_ask(correlation_id)?
+            .ok_or_else(|| anyhow::anyhow!("no ask found for {correlation_id}"))?;
+        if ask.kind != AskKind::ToolPermission {
+            anyhow::bail!("ask {correlation_id} is not a tool permission.");
+        }
+        let answer_body: Option<String> = if let Some(aid) = ask.answer_msg_id {
+            self.rt.block_on(async {
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT body FROM messages WHERE id = ?1",
+                        params(vec![aid.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Ok::<_, anyhow::Error>(r.get::<String>(0).ok()),
+                    None => Ok(None),
+                }
+            })?
+        } else {
+            None
+        };
+        let timeout = if timeout_secs > 0 {
+            timeout_secs
+        } else {
+            crate::model::PERMISSION_TIMEOUT_SECS
+        };
+        let status = permission_status(&ask, answer_body.as_deref(), now(), timeout);
+        Ok((status, answer_body))
+    }
+
+    fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>> {
+        check_ident("me", me)?;
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
+                     FROM asks
+                     WHERE asker = ?1 AND kind = ?2
+                     ORDER BY opened_ts DESC LIMIT ?3",
+                    params(vec![
+                        me.into(),
+                        AskKind::ToolPermission.as_str().into(),
+                        limit.into(),
+                    ]),
+                )
+                .await?;
+            let mut asks = Vec::new();
+            while let Some(r) = it.next().await? {
+                asks.push(row_to_ask(&r)?);
+            }
+            Ok::<_, anyhow::Error>(asks)
+        })
+    }
 }
 
 /// Count unread messages for `me` against any connection (the live connection or
@@ -6786,5 +6853,55 @@ mod tests {
                 None
             )
             .is_err());
+    }
+
+    // ---- WL-021: permission status ----
+
+    #[test]
+    fn permission_verdict_approved_after_answer_libsql() {
+        let s = mem();
+        let (cid, _qid) = s
+            .ask(
+                "alice",
+                "bob",
+                None,
+                "allow rm?",
+                crate::model::AskKind::ToolPermission,
+                Some("Bash\nrm -rf /"),
+                None,
+            )
+            .unwrap();
+        s.answer("bob", &cid, "approve").unwrap();
+        let (status, body) = s.permission_verdict(&cid, 300).unwrap();
+        assert_eq!(status, crate::model::PermissionStatus::Approved);
+        assert_eq!(body.unwrap(), "approve");
+    }
+
+    #[test]
+    fn permission_list_filters_by_asker_libsql() {
+        let s = mem();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q1",
+            crate::model::AskKind::ToolPermission,
+            None,
+            None,
+        )
+        .unwrap();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q2",
+            crate::model::AskKind::FreeText,
+            None,
+            None,
+        )
+        .unwrap();
+        let perms = s.list_permissions("alice", 10).unwrap();
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].kind, crate::model::AskKind::ToolPermission);
     }
 }

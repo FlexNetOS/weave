@@ -407,6 +407,11 @@ fn call_tool(
         "weave_review_add" => tool_review_add(store, args),
         "weave_review_mark" => tool_review_mark(store, me_default, args),
         "weave_review_remove" => tool_review_remove(store, args),
+        "weave_ask_permission" => {
+            tool_ask_permission(store, me_default, nudge_template, args, injector)
+        }
+        "weave_permission_status" => tool_permission_status(store, args),
+        "weave_permission_list" => tool_permission_list(store, me_default, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -3020,6 +3025,33 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "id":{"type":"string","description":"Review item id."}
             },"required":["id"]}
+        },
+        {
+            "name": "weave_ask_permission",
+            "description": "Request approval for a mutating tool (Bash, Edit, Write) from a peer. Creates a ToolPermission ask. The peer answers with 'approve' or 'deny'. Unanswered asks timeout after 300s and are treated as denied.",
+            "inputSchema": {"type":"object","properties":{
+                "to":{"type":"string","description":"Peer session name to ask for approval."},
+                "tool":{"type":"string","description":"Tool name (e.g. Bash, Edit, Write)."},
+                "args":{"type":"string","description":"Tool arguments / command."},
+                "body":{"type":"string","description":"Optional explanatory message."},
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["to","tool"]}
+        },
+        {
+            "name": "weave_permission_status",
+            "description": "Check the permission status of a ToolPermission ask. Returns pending, approved, denied, or timeout.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Permission ask correlation id."},
+                "timeout":{"type":"integer","description":"Custom timeout in seconds (default 300)."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_permission_list",
+            "description": "List ToolPermission asks you created, with their current verdict.",
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer","description":"Max results (bounded by server)."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":[]}
         }
     ])
 }
@@ -3507,6 +3539,117 @@ fn tool_review_remove(store: &dyn Store, args: &Value) -> Result<String, String>
     } else {
         Ok(format!("not found: {id}"))
     }
+}
+
+fn tool_ask_permission(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the peer session name to ask).")?;
+    let to = bound_ident("to", to_raw)?;
+    if model::is_broadcast(&to) {
+        return Err(
+            "tracked ask is point-to-point; use weave_send for broadcast (broadcast ask is P2)."
+                .to_string(),
+        );
+    }
+    let tool = args
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or("'tool' is required.")?;
+    let tool_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
+    let options = format!("{}\n{}", tool, tool_args);
+    let body_raw = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let body = if body_raw.is_empty() {
+        format!("Requesting permission to run {} {}", tool, tool_args)
+    } else {
+        body_raw.to_string()
+    };
+    let (cid, qid) = store
+        .ask(
+            &from,
+            &to,
+            None,
+            &body,
+            model::AskKind::ToolPermission,
+            Some(&options),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    record_delivery_best_effort(
+        store,
+        qid,
+        model::DeliveryRefKind::Ask,
+        &to,
+        model::DeliveryStage::Queued,
+        model::DeliveryOutcome::Ok,
+    );
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, &body, injector);
+    let (stage, outcome) = verdict_to_stage(verdict);
+    record_delivery_best_effort(store, qid, model::DeliveryRefKind::Ask, &to, stage, outcome);
+    Ok(format!(
+        "Opened permission ask {cid} from '{from}' to '{to}'. {}",
+        verdict_sentence(verdict, &to)
+    ))
+}
+
+fn tool_permission_status(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    let timeout = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(0);
+    let (status, answer) = store
+        .permission_verdict(id, timeout)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}: {} (answer: {})",
+        id,
+        status.as_str(),
+        answer.unwrap_or_default()
+    ))
+}
+
+fn tool_permission_list(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let asks = store
+        .list_permissions(&me, limit)
+        .map_err(|e| e.to_string())?;
+    if asks.is_empty() {
+        return Ok("no permission asks".to_string());
+    }
+    let mut out = format!("{} permission ask(s):\n", asks.len());
+    for a in asks {
+        let (status, _) = store
+            .permission_verdict(&a.id, 0)
+            .map_err(|e| e.to_string())?;
+        let tool = a
+            .options
+            .as_ref()
+            .and_then(|o| o.lines().next())
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "{} | {} | {} -> {} | {}\n",
+            a.id,
+            status.as_str(),
+            a.asker,
+            a.askee,
+            tool
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

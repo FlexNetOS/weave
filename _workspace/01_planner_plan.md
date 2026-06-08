@@ -1,41 +1,42 @@
-# WL-020 Implementation Plan: GitHub Review Queue Integration
+# WL-021 Implementation Plan: PreToolUse Tool Approval
 
 ## Goal
-Track PR review state across peers via `review_queue`, `mark_reviewed(pr_url)` through CLI and MCP tools (repowire parity).
+Gate operations behind blocking approval questions using the existing ToolPermission ask kind (WL-015), with timeout-based auto-deny.
 
 ## Current State
-- weave has no concept of PR review queue
-- No store tables or models for tracking external PR state
-- No CLI subcommands or MCP tools for review management
+- `AskKind::ToolPermission` exists with `options` field for `tool_name\ntool_args`
+- No permission-specific CLI, MCP tools, or timeout handling
 
 ## Changes
 
 ### 1. Model (`model.rs`)
-- New `ReviewItem` struct: `id`, `pr_url`, `title`, `author`, `repo`, `state` (open/merged/closed), `review_requested_at`, `reviewed_at`, `reviewed_by`, `created_at`
-- New `ReviewQueueFilter` enum: `All`, `Open`, `Pending` (unreviewed), `Reviewed`
+- New `PermissionStatus` enum: `Pending`, `Approved`, `Denied`, `Timeout`
+- New `PERMISSION_TIMEOUT_SECS: i64 = 300` (5 min default)
+- New `permission_status(ask: &Ask, timeout_secs: i64) -> PermissionStatus` helper
+  - Open + within timeout → Pending
+  - Open + expired → Timeout
+  - Answered/Acked + body == "approve" → Approved
+  - Answered/Acked + body != "approve" → Denied
 
 ### 2. Store trait + both backends
-- `review_queue(&self, filter: ReviewQueueFilter, limit: usize) -> Result<Vec<ReviewItem>>`
-- `add_review_item(&self, item: &ReviewItem) -> Result<()>`
-- `mark_reviewed(&self, id: &str, reviewer: &str) -> Result<()>`
-- `remove_review_item(&self, id: &str) -> Result<()>`
-- Schema migration: new `reviews` table with columns matching `ReviewItem`
+- `permission_verdict(&self, correlation_id: &str, timeout_secs: i64) -> Result<PermissionStatus>`
+  - Reads ask via `get_ask`, reads answer message body if present
+  - Delegates to `permission_status` helper
+- `list_permissions(&self, me: &str, filter: PermissionStatus, limit: i64) -> Result<Vec<Ask>>`
+  - Lists ToolPermission asks where `me` is asker or askee
 
 ### 3. CLI (`main.rs`)
-- `weave review queue [--filter open|pending|reviewed] [--limit N]` — list review items
-- `weave review add <pr_url> [--title <title>] [--author <author>] [--repo <repo>]` — add item
-- `weave review mark <id>` — mark as reviewed (self as reviewer)
-- `weave review remove <id>` — remove item
+- `weave ask permission <to> --tool <tool> [--args <args>]` — creates ToolPermission ask
+- `weave permission status <ask_id>` — shows verdict
+- `weave permission list [--filter pending|approved|denied|timeout] [--limit N]` — lists permissions
 
 ### 4. MCP (`mcp.rs`)
-- `weave_review_queue(filter?, limit?)` — returns JSON array of ReviewItems
-- `weave_review_add(pr_url, title?, author?, repo?)` — adds item
-- `weave_review_mark(id)` — marks reviewed
-- `weave_review_remove(id)` — removes item
+- `weave_ask_permission(to, tool, args?, from?)` — creates ToolPermission ask
+- `weave_permission_status(id)` — returns verdict
+- `weave_permission_list(filter?, limit?, me?)` — lists permissions
 
 ### 5. Tests
-- Unit tests for model validation (id format, url format, cap enforcement)
-- Store roundtrip tests for both backends (add, list, mark, remove)
-- CLI integration tests for all subcommands
-- MCP tool tests for JSON shapes and error paths
-- Security tests: cap enforcement on title/author/repo, URL validation rejects non-GitHub URLs
+- Model unit tests for `permission_status` logic
+- Store roundtrip tests for both backends
+- CLI integration tests
+- MCP tool tests

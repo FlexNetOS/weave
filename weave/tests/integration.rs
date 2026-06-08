@@ -8543,3 +8543,110 @@ fn mcp_memory_search_scoped() {
     mcp.shutdown();
     std::fs::remove_dir_all(&cfg).ok();
 }
+
+#[test]
+fn cli_permission_roundtrip() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "ask",
+            "--to",
+            "bob",
+            "--body",
+            "allow this?",
+            "--kind",
+            "tool_permission",
+            "--options",
+            "Bash\nrm -rf /",
+        ],
+    );
+    assert!(
+        out.contains("ask_"),
+        "ask should print correlation id: {out}"
+    );
+    let cid = out
+        .trim()
+        .strip_prefix("opened ask ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string();
+
+    let status = run_ok(&db, &["permission", "status", "--id", &cid]);
+    assert!(status.contains("pending"), "should be pending: {status}");
+
+    run_ok(
+        &db,
+        &["answer", "--id", &cid, "--body", "approve", "--from", "bob"],
+    );
+
+    let status = run_ok(&db, &["permission", "status", "--id", &cid]);
+    assert!(status.contains("approved"), "should be approved: {status}");
+
+    let list = run_ok(&db, &["permission", "list"]);
+    assert!(
+        list.contains(&cid),
+        "list should contain permission ask: {list}"
+    );
+}
+
+#[test]
+fn mcp_permission_roundtrip() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (err, add_out) = mcp.call_tool(
+        "weave_ask_permission",
+        serde_json::json!({
+            "to": "bob",
+            "tool": "Bash",
+            "args": "echo hello",
+            "from": "alice",
+        }),
+    );
+    assert!(!err, "ask_permission: {add_out}");
+    assert!(add_out.contains("ask_"), "should return ask id: {add_out}");
+    let cid = add_out
+        .trim()
+        .strip_prefix("Opened permission ask ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (err, status_out) =
+        mcp.call_tool("weave_permission_status", serde_json::json!({"id": cid}));
+    assert!(!err, "status: {status_out}");
+    assert!(
+        status_out.contains("pending"),
+        "should be pending: {status_out}"
+    );
+
+    let (err, answer_out) = mcp.call_tool(
+        "weave_answer",
+        serde_json::json!({"correlation_id": cid, "body": "approve", "from": "bob"}),
+    );
+    assert!(!err, "answer: {answer_out}");
+
+    let (err, status_out) =
+        mcp.call_tool("weave_permission_status", serde_json::json!({"id": cid}));
+    assert!(!err, "status after approve: {status_out}");
+    assert!(
+        status_out.contains("approved"),
+        "should be approved: {status_out}"
+    );
+
+    let (err, list_out) =
+        mcp.call_tool("weave_permission_list", serde_json::json!({"me": "alice"}));
+    assert!(!err, "list: {list_out}");
+    assert!(
+        list_out.contains(&cid),
+        "list should contain ask: {list_out}"
+    );
+
+    mcp.shutdown();
+}

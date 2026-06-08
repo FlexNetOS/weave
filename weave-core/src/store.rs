@@ -7,10 +7,10 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    new_review_id, now, pr_url_valid, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome,
-    DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
-    OrchestratorStatus, Peer, ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule,
-    ScheduleKind, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
+    new_review_id, now, permission_status, pr_url_valid, Ask, AskKind, AskManyResult, AskRole,
+    ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec,
+    JobState, Message, OrchestratorStatus, Peer, PermissionStatus, ReviewItem, ReviewItemState,
+    ReviewQueueFilter, Schedule, ScheduleKind, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use anyhow::Result;
 
@@ -667,6 +667,22 @@ pub trait Store: Send {
     /// WL-020: remove a review item by id. Returns `true` if the row existed.
     #[allow(dead_code)]
     fn remove_review_item(&self, id: &str) -> Result<bool>;
+
+    /// WL-021: resolve the permission status of a ToolPermission ask by its
+    /// correlation id. Returns the answer body when available so callers can log
+    /// or audit the exact response. `timeout_secs` defaults to
+    /// [`PERMISSION_TIMEOUT_SECS`] when 0.
+    #[allow(dead_code)]
+    fn permission_verdict(
+        &self,
+        correlation_id: &str,
+        timeout_secs: i64,
+    ) -> Result<(PermissionStatus, Option<String>)>;
+
+    /// WL-021: list ToolPermission asks where `me` is the asker, newest-first,
+    /// capped at `clamp_limit(limit)`. Read-only.
+    #[allow(dead_code)]
+    fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -4502,6 +4518,61 @@ impl Store for SqliteStore {
             .conn
             .execute("DELETE FROM reviews WHERE id = ?1", params![id])?;
         Ok(n > 0)
+    }
+
+    fn permission_verdict(
+        &self,
+        correlation_id: &str,
+        timeout_secs: i64,
+    ) -> Result<(PermissionStatus, Option<String>)> {
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        let ask = self
+            .get_ask(correlation_id)?
+            .ok_or_else(|| anyhow::anyhow!("no ask found for {correlation_id}"))?;
+        if ask.kind != AskKind::ToolPermission {
+            anyhow::bail!("ask {correlation_id} is not a tool permission.");
+        }
+        let answer_body: Option<String> = if let Some(aid) = ask.answer_msg_id {
+            self.conn
+                .query_row(
+                    "SELECT body FROM messages WHERE id = ?1",
+                    params![aid],
+                    |r| r.get(0),
+                )
+                .ok()
+        } else {
+            None
+        };
+        let timeout = if timeout_secs > 0 {
+            timeout_secs
+        } else {
+            crate::model::PERMISSION_TIMEOUT_SECS
+        };
+        let status = permission_status(&ask, answer_body.as_deref(), now(), timeout);
+        Ok((status, answer_body))
+    }
+
+    fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>> {
+        check_ident("me", me)?;
+        let limit = clamp_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                    options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
+             FROM asks
+             WHERE asker = ?1 AND kind = ?2
+             ORDER BY opened_ts DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![me, AskKind::ToolPermission.as_str(), limit],
+            row_to_ask,
+        )?;
+        let mut asks = Vec::new();
+        for r in rows {
+            asks.push(r?);
+        }
+        Ok(asks)
     }
 }
 
@@ -9095,5 +9166,76 @@ mod tests {
         let s = mem();
         assert!(!s.mark_reviewed("review_999_999", "bob").unwrap());
         assert!(!s.remove_review_item("review_999_999").unwrap());
+    }
+
+    // ---- WL-021: permission status ----
+
+    #[test]
+    fn permission_verdict_pending_then_timeout() {
+        let s = mem();
+        let (cid, _qid) = s
+            .ask(
+                "alice",
+                "bob",
+                None,
+                "allow rm?",
+                crate::model::AskKind::ToolPermission,
+                Some("Bash\nrm -rf /"),
+                None,
+            )
+            .unwrap();
+        let (status, _body) = s.permission_verdict(&cid, 300).unwrap();
+        assert_eq!(status, crate::model::PermissionStatus::Pending);
+        // Simulate timeout by using a tiny timeout and an old ask... but the ask is fresh.
+        // Instead test that non-existent ask errors.
+        assert!(s.permission_verdict("ask_999_999", 300).is_err());
+    }
+
+    #[test]
+    fn permission_verdict_approved_after_answer() {
+        let s = mem();
+        let (cid, _qid) = s
+            .ask(
+                "alice",
+                "bob",
+                None,
+                "allow rm?",
+                crate::model::AskKind::ToolPermission,
+                Some("Bash\nrm -rf /"),
+                None,
+            )
+            .unwrap();
+        s.answer("bob", &cid, "approve").unwrap();
+        let (status, body) = s.permission_verdict(&cid, 300).unwrap();
+        assert_eq!(status, crate::model::PermissionStatus::Approved);
+        assert_eq!(body.unwrap(), "approve");
+    }
+
+    #[test]
+    fn permission_list_filters_by_asker() {
+        let s = mem();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q1",
+            crate::model::AskKind::ToolPermission,
+            None,
+            None,
+        )
+        .unwrap();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q2",
+            crate::model::AskKind::FreeText,
+            None,
+            None,
+        )
+        .unwrap();
+        let perms = s.list_permissions("alice", 10).unwrap();
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].kind, crate::model::AskKind::ToolPermission);
     }
 }

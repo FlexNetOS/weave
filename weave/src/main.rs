@@ -635,6 +635,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ReviewCmd,
     },
+    /// Permission approval status (WL-021): check verdict of ToolPermission asks.
+    Permission {
+        #[command(subcommand)]
+        cmd: PermissionCmd,
+    },
 }
 
 /// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
@@ -736,6 +741,24 @@ enum ReviewCmd {
     Remove {
         #[arg(long)]
         id: String,
+    },
+}
+
+/// `weave permission` subcommands (WL-021) — ToolPermission ask verdicts.
+#[derive(Subcommand)]
+enum PermissionCmd {
+    /// Check the permission status of a ToolPermission ask.
+    Status {
+        #[arg(long)]
+        id: String,
+        /// timeout in seconds (default 300)
+        #[arg(long)]
+        timeout: Option<i64>,
+    },
+    /// List ToolPermission asks you created.
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
 }
 
@@ -3608,6 +3631,8 @@ fn main() -> Result<()> {
 
         Cmd::Review { cmd } => dispatch_review(store, &cfg, cmd)?,
 
+        Cmd::Permission { cmd } => dispatch_permission(store, &cfg, cmd)?,
+
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
         Cmd::Schedule {
@@ -3930,6 +3955,53 @@ fn dispatch_review(store: &dyn Store, _cfg: &Config, cmd: ReviewCmd) -> Result<(
                 println!("removed {}", id);
             } else {
                 println!("not found: {}", id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave permission` handler (WL-021).
+fn dispatch_permission(store: &dyn Store, cfg: &Config, cmd: PermissionCmd) -> Result<()> {
+    match cmd {
+        PermissionCmd::Status { id, timeout } => {
+            let (status, answer) = store.permission_verdict(&id, timeout.unwrap_or(0))?;
+            match status {
+                model::PermissionStatus::Pending => println!("{} pending", id),
+                model::PermissionStatus::Approved => {
+                    println!("{} approved (answer: {})", id, answer.unwrap_or_default())
+                }
+                model::PermissionStatus::Denied => {
+                    println!("{} denied (answer: {})", id, answer.unwrap_or_default())
+                }
+                model::PermissionStatus::Timeout => {
+                    println!("{} timeout (denied by default)", id)
+                }
+            }
+        }
+        PermissionCmd::List { limit } => {
+            let me = resolve_me(None, None, cfg);
+            let asks = store.list_permissions(&me, limit)?;
+            if asks.is_empty() {
+                println!("no permission asks");
+            } else {
+                for a in &asks {
+                    let (status, _) = store.permission_verdict(&a.id, 0)?;
+                    let tool = a
+                        .options
+                        .as_ref()
+                        .and_then(|o| o.lines().next())
+                        .unwrap_or("?");
+                    println!(
+                        "{} | {} | {} -> {} | {} | {}",
+                        a.id,
+                        status.as_str(),
+                        a.asker,
+                        a.askee,
+                        tool,
+                        model::fmt_ts(a.opened_ts)
+                    );
+                }
             }
         }
     }
