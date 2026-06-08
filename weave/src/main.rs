@@ -174,7 +174,13 @@ enum Cmd {
         session: Option<String>,
     },
     /// Wire weave into Claude Code (register MCP server + lifecycle hooks).
-    Setup,
+    /// Optionally also install a git pre-commit hook that guards against
+    /// committing files reserved by other peers.
+    Setup {
+        /// Also install the git pre-commit hook in the current repo.
+        #[arg(long)]
+        git_hooks: bool,
+    },
     /// Remove weave's Claude Code wiring.
     Uninstall,
     /// Send a message to another session.
@@ -886,6 +892,9 @@ enum LeaseCmd {
     },
     /// Remove all expired leases. Returns the count swept.
     Sweep,
+    /// Check staged git files against active leases. Exits non-zero if any
+    /// staged file conflicts with a lease held by another peer.
+    Guard,
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -2486,9 +2495,13 @@ fn main() -> Result<()> {
 
     // Commands that don't need the store.
     match &cli.cmd {
-        Cmd::Setup => {
+        Cmd::Setup { git_hooks } => {
             let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-            return setup::run(&exe);
+            setup::run(&exe)?;
+            if *git_hooks {
+                setup::install_git_precommit_hook(&exe)?;
+            }
+            return Ok(());
         }
         Cmd::Uninstall => return setup::uninstall(),
         Cmd::Config {
@@ -2521,7 +2534,11 @@ fn main() -> Result<()> {
     let store = store.as_ref();
 
     match cli.cmd {
-        Cmd::Setup | Cmd::Uninstall | Cmd::Config { .. } | Cmd::Completions { .. } | Cmd::Man => {
+        Cmd::Setup { .. }
+        | Cmd::Uninstall
+        | Cmd::Config { .. }
+        | Cmd::Completions { .. }
+        | Cmd::Man => {
             unreachable!("handled above")
         }
 
@@ -4511,6 +4528,51 @@ fn dispatch_lease(store: &dyn Store, cfg: &Config, cmd: LeaseCmd) -> Result<()> 
         LeaseCmd::Sweep => {
             let n = store.sweep_expired_leases()?;
             println!("swept {} expired lease(s)", n);
+        }
+        LeaseCmd::Guard => {
+            // Get staged files from git.
+            let out = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only", "--relative"])
+                .stderr(std::process::Stdio::null())
+                .output();
+            let files: Vec<String> = match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                _ => {
+                    println!("warning: could not get staged files from git");
+                    return Ok(());
+                }
+            };
+            if files.is_empty() {
+                return Ok(());
+            }
+            let leases = store.list_leases(1000)?;
+            let mut blocked = Vec::new();
+            for f in &files {
+                let norm = model::lease_path_normalize(f);
+                for l in &leases {
+                    if l.holder == me {
+                        continue;
+                    }
+                    if model::lease_path_conflicts(&l.resource, &norm) {
+                        blocked.push((f.clone(), l.resource.clone(), l.holder.clone()));
+                        break;
+                    }
+                }
+            }
+            if !blocked.is_empty() {
+                println!("Blocked: staged files conflict with active leases:");
+                for (file, res, holder) in &blocked {
+                    println!(
+                        "  {} conflicts with lease '{}' held by {}",
+                        file, res, holder
+                    );
+                }
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

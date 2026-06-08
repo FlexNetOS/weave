@@ -241,6 +241,16 @@ pub fn run_in_cwd(db: &TestDb, args: &[&str], cwd: &std::path::Path) -> (bool, S
     run_stdin_full(db, args, "", Some(cwd), &[])
 }
 
+/// Like [`run_in_cwd`] but with extra environment variables applied after [`scrub_env`].
+pub fn run_in_cwd_env(
+    db: &TestDb,
+    args: &[&str],
+    cwd: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (bool, String, String) {
+    run_stdin_full(db, args, "", Some(cwd), extra_env)
+}
+
 /// A live `weave mcp` server you talk to over newline-delimited JSON-RPC.
 ///
 /// Reads happen on a background thread that pushes whole lines down a channel,

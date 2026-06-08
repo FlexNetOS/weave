@@ -42,7 +42,7 @@ and the open gaps the user flagged.
 
 ## Gaps from mcp_agent_mail cross-reference (2026-06-07)
 - [x] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity). `Store::search` with FTS5 virtual table (sqlite) + LIKE fallback (libsql). `weave search` CLI + `weave_search` MCP tool. 512 passed (sqlite), 472 passed + 1 ignored (libsql).
-- [ ] WL-029: Advisory file leases with TTL expiry and conflict detection (mcp_agent_mail parity).
+- [x] WL-029: Advisory file leases with TTL expiry and conflict detection (mcp_agent_mail parity). `lease_path_normalize` + `lease_path_conflicts` for prefix-based path conflict detection. Same-holder re-reserve extends TTL. Auto-sweep before list/reserve. `weave lease sweep` CLI + `weave_lease_sweep` MCP. 517 passed (sqlite), 477 passed + 1 ignored (libsql).
 - [ ] WL-030: Pre-commit Git hook for file reservation guard (mcp_agent_mail parity).
 - [ ] WL-031: Message importance / priority levels with urgent filtering (mcp_agent_mail parity).
 - [ ] WL-032: Per-peer contact policies (open / auto / contacts_only / block_all) with explicit request/respond handshake (mcp_agent_mail parity).

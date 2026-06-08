@@ -14,8 +14,8 @@
 mod common;
 
 use common::{
-    run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_ok, run_ok_env, McpServer,
-    TestDb,
+    run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_in_cwd_env, run_ok,
+    run_ok_env, McpServer, TestDb,
 };
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -97,6 +97,130 @@ fn mcp_stdio_initialize_list_and_send_inbox_roundtrip() {
 
     // Closing stdin ends the server cleanly (and reaps the child).
     mcp.shutdown();
+}
+
+#[test]
+fn cli_setup_git_hooks_installs_pre_commit() {
+    let db = TestDb::new();
+    // Create a temp git repo.
+    let repo = std::env::temp_dir().join(format!(
+        "weave-git-hook-it-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_init.status.success(), "git init failed");
+
+    // Run setup --git-hooks inside the repo.
+    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    assert!(
+        ok,
+        "setup --git-hooks should succeed:\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+    assert!(
+        out.contains("pre-commit guard") || out.contains("pre-commit already contains"),
+        "output should mention pre-commit hook: {out}"
+    );
+
+    // Verify the hook file exists and contains the guard line.
+    let hook = &repo.join(".git").join("hooks").join("pre-commit");
+    let contents = std::fs::read_to_string(&hook).unwrap();
+    assert!(
+        contents.contains("weave lease guard"),
+        "pre-commit hook should contain guard: {contents}"
+    );
+
+    // Idempotent: second run should not duplicate.
+    let (ok2, out2, _err2) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    assert!(ok2, "second setup should succeed: {out2}");
+    assert!(
+        out2.contains("already contains") || out2.contains("pre-commit already contains"),
+        "second run should report idempotency: {out2}"
+    );
+}
+
+#[test]
+fn cli_lease_guard_blocks_staged_file() {
+    let db = TestDb::new();
+    // Create a temp git repo.
+    let repo = std::env::temp_dir().join(format!(
+        "weave-guard-it-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_init.status.success(), "git init failed");
+
+    // Configure git user so commit works if we need it.
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+
+    // Create and stage a file.
+    let file_path = &repo.join("src/core.rs");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, "fn main() {}").unwrap();
+    let git_add = std::process::Command::new("git")
+        .args(["add", "src/core.rs"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_add.status.success(), "git add failed");
+
+    // Reserve the file as another holder (use env to set identity).
+    run_in_cwd_env(
+        &db,
+        &[
+            "lease",
+            "reserve",
+            "--resource",
+            "src/core.rs",
+            "--ttl",
+            "3600",
+        ],
+        &repo,
+        &[("WEAVE_SESSION", "other-peer")],
+    );
+
+    // Guard should fail because another peer holds the lease.
+    let (ok, out, _err) =
+        run_in_cwd_env(&db, &["lease", "guard"], &repo, &[("WEAVE_SESSION", "me")]);
+    assert!(
+        !ok,
+        "guard should fail when staged file is leased by another"
+    );
+    assert!(
+        out.contains("Blocked") || out.contains("conflicts"),
+        "guard output should mention blockage: {out}"
+    );
+
+    // Release the lease and guard should pass.
+    run_in_cwd_env(
+        &db,
+        &["lease", "release", "--resource", "src/core.rs"],
+        &repo,
+        &[("WEAVE_SESSION", "other-peer")],
+    );
+    let (ok2, _out2, _err2) =
+        run_in_cwd_env(&db, &["lease", "guard"], &repo, &[("WEAVE_SESSION", "me")]);
+    assert!(ok2, "guard should pass after lease released");
 }
 
 /// P5: the two new presence tools are advertised, behave self-only, and the failure
@@ -9080,7 +9204,10 @@ fn cli_lease_roundtrip() {
             "extended",
         ],
     );
-    assert!(ext.contains("leased crates/foo"), "extend should succeed: {ext}");
+    assert!(
+        ext.contains("leased crates/foo"),
+        "extend should succeed: {ext}"
+    );
 
     // Release.
     let rel = run_ok(&db, &["lease", "release", "--resource", "crates/foo"]);
