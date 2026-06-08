@@ -1,28 +1,26 @@
 # HANDOFF — weave-loop
 
-closed_utc: 2026-06-08T03:15:00Z
+closed_utc: 2026-06-08T16:20:00Z
 branch: feat/zellij-pane-targeting
 worktree: /home/drdave/Desktop/meta/weave-mcp-daemon-tools
 cycle_budget: 3
-cycles_total: 25
-last_item: WL-025
-next_item: WL-026
-orchestrator_phase: complete
-last_agent: n/a
+cycles_total: 26
+last_item: WL-026
+next_item: WL-027
+orchestrator_phase: handoff
+last_agent: weave-loop
 verifier_status: GREEN
 guardian_verdict: APPROVE
-pr_url: (none)
+pr_url: https://github.com/FlexNetOS/weave/pull/57
 landed_this_session:
-  - 5367747 weave-loop: resume (at WL-024)
-  - 10c2073 WL-024: Reservation leases
-  - 4dd568f WL-025: Stop-boundary wake
+  - PR #57 WL-026 — idempotency keys and trace IDs (auto-merge enabled)
 open_findings:
 decisions:
-  - WL-024 and WL-025 completed in cycle 2/3.
-  - Reservation leases use atomic INSERT ... ON CONFLICT with TTL expiry check.
-  - Stop-boundary wake is opt-in via --wake flag or WEAVE_STOP_WAKE=1 env var.
-  - Default stop behaviour remains peek-only for backward compatibility.
+  - WL-026 implemented with idempotency_key + trace_id on Message/Intent, both backends, CLI --idempotency-key, MCP idempotencyKey, auto-minted trace IDs.
+  - SQLite ALTER TABLE migration uses separate CREATE UNIQUE INDEX (inline UNIQUE rejected on non-empty tables).
+  - Next: WL-027 broadcast notify/ask fan-out to online peers in circle.
 dead_ends:
+  - Explicit SELECT projections in libsql inbox/history/thread needed updating; SELECT * in sqlite covered it automatically.
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh
   - cargo test --all-targets
