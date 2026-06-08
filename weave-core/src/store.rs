@@ -7,10 +7,9 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    new_review_id, now, permission_status, pr_url_valid, Ask, AskKind, AskManyResult, AskRole,
-    ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec,
-    JobState, Message, OrchestratorStatus, Peer, PermissionStatus, ReviewItem, ReviewItemState,
-    ReviewQueueFilter, Schedule, ScheduleKind, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
+    now, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind,
 };
 use anyhow::Result;
 
@@ -26,8 +25,9 @@ pub use crate::store_libsql::{
 #[cfg(feature = "sqlite")]
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
-    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, AskGroup,
-    AskManyChildView, AskState, BROADCAST_SQL, MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS,
+    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id,
+    permission_status, pr_url_valid, AskGroup, AskManyChildView, AskState, BROADCAST_SQL,
+    MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
