@@ -71,7 +71,8 @@ const SCHEMA: &[&str] = &[
         body            TEXT NOT NULL,
         in_reply_to     INTEGER,
         idempotency_key TEXT UNIQUE,
-        trace_id        TEXT
+        trace_id        TEXT,
+        priority        TEXT NOT NULL DEFAULT 'normal'
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -100,7 +101,8 @@ const SCHEMA: &[&str] = &[
         turn_state     TEXT NOT NULL DEFAULT '',
         description    TEXT NOT NULL DEFAULT '',
         description_ts INTEGER NOT NULL DEFAULT 0,
-        birth_cert     TEXT
+        birth_cert     TEXT,
+        contact_policy TEXT NOT NULL DEFAULT 'open'
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +114,8 @@ const SCHEMA: &[&str] = &[
         body            TEXT NOT NULL,
         sig             TEXT NOT NULL DEFAULT '',
         idempotency_key TEXT,
-        trace_id        TEXT
+        trace_id        TEXT,
+        priority        TEXT NOT NULL DEFAULT 'normal'
     )",
     "CREATE TABLE IF NOT EXISTS pull_cursor (
         source  TEXT PRIMARY KEY,
@@ -320,6 +323,7 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         in_reply_to: r.get::<Option<i64>>(6)?,
         idempotency_key: r.get::<Option<String>>(7).ok().flatten(),
         trace_id: r.get::<Option<String>>(8).ok().flatten(),
+        priority: r.get::<String>(9).unwrap_or_else(|_| "normal".to_string()),
     })
 }
 
@@ -338,6 +342,7 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
         sig: r.get::<String>(7)?,
         idempotency_key: r.get::<Option<String>>(8).ok().flatten(),
         trace_id: r.get::<Option<String>>(9).ok().flatten(),
+        priority: r.get::<String>(10).unwrap_or("normal".to_string()),
     })
 }
 
@@ -464,6 +469,8 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         turn_state: r.get::<String>(13)?,
         description: r.get::<String>(14)?,
         description_ts: r.get::<i64>(15)?,
+        birth_cert: r.get::<Option<String>>(16).ok().flatten(),
+        contact_policy: r.get::<String>(17).unwrap_or_else(|_| "open".to_string()),
     })
 }
 
@@ -1012,6 +1019,28 @@ impl LibsqlStore {
             )
             .await
             .context("creating messages_fts delete trigger")?;
+            // WL-031: message priority levels.
+            for (table, col, ddl) in [
+                ("messages", "priority", "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+                ("outbox", "priority", "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+            ] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    conn.execute(ddl, ()).await.with_context(|| format!("adding {table}.{col} column"))?;
+                }
+            }
+            // WL-032: per-peer contact policies.
+            let probe = "SELECT 1 FROM pragma_table_info('peers') WHERE name='contact_policy'";
+            let mut it = conn.query(probe, ()).await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN contact_policy TEXT NOT NULL DEFAULT 'open'",
+                    (),
+                )
+                .await
+                .context("adding peers.contact_policy column")?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1431,14 +1460,14 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
@@ -1485,7 +1514,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -1500,7 +1529,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1521,7 +1550,7 @@ impl Store for LibsqlStore {
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
-            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                  WHERE id IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
                  )
@@ -1542,7 +1571,7 @@ impl Store for LibsqlStore {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
@@ -1838,7 +1867,7 @@ impl Store for LibsqlStore {
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
                 SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                       m.idempotency_key, m.trace_id
+                       m.idempotency_key, m.trace_id, m.priority
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -2036,7 +2065,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -2059,7 +2088,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -2115,7 +2144,7 @@ impl Store for LibsqlStore {
             let holders: Vec<Peer> = {
                 let mut it = tx
                     .query(
-                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
                         (),
                     )
                     .await?;
@@ -2174,7 +2203,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
                     (),
                 )
                 .await?;
@@ -2245,17 +2274,19 @@ impl Store for LibsqlStore {
         sig: &str,
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
+        priority: Option<&str>,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
         check_body(body)?;
+        let p = priority.unwrap_or("normal").to_string();
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params(vec![
                         now().into(),
                         to.into(),
@@ -2266,6 +2297,7 @@ impl Store for LibsqlStore {
                         sig.into(),
                         idempotency_key.map(|s| s.to_string()).into(),
                         trace_id.map(|s| s.to_string()).into(),
+                        p.into(),
                     ]),
                 )
                 .await?;
@@ -2281,7 +2313,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
                      WHERE to_peer = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
                     params(vec![for_recipient.into(), since_id.into(), limit.into()]),
                 )
@@ -2300,7 +2332,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
                      ORDER BY id ASC LIMIT ?1",
                     params(vec![limit.into()]),
                 )
@@ -4033,6 +4065,50 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn set_message_priority(&self, id: i64, priority: &str) -> Result<()> {
+        let p = crate::model::MessagePriority::parse(priority);
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE messages SET priority = ?1 WHERE id = ?2",
+                    params(vec![p.as_str().into(), id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
+        let p = crate::model::ContactPolicy::parse(policy);
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE peers SET contact_policy = ?1 WHERE name = ?2",
+                    params(vec![p.as_str().into(), name.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn get_peer_policy(&self, name: &str) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT contact_policy FROM peers WHERE name = ?1",
+                    params(vec![name.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(row) => Ok::<_, anyhow::Error>(Some(row.get::<String>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn permission_verdict(
         &self,
         correlation_id: &str,
@@ -4120,7 +4196,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
@@ -5895,7 +5971,7 @@ mod tests {
         );
         assert_trapped(
             "enqueue_intent",
-            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None)
+            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None, None)
                 .map(|_| ()),
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
@@ -5986,12 +6062,32 @@ mod tests {
     fn enqueue_and_list_outbox_roundtrip_libsql() {
         let s = mem();
         let i1 = s
-            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "", None, None)
+            .enqueue_intent(
+                "bob",
+                "boxB",
+                "alice",
+                Some("hi"),
+                "body1",
+                "",
+                None,
+                None,
+                None,
+            )
             .unwrap();
-        s.enqueue_intent("carol", "", "alice", None, "for carol", "", None, None)
-            .unwrap();
+        s.enqueue_intent(
+            "carol",
+            "",
+            "alice",
+            None,
+            "for carol",
+            "",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None)
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None)
             .unwrap();
 
         let all = s.outbox_all(50).unwrap();
@@ -6165,8 +6261,18 @@ mod tests {
                 ..Config::default()
             };
             let a = LibsqlStore::open(&cfg).unwrap();
-            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "", None, None)
-                .unwrap();
+            a.enqueue_intent(
+                "bob",
+                "",
+                "alice",
+                Some("hi"),
+                "hello bob",
+                "",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
         // Snapshot A's main DB file BEFORE B pulls (WAL legitimately appears on a
         // read-only open; the invariant is asserted on the main data file + empty WAL).
@@ -7014,6 +7120,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         assert_eq!(
             s.peer_liveness(&p).unwrap(),

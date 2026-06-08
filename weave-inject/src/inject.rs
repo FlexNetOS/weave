@@ -1363,6 +1363,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -1388,6 +1390,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");
@@ -1432,6 +1436,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "terminal_3");

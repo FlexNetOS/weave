@@ -295,6 +295,8 @@ const DANGEROUS_TOOLS: &[&str] = &[
     "weave_uninstall",
     "weave_daemon_start",
     "weave_daemon_stop",
+    "weave_set_message_priority",
+    "weave_set_peer_policy",
 ];
 
 /// True if `name` is a dangerous tool that should be filtered in safe mode.
@@ -429,6 +431,9 @@ fn call_tool(
         "weave_attach" => tool_attach(store, me_default, args, injector),
         "weave_set_description" => tool_set_description(store, me_default, args),
         "weave_set_turn_state" => tool_set_turn_state(store, me_default, args),
+        "weave_set_message_priority" => tool_set_message_priority(store, args),
+        "weave_set_peer_policy" => tool_set_peer_policy(store, args),
+        "weave_get_peer_policy" => tool_get_peer_policy(store, args),
         "weave_connect" => tool_connect(store, args, injector),
         "weave_ask" => tool_ask(store, me_default, nudge_template, args, injector),
         "weave_answer" => tool_answer(store, me_default, nudge_template, args, injector),
@@ -536,6 +541,10 @@ fn tool_send(
         .get("idempotencyKey")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
@@ -574,6 +583,7 @@ fn tool_send(
                 &sig,
                 idempotency_key,
                 trace_id.as_deref(),
+                priority,
             )
             .map_err(e)?;
         return Ok(format!(
@@ -591,6 +601,9 @@ fn tool_send(
             trace_id.as_deref(),
         )
         .map_err(e)?;
+    if let Some(p) = priority {
+        let _ = store.set_message_priority(mid, p);
+    }
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
@@ -745,6 +758,10 @@ fn tool_notify(
         .get("idempotencyKey")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     let trace_id = Some(model::mint_trace_id());
 
     // Persist via the EXISTING send path (no new persistence — notify is a normal
@@ -761,6 +778,9 @@ fn tool_notify(
             trace_id.as_deref(),
         )
         .map_err(e)?;
+    if let Some(p) = priority {
+        let _ = store.set_message_priority(mid, p);
+    }
 
     // Trace: queued after persist (best-effort, never sinks the path).
     record_delivery_best_effort(
@@ -807,6 +827,10 @@ fn tool_broadcast_notify(
         .ok_or("'body' is required.")?;
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let circle = args.get("circle").and_then(|v| v.as_str());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     let peers = store.list_peers().map_err(e)?;
     let online: Vec<String> = peers
         .into_iter()
@@ -835,6 +859,9 @@ fn tool_broadcast_notify(
                 trace_id.as_deref(),
             )
             .map_err(e)?;
+        if let Some(p) = priority {
+            let _ = store.set_message_priority(mid, p);
+        }
         let verdict = ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
         let (stage, outcome) = verdict_to_stage(verdict);
         record_delivery_best_effort(
@@ -2059,6 +2086,51 @@ fn tool_set_turn_state(
     Ok(format!("Set turn_state for '{me}': {state}"))
 }
 
+fn tool_set_message_priority(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let message_id = args
+        .get("message_id")
+        .and_then(|v| v.as_i64())
+        .ok_or("'message_id' is required.")?;
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .ok_or("'priority' is required (low, normal, high, urgent).")?;
+    store
+        .set_message_priority(message_id, priority)
+        .map_err(e)?;
+    Ok(format!(
+        "Set priority of message #{message_id} to '{priority}'."
+    ))
+}
+
+fn tool_set_peer_policy(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("'name' is required.")?;
+    let policy = args
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .ok_or("'policy' is required (open, auto, contacts_only, block_all).")?;
+    let parsed = model::ContactPolicy::parse(policy);
+    store.set_peer_policy(name, parsed.as_str()).map_err(e)?;
+    Ok(format!(
+        "Set contact_policy for '{name}': {}",
+        parsed.as_str()
+    ))
+}
+
+fn tool_get_peer_policy(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("'name' is required.")?;
+    match store.get_peer_policy(name).map_err(e)? {
+        Some(p) => Ok(p),
+        None => Err(format!("No peer '{name}' found.")),
+    }
+}
+
 /// Connect handshake: capability-probe `peer` before sending. Reports a structured
 /// verdict and degrades gracefully — a registered-but-not-alive or non-injectable
 /// peer is NOT an error (`isError=false`); its messages still arrive via the store
@@ -2833,7 +2905,8 @@ fn tools() -> Value {
                 "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
                 "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
-                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."}
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
             },"required":["to","body"]}
         },
         {
@@ -2844,7 +2917,8 @@ fn tools() -> Value {
                 "to":{"type":"string","description":"Recipient session name (point-to-point; broadcast is not supported)."},
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
-                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."}
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
             },"required":["to","body"]}
         },
         {
@@ -2854,7 +2928,8 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
-                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."}
+                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
             },"required":["body"]}
         },
         {
@@ -2995,6 +3070,29 @@ fn tools() -> Value {
                 "state":{"type":"string","enum":["pending_first_turn","working","awaiting_input","idle"],"description":"The turn-state to set."},
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
             },"required":["state"]}
+        },
+        {
+            "name": "weave_set_message_priority",
+            "description": "Set the priority of an existing message. low, normal, high, urgent (default normal).",
+            "inputSchema": {"type":"object","properties":{
+                "message_id":{"type":"integer","description":"The message id to update."},
+                "priority":{"type":"string","description":"Priority level: low, normal, high, urgent."}
+            },"required":["message_id","priority"]}
+        },
+        {
+            "name": "weave_set_peer_policy",
+            "description": "Set a peer's contact policy. open (default), auto, contacts_only, block_all.",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The peer session name."},
+                "policy":{"type":"string","description":"Policy: open, auto, contacts_only, block_all."}
+            },"required":["name","policy"]}
+        },
+        {
+            "name": "weave_get_peer_policy",
+            "description": "Get a peer's current contact policy. Returns open, auto, contacts_only, block_all, or an error if the peer is not found.",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The peer session name."}
+            },"required":["name"]}
         },
         {
             "name": "weave_connect",

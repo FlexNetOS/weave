@@ -108,6 +108,10 @@ pub struct Message {
     /// `#[serde(default)]` keeps older JSON payloads deserializable.
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// Message priority: low, normal, high, urgent. Default normal.
+    /// Additive + backward-compatible: pre-existing rows read back as "normal".
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
@@ -153,6 +157,9 @@ pub struct Intent {
     /// `#[serde(default)]` keeps older JSON payloads deserializable.
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// Message priority carried on cross-store intents.
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 /// Hard upper bound (in chars) on a tracked-ask correlation id. The id is always
@@ -295,6 +302,86 @@ impl AskKind {
     pub fn parse(s: &str) -> Self {
         Self::from_str(s.trim().to_ascii_lowercase().as_str())
     }
+}
+
+/// WL-031: message priority levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessagePriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+
+impl MessagePriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessagePriority::Low => "low",
+            MessagePriority::Normal => "normal",
+            MessagePriority::High => "high",
+            MessagePriority::Urgent => "urgent",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => MessagePriority::Low,
+            "high" => MessagePriority::High,
+            "urgent" => MessagePriority::Urgent,
+            _ => MessagePriority::Normal,
+        }
+    }
+    /// Numeric rank for filtering: higher = more important.
+    pub fn rank(self) -> u8 {
+        match self {
+            MessagePriority::Low => 0,
+            MessagePriority::Normal => 1,
+            MessagePriority::High => 2,
+            MessagePriority::Urgent => 3,
+        }
+    }
+}
+
+pub fn default_priority() -> String {
+    MessagePriority::Normal.as_str().to_string()
+}
+
+/// WL-032: per-peer contact policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContactPolicy {
+    /// Accept all messages (default).
+    #[default]
+    Open,
+    /// Accept from known contacts; unknown senders get an auto-approval ask.
+    Auto,
+    /// Accept only from explicitly allowed contacts; block others.
+    ContactsOnly,
+    /// Block all incoming messages.
+    BlockAll,
+}
+
+impl ContactPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContactPolicy::Open => "open",
+            ContactPolicy::Auto => "auto",
+            ContactPolicy::ContactsOnly => "contacts_only",
+            ContactPolicy::BlockAll => "block_all",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => ContactPolicy::Open,
+            "auto" => ContactPolicy::Auto,
+            "contacts_only" | "contacts-only" | "contactsonly" => ContactPolicy::ContactsOnly,
+            "block_all" | "block-all" | "blockall" => ContactPolicy::BlockAll,
+            _ => ContactPolicy::Open,
+        }
+    }
+}
+
+pub fn default_contact_policy() -> String {
+    ContactPolicy::Open.as_str().to_string()
 }
 
 /// Which side of an ask a `list_asks` query filters on. `Asker` = asks I opened;
@@ -1467,6 +1554,14 @@ pub struct Peer {
     /// rows read `0`. `#[serde(default)]` keeps older JSON payloads deserializable.
     #[serde(default)]
     pub description_ts: i64,
+    /// Birth certificate nonce for identity takeover protection (WL-018).
+    /// Nullable; None means "not yet enrolled". Additive + backward-compatible.
+    #[serde(default)]
+    pub birth_cert: Option<String>,
+    /// Contact policy: open, auto, contacts_only, block_all. Default open.
+    /// Additive + backward-compatible: pre-existing rows read back as "open".
+    #[serde(default = "default_contact_policy")]
+    pub contact_policy: String,
 }
 
 /// Daemon-tier liveness classification (v0.2 presence seam).  Three tiers:
@@ -2414,6 +2509,8 @@ mod tests {
             turn_state: String::new(),
             description: desc.to_string(),
             description_ts: ts,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         }
     }
 

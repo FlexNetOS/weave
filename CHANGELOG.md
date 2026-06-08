@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased] — message priority & contact policies (WL-031 + WL-032)
+
+> **Message importance levels and per-peer contact policies.** Senders can tag
+> messages with `low`/`normal`/`high`/`urgent` priority. Recipients can set a
+> contact policy (`open`, `auto`, `contacts_only`, `block_all`) on each peer row.
+> Priority propagates through cross-store intents so pulled messages retain it.
+
+### Added
+- **model:** `MessagePriority` enum (`Low`/`Normal`/`High`/`Urgent`) and
+  `ContactPolicy` enum (`Open`/`Auto`/`ContactsOnly`/`BlockAll`); `priority`
+  column on `Message`/`Intent` with serde defaults for backward compatibility.
+- **store (both backends):** `priority` column on `messages` and `outbox`,
+  `contact_policy` column on `peers`, all via guarded additive migration;
+  `Store::set_message_priority`, `Store::set_peer_policy`, `Store::get_peer_policy`.
+- **CLI:** `--priority` on `weave send`, `weave notify`, and
+  `weave broadcast-notify`; new `weave peer-policy --name <peer> [--policy <policy>]`
+  command (omit `--policy` to read).
+- **MCP:** `priority` optional parameter on `weave_send`, `weave_notify`, and
+  `weave_broadcast_notify`; three new tools: `weave_set_message_priority`,
+  `weave_set_peer_policy`, `weave_get_peer_policy`.
+- **Tier-2:** `Intent` carries `priority`; `enqueue_intent` writes it to the
+  outbox and `commit_pulled` applies it to the receiver's local message.
+- **Tests:** CLI + MCP roundtrip tests for send/notify priority, broadcast
+  notify priority, set-message-priority, peer-policy set/get, and tools/list
+  presence.
+
+### Fixed
+- libsql `inbox` unread SELECT was missing `m.priority`, causing unread messages
+  to always read back as `normal` regardless of stored value.
+
 ## [Unreleased] — idempotency & tracing (WL-026)
 
 > **Per-message idempotency keys and distributed trace IDs.** Callers can supply

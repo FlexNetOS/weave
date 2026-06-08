@@ -210,6 +210,9 @@ enum Cmd {
         /// message id is returned instead of creating a new row.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -228,6 +231,9 @@ enum Cmd {
         /// message id is returned instead of creating a new row.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
     },
     /// Broadcast a notification to all online peers in your circle. Fan-out:
     /// one message per online peer, plus a live nudge for each injectable peer.
@@ -245,6 +251,9 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
     },
     /// Broadcast an ask to all online peers in your circle. Fan-out via
     /// ask-many: one tracked question per online peer. Returns a parent id
@@ -640,6 +649,14 @@ enum Cmd {
         state: String,
         #[arg(long)]
         me: Option<String>,
+    },
+    /// Set or get a peer's contact policy (WL-032). open (default), auto,
+    /// contacts_only, block_all. Omit --policy to read the current value.
+    PeerPolicy {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Schedule a future message delivery (one-shot or recurring).
     Schedule {
@@ -2594,6 +2611,7 @@ fn main() -> Result<()> {
             to_host,
             no_memory,
             idempotency_key,
+            priority,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2628,6 +2646,7 @@ fn main() -> Result<()> {
                         &sig,
                         idempotency_key.as_deref(),
                         Some(&trace_id),
+                        priority.as_deref(),
                     )?;
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
@@ -2640,6 +2659,9 @@ fn main() -> Result<()> {
                         idempotency_key.as_deref(),
                         Some(&trace_id),
                     )?;
+                    if let Some(p) = priority {
+                        let _ = store.set_message_priority(mid, &p);
+                    }
                     println!("sent #{mid}: {from} -> {to}");
                     let _ = inject_and_trace(
                         store,
@@ -2660,6 +2682,7 @@ fn main() -> Result<()> {
             subject,
             body,
             idempotency_key,
+            priority,
         } => {
             // Fire-and-forget point-to-point notification. Persist via the normal send
             // path (no fork), fire the SAME caller-side nudge + trace, and print the
@@ -2681,6 +2704,9 @@ fn main() -> Result<()> {
                 idempotency_key.as_deref(),
                 Some(&trace_id),
             )?;
+            if let Some(p) = priority {
+                let _ = store.set_message_priority(mid, &p);
+            }
             // Trace + nudge (best-effort trace, no store→inject edge). The honest
             // verdict is derived from the SAME inject result that drove the trace, so
             // the printed token and the recorded stage can never disagree.
@@ -2702,6 +2728,7 @@ fn main() -> Result<()> {
             body,
             circle,
             json,
+            priority,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2738,6 +2765,9 @@ fn main() -> Result<()> {
                         None,
                         Some(&trace_id),
                     )?;
+                    if let Some(p) = priority.as_ref() {
+                        let _ = store.set_message_priority(mid, p);
+                    }
                     let verdict = inject_and_trace(
                         store,
                         &cfg,
@@ -3981,6 +4011,20 @@ fn main() -> Result<()> {
             store::check_ident("name", &me)?;
             store.set_turn_state(&me, &state)?;
             println!("turn_state set for '{me}': {state}");
+        }
+
+        Cmd::PeerPolicy { name, policy } => {
+            store::check_ident("name", &name)?;
+            if let Some(p) = policy {
+                let parsed = crate::model::ContactPolicy::parse(&p);
+                store.set_peer_policy(&name, parsed.as_str())?;
+                println!("contact_policy set for '{name}': {}", parsed.as_str());
+            } else {
+                match store.get_peer_policy(&name)? {
+                    Some(p) => println!("{p}"),
+                    None => println!("(no peer '{name}' found)"),
+                }
+            }
         }
 
         Cmd::Memory { cmd } => dispatch_memory(&cfg, cmd)?,
@@ -5818,6 +5862,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let cases: &[(&str, Option<i64>, i64)] = &[
             ("h1", None, now),                               // same host, recent, no pid

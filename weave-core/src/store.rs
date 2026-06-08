@@ -313,6 +313,7 @@ pub trait Store: Send {
         sig: &str,
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
+        priority: Option<&str>,
     ) -> Result<i64>;
 
     /// Tier-2: read intents from THIS store's `outbox` addressed to `for_recipient`
@@ -707,6 +708,18 @@ pub trait Store: Send {
     /// removed. Write path.
     #[allow(dead_code)]
     fn sweep_expired_leases(&self) -> Result<usize>;
+
+    /// WL-031: set the priority of a message after creation.
+    #[allow(dead_code)]
+    fn set_message_priority(&self, id: i64, priority: &str) -> Result<()>;
+
+    /// WL-032: set a peer's contact policy.
+    #[allow(dead_code)]
+    fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()>;
+
+    /// WL-032: get a peer's contact policy.
+    #[allow(dead_code)]
+    fn get_peer_policy(&self, name: &str) -> Result<Option<String>>;
 
     /// WL-021: resolve the permission status of a ToolPermission ask by its
     /// correlation id. Returns the answer body when available so callers can log
@@ -1330,7 +1343,8 @@ CREATE TABLE IF NOT EXISTS messages (
     body            TEXT NOT NULL,
     in_reply_to     INTEGER,
     idempotency_key TEXT UNIQUE,
-    trace_id        TEXT
+    trace_id        TEXT,
+    priority        TEXT NOT NULL DEFAULT 'normal'
 );
 CREATE TABLE IF NOT EXISTS reads (
     message_id INTEGER NOT NULL,
@@ -1359,7 +1373,8 @@ CREATE TABLE IF NOT EXISTS peers (
     turn_state     TEXT NOT NULL DEFAULT '',
     description    TEXT NOT NULL DEFAULT '',
     description_ts INTEGER NOT NULL DEFAULT 0,
-    birth_cert     TEXT
+    birth_cert     TEXT,
+    contact_policy TEXT NOT NULL DEFAULT 'open'
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1371,7 +1386,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     body            TEXT NOT NULL,
     sig             TEXT NOT NULL DEFAULT '',
     idempotency_key TEXT,
-    trace_id        TEXT
+    trace_id        TEXT,
+    priority        TEXT NOT NULL DEFAULT 'normal'
 );
 CREATE TABLE IF NOT EXISTS pull_cursor (
     source  TEXT PRIMARY KEY,
@@ -1538,6 +1554,7 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
         in_reply_to: r.get("in_reply_to").unwrap_or(None),
         idempotency_key: r.get("idempotency_key").unwrap_or(None),
         trace_id: r.get("trace_id").unwrap_or(None),
+        priority: r.get("priority").unwrap_or("normal".to_string()),
     })
 }
 
@@ -1722,7 +1739,7 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
 #[cfg(feature = "sqlite")]
 fn peek_oldest_unread_conn(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
@@ -1768,6 +1785,8 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         turn_state: r.get(13)?,
         description: r.get(14)?,
         description_ts: r.get(15)?,
+        birth_cert: r.get(16).unwrap_or(None),
+        contact_policy: r.get(17).unwrap_or("open".to_string()),
     })
 }
 
@@ -1786,6 +1805,7 @@ fn row_to_intent(r: &Row) -> rusqlite::Result<Intent> {
         sig: r.get(7)?,
         idempotency_key: r.get(8).unwrap_or(None),
         trace_id: r.get(9).unwrap_or(None),
+        priority: r.get(10).unwrap_or("normal".to_string()),
     })
 }
 
@@ -2162,6 +2182,23 @@ fn migrate(conn: &Connection) -> Result<()> {
             VALUES ('delete', old.id, old.body, old.subject, old.sender);
         END;",
     )?;
+    // WL-031: message priority levels.
+    if !column_exists(conn, "messages", "priority")? {
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';",
+        )?;
+    }
+    if !column_exists(conn, "outbox", "priority")? {
+        conn.execute_batch(
+            "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';",
+        )?;
+    }
+    // WL-032: per-peer contact policies.
+    if !column_exists(conn, "peers", "contact_policy")? {
+        conn.execute_batch(
+            "ALTER TABLE peers ADD COLUMN contact_policy TEXT NOT NULL DEFAULT 'open';",
+        )?;
+    }
     Ok(())
 }
 
@@ -2599,7 +2636,12 @@ pub fn commit_pulled(
                 intent.idempotency_key.as_deref(),
                 intent.trace_id.as_deref(),
             ) {
-                Ok(_) => committed += 1,
+                Ok(mid) => {
+                    if !intent.priority.is_empty() && intent.priority != "normal" {
+                        let _ = local.set_message_priority(mid, &intent.priority);
+                    }
+                    committed += 1;
+                }
                 Err(e) => {
                     eprintln!(
                         "[weave] skipping intent #{} from source '{source}': {e}",
@@ -3235,7 +3277,7 @@ impl Store for SqliteStore {
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
@@ -3266,7 +3308,7 @@ impl Store for SqliteStore {
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
         )?;
         let mut rows: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3306,7 +3348,7 @@ impl Store for SqliteStore {
         };
         // Current orchestrators in the circle (normalize empty/legacy to default).
         let mut stmt = tx.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3353,7 +3395,7 @@ impl Store for SqliteStore {
             .unwrap_or(crate::model::DEFAULT_CIRCLE)
             .to_string();
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3453,7 +3495,7 @@ impl Store for SqliteStore {
                 SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
             )
             SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                   m.idempotency_key, m.trace_id
+                   m.idempotency_key, m.trace_id, m.priority
             FROM messages m JOIN t ON m.id = t.id
             ORDER BY m.id ASC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
@@ -3469,6 +3511,7 @@ impl Store for SqliteStore {
                     in_reply_to: r.get(6)?,
                     idempotency_key: r.get(7).unwrap_or(None),
                     trace_id: r.get(8).unwrap_or(None),
+                    priority: r.get(9).unwrap_or("normal".to_string()),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3504,15 +3547,17 @@ impl Store for SqliteStore {
         sig: &str,
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
+        priority: Option<&str>,
     ) -> Result<i64> {
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
         check_body(body)?;
+        let p = priority.unwrap_or("normal");
         self.conn.execute(
-            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![now(), to, to_host, from, subject, body, sig, idempotency_key, trace_id],
+            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![now(), to, to_host, from, subject, body, sig, idempotency_key, trace_id, p],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -3520,7 +3565,7 @@ impl Store for SqliteStore {
     fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox
              WHERE to_peer = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
         )?;
@@ -3533,7 +3578,7 @@ impl Store for SqliteStore {
     fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox
              ORDER BY id ASC LIMIT ?1",
         )?;
         let rows = stmt
@@ -4805,6 +4850,35 @@ impl Store for SqliteStore {
         Ok(n)
     }
 
+    fn set_message_priority(&self, id: i64, priority: &str) -> Result<()> {
+        let p = crate::model::MessagePriority::parse(priority);
+        self.conn.execute(
+            "UPDATE messages SET priority = ?1 WHERE id = ?2",
+            params![p.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
+        let p = crate::model::ContactPolicy::parse(policy);
+        self.conn.execute(
+            "UPDATE peers SET contact_policy = ?1 WHERE name = ?2",
+            params![p.as_str(), name],
+        )?;
+        Ok(())
+    }
+
+    fn get_peer_policy(&self, name: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT contact_policy FROM peers WHERE name = ?1")?;
+        let mut rows = stmt.query_map(params![name], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            _ => Ok(None),
+        }
+    }
+
     fn permission_verdict(
         &self,
         correlation_id: &str,
@@ -5003,6 +5077,8 @@ mod federation_tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         }
     }
 
@@ -6125,6 +6201,7 @@ mod tests {
                 "",
                 Some("ik"),
                 Some("tk"),
+                None,
             )
             .unwrap();
         let intents = s.outbox_all(10).unwrap();
@@ -6273,7 +6350,9 @@ mod tests {
                 turn_state: String::new(),
                 description: String::new(),
                 description_ts: 0,
-            };
+            birth_cert: None,
+            contact_policy: "open".to_string(),
+        };
 
             // Determinism: two evaluations of the same inputs agree.
             let a = liveness_for(&p, &this_host, now_ts);
@@ -6866,6 +6945,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -6877,6 +6958,8 @@ mod tests {
         let remote = Peer {
             host: format!("{}-not-this-host", crate::config::this_host()),
             pid: Some(999_999_999),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_ne!(remote.host, crate::config::this_host());
@@ -6889,6 +6972,8 @@ mod tests {
         let live_local = Peer {
             host: crate::config::this_host(),
             pid: Some(std::process::id() as i64),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert!(
@@ -6902,6 +6987,8 @@ mod tests {
         let dead_local = Peer {
             host: crate::config::this_host(),
             pid: Some(999_999_999),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         if cfg!(target_os = "linux") {
@@ -6916,6 +7003,8 @@ mod tests {
             host: crate::config::this_host(),
             pid: Some(std::process::id() as i64),
             last_seen: now() - ONLINE_TTL_SECS - 1,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert!(
@@ -6949,11 +7038,15 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
 
         // same-host + live pid (our own) => AliveLocal.
         let live_local = Peer {
             pid: Some(std::process::id() as i64),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -6973,6 +7066,8 @@ mod tests {
         // Linux-gated: on non-Linux pid_alive degrades to true.
         let dead_local = Peer {
             pid: Some(999_999_999),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         if cfg!(target_os = "linux") {
@@ -6987,6 +7082,8 @@ mod tests {
         let remote = Peer {
             host: format!("{this}-other"),
             pid: Some(999_999_999),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7000,6 +7097,8 @@ mod tests {
             host: format!("{this}-other"),
             pid: Some(999_999_999),
             last_seen: now_ts - ONLINE_TTL_SECS - 1,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7012,6 +7111,8 @@ mod tests {
         let empty_host = Peer {
             host: String::new(),
             pid: Some(999_999_999),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7023,6 +7124,8 @@ mod tests {
         // this_host == peer.host boundary: exact equality flips local/remote.
         let just_remote = Peer {
             host: format!("{this}x"),
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7034,6 +7137,8 @@ mod tests {
         // TTL boundary: last_seen == now_ts - ONLINE_TTL_SECS is inclusive-alive.
         let edge_alive = Peer {
             last_seen: now_ts - ONLINE_TTL_SECS,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7043,6 +7148,8 @@ mod tests {
         );
         let edge_stale = Peer {
             last_seen: now_ts - ONLINE_TTL_SECS - 1,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -7205,13 +7312,33 @@ mod tests {
     fn enqueue_and_list_outbox_roundtrip() {
         let s = mem();
         let i1 = s
-            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "", None, None)
+            .enqueue_intent(
+                "bob",
+                "boxB",
+                "alice",
+                Some("hi"),
+                "body1",
+                "",
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let _i2 = s
-            .enqueue_intent("carol", "", "alice", None, "for carol", "", None, None)
+            .enqueue_intent(
+                "carol",
+                "",
+                "alice",
+                None,
+                "for carol",
+                "",
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None)
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None)
             .unwrap();
 
         // Self-inspection sees all three, oldest-first.
@@ -7243,22 +7370,22 @@ mod tests {
     fn enqueue_intent_enforces_caps() {
         let s = mem();
         assert!(s
-            .enqueue_intent("", "", "a", None, "x", "", None, None)
+            .enqueue_intent("", "", "a", None, "x", "", None, None, None)
             .is_err());
         assert!(s
-            .enqueue_intent("b", "", "", None, "x", "", None, None)
+            .enqueue_intent("b", "", "", None, "x", "", None, None, None)
             .is_err());
         assert!(
-            s.enqueue_intent("b", "h\nx", "a", None, "x", "", None, None)
+            s.enqueue_intent("b", "h\nx", "a", None, "x", "", None, None, None)
                 .is_err(),
             "control char in to_host rejected"
         );
         let big = "x".repeat(MAX_BODY + 1);
         assert!(s
-            .enqueue_intent("b", "", "a", None, &big, "", None, None)
+            .enqueue_intent("b", "", "a", None, &big, "", None, None, None)
             .is_err());
         assert!(s
-            .enqueue_intent("b", "", "a", None, "ok", "", None, None)
+            .enqueue_intent("b", "", "a", None, "ok", "", None, None, None)
             .is_ok());
     }
 
@@ -7297,8 +7424,18 @@ mod tests {
         {
             let a = SqliteStore::open(&a_path).unwrap();
             for n in 0..3 {
-                a.enqueue_intent("bob", "", "alice", None, &format!("m{n}"), "", None, None)
-                    .unwrap();
+                a.enqueue_intent(
+                    "bob",
+                    "",
+                    "alice",
+                    None,
+                    &format!("m{n}"),
+                    "",
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
             }
         }
         let b = SqliteStore::open(&b_path).unwrap();
@@ -7355,8 +7492,18 @@ mod tests {
         // A enqueues an intent addressed to "bob" (B's identity).
         {
             let a = SqliteStore::open(&a_path).unwrap();
-            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "", None, None)
-                .unwrap();
+            a.enqueue_intent(
+                "bob",
+                "",
+                "alice",
+                Some("hi"),
+                "hello bob",
+                "",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
         // Snapshot A's bytes BEFORE B pulls.
         let before = std::fs::read(&a_path).unwrap();
@@ -7398,8 +7545,18 @@ mod tests {
         {
             let a = SqliteStore::open(&a_path).unwrap();
             // Addressed to carol, NOT to bob — must never reach bob's inbox.
-            a.enqueue_intent("carol", "", "alice", None, "not for bob", "", None, None)
-                .unwrap();
+            a.enqueue_intent(
+                "carol",
+                "",
+                "alice",
+                None,
+                "not for bob",
+                "",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let b = SqliteStore::open(&b_path).unwrap();
         let allow = vec![
@@ -7435,7 +7592,7 @@ mod tests {
         let s = SqliteStore::open(&path).unwrap();
         // The new tables exist and work.
         let id = s
-            .enqueue_intent("bob", "", "alice", None, "x", "", None, None)
+            .enqueue_intent("bob", "", "alice", None, "x", "", None, None, None)
             .unwrap();
         assert!(id > 0);
         assert_eq!(s.pull_cursor_get("src").unwrap(), 0);
@@ -7620,7 +7777,7 @@ mod tests {
         ) -> StoreSource {
             let p = dir.join(format!("{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
                 .unwrap();
             StoreSource::Local(p)
         }
@@ -7754,7 +7911,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -7959,7 +8116,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8046,7 +8203,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8120,7 +8277,7 @@ mod tests {
             let p = dir.join(format!("r{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
             let sig = sign_intent(pk_signer, "alice", "bob", body);
-            a.enqueue_intent("bob", "", "alice", None, body, &sig, None, None)
+            a.enqueue_intent("bob", "", "alice", None, body, &sig, None, None, None)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8464,8 +8621,18 @@ mod tests {
         let src_path = dir.join("src.db");
         let sa = SqliteStore::open(&src_path).unwrap();
         let sig = sign_intent(&alice, "alice", "bob", "revoked-hello");
-        sa.enqueue_intent("bob", "", "alice", None, "revoked-hello", &sig, None, None)
-            .unwrap();
+        sa.enqueue_intent(
+            "bob",
+            "",
+            "alice",
+            None,
+            "revoked-hello",
+            &sig,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let source = StoreSource::Local(src_path);
 
         // Receiver B registers alice's key but REVOKES its fingerprint.
@@ -8518,8 +8685,18 @@ mod tests {
         let src_path = dir.join("src.db");
         let sa = SqliteStore::open(&src_path).unwrap();
         let sig = sign_intent(&alice, "alice", "bob", "clean-hello");
-        sa.enqueue_intent("bob", "", "alice", None, "clean-hello", &sig, None, None)
-            .unwrap();
+        sa.enqueue_intent(
+            "bob",
+            "",
+            "alice",
+            None,
+            "clean-hello",
+            &sig,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let source = StoreSource::Local(src_path);
 
         let b = SqliteStore::open(&dir.join("b.db")).unwrap();
@@ -9141,6 +9318,8 @@ mod tests {
             turn_state: String::new(),
             description: desc.to_string(),
             description_ts: ts,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let ttl = crate::model::DESCRIPTION_TTL_SECS;
         // Exactly at the TTL boundary => expired (>=).
@@ -9236,6 +9415,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let liveness = s.peer_liveness(&p).unwrap();
         assert_eq!(
@@ -9249,6 +9430,8 @@ mod tests {
             name: "dave".into(),
             last_seen: crate::model::now(),
             pid: None,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..p.clone()
         };
         let liveness2 = s.peer_liveness(&p2).unwrap();
@@ -9259,6 +9442,8 @@ mod tests {
             name: "eve".into(),
             last_seen: 0,
             pid: None,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
             ..p.clone()
         };
         let liveness3 = s.peer_liveness(&p3).unwrap();
