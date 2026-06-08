@@ -3,27 +3,36 @@
 ## Current session state
 - **Branch:** `feat/zellij-pane-targeting`
 - **Worktree:** `/home/drdave/Desktop/meta/weave-mcp-daemon-tools`
-- **Last completed:** WL-017 — Mesh memory system
-- **Cycles this session:** 1 / 3
-- **Commit:** `9998190`
+- **Last completed:** WL-018 — Birth certificates / runtime identity envelopes
+- **Cycles this session:** 2 / 3
+- **Commit:** `48eefba`
 
 ## What was done (this session)
 
 ### Cycle 1 — WL-017: Mesh memory system
-- Added `weave-core/src/memory.rs` with `MemoryScope` (Global/Project/Persona/Orchestrator), `MemoryEntry`, full CRUD + search API
-- Added `build_context_prefix` for automatic memory context prefixing on message delivery
-- Added `config_dir()` helper in `config.rs`
-- CLI: `weave memory write/read/search/list/delete/scopes` + `--no-memory` opt-out on ask/send/reply
-- MCP: 5 memory tools (`weave_memory_write/read/search/list/delete`) with `no_memory` support
-- Context prefixing hooked into `tool_ask`, `tool_send`, `tool_reply`, `tool_answer`
-- Input caps: key ≤128 [a-zA-Z0-9_-], title ≤256, tags ≤16×64, body ≤64KiB, files ≤10k/scope, prefix ≤5 entries
-- Path traversal defense via `sanitize_key`
-- Tests: 13 unit tests in memory.rs, integration tests (CLI + MCP), security tests (path traversal + caps)
-- Full gate green: **463 passed** (sqlite), **433 passed + 1 ignored** (libsql)
+- Filesystem-backed scoped memory (`~/.config/weave/memory/`)
+- `MemoryScope`: Global, Project, Persona, Orchestrator
+- CLI: `weave memory write/read/search/list/delete/scopes`
+- MCP: 5 memory tools
+- Context prefixing on ask/send/reply/answer delivery
+- Full gate green: 463 passed (sqlite), 433 passed + 1 ignored (libsql)
 - Committed: `9998190`
 
+### Cycle 2 — WL-018: Birth certificates
+- `birth_cert` column on `peers` table (both backends)
+- `getrandom` made non-optional for crypto-secure nonces
+- `mint_birth_cert()`: 32 bytes → 64 hex chars
+- `register_peer_full` returns cert, verifies on re-register
+- Backward-compat: legacy peers get cert on next re-registration
+- CLI `attach`: `--cert` flag, auto-fetches stored cert
+- Hook `session`: reads `WEAVE_BIRTH_CERT` env var
+- MCP `initialize`/`tool_attach`: accept cert, return cert
+- Secret never leaked in `Peer` struct or public APIs
+- Full gate green: **463 passed** (sqlite), **433 passed + 1 ignored** (libsql)
+- Committed: `48eefba`
+
 ## Next up
-WL-018: Birth certificates / runtime identity envelopes — mint unguessable nonces at `SessionStart` to prevent path-based identity takeover during lazy MCP registration (repowire parity).
+WL-019: Co-orchestrator support — allow multiple live orchestrators to coexist in the same circle for resilience against rate limits or credit caps (repowire parity).
 
 ## Known issues / blockers
 None. Both backends build, test, and lint clean.

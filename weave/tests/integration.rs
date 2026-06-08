@@ -7236,20 +7236,33 @@ fn cli_orchestrator_claim_status_and_refusal() {
         &["orchestrator", "status", "--circle", "ring"],
         &[("WEAVE_SESSION", "lead")],
     );
-    assert!(status.contains("orchestrator present"), "status: {status}");
+    assert!(
+        status.contains("orchestrator(s) present"),
+        "status: {status}"
+    );
     assert!(status.contains("lead"), "status names the holder: {status}");
 
-    // A second peer's non-force claim is refused while lead is live.
-    let refused = run_ok_env(
+    // WL-019: co-orchestrator support — a second peer's non-force claim succeeds
+    // and becomes a co-orchestrator without demoting the first.
+    let co_claim = run_ok_env(
         &db,
         &["orchestrator", "claim"],
         &[("WEAVE_SESSION", "other"), ("WEAVE_CIRCLE", "ring")],
     );
     assert!(
-        refused.contains("refused"),
-        "non-force claim refused: {refused}"
+        co_claim.contains("claimed role=orchestrator"),
+        "co-orchestrator claim: {co_claim}"
     );
-    assert!(refused.contains("lead"), "names the live holder: {refused}");
+    // Status now lists both orchestrators.
+    let status2 = run_ok_env(
+        &db,
+        &["orchestrator", "status", "--circle", "ring"],
+        &[("WEAVE_SESSION", "lead")],
+    );
+    assert!(
+        status2.contains("lead") && status2.contains("other"),
+        "status shows both: {status2}"
+    );
 
     // An empty circle reports absent.
     let absent = run_ok_env(
@@ -7353,21 +7366,24 @@ fn mcp_orchestrator_claim_status_whoami() {
         serde_json::json!({"circle":"mcpc"}),
     );
     assert!(
-        present.contains("orchestrator present"),
+        present.contains("orchestrator(s) present"),
         "present: {present}"
     );
 
-    // FAILURE PATH: other claims without force while lead is live ⇒ refused (a
-    // normal tool result, not a protocol error).
-    let (is_err, refused) = mcp.call_tool(
+    // WL-019: co-orchestrator support — other claims without force succeed
+    // and becomes a co-orchestrator.
+    let (is_err, co_claimed) = mcp.call_tool(
         "weave_claim_orchestrator",
         serde_json::json!({"from":"other"}),
     );
     assert!(
         !is_err,
-        "refusal is a normal result, not a protocol error: {refused}"
+        "co-orchestrator claim is a normal result: {co_claimed}"
     );
-    assert!(refused.contains("refused"), "refusal text: {refused}");
+    assert!(
+        co_claimed.contains("claimed role=orchestrator"),
+        "co-orchestrator claim: {co_claimed}"
+    );
 
     // whoami echoes circle + role for lead.
     let (_e, who) = mcp.call_tool("weave_whoami", serde_json::json!({"me":"lead"}));

@@ -3100,28 +3100,19 @@ impl Store for SqliteStore {
             .filter(|p| crate::model::circle_or_default(&p.circle) == target)
             .collect();
         drop(stmt);
-        // A DIFFERENT live holder blocks an unforced claim.
-        if !force {
-            if let Some(live) = holders
-                .iter()
-                .filter(|p| p.name != me && is_alive(p))
-                .max_by_key(|p| p.last_seen)
-            {
-                return Ok(ClaimOutcome::Refused {
-                    circle: target,
-                    holder: live.name.clone(),
-                });
-            }
-        }
-        // Demote every OTHER orchestrator in the circle, then promote the caller.
+        // WL-019: co-orchestrator support.
+        // Non-force claims are additive: become a co-orchestrator without
+        // demoting existing ones. Force claims still steal (demote all others).
         let mut demoted = Vec::new();
-        for p in &holders {
-            if p.name != me {
-                tx.execute(
-                    "UPDATE peers SET role=?1 WHERE name=?2",
-                    params![crate::model::PeerRole::Peer.as_str(), p.name],
-                )?;
-                demoted.push(p.name.clone());
+        if force {
+            for p in &holders {
+                if p.name != me {
+                    tx.execute(
+                        "UPDATE peers SET role=?1 WHERE name=?2",
+                        params![crate::model::PeerRole::Peer.as_str(), p.name],
+                    )?;
+                    demoted.push(p.name.clone());
+                }
             }
         }
         // Promote the caller (and pin its circle to the resolved target so a claim
@@ -3149,16 +3140,16 @@ impl Store for SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
         )?;
-        let holder = stmt
+        let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .filter(|p| crate::model::circle_or_default(&p.circle) == target && is_alive(p))
-            .max_by_key(|p| p.last_seen);
+            .collect();
         Ok(OrchestratorStatus {
             circle: target,
-            present: holder.is_some(),
-            holder,
+            present: !holders.is_empty(),
+            holders,
         })
     }
 
@@ -6173,7 +6164,7 @@ mod tests {
     /// P4: claim refuses a non-force claim while a LIVE holder exists, and a
     /// `force=true` claim steals it (demoting the prior holder to 'peer').
     #[test]
-    fn claim_refuses_live_holder_then_force_steals() {
+    fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
         s.register_peer_full(
             "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
@@ -6188,15 +6179,19 @@ mod tests {
             s.claim_orchestrator_role("a", None, false).unwrap(),
             crate::model::ClaimOutcome::Claimed { .. }
         ));
-        // b claims without force while a is a LIVE holder ⇒ Refused (no write).
+        // WL-019: b claims without force while a is live ⇒ co-orchestrator (no demotion).
         match s.claim_orchestrator_role("b", None, false).unwrap() {
-            crate::model::ClaimOutcome::Refused { holder, circle } => {
-                assert_eq!(holder, "a");
+            crate::model::ClaimOutcome::Claimed { demoted, circle } => {
                 assert_eq!(circle, "c1");
+                assert!(
+                    demoted.is_empty(),
+                    "non-force claim should not demote: {demoted:?}"
+                );
             }
-            other => panic!("expected Refused, got {other:?}"),
+            other => panic!("expected Claimed, got {other:?}"),
         }
-        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "peer");
+        assert_eq!(s.get_peer("a").unwrap().unwrap().role, "orchestrator");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "orchestrator");
         // b claims WITH force ⇒ Claimed, a demoted to 'peer'.
         match s.claim_orchestrator_role("b", None, true).unwrap() {
             crate::model::ClaimOutcome::Claimed { demoted, circle } => {
@@ -6250,11 +6245,11 @@ mod tests {
         // Fresh holder ⇒ present.
         let st = s.orchestrator_status(Some("c1")).unwrap();
         assert!(st.present);
-        assert_eq!(st.holder.unwrap().name, "o");
+        assert_eq!(st.holders[0].name, "o");
         // An empty circle ⇒ absent.
         let st2 = s.orchestrator_status(Some("empty")).unwrap();
         assert!(!st2.present);
-        assert!(st2.holder.is_none());
+        assert!(st2.holders.is_empty());
         // Backdate last_seen well past the TTL window ⇒ is_alive false ⇒ absent.
         {
             let conn = Connection::open(&path).unwrap();

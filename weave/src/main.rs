@@ -3712,14 +3712,15 @@ fn dispatch_orchestrator(store: &dyn Store, cfg: &Config, cmd: OrchestratorCmd) 
             // given (so `weave orchestrator status` reports YOUR circle).
             let effective = circle.or_else(|| Some(cfg.circle()));
             let st = store.orchestrator_status(effective.as_deref())?;
-            match st.holder {
-                Some(h) if st.present => {
-                    println!(
-                        "orchestrator present in circle '{}': '{}' (online)",
-                        st.circle, h.name
-                    );
-                }
-                _ => println!("no live orchestrator in circle '{}'", st.circle),
+            if st.present {
+                let names: Vec<_> = st.holders.iter().map(|h| h.name.as_str()).collect();
+                println!(
+                    "orchestrator(s) present in circle '{}': {} (online)",
+                    st.circle,
+                    names.join(", ")
+                );
+            } else {
+                println!("no live orchestrator in circle '{}'", st.circle);
             }
         }
     }

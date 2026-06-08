@@ -1295,12 +1295,15 @@ fn tool_orchestrator_status(store: &dyn Store, args: &Value) -> Result<String, S
         .map(str::to_string)
         .unwrap_or_else(|| weave_core::config::Config::load().circle());
     let st = store.orchestrator_status(Some(&circle)).map_err(e)?;
-    match st.holder {
-        Some(h) if st.present => Ok(format!(
-            "orchestrator present in circle '{}': '{}' (online)",
-            st.circle, h.name
-        )),
-        _ => Ok(format!("no live orchestrator in circle '{}'", st.circle)),
+    if st.present {
+        let names: Vec<_> = st.holders.iter().map(|h| h.name.as_str()).collect();
+        Ok(format!(
+            "orchestrator(s) present in circle '{}': {} (online)",
+            st.circle,
+            names.join(", ")
+        ))
+    } else {
+        Ok(format!("no live orchestrator in circle '{}'", st.circle))
     }
 }
 

@@ -1061,15 +1061,15 @@ pub enum ClaimOutcome {
 }
 
 /// The result of an [`orchestrator_status`](crate::store::Store::orchestrator_status)
-/// query for a circle. `present` is true iff a LIVE (`role='orchestrator'` AND
-/// `is_alive`) holder exists; `holder` is the most-recently-seen live one. Pure
-/// data (no I/O), shared by the store + the mcp/main consumers.
+/// query for a circle. `present` is true iff at least one LIVE (`role='orchestrator'`
+/// AND `is_alive`) holder exists; `holders` lists all live ones. Pure data (no I/O),
+/// shared by the store + the mcp/main consumers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorStatus {
     pub circle: String,
     pub present: bool,
     #[serde(default)]
-    pub holder: Option<Peer>,
+    pub holders: Vec<Peer>,
 }
 
 /// A session that has registered itself, with where (if anywhere) it can be
