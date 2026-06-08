@@ -351,6 +351,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Full-text search over messages (FTS5 on sqlite, LIKE fallback on libsql).
+    Search {
+        /// FTS5 query string (sqlite) or substring (libsql)
+        #[arg(long, allow_hyphen_values = true)]
+        query: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// List registered peers (with presence + injectability).
     Peers {
         /// machine-readable JSON output
@@ -3300,6 +3311,37 @@ fn main() -> Result<()> {
                 }
                 if remaining > 0 {
                     println!("({remaining} more unread)");
+                }
+            }
+        }
+
+        Cmd::Search { query, limit, json } => {
+            let rows = store.search(&query, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query": query, "messages": rows
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!("search '{query}': no matches");
+            } else {
+                for m in &rows {
+                    let subj = m
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    println!(
+                        "#{} [{}] {} -> {}{}\n  {}",
+                        m.id,
+                        model::fmt_ts(m.ts),
+                        m.sender,
+                        m.recipient,
+                        subj,
+                        m.body
+                    );
                 }
             }
         }

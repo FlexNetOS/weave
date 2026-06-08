@@ -41,7 +41,7 @@ and the open gaps the user flagged.
 - [x] **FrankenNetworkX crate extraction** (bonus, not in original backlog) — `fnx-classes` + `fnx-algorithms` + `fnx-runtime` wired in via Cargo git dependencies. `weave graph` command builds peer/message communication graph and runs connected_components + degree_centrality + density. 510 passed (sqlite), 470 passed + 1 ignored (libsql).
 
 ## Gaps from mcp_agent_mail cross-reference (2026-06-07)
-- [x] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity). `Store::search` with FTS5 virtual table (sqlite) + LIKE fallback (libsql). `weave search` CLI + `weave_search` MCP tool. 512 passed (sqlite), 472 passed + 1 ignored (libsql).
+- [ ] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity).
 - [ ] WL-029: Advisory file leases with TTL expiry and conflict detection (mcp_agent_mail parity).
 - [ ] WL-030: Pre-commit Git hook for file reservation guard (mcp_agent_mail parity).
 - [ ] WL-031: Message importance / priority levels with urgent filtering (mcp_agent_mail parity).

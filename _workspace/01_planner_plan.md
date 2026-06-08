@@ -1,49 +1,72 @@
-# WL-027 Plan: Broadcast notify / broadcast ask
+# Plan: WL-028 — FTS5 full-text search on messages
 
-## Goal
-Add fan-out notifications and asks to all online peers in the caller's circle, not just the existing `--to all` store broadcast alias. This is repowire parity.
+## Objective
+Enable fast full-text search across message body, subject, and sender fields using
+SQLite FTS5. Provide CLI (`weave search`) and MCP (`weave_search`) interfaces.
 
-## Current state
-- `send --to all` writes ONE message row with `recipient = "all"`; read-time `IN` clause makes it visible to everyone.
-- `notify` and `ask` explicitly REJECT broadcast aliases.
-- `ask_many` is the only existing fan-out: caller enumerates peers explicitly, store creates one child per peer, caller nudges each.
-- Circle is a peer-listing filter, not a message-layer scope.
-- Presence/liveness: `is_alive()` checks TTL (15 min) + PID for local peers.
+## Architecture
 
-## Touched files
-| File | Layer | What changes | Why |
-|---|---|---|---|
-| `weave-core/src/store.rs` | store | Add `broadcast_notify(me, subject, body)` and `broadcast_ask(me, subject, body, reply_to)` default methods on `Store` trait that enumerate online peers in circle and fan out | Core fan-out logic |
-| `weave-core/src/store.rs` | store | Add `list_online_peers_in_circle(circle)` helper | Filter peers by liveness + circle |
-| `weave/src/main.rs` | main | Add `BroadcastNotify { subject, body }` and `BroadcastAsk { subject, body, reply_to }` CLI subcommands | User-facing |
-| `weave-mcp/src/mcp.rs` | mcp | Add `weave_broadcast_notify` and `weave_broadcast_ask` MCP tools | MCP-facing |
-| `weave/tests/integration.rs` | tests | Add CLI roundtrip tests for broadcast notify/ask | Integration |
-| `weave/tests/security.rs` | tests | Add caps tests (max peer count, body length) | Security |
+### Schema (both backends)
+- New `messages_fts` FTS5 virtual table shadowing `messages`:
+  ```sql
+  CREATE VIRTUAL TABLE messages_fts USING fts5(
+    body, subject, sender,
+    content='messages',
+    content_rowid='id'
+  );
+  ```
+- Triggers keep `messages_fts` in sync on INSERT/UPDATE/DELETE:
+  ```sql
+  CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, body, subject, sender)
+    VALUES (new.id, new.body, new.subject, new.sender);
+  END;
+  CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+    VALUES ('delete', old.id, old.body, old.subject, old.sender);
+  END;
+  ```
+- Guarded migration: `CREATE VIRTUAL TABLE IF NOT EXISTS` + trigger `IF NOT EXISTS`.
 
-## Dual-backend?
-**Yes.** The `Store` trait changes need to compile on both backends. The fan-out logic should be default trait methods that call existing backend-specific methods (`list_peers`, `send`, `ask`), so minimal per-backend code.
+### Store trait
+- New method: `fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>>`
+- sqlite: `SELECT * FROM messages WHERE id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2)`
+- libsql: same SQL (libsql FFI includes FTS5 constants; verified in target/debug/build/libsql-ffi-*/out/bindgen.rs)
 
-## Invariants in scope
-- Input caps: body length, subject length
-- No shell: no new external process spawning
-- MCP stdout discipline
+### CLI
+- `Cmd::Search { query: String, limit: i64, json: bool }`
+- `weave search "hello world"` → human-readable list
+- `weave search "hello world" --json` → JSON array
+- `weave search "hello world" --limit 20` (default 50, capped at MAX_LIMIT)
 
-## Test layers required
-| Layer | Cases |
-|---|---|
-| Unit (store) | `broadcast_notify` creates one row per online peer; offline peers skipped |
-| Integration | CLI `broadcast-notify` and `broadcast-ask` roundtrip |
-| Security | Oversized body rejected; max peer count enforced |
+### MCP
+- `weave_search` tool in `tools()` schema
+- `tool_search(store, args)` → JSON result string
 
-## Edit order
-1. `store.rs`: Add `list_online_peers_in_circle` and `broadcast_notify`/`broadcast_ask` default trait methods.
-2. `store_libsql.rs`: Ensure `list_peers` returns enough data for liveness filtering.
-3. `main.rs`: Add CLI subcommands.
-4. `mcp.rs`: Add MCP tools.
-5. Tests.
-6. Full gate both backends.
+### Test layers
+- Unit: `store.search` roundtrip in both backends
+- Integration: `cli_search_finds_sent_message` — send a message, search for its body
+- Security: oversized query rejected, hostile query sanitized
 
-## Risks / open questions
-- Should offline peers get a queued message anyway (like store broadcast does), or should broadcast be strictly online-only? **Tentative: online-only for notify, online-only for ask** — this matches the "push to live panes" intent of broadcast.
-- How to report per-peer results? Aggregated list like `ask_many` outcome.
-- Circle scope: use the caller's own circle from config, or accept `--circle` override? **Tentative: accept optional `--circle`; default to caller's configured circle.**
+## Invariants (from weave-invariants skill)
+- No shell: query text never reaches a shell
+- Parameterized SQL: `MATCH ?1`
+- Input caps: query length capped, limit clamped
+- No upward deps: `model` ← `store` ← `mcp`/`main`
+
+## Dual-backend
+- FTS5 virtual table + triggers in both `store.rs` (sqlite) and `store_libsql.rs` (libsql)
+- libsql verified: libsql-ffi build output contains `FTS5_TOKENIZE_QUERY` etc.
+
+## Files to touch
+- `weave-core/src/store.rs` — schema migration, Store trait + impl, `search` method
+- `weave-core/src/store_libsql.rs` — schema migration, async `search` impl
+- `weave/src/main.rs` — `Cmd::Search` + dispatch arm
+- `weave-mcp/src/mcp.rs` — `weave_search` tool schema + handler
+- `weave/tests/integration.rs` — integration test
+- `weave/tests/security.rs` — security test
+
+## Migration strategy
+- Additive only: `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts`
+- Triggers with `IF NOT EXISTS` guard
+- Backfill existing messages: `INSERT INTO messages_fts(rowid, body, subject, sender) SELECT id, body, subject, sender FROM messages`

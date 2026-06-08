@@ -4,24 +4,23 @@ closed_utc: 2026-06-08T16:58:00Z
 branch: feat/zellij-pane-targeting
 worktree: /home/drdave/Desktop/meta/weave-mcp-daemon-tools
 cycle_budget: 3
-cycles_total: 26
-last_item: WL-027
-next_item: WL-028
+cycles_total: 27
+last_item: WL-028
+next_item:
 orchestrator_phase: handoff
 last_agent: weave-loop
 verifier_status: GREEN
 guardian_verdict: APPROVE
 pr_url:
 landed_this_session:
-  - WL-027 — broadcast notify / broadcast ask (MCP + CLI)
-  - FrankenNetworkX crate extraction — `weave graph` command
+  - WL-028 — FTS5 full-text search on messages (Store trait + sqlite + libsql + CLI + MCP + tests)
 open_findings:
 decisions:
-  - WL-027: `weave_broadcast_notify` + `weave_broadcast_ask` MCP tools with circle-scoped online peer enumeration and per-peer live nudge fan-out.
-  - WL-027: `weave broadcast-notify` + `weave broadcast-ask` CLI commands with `--json` output.
-  - FrankenNetworkX: extracted `fnx-classes`, `fnx-algorithms`, `fnx-runtime` via Cargo git dependencies.
-  - `weave graph` builds a communication graph from peer/message store data, runs connected_components + degree_centrality + density.
-  - All gates green: 510 tests (sqlite), 470 tests (libsql), fmt + clippy clean.
+  - WL-028: `Store::search` trait method with FTS5 virtual table on sqlite (body, subject, sender) and LIKE fallback on libsql.
+  - WL-028: `weave search` CLI command with `--query`, `--limit`, `--json` flags.
+  - WL-028: `weave_search` MCP tool advertised in tools/list with required `query` param.
+  - Integration tests: `cli_search_finds_messages_by_body_and_subject`, `mcp_search_finds_messages`.
+  - All gates green: 512 tests (sqlite), 472 tests (libsql), fmt + clippy clean on both backends.
 dead_ends:
 verify_on_resume:
   - bash _workspace/verify-on-resume.sh

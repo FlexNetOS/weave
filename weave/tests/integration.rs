@@ -368,6 +368,78 @@ fn cli_send_trace_id_in_json() {
 }
 
 #[test]
+fn cli_search_finds_messages_by_body_and_subject() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "project alpha",
+            "--body",
+            "the quick brown fox",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "bob",
+            "--to",
+            "alice",
+            "--subject",
+            "project beta",
+            "--body",
+            "lazy dog",
+        ],
+    );
+    // Search by body substring (FTS5 token on sqlite, LIKE on libsql).
+    let out = run_ok(&db, &["search", "--query", "quick"]);
+    assert!(
+        out.contains("quick brown fox"),
+        "search should find body: {out:?}"
+    );
+    assert!(
+        !out.contains("lazy dog"),
+        "search should not match other message: {out:?}"
+    );
+
+    // Search by subject.
+    let subj = run_ok(&db, &["search", "--query", "alpha"]);
+    assert!(
+        subj.contains("project alpha"),
+        "search should find subject: {subj:?}"
+    );
+
+    // Search by sender.
+    let sender = run_ok(&db, &["search", "--query", "bob"]);
+    assert!(
+        sender.contains("lazy dog"),
+        "search should find by sender: {sender:?}"
+    );
+
+    // No matches.
+    let empty = run_ok(&db, &["search", "--query", "nonexistent"]);
+    assert!(
+        empty.contains("no matches"),
+        "empty search should say no matches: {empty:?}"
+    );
+
+    // JSON output.
+    let json = run_ok(&db, &["search", "--query", "fox", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["query"], "fox", "json should echo query");
+    let msgs = parsed["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "json should have one match");
+    assert_eq!(msgs[0]["body"], "the quick brown fox");
+}
+
+#[test]
 fn cli_graph_shows_peer_communication_network() {
     let db = TestDb::new();
     // Register peers under a different host so they stay alive after register exits.
@@ -417,6 +489,51 @@ fn cli_graph_shows_peer_communication_network() {
         cent["alice"].as_f64().unwrap() > cent["bob"].as_f64().unwrap(),
         "alice should have higher centrality than bob"
     );
+}
+
+#[test]
+fn mcp_search_finds_messages() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    mcp.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "weave-it", "version": "0"}
+        }),
+    );
+    mcp.send_raw(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    }));
+
+    // Seed a message.
+    let (is_err, _) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({"from": "alice", "to": "bob", "body": "hello world"}),
+    );
+    assert!(!is_err, "send should succeed");
+
+    // Search for it.
+    let (is_err, text) = mcp.call_tool("weave_search", serde_json::json!({"query": "hello"}));
+    assert!(!is_err, "search should not error: {text}");
+    assert!(
+        text.contains("hello world"),
+        "search result should contain message body: {text:?}"
+    );
+
+    // Empty search.
+    let (is_err, empty) =
+        mcp.call_tool("weave_search", serde_json::json!({"query": "nonexistent"}));
+    assert!(!is_err, "empty search should not error: {empty}");
+    assert!(
+        empty.contains("no matches"),
+        "empty search should report no matches: {empty:?}"
+    );
+
+    mcp.shutdown();
 }
 
 #[test]

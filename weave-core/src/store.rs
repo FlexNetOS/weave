@@ -87,6 +87,9 @@ pub trait Store: Send {
         limit: i64,
     ) -> Result<(Vec<Message>, i64)>;
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>>;
+    /// Full-text search over messages using FTS5. Returns matching messages
+    /// newest-first, capped at `limit`. Read-only.
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>>;
     /// Messages addressed to `me` (direct or broadcast) with `id > since_id` and
     /// `sender != me`, oldest-first, capped at `limit`. Lets `weave watch` page
     /// strictly forward from the last id it saw without dropping backlog (unlike
@@ -2133,6 +2136,27 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "outbox", "trace_id")? {
         conn.execute_batch("ALTER TABLE outbox ADD COLUMN trace_id TEXT;")?;
     }
+    // WL-028: FTS5 full-text search on messages.
+    // The virtual table is created only when FTS5 is available (sqlite build).
+    // libsql also supports FTS5 (verified via libsql-ffi build constants).
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            body, subject, sender,
+            content='messages',
+            content_rowid='id'
+        );",
+    )?;
+    // Sync triggers: keep messages_fts in sync with messages.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, body, subject, sender)
+            VALUES (new.id, new.body, new.subject, new.sender);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+            VALUES ('delete', old.id, old.body, old.subject, old.sender);
+        END;",
+    )?;
     Ok(())
 }
 
@@ -2926,6 +2950,20 @@ impl Store for SqliteStore {
             v
         };
         rows.reverse();
+        Ok(rows)
+    }
+
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        let sql = "SELECT * FROM messages
+             WHERE id IN (
+                 SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
+             )
+             ORDER BY id DESC LIMIT ?2";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![query, limit], row_to_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 

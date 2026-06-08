@@ -244,6 +244,20 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS leases (\n        resource  TEXT PRIMARY KEY,\n        holder    TEXT NOT NULL,\n        acquired  INTEGER NOT NULL,\n        expires   INTEGER NOT NULL,\n        note      TEXT NOT NULL DEFAULT ''\n    )",
     "CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder)",
     "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires)",
+    // WL-028: FTS5 full-text search on messages
+    "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        body, subject, sender,
+        content='messages',
+        content_rowid='id'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, body, subject, sender)
+        VALUES (new.id, new.body, new.subject, new.sender);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+        VALUES ('delete', old.id, old.body, old.subject, old.sender);
+    END",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -969,6 +983,35 @@ impl LibsqlStore {
             )
             .await
             .context("creating idempotency_key unique index")?;
+            // WL-028: FTS5 full-text search on messages.
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    body, subject, sender,
+                    content='messages',
+                    content_rowid='id'
+                )",
+                (),
+            )
+            .await
+            .context("creating messages_fts virtual table")?;
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, body, subject, sender)
+                    VALUES (new.id, new.body, new.subject, new.sender);
+                END",
+                (),
+            )
+            .await
+            .context("creating messages_fts insert trigger")?;
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+                    VALUES ('delete', old.id, old.body, old.subject, old.sender);
+                END",
+                (),
+            )
+            .await
+            .context("creating messages_fts delete trigger")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1471,6 +1514,26 @@ impl Store for LibsqlStore {
                 }
             };
             rows.reverse();
+            Ok(rows)
+        })
+    }
+
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id FROM messages
+                 WHERE id IN (
+                     SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
+                 )
+                 ORDER BY id DESC LIMIT ?2";
+            let mut it = self
+                .conn
+                .query(sql, params(vec![query.into(), limit.into()]))
+                .await?;
+            let mut rows: Vec<Message> = Vec::new();
+            while let Some(r) = it.next().await? {
+                rows.push(row_to_message(&r)?);
+            }
             Ok(rows)
         })
     }

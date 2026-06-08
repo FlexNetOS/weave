@@ -416,6 +416,7 @@ fn call_tool(
         "weave_outbox" => tool_outbox(store, args),
         "weave_inbox" => tool_inbox(store, me_default, pull, args, injector),
         "weave_history" => tool_history(store, me_default, args),
+        "weave_search" => tool_search(store, args),
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
         "weave_peers" => tool_peers(store, me_default, extra_dbs, args, injector),
@@ -1116,6 +1117,38 @@ fn tool_history(store: &dyn Store, def: &Option<String>, args: &Value) -> Result
         None => format!("involving '{me}' (incl. broadcasts)"),
     };
     let mut out = format!("History ({label}) — {} message(s):", rows.len());
+    for m in &rows {
+        let subj = m
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n\n#{} [{}] {} -> {}{}\n{}",
+            m.id,
+            fmt_ts(m.ts),
+            m.sender,
+            m.recipient,
+            subj,
+            m.body
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_search(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing or empty 'query' parameter.".to_string())?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let rows = store.search(query, limit).map_err(e)?;
+    if rows.is_empty() {
+        return Ok(format!("Search for '{query}': no matches."));
+    }
+    let mut out = format!("Search ('{query}') — {} message(s):", rows.len());
     for m in &rows {
         let subj = m
             .subject
@@ -2865,6 +2898,14 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "me":{"type":"string"},"peer":{"type":"string"},"limit":{"type":"integer"}
             },"required":[]}
+        },
+        {
+            "name": "weave_search",
+            "description": "Full-text search over messages (FTS5 on sqlite, LIKE fallback on libsql). Returns matching messages newest-first.",
+            "inputSchema": {"type":"object","properties":{
+                "query":{"type":"string","description":"Search query string (FTS5 syntax on sqlite, substring on libsql)."},
+                "limit":{"type":"integer"}
+            },"required":["query"]}
         },
         {
             "name": "weave_sessions",
