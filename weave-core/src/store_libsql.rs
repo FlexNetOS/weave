@@ -261,6 +261,14 @@ const SCHEMA: &[&str] = &[
         INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
         VALUES ('delete', old.id, old.body, old.subject, old.sender);
     END",
+    // WL-033: thread summarization cache
+    "CREATE TABLE IF NOT EXISTS summaries (
+        root_id     INTEGER PRIMARY KEY,
+        text        TEXT NOT NULL,
+        model       TEXT NOT NULL DEFAULT '',
+        created_ts  INTEGER NOT NULL,
+        refreshed_ts INTEGER NOT NULL
+    )",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -1041,6 +1049,19 @@ impl LibsqlStore {
                 .await
                 .context("adding peers.contact_policy column")?;
             }
+            // WL-033: thread summarization cache.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS summaries (
+                    root_id     INTEGER PRIMARY KEY,
+                    text        TEXT NOT NULL,
+                    model       TEXT NOT NULL DEFAULT '',
+                    created_ts  INTEGER NOT NULL,
+                    refreshed_ts INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating summaries table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -4173,6 +4194,67 @@ impl Store for LibsqlStore {
                 asks.push(row_to_ask(&r)?);
             }
             Ok::<_, anyhow::Error>(asks)
+        })
+    }
+
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(root_id) DO UPDATE SET
+                     text = excluded.text,
+                     model = excluded.model,
+                     refreshed_ts = excluded.refreshed_ts",
+                    params(vec![
+                        root_id.into(),
+                        text.into(),
+                        model.into(),
+                        ts.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT root_id, text, model, created_ts, refreshed_ts
+                     FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            if let Some(r) = it.next().await? {
+                Ok(Some(crate::model::Summary {
+                    root_id: r.get(0)?,
+                    text: r.get(1)?,
+                    model: r.get(2)?,
+                    created_ts: r.get(3)?,
+                    refreshed_ts: r.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn delete_summary(&self, root_id: i64) -> Result<bool> {
+        self.rt.block_on(async {
+            let rows = self
+                .conn
+                .execute(
+                    "DELETE FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(rows > 0)
         })
     }
 }
@@ -7352,5 +7434,24 @@ mod tests {
         let perms = s.list_permissions("alice", 10).unwrap();
         assert_eq!(perms.len(), 1);
         assert_eq!(perms[0].kind, crate::model::AskKind::ToolPermission);
+    }
+
+    #[test]
+    fn summary_roundtrip_libsql() {
+        let s = mem();
+        assert!(s.get_summary(1).unwrap().is_none());
+        s.store_summary(1, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum.root_id, 1);
+        assert_eq!(sum.text, "summary text");
+        assert_eq!(sum.model, "gpt-4");
+        // Upsert refreshes
+        s.store_summary(1, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum2.text, "new text");
+        assert_eq!(sum2.model, "gpt-3");
+        assert!(s.delete_summary(1).unwrap());
+        assert!(!s.delete_summary(1).unwrap());
+        assert!(s.get_summary(1).unwrap().is_none());
     }
 }

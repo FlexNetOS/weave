@@ -622,6 +622,24 @@ pub struct Config {
     /// omit the key loading unchanged.
     #[serde(default)]
     pub circle: Option<String>,
+    /// LLM API endpoint for thread summarization (WL-033). e.g.
+    /// `https://api.openai.com/v1/chat/completions`. Overlaid by `WEAVE_LLM_ENDPOINT`.
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    /// LLM API key. Treated as a secret: redacted in Debug. Overlaid by
+    /// `WEAVE_LLM_API_KEY`.
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    /// Model name to request from the LLM endpoint. Overlaid by `WEAVE_LLM_MODEL`.
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// Timeout in seconds for a single LLM request. Overlaid by `WEAVE_LLM_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub llm_timeout_secs: Option<i64>,
+    /// Maximum characters of thread text to send to the LLM. Overlaid by
+    /// `WEAVE_LLM_MAX_INPUT_CHARS`.
+    #[serde(default)]
+    pub llm_max_input_chars: Option<i64>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -651,6 +669,14 @@ impl std::fmt::Debug for Config {
                 &self.pull_token.as_ref().map(|_| "<redacted>"),
             )
             .field("circle", &self.circle)
+            .field("llm_endpoint", &self.llm_endpoint)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("llm_model", &self.llm_model)
+            .field("llm_timeout_secs", &self.llm_timeout_secs)
+            .field("llm_max_input_chars", &self.llm_max_input_chars)
             .finish()
     }
 }

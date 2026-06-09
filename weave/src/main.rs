@@ -314,6 +314,21 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Generate or retrieve a cached LLM summary of the thread.
+        #[arg(long)]
+        summarize: bool,
+        /// Force a fresh LLM summary even if a cached one exists.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Summarize arbitrary text via the configured LLM endpoint.
+    Summarize {
+        /// Text to summarize (inline). If omitted, reads from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Show read receipts for a message: who has read it, and when.
     Receipts {
@@ -3209,8 +3224,50 @@ fn main() -> Result<()> {
 
         Cmd::Orchestrator { cmd } => dispatch_orchestrator(store, &cfg, cmd)?,
 
-        Cmd::Thread { root, limit, json } => {
+        Cmd::Thread {
+            root,
+            limit,
+            json,
+            summarize: _summarize,
+            refresh: _refresh,
+        } => {
             let rows = store.thread(root, limit)?;
+            #[cfg(feature = "llm")]
+            if _summarize {
+                let summary = if _refresh {
+                    None
+                } else {
+                    store.get_summary(root)?
+                };
+                let text = match summary {
+                    Some(s) => s.text,
+                    None => {
+                        let thread_text = rows
+                            .iter()
+                            .map(|m| format!("{}: {}", m.sender, m.body))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let sum = weave_core::llm::summarize_text(&cfg, &thread_text)?;
+                        store.store_summary(
+                            root,
+                            &sum,
+                            cfg.llm_model.as_deref().unwrap_or("unknown"),
+                        )?;
+                        sum
+                    }
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "root": root, "summary": text
+                        }))?
+                    );
+                } else {
+                    println!("thread #{root} summary:\n{text}");
+                }
+                return Ok(());
+            }
             if json {
                 println!(
                     "{}",
@@ -3244,6 +3301,37 @@ fn main() -> Result<()> {
                         m.body
                     );
                 }
+            }
+        }
+
+        Cmd::Summarize { text, json } => {
+            #[cfg(feature = "llm")]
+            {
+                let input = match text {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    }
+                };
+                let sum = weave_core::llm::summarize_text(&cfg, &input)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "summary": sum
+                        }))?
+                    );
+                } else {
+                    println!("{sum}");
+                }
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                let _ = text;
+                let _ = json;
+                anyhow::bail!("weave was compiled without the llm feature");
             }
         }
 

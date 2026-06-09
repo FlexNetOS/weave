@@ -19,6 +19,7 @@ default = ["sqlite"]
 sqlite = ["weave-core/sqlite"]
 libsql = ["weave-core/libsql", "weave-mcp/libsql"]
 sign = ["weave-core/sign", "weave-mcp/sign"]
+llm = ["weave-core/llm"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }

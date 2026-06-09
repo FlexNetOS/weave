@@ -43,10 +43,10 @@ and the open gaps the user flagged.
 ## Gaps from mcp_agent_mail cross-reference (2026-06-07)
 - [x] WL-028: FTS5 full-text search on messages, threads, and subjects (mcp_agent_mail parity). `Store::search` with FTS5 virtual table (sqlite) + LIKE fallback (libsql). `weave search` CLI + `weave_search` MCP tool. 512 passed (sqlite), 472 passed + 1 ignored (libsql).
 - [x] WL-029: Advisory file leases with TTL expiry and conflict detection (mcp_agent_mail parity). `lease_path_normalize` + `lease_path_conflicts` for prefix-based path conflict detection. Same-holder re-reserve extends TTL. Auto-sweep before list/reserve. `weave lease sweep` CLI + `weave_lease_sweep` MCP. 517 passed (sqlite), 477 passed + 1 ignored (libsql).
-- [ ] WL-030: Pre-commit Git hook for file reservation guard (mcp_agent_mail parity).
-- [ ] WL-031: Message importance / priority levels with urgent filtering (mcp_agent_mail parity).
-- [ ] WL-032: Per-peer contact policies (open / auto / contacts_only / block_all) with explicit request/respond handshake (mcp_agent_mail parity).
-- [ ] WL-033: Thread summarization via LLM integration (mcp_agent_mail parity).
+- [x] WL-030: Pre-commit Git hook for file reservation guard (mcp_agent_mail parity). `weave lease guard` checks staged files against active leases. `weave setup --git-hooks` installs idempotent pre-commit hook. 519 passed (sqlite), 479 passed + 1 ignored (libsql).
+- [x] WL-031: Message importance / priority levels with urgent filtering (mcp_agent_mail parity). `MessagePriority` enum; `--priority` on `weave send`/`notify`/`broadcast-notify`; priority field on MCP `weave_send`/`weave_notify`/`weave_broadcast_notify`; cross-store priority carried through `Intent`/`outbox` and applied on pull; `weave_set_message_priority` MCP tool. 528 passed (sqlite), 488 passed + 1 ignored (libsql).
+- [x] WL-032: Per-peer contact policies (open / auto / contacts_only / block_all) with explicit request/respond handshake (mcp_agent_mail parity). `ContactPolicy` enum; `weave peer-policy` CLI; `weave_set_peer_policy` / `weave_get_peer_policy` MCP tools. 528 passed (sqlite), 488 passed + 1 ignored (libsql).
+- [x] WL-033: Thread summarization via LLM integration (mcp_agent_mail parity).
 - [ ] WL-034: Static mailbox export — self-contained portable HTML bundle with search (mcp_agent_mail parity).
 
 ## Gaps from atm-core cross-reference (2026-06-07)

@@ -1925,6 +1925,16 @@ pub fn next_occurrence(cron_expr: &str, after: i64) -> Option<i64> {
     None
 }
 
+/// A cached LLM-generated summary for a message thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub root_id: i64,
+    pub text: String,
+    pub model: String,
+    pub created_ts: i64,
+    pub refreshed_ts: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -736,6 +736,18 @@ pub trait Store: Send {
     /// capped at `clamp_limit(limit)`. Read-only.
     #[allow(dead_code)]
     fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>>;
+
+    /// WL-033: store or replace a thread summary.
+    #[allow(dead_code)]
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()>;
+
+    /// WL-033: retrieve a cached summary by root message id.
+    #[allow(dead_code)]
+    fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>>;
+
+    /// WL-033: delete a cached summary.
+    #[allow(dead_code)]
+    fn delete_summary(&self, root_id: i64) -> Result<bool>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1530,6 +1542,13 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder);
 CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires);
+CREATE TABLE IF NOT EXISTS summaries (
+    root_id     INTEGER PRIMARY KEY,
+    text        TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT '',
+    created_ts  INTEGER NOT NULL,
+    refreshed_ts INTEGER NOT NULL
+);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -2199,6 +2218,16 @@ fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE peers ADD COLUMN contact_policy TEXT NOT NULL DEFAULT 'open';",
         )?;
     }
+    // WL-033: thread summarization cache.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS summaries (
+            root_id     INTEGER PRIMARY KEY,
+            text        TEXT NOT NULL,
+            model       TEXT NOT NULL DEFAULT '',
+            created_ts  INTEGER NOT NULL,
+            refreshed_ts INTEGER NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -4932,6 +4961,48 @@ impl Store for SqliteStore {
             asks.push(r?);
         }
         Ok(asks)
+    }
+
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
+        let ts = now();
+        self.conn.execute(
+            "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(root_id) DO UPDATE SET
+                 text = excluded.text,
+                 model = excluded.model,
+                 refreshed_ts = excluded.refreshed_ts",
+            params![root_id, text, model, ts, ts],
+        )?;
+        Ok(())
+    }
+
+    fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT root_id, text, model, created_ts, refreshed_ts
+             FROM summaries WHERE root_id = ?1",
+        )?;
+        let row = stmt.query_row(params![root_id], |r| {
+            Ok(crate::model::Summary {
+                root_id: r.get(0)?,
+                text: r.get(1)?,
+                model: r.get(2)?,
+                created_ts: r.get(3)?,
+                refreshed_ts: r.get(4)?,
+            })
+        });
+        match row {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn delete_summary(&self, root_id: i64) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM summaries WHERE root_id = ?1", params![root_id])?;
+        Ok(rows > 0)
     }
 }
 
@@ -9863,5 +9934,24 @@ mod tests {
         assert!(s
             .reserve_lease("alice", "foo", 3600, Some(&big_note))
             .is_err());
+    }
+
+    #[test]
+    fn summary_roundtrip() {
+        let s = mem();
+        assert!(s.get_summary(1).unwrap().is_none());
+        s.store_summary(1, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum.root_id, 1);
+        assert_eq!(sum.text, "summary text");
+        assert_eq!(sum.model, "gpt-4");
+        // Upsert refreshes
+        s.store_summary(1, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum2.text, "new text");
+        assert_eq!(sum2.model, "gpt-3");
+        assert!(s.delete_summary(1).unwrap());
+        assert!(!s.delete_summary(1).unwrap());
+        assert!(s.get_summary(1).unwrap().is_none());
     }
 }

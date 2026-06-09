@@ -8,5 +8,8 @@ pub mod testenv;
 #[cfg(feature = "libsql")]
 pub mod store_libsql;
 
+#[cfg(feature = "llm")]
+pub mod llm;
+
 #[cfg(feature = "sign")]
 pub mod sign;

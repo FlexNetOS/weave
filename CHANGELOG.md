@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased] — thread summarization via LLM (WL-033)
+
+> **LLM-powered thread summarization.** Generate concise summaries of message
+> threads using an OpenAI-compatible chat-completion endpoint. Summaries are
+> cached in-store and can be refreshed on demand.
+
+### Added
+- **model:** `Summary` struct with `root_id`, `text`, `model`, `created_ts`,
+  `refreshed_ts`; new `summaries` table in both backends with additive migration.
+- **store (both backends):** `Store::store_summary`, `Store::get_summary`,
+  `Store::delete_summary`.
+- **config:** `llm_endpoint`, `llm_api_key` (redacted in Debug), `llm_model`,
+  `llm_timeout_secs`, `llm_max_input_chars`; all overlayable via env vars.
+- **CLI:** `weave thread --root <id> --summarize [--refresh]`; new
+  `weave summarize --text "..."` command.
+- **MCP:** `weave_thread_summarize` and `weave_summarize_text` tools
+  (feature-gated behind `llm`; return graceful errors when unconfigured).
+- **LLM client:** new `weave-core/src/llm.rs` module using `reqwest::blocking`,
+  gated behind the `llm` Cargo feature (off by default). Caps input text and
+  `max_tokens` for safety.
+- **Tests:** store round-trip tests for both backends; unconfigured-endpoint and
+  secret-redaction tests for the LLM module.
+
 ## [Unreleased] — message priority & contact policies (WL-031 + WL-032)
 
 > **Message importance levels and per-peer contact policies.** Senders can tag

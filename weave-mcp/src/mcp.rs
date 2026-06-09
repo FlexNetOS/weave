@@ -477,6 +477,8 @@ fn call_tool(
         "weave_lease_release" => tool_lease_release(store, me_default, args),
         "weave_lease_list" => tool_lease_list(store, args),
         "weave_lease_sweep" => tool_lease_sweep(store),
+        "weave_thread_summarize" => tool_thread_summarize(store, args),
+        "weave_summarize_text" => tool_summarize_text(args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -3454,6 +3456,21 @@ fn tools() -> Value {
             "name": "weave_lease_sweep",
             "description": "Remove all expired leases and return the count swept.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_thread_summarize",
+            "description": "Generate or retrieve a cached LLM summary for a message thread. If a cached summary exists and refresh is not requested, it is returned immediately.",
+            "inputSchema": {"type":"object","properties":{
+                "root_id":{"type":"integer","description":"The message id at the root of the thread."},
+                "refresh":{"type":"boolean","description":"Force a fresh summary even if a cached one exists."}
+            },"required":["root_id"]}
+        },
+        {
+            "name": "weave_summarize_text",
+            "description": "Summarize arbitrary text via the configured LLM endpoint. Does not persist the summary.",
+            "inputSchema": {"type":"object","properties":{
+                "text":{"type":"string","description":"The text to summarize."}
+            },"required":["text"]}
         }
     ])
 }
@@ -4122,6 +4139,47 @@ fn tool_lease_list(store: &dyn Store, args: &Value) -> Result<String, String> {
 fn tool_lease_sweep(store: &dyn Store) -> Result<String, String> {
     let n = store.sweep_expired_leases().map_err(|e| e.to_string())?;
     Ok(format!("swept {} expired lease(s)", n))
+}
+
+#[cfg(feature = "llm")]
+fn tool_thread_summarize(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let root_id = args["root_id"]
+        .as_i64()
+        .ok_or("root_id must be an integer")?;
+    let refresh = args["refresh"].as_bool().unwrap_or(false);
+    let summary = if refresh {
+        None
+    } else {
+        store.get_summary(root_id).map_err(|e| e.to_string())?
+    };
+    let text = match summary {
+        Some(s) => s.text,
+        None => {
+            let rows = store.thread(root_id, 200).map_err(|e| e.to_string())?;
+            let _thread_text = rows
+                .iter()
+                .map(|m| format!("{}: {}", m.sender, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err("LLM summarization not yet available via MCP".to_string());
+        }
+    };
+    Ok(text)
+}
+
+#[cfg(not(feature = "llm"))]
+fn tool_thread_summarize(_store: &dyn Store, _args: &Value) -> Result<String, String> {
+    Err("weave was compiled without the llm feature".to_string())
+}
+
+#[cfg(feature = "llm")]
+fn tool_summarize_text(_args: &Value) -> Result<String, String> {
+    Err("weave_summarize_text requires config access not yet wired in MCP".to_string())
+}
+
+#[cfg(not(feature = "llm"))]
+fn tool_summarize_text(_args: &Value) -> Result<String, String> {
+    Err("weave was compiled without the llm feature".to_string())
 }
 
 #[cfg(test)]
