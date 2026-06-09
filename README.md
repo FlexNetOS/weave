@@ -67,6 +67,21 @@ Send `--to all` (or `*`) to broadcast; read state is tracked per-reader.
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
 
+## Codex 7-layer harness
+
+The checked-in weave-loop can be driven through the binary:
+
+```bash
+weave harness ide-merge-ide
+weave harness ide-merge-ide --execute
+```
+
+Dry-run is the default and prints the seven layers plus the exact environment.
+`--execute` delegates to `.claude/skills/weave-loop/scripts/ralph-weave.sh` with
+Kimi Code preflight/review around Ollama-launched Claude MiniMax implementation
+passes. Execution defaults to apply mode for the no-human loop; use `--safe` to
+disable destructive applies inside the runner.
+
 ## Native injector
 
 | Mux | Detect (env) | Inject |

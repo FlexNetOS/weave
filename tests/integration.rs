@@ -205,6 +205,37 @@ fn cli_sessions_reports_activity_after_send() {
     );
 }
 
+#[test]
+fn harness_ide_merge_ide_dry_run_prints_seven_layer_plan() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "harness",
+            "ide-merge-ide",
+            "--worktree",
+            "/tmp/weave-harness-test",
+        ],
+    );
+
+    assert!(
+        out.contains("codex-7-layer ide-merge-ide harness (dry-run)"),
+        "dry run should identify the harness: {out:?}"
+    );
+    assert!(
+        out.contains("Kimi Code preflight") && out.contains("Ollama-launched Claude"),
+        "dry run should show Kimi and Ollama/Claude MiniMax layers: {out:?}"
+    );
+    assert!(
+        out.contains("WEAVE_AGENT_CMD=ollama launch claude --model minimax-m3:cloud --"),
+        "dry run should expose the MiniMax agent command: {out:?}"
+    );
+    assert!(
+        out.contains("WEAVE_KIMI_CMD=kimi-legacy"),
+        "dry run should expose the Kimi command: {out:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Native injector via a fake mux
 // ---------------------------------------------------------------------------

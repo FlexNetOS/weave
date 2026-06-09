@@ -14,6 +14,7 @@
 //!   weave sessions       list known sessions
 //!   weave register       register this session as an injectable peer
 //!   weave inject         manually inject text into a peer's pane (test)
+//!   weave harness        dry-run/run autonomous orchestration harnesses
 //!   weave config init    scaffold a commented ~/.config/weave/config.toml
 //!   weave completions    print a shell completion script (bash|zsh|fish)
 //!   weave man            print a roff man page to stdout
@@ -29,6 +30,7 @@ compile_error!(
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
 mod config;
+mod harness;
 mod inject;
 mod mcp;
 mod model;
@@ -231,6 +233,11 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// Autonomous orchestration harnesses.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
     /// Configuration helpers.
     Config {
         #[command(subcommand)]
@@ -252,6 +259,69 @@ enum ConfigCmd {
     /// Scaffold a commented ~/.config/weave/config.toml. Never overwrites an
     /// existing file, so it is safe to run repeatedly.
     Init,
+}
+
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Seven-layer Codex IDE-merge-IDE loop: Kimi Code plans/reviews, Ollama
+    /// launches Claude MiniMax for implementation, durable workspace sentinels
+    /// control resume/handoff. Defaults to dry-run; pass --execute to run.
+    IdeMergeIde {
+        /// Worktree that contains Cargo.toml and the checked-in weave-loop script.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+        /// Number of backlog cycles a fresh MiniMax pass may close before handoff.
+        #[arg(long, default_value_t = 3)]
+        budget: u32,
+        /// External runner hard stop.
+        #[arg(long, default_value_t = 50)]
+        max_iters: u32,
+        /// Seconds between fresh MiniMax sessions.
+        #[arg(long, default_value_t = 5)]
+        sleep: u64,
+        /// Execute the harness. Without this flag the command only prints the plan.
+        #[arg(long)]
+        execute: bool,
+        /// Keep destructive applies disabled inside the loop.
+        #[arg(long)]
+        safe: bool,
+        /// Print machine-readable JSON plan in dry-run mode.
+        #[arg(long)]
+        json: bool,
+        /// Command prefix used for the implementation agent.
+        #[arg(
+            long,
+            default_value = "ollama launch claude --model minimax-m3:cloud --"
+        )]
+        agent_cmd: String,
+        /// Label passed through to the existing runner for logs.
+        #[arg(long, default_value = "minimax-m3:cloud")]
+        model: String,
+        /// Extra args appended after the implementation prompt.
+        #[arg(long, default_value = "")]
+        agent_model_args: String,
+        /// Disable Kimi Code preflight.
+        #[arg(long)]
+        no_kimi_plan: bool,
+        /// Disable Kimi Code review.
+        #[arg(long)]
+        no_kimi_review: bool,
+        /// Kimi Code command.
+        #[arg(long, default_value = "kimi-legacy")]
+        kimi_cmd: String,
+        /// Kimi Code model label.
+        #[arg(long, default_value = "kimi-code/kimi-for-coding")]
+        kimi_model: String,
+        /// Reused logged-in Kimi Code session id.
+        #[arg(long, default_value = "3c6e42cf-090d-4553-a84b-e63fb9c511c1")]
+        kimi_session: String,
+        /// Kimi session-resume flag (`-r` for kimi-legacy).
+        #[arg(long, default_value = "-r")]
+        kimi_session_flag: String,
+        /// Extra Kimi args.
+        #[arg(long, default_value = "--quiet")]
+        kimi_extra_args: String,
+    },
 }
 
 /// Shells we can emit completion scripts for. Kept as a local enum (rather than
@@ -451,6 +521,49 @@ fn print_man() -> Result<()> {
     Ok(())
 }
 
+fn run_harness(cmd: &HarnessCmd) -> Result<()> {
+    match cmd {
+        HarnessCmd::IdeMergeIde {
+            worktree,
+            budget,
+            max_iters,
+            sleep,
+            execute,
+            safe,
+            json,
+            agent_cmd,
+            model,
+            agent_model_args,
+            no_kimi_plan,
+            no_kimi_review,
+            kimi_cmd,
+            kimi_model,
+            kimi_session,
+            kimi_session_flag,
+            kimi_extra_args,
+        } => {
+            let mut opts = harness::IdeMergeIde::with_defaults(worktree.clone());
+            opts.budget = *budget;
+            opts.max_iters = *max_iters;
+            opts.sleep_secs = *sleep;
+            opts.execute = *execute;
+            opts.apply = !*safe;
+            opts.json = *json;
+            opts.agent_cmd = agent_cmd.clone();
+            opts.model = model.clone();
+            opts.agent_model_args = agent_model_args.clone();
+            opts.no_kimi_plan = *no_kimi_plan;
+            opts.no_kimi_review = *no_kimi_review;
+            opts.kimi_cmd = kimi_cmd.clone();
+            opts.kimi_model = kimi_model.clone();
+            opts.kimi_session = kimi_session.clone();
+            opts.kimi_session_flag = kimi_session_flag.clone();
+            opts.kimi_extra_args = kimi_extra_args.clone();
+            harness::run_ide_merge_ide(opts)
+        }
+    }
+}
+
 /// Poll the inbox and print new messages until interrupted (Ctrl-C). Always a
 /// PEEK (never marks read) so the normal hook drain still delivers them.
 ///
@@ -569,6 +682,7 @@ fn main() -> Result<()> {
         }
         Cmd::Completions { shell } => return print_completions(*shell),
         Cmd::Man => return print_man(),
+        Cmd::Harness { cmd } => return run_harness(cmd),
         _ => {}
     }
 
@@ -576,9 +690,12 @@ fn main() -> Result<()> {
     let store = store.as_ref();
 
     match cli.cmd {
-        Cmd::Setup | Cmd::Uninstall | Cmd::Config { .. } | Cmd::Completions { .. } | Cmd::Man => {
-            unreachable!("handled above")
-        }
+        Cmd::Setup
+        | Cmd::Uninstall
+        | Cmd::Config { .. }
+        | Cmd::Completions { .. }
+        | Cmd::Man
+        | Cmd::Harness { .. } => unreachable!("handled above"),
 
         Cmd::Mcp { session } => {
             let def = session

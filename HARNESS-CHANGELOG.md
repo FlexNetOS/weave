@@ -12,6 +12,7 @@ git-tracked commit on `harness/weave-loop`. (Per HARNESS-UPGRADE-KIT §9.)
 | 2026-06-06 | (this) | `.claude/commands/weave-loop.md` | `/weave-loop resume from _workspace/HANDOFF.md` slash command. |
 | 2026-06-06 | (this) | `.claude/skills/weave-loop/scripts/ralph-weave.sh` + `README.md` | External `/new` runner; SAFE default, `WEAVE_APPLY=1` opt-in, `STOP`/`MAX_ITERS` backstops. |
 | 2026-06-07 | (this) | `.claude/skills/weave-loop/scripts/ralph-weave.sh` + `README.md` | Coordinated logged-in Kimi Code K2.6 session (`kimi-legacy -r 3c6e...`) preflight/review around Ollama Cloud MiniMax implementation passes. |
+| 2026-06-07 | (this) | `src/harness.rs`, `src/main.rs`, `tests/integration.rs`, `README.md` | Added `weave harness ide-merge-ide`: a dry-run/execute Codex seven-layer orchestration surface for Kimi Code + Ollama-launched Claude MiniMax. |
 
 ## Bootstrap hazard (single rule, repeated)
 
