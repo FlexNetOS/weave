@@ -41,7 +41,7 @@ use crate::model::{
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
     AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job,
     JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
-    BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    Summary, BROADCAST_SQL, MAX_DELIVERY_ROWS,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
@@ -212,6 +212,16 @@ const SCHEMA: &[&str] = &[
         pid          INTEGER,
         heartbeat_ts INTEGER NOT NULL DEFAULT 0
     )",
+    // WL-033: LLM thread summarization cache
+    "CREATE TABLE IF NOT EXISTS summaries (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        root_id      INTEGER NOT NULL UNIQUE,
+        text         TEXT NOT NULL,
+        model        TEXT NOT NULL DEFAULT '',
+        created_ts   INTEGER NOT NULL,
+        refreshed_ts INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_summaries_root ON summaries(root_id)",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -786,6 +796,27 @@ impl LibsqlStore {
                     .await
                     .context("creating delivery_log index")?;
             }
+            // Migration (WL-033): summaries table for LLM thread summarization.
+            // Created via SCHEMA above for a fresh DB; also created idempotently here.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS summaries (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    root_id      INTEGER NOT NULL UNIQUE,
+                    text         TEXT NOT NULL,
+                    model        TEXT NOT NULL DEFAULT '',
+                    created_ts   INTEGER NOT NULL,
+                    refreshed_ts INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating summaries table")?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_summaries_root ON summaries(root_id)",
+                (),
+            )
+            .await
+            .context("creating idx_summaries_root")?;
             // Migration (v0.2): presence table for daemon heartbeats. Created via
             // SCHEMA above for a fresh DB; also created idempotently here for a DB
             // that predates it. Constant DDL — no user data interpolated.
@@ -3292,6 +3323,73 @@ impl Store for LibsqlStore {
                 )
                 .await
                 .context("evict_stale_presence")?;
+            Ok(n as usize)
+        })
+    }
+
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<i64> {
+        let ts = crate::model::now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
+                     VALUES (?1, ?2, ?3, ?4, ?4)
+                     ON CONFLICT(root_id) DO UPDATE SET
+                         text = excluded.text,
+                         model = excluded.model,
+                         refreshed_ts = excluded.refreshed_ts",
+                    params(vec![root_id.into(), text.into(), model.into(), ts.into()]),
+                )
+                .await
+                .context("store_summary")?;
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(r.get::<i64>(0)?),
+                None => anyhow::bail!("summary row not found after upsert"),
+            }
+        })
+    }
+
+    fn get_summary(&self, root_id: i64) -> Result<Option<Summary>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, root_id, text, model, created_ts, refreshed_ts
+                     FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => Ok(Some(Summary {
+                    id: r.get::<i64>(0)?,
+                    root_id: r.get::<i64>(1)?,
+                    text: r.get::<String>(2)?,
+                    model: r.get::<String>(3)?,
+                    created_ts: r.get::<i64>(4)?,
+                    refreshed_ts: r.get::<i64>(5)?,
+                })),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn delete_summary(&self, root_id: i64) -> Result<usize> {
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await
+                .context("delete_summary")?;
             Ok(n as usize)
         })
     }

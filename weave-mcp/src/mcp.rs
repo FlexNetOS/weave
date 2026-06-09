@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use weave_core::config::StoreSource;
+use weave_core::llm;
 use weave_core::model::{self, fmt_ts};
 #[cfg(feature = "sign")]
 use weave_core::sign;
@@ -141,6 +142,7 @@ pub fn serve<I: Injector>(
     nudge_template: Option<&str>,
     extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
+    llm_params: llm::LlmParams,
     injector: &I,
 ) -> Result<()> {
     log(&format!(
@@ -178,6 +180,7 @@ pub fn serve<I: Injector>(
             nudge_template,
             &extra_dbs,
             &pull,
+            &llm_params,
             &req,
             injector as &dyn Injector,
         ) {
@@ -271,6 +274,7 @@ fn handle(
     nudge_template: Option<&str>,
     extra_dbs: &[StoreSource],
     pull: &PullConsent,
+    llm_params: &llm::LlmParams,
     req: &Value,
     injector: &dyn Injector,
 ) -> Option<String> {
@@ -320,6 +324,7 @@ fn handle(
                 nudge_template,
                 extra_dbs,
                 pull,
+                llm_params,
                 name,
                 &args,
                 injector,
@@ -349,6 +354,7 @@ fn call_tool(
     nudge_template: Option<&str>,
     extra_dbs: &[StoreSource],
     pull: &PullConsent,
+    llm_params: &llm::LlmParams,
     name: &str,
     args: &Value,
     injector: &dyn Injector,
@@ -393,6 +399,8 @@ fn call_tool(
         "weave_daemon_start" => tool_daemon_start(me_default, args),
         "weave_daemon_stop" => tool_daemon_stop(),
         "weave_daemon_status" => tool_daemon_status(),
+        "weave_thread_summarize" => tool_thread_summarize(store, llm_params, args),
+        "weave_summarize_text" => tool_summarize_text(llm_params, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -2849,8 +2857,71 @@ fn tools() -> Value {
             "name": "weave_daemon_status",
             "description": "Show whether the optional presence daemon is running. Returns running:true + pid when active, or running:false when stopped. A stale pidfile is automatically cleaned up.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_thread_summarize",
+            "description": "Summarize a conversation thread via LLM. Returns a cached summary when fresh (within 1 hour) unless refresh=true. Requires LLM to be configured (llm_endpoint + llm_api_key).",
+            "inputSchema": {"type":"object","properties":{
+                "root_id":{"type":"integer","description":"The message id at the root of the thread."},
+                "refresh":{"type":"boolean","description":"Force a fresh LLM call even if a cached summary exists."}
+            },"required":["root_id"]}
+        },
+        {
+            "name": "weave_summarize_text",
+            "description": "Ad-hoc summarization of arbitrary text via LLM. No persistence. Requires LLM to be configured (llm_endpoint + llm_api_key).",
+            "inputSchema": {"type":"object","properties":{
+                "text":{"type":"string","description":"The text to summarize."}
+            },"required":["text"]}
         }
     ])
+}
+
+/// WL-033: summarize a thread by root_id, with caching.
+fn tool_thread_summarize(
+    store: &dyn Store,
+    llm_params: &llm::LlmParams,
+    args: &Value,
+) -> Result<String, String> {
+    let root_id = args
+        .get("root_id")
+        .and_then(|v| v.as_i64())
+        .ok_or("'root_id' is required (the message id at the root of the thread).")?;
+    if root_id <= 0 {
+        return Err("'root_id' must be a positive message id.".into());
+    }
+    let refresh = args
+        .get("refresh")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !refresh {
+        if let Ok(Some(summary)) = store.get_summary(root_id) {
+            let age = model::now().saturating_sub(summary.refreshed_ts);
+            if age < llm::SUMMARY_CACHE_TTL_SECS {
+                return Ok(summary.text);
+            }
+        }
+    }
+
+    let limit = store::clamp_limit(200);
+    let thread = store.thread(root_id, limit).map_err(e)?;
+    if thread.is_empty() {
+        return Ok(format!("No thread found for root #{root_id}."));
+    }
+    let rendered = llm::render_thread(&thread, llm_params.max_input_chars());
+    let summary_text = llm::summarize_text(llm_params, &rendered).map_err(|err| err.to_string())?;
+    let _ = store.store_summary(root_id, &summary_text, &llm_params.model());
+    Ok(summary_text)
+}
+
+/// WL-033: ad-hoc text summarization with no persistence.
+fn tool_summarize_text(llm_params: &llm::LlmParams, args: &Value) -> Result<String, String> {
+    let text = args
+        .get("text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'text' is required.")?;
+    llm::summarize_text(llm_params, text).map_err(|err| err.to_string())
 }
 
 fn tool_daemon_start(me_default: &Option<String>, args: &Value) -> Result<String, String> {

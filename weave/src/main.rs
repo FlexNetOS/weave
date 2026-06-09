@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use weave_core::config::Config;
 use weave_core::store::{is_alive, Store};
-use weave_core::{config, model, store};
+use weave_core::{config, llm, model, store};
 use weave_inject::{self as inject, inject_text, Injector};
 use weave_mcp::{self as mcp};
 
@@ -247,6 +247,12 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Summarize the thread via LLM instead of printing full messages.
+        #[arg(long)]
+        summarize: bool,
+        /// Force a fresh LLM call even if a cached summary exists.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Show read receipts for a message: who has read it, and when.
     Receipts {
@@ -559,6 +565,14 @@ enum Cmd {
         state: String,
         #[arg(long)]
         me: Option<String>,
+    },
+    /// Summarize arbitrary text via LLM (WL-033). No store interaction.
+    Summarize {
+        #[arg(long, allow_hyphen_values = true)]
+        text: String,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
     Hook { event: String },
@@ -2137,6 +2151,7 @@ fn main() -> Result<()> {
                 nudge_tpl.as_deref(),
                 extra_dbs,
                 pull,
+                weave_core::llm::params_from_config(&cfg),
                 &RealInjector {
                     preferred_mux: parse_mux_preference(&cfg),
                 },
@@ -2536,41 +2551,136 @@ fn main() -> Result<()> {
 
         Cmd::Orchestrator { cmd } => dispatch_orchestrator(store, &cfg, cmd)?,
 
-        Cmd::Thread { root, limit, json } => {
-            let rows = store.thread(root, limit)?;
+        Cmd::Thread {
+            root,
+            limit,
+            json,
+            summarize,
+            refresh,
+        } => {
+            if summarize {
+                let llm_params = llm::params_from_config(&cfg);
+                if !llm_params.is_configured() {
+                    eprintln!("LLM not configured (set llm_endpoint and llm_api_key).");
+                    std::process::exit(1);
+                }
+                let summary_text = if !refresh {
+                    if let Some(s) = store.get_summary(root)? {
+                        let age = model::now().saturating_sub(s.refreshed_ts);
+                        if age < llm::SUMMARY_CACHE_TTL_SECS {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "summary": s.text,
+                                        "cached": true,
+                                        "root_id": root,
+                                    }))?
+                                );
+                            } else {
+                                println!("{}", s.text);
+                            }
+                            return Ok(());
+                        }
+                        s.text
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                let effective_text = if summary_text.is_empty() {
+                    let rows = store.thread(root, store::clamp_limit(limit))?;
+                    if rows.is_empty() {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "summary": "No thread found.",
+                                    "cached": false,
+                                    "root_id": root,
+                                }))?
+                            );
+                        } else {
+                            println!("thread #{root}: empty (no such root, or no messages)");
+                        }
+                        return Ok(());
+                    }
+                    let rendered = llm::render_thread(&rows, llm_params.max_input_chars());
+                    llm::summarize_text(&llm_params, &rendered)?
+                } else {
+                    summary_text
+                };
+
+                let _ = store.store_summary(root, &effective_text, &llm_params.model());
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "summary": effective_text,
+                            "cached": false,
+                            "root_id": root,
+                        }))?
+                    );
+                } else {
+                    println!("{}", effective_text);
+                }
+            } else {
+                let rows = store.thread(root, limit)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "root": root, "messages": rows
+                        }))?
+                    );
+                } else if rows.is_empty() {
+                    println!("thread #{root}: empty (no such root, or no messages)");
+                } else {
+                    for m in &rows {
+                        let subj = m
+                            .subject
+                            .as_ref()
+                            .map(|s| format!(" | {s}"))
+                            .unwrap_or_default();
+                        // Show the reply linkage so the conversation structure is visible
+                        // in plain text without needing --json.
+                        let reply = m
+                            .in_reply_to
+                            .map(|r| format!(" (re #{r})"))
+                            .unwrap_or_default();
+                        println!(
+                            "#{}{} [{}] {} -> {}{}\n  {}",
+                            m.id,
+                            reply,
+                            model::fmt_ts(m.ts),
+                            m.sender,
+                            m.recipient,
+                            subj,
+                            m.body
+                        );
+                    }
+                }
+            }
+        }
+
+        Cmd::Summarize { text, json } => {
+            let llm_params = llm::params_from_config(&cfg);
+            if !llm_params.is_configured() {
+                eprintln!("LLM not configured (set llm_endpoint and llm_api_key).");
+                std::process::exit(1);
+            }
+            let summary = llm::summarize_text(&llm_params, &text)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "root": root, "messages": rows
+                        "summary": summary,
                     }))?
                 );
-            } else if rows.is_empty() {
-                println!("thread #{root}: empty (no such root, or no messages)");
             } else {
-                for m in &rows {
-                    let subj = m
-                        .subject
-                        .as_ref()
-                        .map(|s| format!(" | {s}"))
-                        .unwrap_or_default();
-                    // Show the reply linkage so the conversation structure is visible
-                    // in plain text without needing --json.
-                    let reply = m
-                        .in_reply_to
-                        .map(|r| format!(" (re #{r})"))
-                        .unwrap_or_default();
-                    println!(
-                        "#{}{} [{}] {} -> {}{}\n  {}",
-                        m.id,
-                        reply,
-                        model::fmt_ts(m.ts),
-                        m.sender,
-                        m.recipient,
-                        subj,
-                        m.body
-                    );
-                }
+                println!("{}", summary);
             }
         }
 

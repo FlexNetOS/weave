@@ -622,6 +622,29 @@ pub struct Config {
     /// omit the key loading unchanged.
     #[serde(default)]
     pub circle: Option<String>,
+    /// LLM endpoint for thread summarization (WL-033). An OpenAI-compatible
+    /// chat-completion URL. Default when unset:
+    /// `https://api.openai.com/v1/chat/completions`. Overlaid by
+    /// `WEAVE_LLM_ENDPOINT`.
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    /// LLM API key (SECRET). Redacted in [`Config`]'s Debug; never logged or
+    /// printed. Prefer `WEAVE_LLM_API_KEY` over storing it in the config file.
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    /// LLM model name for summarization (WL-033). Default: `gpt-4o-mini`.
+    /// Overlaid by `WEAVE_LLM_MODEL`.
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// Connect+read timeout (seconds) for LLM requests. Clamped to [5, 120];
+    /// default 30. Overlaid by `WEAVE_LLM_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub llm_timeout_secs: Option<u64>,
+    /// Maximum input characters before truncating the rendered thread text sent
+    /// to the LLM. Clamped to [1_024, 65_536]; default 32_768. Overlaid by
+    /// `WEAVE_LLM_MAX_INPUT_CHARS`.
+    #[serde(default)]
+    pub llm_max_input_chars: Option<usize>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -651,6 +674,14 @@ impl std::fmt::Debug for Config {
                 &self.pull_token.as_ref().map(|_| "<redacted>"),
             )
             .field("circle", &self.circle)
+            .field("llm_endpoint", &self.llm_endpoint)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("llm_model", &self.llm_model)
+            .field("llm_timeout_secs", &self.llm_timeout_secs)
+            .field("llm_max_input_chars", &self.llm_max_input_chars)
             .finish()
     }
 }
@@ -838,6 +869,23 @@ impl Config {
         // session/host discipline — overlay then validate, never store-side trust).
         if let Some(v) = nonempty("WEAVE_CIRCLE") {
             cfg.circle = Some(v);
+        }
+        // WL-033 LLM summarization overrides.
+        if let Some(v) = nonempty("WEAVE_LLM_ENDPOINT") {
+            cfg.llm_endpoint = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_API_KEY") {
+            cfg.llm_api_key = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_MODEL") {
+            cfg.llm_model = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_TIMEOUT_SECS").and_then(|s| s.parse::<u64>().ok()) {
+            cfg.llm_timeout_secs = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_MAX_INPUT_CHARS").and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.llm_max_input_chars = Some(v);
         }
         cfg
     }
@@ -1626,6 +1674,25 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Default (unset) ⇒ \"default\", so a single-circle deployment behaves as before.
 # Overridable via WEAVE_CIRCLE.
 # circle = \"default\"
+# LLM endpoint for thread summarization (OpenAI-compatible chat-completion).
+# Overridable via WEAVE_LLM_ENDPOINT.
+# llm_endpoint = \"https://api.openai.com/v1/chat/completions\"
+
+# LLM API key. Treated as a SECRET; redacted in debug output.
+# Overridable via WEAVE_LLM_API_KEY.
+# llm_api_key = \"...\"
+
+# LLM model name. Default \"gpt-4o-mini\".
+# Overridable via WEAVE_LLM_MODEL.
+# llm_model = \"gpt-4o-mini\"
+
+# LLM request timeout in seconds. Default 30.
+# Overridable via WEAVE_LLM_TIMEOUT_SECS.
+# llm_timeout_secs = 30
+
+# Maximum characters of thread text sent to the LLM. Default 32768.
+# Overridable via WEAVE_LLM_MAX_INPUT_CHARS.
+# llm_max_input_chars = 32768
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -1702,6 +1769,11 @@ mod tests {
         assert!(cfg.revoked.is_none());
         assert!(cfg.pull_token.is_none());
         assert!(cfg.circle.is_none());
+        assert!(cfg.llm_endpoint.is_none());
+        assert!(cfg.llm_api_key.is_none());
+        assert!(cfg.llm_model.is_none());
+        assert!(cfg.llm_timeout_secs.is_none());
+        assert!(cfg.llm_max_input_chars.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -1733,6 +1805,11 @@ mod tests {
             "revoked",
             "pull_token",
             "circle",
+            "llm_endpoint",
+            "llm_api_key",
+            "llm_model",
+            "llm_timeout_secs",
+            "llm_max_input_chars",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),

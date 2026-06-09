@@ -100,6 +100,17 @@ pub struct Message {
     pub in_reply_to: Option<i64>,
 }
 
+/// A cached LLM summary of a conversation thread (WL-033).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: i64,
+    pub root_id: i64,
+    pub text: String,
+    pub model: String,
+    pub created_ts: i64,
+    pub refreshed_ts: i64,
+}
+
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
 /// in the sender's own `outbox` table describing a message addressed to a peer
 /// living in a *different* store. The sender never writes the recipient's store;

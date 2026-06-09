@@ -8,7 +8,7 @@
 use crate::config::StoreSource;
 use crate::model::{
     now, Ask, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
+    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer, Summary,
 };
 use anyhow::Result;
 
@@ -569,6 +569,18 @@ pub trait Store: Send {
     /// periodically (e.g. every 60 s in the daemon loop).
     #[allow(dead_code)]
     fn evict_stale_presence(&self, cutoff_secs: i64) -> Result<usize>;
+
+    /// WL-033: upsert a summary for a thread root. Returns the summary row id.
+    #[allow(dead_code)]
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<i64>;
+
+    /// WL-033: fetch a summary by root_id, or `None`.
+    #[allow(dead_code)]
+    fn get_summary(&self, root_id: i64) -> Result<Option<Summary>>;
+
+    /// WL-033: delete a summary by root_id. Returns rows deleted.
+    #[allow(dead_code)]
+    fn delete_summary(&self, root_id: i64) -> Result<usize>;
 
     /// Presence seam (v0.2): three-tier liveness resolver.  A fresh daemon
     /// heartbeat (≤ `PRESENCE_TTL_SECS`) → [`crate::model::Liveness::Live`]; absent /
@@ -1335,6 +1347,15 @@ CREATE TABLE IF NOT EXISTS presence (
     pid          INTEGER,
     heartbeat_ts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS summaries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id      INTEGER NOT NULL UNIQUE,
+    text         TEXT NOT NULL,
+    model        TEXT NOT NULL DEFAULT '',
+    created_ts   INTEGER NOT NULL,
+    refreshed_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summaries_root ON summaries(root_id);
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1858,6 +1879,18 @@ fn migrate(conn: &Connection) -> Result<()> {
             pid          INTEGER,
             heartbeat_ts INTEGER NOT NULL DEFAULT 0
         );",
+    )?;
+    // WL-033: summaries table for LLM thread summarization.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS summaries (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_id      INTEGER NOT NULL UNIQUE,
+            text         TEXT NOT NULL,
+            model        TEXT NOT NULL DEFAULT '',
+            created_ts   INTEGER NOT NULL,
+            refreshed_ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_summaries_root ON summaries(root_id);",
     )?;
     Ok(())
 }
@@ -4089,6 +4122,51 @@ impl Store for SqliteStore {
             "DELETE FROM presence WHERE heartbeat_ts < ?1",
             params![cutoff],
         )?;
+        Ok(n)
+    }
+
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<i64> {
+        let ts = crate::model::now();
+        self.conn.execute(
+            "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(root_id) DO UPDATE SET
+                 text = excluded.text,
+                 model = excluded.model,
+                 refreshed_ts = excluded.refreshed_ts",
+            params![root_id, text, model, ts],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM summaries WHERE root_id = ?1",
+            params![root_id],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    fn get_summary(&self, root_id: i64) -> Result<Option<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_id, text, model, created_ts, refreshed_ts
+             FROM summaries WHERE root_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![root_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(Summary {
+                id: r.get(0)?,
+                root_id: r.get(1)?,
+                text: r.get(2)?,
+                model: r.get(3)?,
+                created_ts: r.get(4)?,
+                refreshed_ts: r.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    fn delete_summary(&self, root_id: i64) -> Result<usize> {
+        let n = self
+            .conn
+            .execute("DELETE FROM summaries WHERE root_id = ?1", params![root_id])?;
         Ok(n)
     }
 }
