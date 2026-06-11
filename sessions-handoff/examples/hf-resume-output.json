@@ -1,19 +1,34 @@
 {
-  "schema": "handoff.resume.v2",
-  "project_name": "Handoff Ledger",
-  "northstar": "Integrity, reversibility, capability gain.",
-  "active_objective": "Build Rust-native repo-local session handoff for AI agents.",
-  "active_task": {
-    "id": "TASK-0001",
-    "title": "Bootstrap Rust-native handoff workspace",
-    "status": "claimed"
-  },
-  "branch": "agent/TASK-0001/agent-a/20260602T170000Z",
-  "worktree": "../.worktrees/repo/TASK-0001-agent-a",
-  "claimed_paths": ["Cargo.toml", "crates/**", ".handoff/**", "docs/**"],
-  "blocked_paths": [],
-  "latest_packet": ".handoff/packets/latest.md",
-  "drift_status": "pass",
-  "required_tests": ["cargo test --workspace"],
-  "next_command": "hf start"
+  "schema": "weave.resume.v1",
+  "project_name": "weave",
+  "worktree": "/home/drdave/Desktop/meta/weave-mcp-daemon-tools",
+  "branch": "feat/zellij-pane-targeting",
+  "last_item": "WL-009",
+  "next_item": "WL-014",
+  "cycles_total": 14,
+  "cycle_budget": 3,
+  "status": "active",
+  "completed_items": [
+    "WL-001", "WL-002 Phase A", "WL-002 Phase B", "WL-003", "WL-004",
+    "WL-005", "WL-006", "WL-007", "WL-008", "WL-009",
+    "WL-010", "WL-011", "WL-012", "WL-013"
+  ],
+  "open_gaps": [
+    "WL-014", "WL-015", "WL-016", "WL-017", "WL-018", "WL-019",
+    "WL-020", "WL-021", "WL-022", "WL-023", "WL-024", "WL-025",
+    "WL-026", "WL-027", "WL-028", "WL-029", "WL-030", "WL-031",
+    "WL-032", "WL-033", "WL-034", "WL-035", "WL-036", "WL-037",
+    "WL-038", "WL-039", "WL-040", "WL-041", "WL-042"
+  ],
+  "next_command": "bash _workspace/verify-on-resume.sh",
+  "must_read": [
+    "_workspace/HANDOFF.md",
+    "_workspace/backlog.md",
+    "_workspace/loop_state.md"
+  ],
+  "must_not": [
+    "edit without verify-on-resume",
+    "skip handoff file updates",
+    "parallel write same path"
+  ]
 }

@@ -38,19 +38,21 @@
 use crate::config::{Config, StoreSource, REMOTE_TIMEOUT_MS_DEFAULT};
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
-    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, now, Ask, AskGroup,
-    AskManyChildView, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job,
-    JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
-    BROADCAST_SQL, MAX_DELIVERY_ROWS,
+    job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id, now,
+    permission_status, pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult,
+    AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch,
+    JobResultView, JobSpec, JobState, Lease, Message, OrchestratorStatus, Peer, PermissionStatus,
+    ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind, BROADCAST_SQL,
+    MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use crate::store::{
-    append_progress_event, canonical_source, check_body, check_host, check_ident, check_job_text,
-    clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view, merge_peer_views,
-    merge_session_views, remote_scheme_host, reply_subject, sanitize_tag, store_label,
-    validate_job_patch, validate_job_spec, AskManyOutcome, Origin, PeerView, Pulled,
-    RevocationEvent, RevocationKind, SessionInfo, SessionView, Store, VerifyPolicy,
-    MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN, MAX_REPO_LEN,
-    MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
+    append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
+    check_job_text, clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view,
+    merge_peer_views, merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject,
+    sanitize_tag, store_label, validate_job_patch, validate_job_spec, AskManyOutcome, Origin,
+    PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo, SessionView, Store,
+    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
+    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -61,13 +63,16 @@ use tokio::runtime::Runtime;
 /// works for local but splitting keeps both backends identical.
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS messages (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts          INTEGER NOT NULL,
-        sender      TEXT NOT NULL,
-        recipient   TEXT NOT NULL,
-        subject     TEXT,
-        body        TEXT NOT NULL,
-        in_reply_to INTEGER
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              INTEGER NOT NULL,
+        sender          TEXT NOT NULL,
+        recipient       TEXT NOT NULL,
+        subject         TEXT,
+        body            TEXT NOT NULL,
+        in_reply_to     INTEGER,
+        idempotency_key TEXT UNIQUE,
+        trace_id        TEXT,
+        priority        TEXT NOT NULL DEFAULT 'normal'
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -95,17 +100,22 @@ const SCHEMA: &[&str] = &[
         role        TEXT NOT NULL DEFAULT 'peer',
         turn_state     TEXT NOT NULL DEFAULT '',
         description    TEXT NOT NULL DEFAULT '',
-        description_ts INTEGER NOT NULL DEFAULT 0
+        description_ts INTEGER NOT NULL DEFAULT 0,
+        birth_cert     TEXT,
+        contact_policy TEXT NOT NULL DEFAULT 'open'
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts        INTEGER NOT NULL,
-        to_peer   TEXT NOT NULL,
-        to_host   TEXT NOT NULL DEFAULT '',
-        from_peer TEXT NOT NULL,
-        subject   TEXT,
-        body      TEXT NOT NULL,
-        sig       TEXT NOT NULL DEFAULT ''
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              INTEGER NOT NULL,
+        to_peer         TEXT NOT NULL,
+        to_host         TEXT NOT NULL DEFAULT '',
+        from_peer       TEXT NOT NULL,
+        subject         TEXT,
+        body            TEXT NOT NULL,
+        sig             TEXT NOT NULL DEFAULT '',
+        idempotency_key TEXT,
+        trace_id        TEXT,
+        priority        TEXT NOT NULL DEFAULT 'normal'
     )",
     "CREATE TABLE IF NOT EXISTS pull_cursor (
         source  TEXT PRIMARY KEY,
@@ -137,6 +147,8 @@ const SCHEMA: &[&str] = &[
         askee           TEXT NOT NULL,
         subject         TEXT,
         state           TEXT NOT NULL,
+        kind            TEXT NOT NULL DEFAULT 'free_text',
+        options         TEXT,
         reply_to        TEXT,
         close_note      TEXT,
         opened_ts       INTEGER NOT NULL,
@@ -211,6 +223,52 @@ const SCHEMA: &[&str] = &[
         pid          INTEGER,
         heartbeat_ts INTEGER NOT NULL DEFAULT 0
     )",
+    // WL-016: scheduled message delivery
+    "CREATE TABLE IF NOT EXISTS schedules (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT NOT NULL,
+        cron_expr   TEXT NOT NULL,
+        next_run    INTEGER NOT NULL,
+        sender      TEXT NOT NULL,
+        recipient   TEXT NOT NULL,
+        subject     TEXT,
+        body        TEXT NOT NULL,
+        created_ts  INTEGER NOT NULL,
+        executed_ts INTEGER,
+        cancelled   INTEGER NOT NULL DEFAULT 0
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)",
+    "CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender)",
+    // WL-020: reviews table
+    "CREATE TABLE IF NOT EXISTS reviews (\n        id                 TEXT PRIMARY KEY,\n        pr_url             TEXT NOT NULL,\n        title              TEXT NOT NULL DEFAULT '',\n        author             TEXT NOT NULL DEFAULT '',\n        repo               TEXT NOT NULL DEFAULT '',\n        state              TEXT NOT NULL DEFAULT 'open',\n        review_requested_at INTEGER,\n        reviewed_at        INTEGER,\n        reviewed_by        TEXT,\n        created_at         INTEGER NOT NULL\n    )",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state)",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at)",
+    // WL-024: leases table
+    "CREATE TABLE IF NOT EXISTS leases (\n        resource  TEXT PRIMARY KEY,\n        holder    TEXT NOT NULL,\n        acquired  INTEGER NOT NULL,\n        expires   INTEGER NOT NULL,\n        note      TEXT NOT NULL DEFAULT ''\n    )",
+    "CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder)",
+    "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires)",
+    // WL-028: FTS5 full-text search on messages
+    "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        body, subject, sender,
+        content='messages',
+        content_rowid='id'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, body, subject, sender)
+        VALUES (new.id, new.body, new.subject, new.sender);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+        VALUES ('delete', old.id, old.body, old.subject, old.sender);
+    END",
+    // WL-033: thread summarization cache
+    "CREATE TABLE IF NOT EXISTS summaries (
+        root_id     INTEGER PRIMARY KEY,
+        text        TEXT NOT NULL,
+        model       TEXT NOT NULL DEFAULT '',
+        created_ts  INTEGER NOT NULL,
+        refreshed_ts INTEGER NOT NULL
+    )",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -271,6 +329,9 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         subject: r.get::<Option<String>>(4)?,
         body: r.get::<String>(5)?,
         in_reply_to: r.get::<Option<i64>>(6)?,
+        idempotency_key: r.get::<Option<String>>(7).ok().flatten(),
+        trace_id: r.get::<Option<String>>(8).ok().flatten(),
+        priority: r.get::<String>(9).unwrap_or_else(|_| "normal".to_string()),
     })
 }
 
@@ -287,6 +348,9 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
         subject: r.get::<Option<String>>(5)?,
         body: r.get::<String>(6)?,
         sig: r.get::<String>(7)?,
+        idempotency_key: r.get::<Option<String>>(8).ok().flatten(),
+        trace_id: r.get::<Option<String>>(9).ok().flatten(),
+        priority: r.get::<String>(10).unwrap_or("normal".to_string()),
     })
 }
 
@@ -297,6 +361,8 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
 fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
     let state_str = r.get::<String>(6)?;
     let state = AskState::from_str(&state_str).map_err(|m| anyhow::anyhow!(m))?;
+    let kind_str = r.get::<String>(7)?;
+    let kind = AskKind::from_str(&kind_str);
     Ok(Ask {
         id: r.get::<String>(0)?,
         question_msg_id: r.get::<i64>(1)?,
@@ -305,14 +371,16 @@ fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
         askee: r.get::<String>(4)?,
         subject: r.get::<Option<String>>(5)?,
         state,
-        reply_to: r.get::<Option<String>>(7)?,
-        close_note: r.get::<Option<String>>(8)?,
-        opened_ts: r.get::<i64>(9)?,
-        updated_ts: r.get::<i64>(10)?,
-        closed_ts: r.get::<Option<i64>>(11)?,
-        // 13th projected column (P2). Every `get_ask`/`list_asks` projection now
-        // selects `parent_id` last so positional index 12 is always present.
-        parent_id: r.get::<Option<String>>(12)?,
+        kind,
+        options: r.get::<Option<String>>(8)?,
+        reply_to: r.get::<Option<String>>(9)?,
+        close_note: r.get::<Option<String>>(10)?,
+        opened_ts: r.get::<i64>(11)?,
+        updated_ts: r.get::<i64>(12)?,
+        closed_ts: r.get::<Option<i64>>(13)?,
+        // 15th projected column (P2 / WL-015). Every projection selects `parent_id`
+        // last so positional index 14 is always present.
+        parent_id: r.get::<Option<String>>(14)?,
     })
 }
 
@@ -368,6 +436,27 @@ fn row_to_job(r: &libsql::Row) -> Result<Job> {
     })
 }
 
+/// Convert a `schedules` row into our owned [`Schedule`]. Positional order
+/// matches a `SELECT *` projection: id, kind, cron_expr, next_run, sender,
+/// recipient, subject, body, created_ts, executed_ts, cancelled.
+fn row_to_schedule(r: &libsql::Row) -> Result<Schedule> {
+    let kind_str = r.get::<String>(1)?;
+    let kind = ScheduleKind::from_str(&kind_str).map_err(|m| anyhow::anyhow!(m))?;
+    Ok(Schedule {
+        id: r.get::<i64>(0)?,
+        kind,
+        cron_expr: r.get::<String>(2)?,
+        next_run: r.get::<i64>(3)?,
+        sender: r.get::<String>(4)?,
+        recipient: r.get::<String>(5)?,
+        subject: r.get::<Option<String>>(6)?,
+        body: r.get::<String>(7)?,
+        created_ts: r.get::<i64>(8)?,
+        executed_ts: r.get::<Option<i64>>(9)?,
+        cancelled: r.get::<i64>(10)? != 0,
+    })
+}
+
 /// Column order: name, mux, target, socket, cwd, last_seen, pid, host, repo,
 /// branch, worktree_id, circle, role, turn_state, description, description_ts.
 fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
@@ -388,6 +477,8 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         turn_state: r.get::<String>(13)?,
         description: r.get::<String>(14)?,
         description_ts: r.get::<i64>(15)?,
+        birth_cert: r.get::<Option<String>>(16).ok().flatten(),
+        contact_policy: r.get::<String>(17).unwrap_or_else(|_| "open".to_string()),
     })
 }
 
@@ -573,6 +664,23 @@ impl LibsqlStore {
                     .context("adding description_ts column")?;
                 }
             }
+            // WL-018: birth certificate for identity takeover protection. Nullable;
+            // NULL means "not yet enrolled" (backward-compat). Existing peers without
+            // a cert get one minted on their next re-registration.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='birth_cert'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN birth_cert TEXT",
+                    (),
+                )
+                .await
+                .context("adding birth_cert column")?;
+            }
             // Migration (P5): the wake-hook watermark table. Tracks the last
             // unread message id that triggered a block for each reader. Created
             // via SCHEMA above for a fresh DB; also created idempotently here for
@@ -672,6 +780,32 @@ impl LibsqlStore {
                 conn.execute("ALTER TABLE asks ADD COLUMN parent_id TEXT", ())
                     .await
                     .context("adding asks.parent_id column")?;
+            }
+            // WL-015: structured ask kinds + options.
+            let mut kind_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='kind'",
+                    (),
+                )
+                .await?;
+            if kind_it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'free_text'",
+                    (),
+                )
+                .await
+                .context("adding asks.kind column")?;
+            }
+            let mut opt_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='options'",
+                    (),
+                )
+                .await?;
+            if opt_it.next().await?.is_none() {
+                conn.execute("ALTER TABLE asks ADD COLUMN options TEXT", ())
+                    .await
+                    .context("adding asks.options column")?;
             }
             // Migration (P2): the ask-many PARENT anchor table. Created via SCHEMA above
             // for a fresh DB; also created idempotently here for a DB that predates
@@ -785,6 +919,149 @@ impl LibsqlStore {
             )
             .await
             .context("creating presence table")?;
+            // WL-016: schedules table for legacy DBs. Created via SCHEMA for fresh DBs;
+            // also created idempotently here. Constant DDL — no user data interpolated.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schedules (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind        TEXT NOT NULL,
+                    cron_expr   TEXT NOT NULL,
+                    next_run    INTEGER NOT NULL,
+                    sender      TEXT NOT NULL,
+                    recipient   TEXT NOT NULL,
+                    subject     TEXT,
+                    body        TEXT NOT NULL,
+                    created_ts  INTEGER NOT NULL,
+                    executed_ts INTEGER,
+                    cancelled   INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .context("creating schedules table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_sender    ON schedules(sender)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating schedules index")?;
+            }
+            // WL-020: reviews table
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reviews (\n                    id                 TEXT PRIMARY KEY,\n                    pr_url             TEXT NOT NULL,\n                    title              TEXT NOT NULL DEFAULT '',\n                    author             TEXT NOT NULL DEFAULT '',\n                    repo               TEXT NOT NULL DEFAULT '',\n                    state              TEXT NOT NULL DEFAULT 'open',\n                    review_requested_at INTEGER,\n                    reviewed_at        INTEGER,\n                    reviewed_by        TEXT,\n                    created_at         INTEGER NOT NULL\n                )",
+                (),
+            )
+            .await
+            .context("creating reviews table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_reviews_state ON reviews(state)",
+                "CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating reviews index")?;
+            }
+            // WL-024: leases table
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS leases (\n                    resource  TEXT PRIMARY KEY,\n                    holder    TEXT NOT NULL,\n                    acquired  INTEGER NOT NULL,\n                    expires   INTEGER NOT NULL,\n                    note      TEXT NOT NULL DEFAULT ''\n                )",
+                (),
+            )
+            .await
+            .context("creating leases table")?;
+            for idx in [
+                "CREATE INDEX IF NOT EXISTS idx_leases_holder ON leases(holder)",
+                "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires)",
+            ] {
+                conn.execute(idx, ())
+                    .await
+                    .context("creating leases index")?;
+            }
+            // WL-026: idempotency keys and trace IDs on messages and outbox.
+            // SQLite `ALTER TABLE ADD COLUMN` rejects inline UNIQUE on non-empty tables,
+            // so we add the column plain then create the unique index separately.
+            for (table, col, ddl) in [
+                ("messages", "idempotency_key", "ALTER TABLE messages ADD COLUMN idempotency_key TEXT"),
+                ("messages", "trace_id", "ALTER TABLE messages ADD COLUMN trace_id TEXT"),
+                ("outbox", "idempotency_key", "ALTER TABLE outbox ADD COLUMN idempotency_key TEXT"),
+                ("outbox", "trace_id", "ALTER TABLE outbox ADD COLUMN trace_id TEXT"),
+            ] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    conn.execute(ddl, ()).await.with_context(|| format!("adding {table}.{col} column"))?;
+                }
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_key ON messages(idempotency_key)",
+                (),
+            )
+            .await
+            .context("creating idempotency_key unique index")?;
+            // WL-028: FTS5 full-text search on messages.
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    body, subject, sender,
+                    content='messages',
+                    content_rowid='id'
+                )",
+                (),
+            )
+            .await
+            .context("creating messages_fts virtual table")?;
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, body, subject, sender)
+                    VALUES (new.id, new.body, new.subject, new.sender);
+                END",
+                (),
+            )
+            .await
+            .context("creating messages_fts insert trigger")?;
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, body, subject, sender)
+                    VALUES ('delete', old.id, old.body, old.subject, old.sender);
+                END",
+                (),
+            )
+            .await
+            .context("creating messages_fts delete trigger")?;
+            // WL-031: message priority levels.
+            for (table, col, ddl) in [
+                ("messages", "priority", "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+                ("outbox", "priority", "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+            ] {
+                let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
+                let mut it = conn.query(&probe, ()).await?;
+                if it.next().await?.is_none() {
+                    conn.execute(ddl, ()).await.with_context(|| format!("adding {table}.{col} column"))?;
+                }
+            }
+            // WL-032: per-peer contact policies.
+            let probe = "SELECT 1 FROM pragma_table_info('peers') WHERE name='contact_policy'";
+            let mut it = conn.query(probe, ()).await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN contact_policy TEXT NOT NULL DEFAULT 'open'",
+                    (),
+                )
+                .await
+                .context("adding peers.contact_policy column")?;
+            }
+            // WL-033: thread summarization cache.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS summaries (
+                    root_id     INTEGER PRIMARY KEY,
+                    text        TEXT NOT NULL,
+                    model       TEXT NOT NULL DEFAULT '',
+                    created_ts  INTEGER NOT NULL,
+                    refreshed_ts INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating summaries table")?;
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1139,22 +1416,48 @@ impl Store for LibsqlStore {
         recipient: &str,
         subject: Option<&str>,
         body: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
         check_body(body)?;
+        if let Some(key) = idempotency_key {
+            if !crate::model::idempotency_key_valid(key) {
+                anyhow::bail!("idempotency_key is invalid or too long.");
+            }
+        }
+        if let Some(id) = trace_id {
+            if !crate::model::trace_id_valid(id) {
+                anyhow::bail!("trace_id is invalid or too long.");
+            }
+        }
         self.rt.block_on(async {
+            if let Some(key) = idempotency_key {
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT id FROM messages WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if let Some(r) = it.next().await? {
+                    return Ok(r.get::<i64>(0)?);
+                }
+            }
             self.conn
                 .execute(
-                    "INSERT INTO messages (ts, sender, recipient, subject, body) \
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO messages (ts, sender, recipient, subject, body, idempotency_key, trace_id) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params(vec![
                         now().into(),
                         sender.into(),
                         recipient.into(),
                         subject.map(|s| s.to_string()).into(),
                         body.into(),
+                        idempotency_key.map(|s| s.to_string()).into(),
+                        trace_id.map(|s| s.to_string()).into(),
                     ]),
                 )
                 .await?;
@@ -1178,14 +1481,14 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
@@ -1232,7 +1535,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -1247,7 +1550,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1265,11 +1568,31 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                 WHERE id IN (
+                     SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
+                 )
+                 ORDER BY id DESC LIMIT ?2";
+            let mut it = self
+                .conn
+                .query(sql, params(vec![query.into(), limit.into()]))
+                .await?;
+            let mut rows: Vec<Message> = Vec::new();
+            while let Some(r) = it.next().await? {
+                rows.push(row_to_message(&r)?);
+            }
+            Ok(rows)
+        })
+    }
+
     fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>> {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
@@ -1449,6 +1772,12 @@ impl Store for LibsqlStore {
                 params(vec![cutoff.into()]),
             )
             .await?;
+            // WL-016: prune terminal schedule rows older than the retention cutoff.
+            tx.execute(
+                "DELETE FROM schedules WHERE created_ts < ?1 AND (cancelled = 1 OR executed_ts IS NOT NULL)",
+                params(vec![cutoff.into()]),
+            )
+            .await?;
             tx.commit().await?;
             Ok(n)
         })
@@ -1558,7 +1887,8 @@ impl Store for LibsqlStore {
                     UNION
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
-                SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to
+                SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
+                       m.idempotency_key, m.trace_id, m.priority
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -1616,47 +1946,138 @@ impl Store for LibsqlStore {
         branch: &str,
         worktree_id: &str,
         circle: &str,
-    ) -> Result<()> {
+        birth_cert: Option<&str>,
+    ) -> Result<String> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
-        // Bound + control-strip the descriptive git tags at the store seam
-        // (lossy-but-total), mirroring the sqlite backend.
+        if let Some(cert) = birth_cert {
+            check_birth_cert(cert)?;
+        }
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
-        // Re-validate the circle at the store seam (defense-in-depth, mirroring
-        // the sqlite backend): an invalid value falls back to the default circle.
         let circle = if crate::model::circle_valid(circle) {
             circle.to_string()
         } else {
             crate::model::DEFAULT_CIRCLE.to_string()
         };
         self.rt.block_on(async {
-            // `role` is INTENTIONALLY omitted from both the column list and the
-            // ON CONFLICT SET: a NEW row gets the table default ('peer'); an upsert
-            // leaves `role` untouched so a re-register never demotes an orchestrator.
-            self.conn
-                .execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                     ON CONFLICT(name) DO UPDATE SET mux=?2, target=?3, socket=?4, cwd=?5, last_seen=?6, pid=?7, host=?8, repo=?9, branch=?10, worktree_id=?11, circle=?12",
-                    params(vec![
-                        name.into(),
-                        mux.into(),
-                        target.into(),
-                        socket.into(),
-                        cwd.map(|s| s.to_string()).into(),
-                        now().into(),
-                        pid.into(),
-                        host.into(),
-                        repo.into(),
-                        branch.into(),
-                        worktree_id.into(),
-                        circle.into(),
-                    ]),
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let existing_cert: Option<Option<String>> = {
+                let mut it = tx
+                    .query(
+                        "SELECT birth_cert FROM peers WHERE name = ?1",
+                        params(vec![name.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some(r.get::<Option<String>>(0)?),
+                    None => None,
+                }
+            };
+            let cert = match existing_cert {
+                None => {
+                    let new_cert = mint_birth_cert()?;
+                    tx.execute(
+                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        params(vec![
+                            name.into(),
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            new_cert.clone().into(),
+                        ]),
+                    )
+                    .await?;
+                    new_cert
+                }
+                Some(None) => {
+                    let new_cert = mint_birth_cert()?;
+                    tx.execute(
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
+                         WHERE name=?13",
+                        params(vec![
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            new_cert.clone().into(),
+                            name.into(),
+                        ]),
+                    )
+                    .await?;
+                    new_cert
+                }
+                Some(Some(stored_cert)) => {
+                    if let Some(supplied) = birth_cert {
+                        if supplied != stored_cert {
+                            anyhow::bail!("birth certificate mismatch for peer '{name}'");
+                        }
+                    } else {
+                        anyhow::bail!("peer '{name}' already registered; provide --cert to re-register");
+                    }
+                    tx.execute(
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
+                         WHERE name=?12",
+                        params(vec![
+                            mux.into(),
+                            target.into(),
+                            socket.into(),
+                            cwd.map(|s| s.to_string()).into(),
+                            now().into(),
+                            pid.into(),
+                            host.into(),
+                            repo.into(),
+                            branch.into(),
+                            worktree_id.into(),
+                            circle.into(),
+                            name.into(),
+                        ]),
+                    )
+                    .await?;
+                    stored_cert
+                }
+            };
+            tx.commit().await?;
+            Ok(cert)
+        })
+    }
+
+    fn get_birth_cert(&self, name: &str) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT birth_cert FROM peers WHERE name=?1",
+                    params(vec![name.into()]),
                 )
                 .await?;
-            Ok(())
+            match it.next().await? {
+                Some(r) => {
+                    let cert: Option<String> = r.get(0)?;
+                    Ok(cert)
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -1665,7 +2086,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -1688,7 +2109,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -1744,7 +2165,7 @@ impl Store for LibsqlStore {
             let holders: Vec<Peer> = {
                 let mut it = tx
                     .query(
-                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
                         (),
                     )
                     .await?;
@@ -1757,32 +2178,22 @@ impl Store for LibsqlStore {
                 }
                 out
             };
-            // A DIFFERENT live holder blocks an unforced claim.
-            if !force {
-                if let Some(live) = holders
-                    .iter()
-                    .filter(|p| p.name != me && is_alive(p))
-                    .max_by_key(|p| p.last_seen)
-                {
-                    return Ok(ClaimOutcome::Refused {
-                        circle: target,
-                        holder: live.name.clone(),
-                    });
-                }
-            }
-            // Demote every OTHER orchestrator in the circle, then promote the caller.
+            // WL-019: co-orchestrator support.
+            // Non-force claims are additive; force claims still steal.
             let mut demoted = Vec::new();
-            for p in &holders {
-                if p.name != me {
-                    tx.execute(
-                        "UPDATE peers SET role=?1 WHERE name=?2",
-                        params(vec![
-                            crate::model::PeerRole::Peer.as_str().into(),
-                            p.name.clone().into(),
-                        ]),
-                    )
-                    .await?;
-                    demoted.push(p.name.clone());
+            if force {
+                for p in &holders {
+                    if p.name != me {
+                        tx.execute(
+                            "UPDATE peers SET role=?1 WHERE name=?2",
+                            params(vec![
+                                crate::model::PeerRole::Peer.as_str().into(),
+                                p.name.clone().into(),
+                            ]),
+                        )
+                        .await?;
+                        demoted.push(p.name.clone());
+                    }
                 }
             }
             tx.execute(
@@ -1813,27 +2224,21 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts FROM peers WHERE role='orchestrator'",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
                     (),
                 )
                 .await?;
-            let mut holder: Option<Peer> = None;
+            let mut holders = Vec::new();
             while let Some(r) = it.next().await? {
                 let p = row_to_peer(&r)?;
-                if crate::model::circle_or_default(&p.circle) == target
-                    && is_alive(&p)
-                    && holder
-                        .as_ref()
-                        .map(|h| p.last_seen > h.last_seen)
-                        .unwrap_or(true)
-                {
-                    holder = Some(p);
+                if crate::model::circle_or_default(&p.circle) == target && is_alive(&p) {
+                    holders.push(p);
                 }
             }
             Ok(OrchestratorStatus {
                 circle: target,
-                present: holder.is_some(),
-                holder,
+                present: !holders.is_empty(),
+                holders,
             })
         })
     }
@@ -1888,17 +2293,21 @@ impl Store for LibsqlStore {
         subject: Option<&str>,
         body: &str,
         sig: &str,
+        idempotency_key: Option<&str>,
+        trace_id: Option<&str>,
+        priority: Option<&str>,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
         check_body(body)?;
+        let p = priority.unwrap_or("normal").to_string();
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params(vec![
                         now().into(),
                         to.into(),
@@ -1907,6 +2316,9 @@ impl Store for LibsqlStore {
                         subject.map(|s| s.to_string()).into(),
                         body.into(),
                         sig.into(),
+                        idempotency_key.map(|s| s.to_string()).into(),
+                        trace_id.map(|s| s.to_string()).into(),
+                        p.into(),
                     ]),
                 )
                 .await?;
@@ -1922,7 +2334,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
                      WHERE to_peer = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
                     params(vec![for_recipient.into(), since_id.into(), limit.into()]),
                 )
@@ -1941,7 +2353,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
                      ORDER BY id ASC LIMIT ?1",
                     params(vec![limit.into()]),
                 )
@@ -2174,6 +2586,8 @@ impl Store for LibsqlStore {
         askee: &str,
         subject: Option<&str>,
         body: &str,
+        kind: AskKind,
+        options: Option<&str>,
         reply_to: Option<&str>,
     ) -> Result<(String, i64)> {
         self.guard_writable()?;
@@ -2284,9 +2698,9 @@ impl Store for LibsqlStore {
             // children share this insert shape with a non-NULL parent_id.
             tx.execute(
                 "INSERT INTO asks \
-                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                     reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, NULL, NULL)",
+                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                     options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, NULL, NULL)",
                 params(vec![
                     id.clone().into(),
                     question_msg_id.into(),
@@ -2294,6 +2708,8 @@ impl Store for LibsqlStore {
                     askee.into(),
                     subject_final.into(),
                     AskState::Open.as_str().into(),
+                    kind.as_str().into(),
+                    options.into(),
                     reply_to_owned.clone().into(),
                     ts.into(),
                 ]),
@@ -2450,8 +2866,8 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                            reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
                      FROM asks WHERE id = ?1",
                     params(vec![correlation_id.into()]),
                 )
@@ -2472,8 +2888,8 @@ impl Store for LibsqlStore {
             AskRole::Any => "(asker = ?1 OR askee = ?1)",
         };
         let sql = format!(
-            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                    reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+            "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                    options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
              FROM asks WHERE {where_clause} \
              ORDER BY opened_ts DESC, rowid DESC LIMIT ?2"
         );
@@ -2487,6 +2903,26 @@ impl Store for LibsqlStore {
                 out.push(row_to_ask(&r)?);
             }
             Ok(out)
+        })
+    }
+
+    fn has_open_asks(&self, me: &str) -> Result<bool> {
+        check_ident("me", me)?;
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM asks WHERE askee = ?1 AND state = 'open'",
+                    params(vec![me.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => {
+                    let count: i64 = r.get(0)?;
+                    Ok(count > 0)
+                }
+                None => Ok(false),
+            }
         })
     }
 
@@ -2606,9 +3042,9 @@ impl Store for LibsqlStore {
                 // Same insert shape as the plain `ask`, with the parent_id stamped.
                 tx.execute(
                     "INSERT INTO asks \
-                        (id, question_msg_id, answer_msg_id, asker, askee, subject, state, \
-                         reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
-                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?7, NULL, ?8)",
+                        (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                         options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9, NULL, ?10)",
                     params(vec![
                         cid.clone().into(),
                         question_msg_id.into(),
@@ -2616,6 +3052,8 @@ impl Store for LibsqlStore {
                         peer.clone().into(),
                         subject_owned.clone().into(),
                         AskState::Open.as_str().into(),
+                        AskKind::FreeText.as_str().into(),
+                        Value::Null,
                         ts.into(),
                         parent_id.clone().into(),
                     ]),
@@ -3189,6 +3627,636 @@ impl Store for LibsqlStore {
             Ok(n as usize)
         })
     }
+
+    // ── WL-016 scheduler ──────────────────────────────────────────────────────
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_message(
+        &self,
+        sender: &str,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        kind: ScheduleKind,
+        cron_expr: &str,
+        next_run: i64,
+    ) -> Result<i64> {
+        self.guard_writable()?;
+        check_ident("sender", sender)?;
+        check_ident("recipient", recipient)?;
+        check_body(body)?;
+        if cron_expr.len() > MAX_CRON_EXPR_LEN {
+            anyhow::bail!(
+                "cron expression is too long ({} chars; max {MAX_CRON_EXPR_LEN}).",
+                cron_expr.len()
+            );
+        }
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO schedules (kind, cron_expr, next_run, sender, recipient, subject, body, created_ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params(vec![
+                        kind.as_str().into(),
+                        cron_expr.into(),
+                        next_run.into(),
+                        sender.into(),
+                        recipient.into(),
+                        subject.map(|s| s.to_string()).into(),
+                        body.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok(self.conn.last_insert_rowid())
+        })
+    }
+
+    fn list_schedules(&self, sender: &str, limit: i64) -> Result<Vec<Schedule>> {
+        check_ident("sender", sender)?;
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, kind, cron_expr, next_run, sender, recipient, subject, body, created_ts, executed_ts, cancelled
+                     FROM schedules WHERE sender = ?1 ORDER BY created_ts DESC LIMIT ?2",
+                    params(vec![sender.into(), limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_schedule(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn cancel_schedule(&self, id: i64) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE schedules SET cancelled = 1 WHERE id = ?1 AND cancelled = 0 AND executed_ts IS NULL",
+                    params(vec![id.into()]),
+                )
+                .await?;
+            Ok(n > 0)
+        })
+    }
+
+    fn get_due_schedules(&self, before_ts: i64) -> Result<Vec<Schedule>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, kind, cron_expr, next_run, sender, recipient, subject, body, created_ts, executed_ts, cancelled
+                     FROM schedules
+                     WHERE next_run <= ?1 AND cancelled = 0
+                       AND (executed_ts IS NULL OR kind = 'recurring')
+                     ORDER BY next_run ASC",
+                    params(vec![before_ts.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(r) = it.next().await? {
+                out.push(row_to_schedule(&r)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn mark_schedule_executed(&self, id: i64) -> Result<()> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let row: Option<(String, String)> = {
+                let mut it = tx
+                    .query(
+                        "SELECT kind, cron_expr FROM schedules WHERE id = ?1",
+                        params(vec![id.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Some((r.get::<String>(0)?, r.get::<String>(1)?)),
+                    None => None,
+                }
+            };
+            let Some((kind_str, cron_expr)) = row else {
+                tx.commit().await?;
+                return Ok(());
+            };
+            let kind = ScheduleKind::from_str(&kind_str).map_err(|m| anyhow::anyhow!(m))?;
+            match kind {
+                ScheduleKind::OneShot => {
+                    tx.execute(
+                        "UPDATE schedules SET executed_ts = ?1 WHERE id = ?2",
+                        params(vec![now().into(), id.into()]),
+                    )
+                    .await?;
+                }
+                ScheduleKind::Recurring => {
+                    let next = crate::model::next_occurrence(&cron_expr, now());
+                    if let Some(ts) = next {
+                        tx.execute(
+                            "UPDATE schedules SET next_run = ?1 WHERE id = ?2",
+                            params(vec![ts.into(), id.into()]),
+                        )
+                        .await?;
+                    } else {
+                        tx.execute(
+                            "UPDATE schedules SET cancelled = 1 WHERE id = ?1",
+                            params(vec![id.into()]),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn add_review_item(
+        &self,
+        pr_url: &str,
+        title: &str,
+        author: &str,
+        repo: &str,
+        state: ReviewItemState,
+        review_requested_at: Option<i64>,
+    ) -> Result<String> {
+        self.guard_writable()?;
+        if !pr_url_valid(pr_url) {
+            anyhow::bail!("pr_url must be a valid GitHub pull request URL");
+        }
+        if title.len() > MAX_REVIEW_TITLE_LEN {
+            anyhow::bail!("title exceeds {} chars", MAX_REVIEW_TITLE_LEN);
+        }
+        if author.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("author exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        if repo.len() > MAX_REVIEW_IDENT_LEN {
+            anyhow::bail!("repo exceeds {} chars", MAX_REVIEW_IDENT_LEN);
+        }
+        let id = new_review_id(now());
+        let created_at = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO reviews (id, pr_url, title, author, repo, state, review_requested_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params(vec![
+                        id.clone().into(),
+                        pr_url.into(),
+                        title.into(),
+                        author.into(),
+                        repo.into(),
+                        state.as_str().into(),
+                        review_requested_at.into(),
+                        created_at.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(id)
+    }
+
+    fn review_queue(&self, filter: ReviewQueueFilter, limit: i64) -> Result<Vec<ReviewItem>> {
+        let limit = clamp_limit(limit);
+        let (where_clause, binds): (&str, Vec<Value>) = match filter {
+            ReviewQueueFilter::All => ("", Vec::new()),
+            ReviewQueueFilter::Open => {
+                let p: Vec<Value> = vec!["open".into()];
+                ("WHERE state = ?1", p)
+            }
+            ReviewQueueFilter::Pending => {
+                let p: Vec<Value> = vec!["open".into()];
+                ("WHERE state = ?1 AND reviewed_at IS NULL", p)
+            }
+            ReviewQueueFilter::Reviewed => ("WHERE reviewed_at IS NOT NULL", Vec::new()),
+        };
+        let sql = format!(
+            "SELECT id, pr_url, title, author, repo, state, review_requested_at, reviewed_at, reviewed_by, created_at
+             FROM reviews {} ORDER BY created_at DESC LIMIT {}",
+            where_clause, limit
+        );
+        self.rt.block_on(async {
+            let mut it = self.conn.query(&sql, params(binds)).await?;
+            let mut items = Vec::new();
+            while let Some(r) = it.next().await? {
+                items.push(ReviewItem {
+                    id: r.get(0)?,
+                    pr_url: r.get(1)?,
+                    title: r.get(2)?,
+                    author: r.get(3)?,
+                    repo: r.get(4)?,
+                    state: ReviewItemState::from_str(&r.get::<String>(5)?)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    review_requested_at: r.get(6)?,
+                    reviewed_at: r.get(7)?,
+                    reviewed_by: r.get(8)?,
+                    created_at: r.get(9)?,
+                });
+            }
+            Ok::<_, anyhow::Error>(items)
+        })
+    }
+
+    fn mark_reviewed(&self, id: &str, reviewer: &str) -> Result<bool> {
+        self.guard_writable()?;
+        check_ident("reviewer", reviewer)?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE reviews SET reviewed_at = ?1, reviewed_by = ?2 WHERE id = ?3",
+                    params(vec![now().into(), reviewer.into(), id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn remove_review_item(&self, id: &str) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute("DELETE FROM reviews WHERE id = ?1", params(vec![id.into()]))
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn reserve_lease(
+        &self,
+        holder: &str,
+        resource: &str,
+        ttl_secs: i64,
+        note: Option<&str>,
+    ) -> Result<Lease> {
+        use crate::model::{
+            lease_path_conflicts, lease_path_normalize, lease_resource_valid, lease_ttl_valid,
+        };
+        if !lease_resource_valid(resource) {
+            anyhow::bail!("invalid resource string");
+        }
+        if !lease_ttl_valid(ttl_secs) {
+            anyhow::bail!(
+                "ttl must be > 0 and <= {}s",
+                crate::model::MAX_LEASE_TTL_SECS
+            );
+        }
+        let note = note.unwrap_or("");
+        if note.len() > crate::model::MAX_LEASE_NOTE_LEN {
+            anyhow::bail!("note exceeds {} chars", crate::model::MAX_LEASE_NOTE_LEN);
+        }
+        let resource_norm = lease_path_normalize(resource);
+        if resource_norm.is_empty() {
+            anyhow::bail!("invalid resource path");
+        }
+        let acquired = now();
+        let expires = acquired + ttl_secs;
+
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            // Sweep expired leases inline (cannot call sweep_expired_leases
+            // because it also uses block_on).
+            self.conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
+
+            // Check for path conflicts (exact, parent, child) with any *other* holder.
+            let mut stmt = self
+                .conn
+                .query(
+                    "SELECT resource, holder, expires FROM leases
+                     WHERE expires > ?1
+                       AND (resource = ?2
+                            OR resource || '/' = SUBSTR(?2, 1, LENGTH(resource) + 1)
+                            OR ?2 || '/' = SUBSTR(resource, 1, LENGTH(?2) + 1))",
+                    params(vec![now().into(), resource_norm.clone().into()]),
+                )
+                .await?;
+            let mut conflicts: Vec<(String, String, i64)> = Vec::new();
+            while let Some(row) = stmt.next().await? {
+                conflicts.push((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<i64>(2)?,
+                ));
+            }
+            for (existing_res, existing_holder, existing_expires) in conflicts {
+                if existing_holder == holder && existing_res == resource_norm {
+                    self.conn
+                        .execute(
+                            "UPDATE leases SET acquired = ?1, expires = ?2, note = ?3
+                             WHERE resource = ?4 AND holder = ?5",
+                            params(vec![
+                                acquired.into(),
+                                expires.into(),
+                                note.into(),
+                                resource_norm.clone().into(),
+                                holder.into(),
+                            ]),
+                        )
+                        .await?;
+                    return Ok::<_, anyhow::Error>(Lease {
+                        resource: resource_norm,
+                        holder: holder.to_string(),
+                        acquired,
+                        expires,
+                        note: note.to_string(),
+                    });
+                }
+                if lease_path_conflicts(&existing_res, &resource_norm) {
+                    anyhow::bail!(
+                        "resource '{}' conflicts with '{}' held by '{}' until {}",
+                        resource,
+                        existing_res,
+                        existing_holder,
+                        existing_expires
+                    );
+                }
+            }
+
+            let n = self
+                .conn
+                .execute(
+                    "INSERT INTO leases (resource, holder, acquired, expires, note)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(resource) DO UPDATE SET
+                         holder = excluded.holder,
+                         acquired = excluded.acquired,
+                         expires = excluded.expires,
+                         note = excluded.note
+                     WHERE leases.expires < ?6",
+                    params(vec![
+                        resource_norm.into(),
+                        holder.into(),
+                        acquired.into(),
+                        expires.into(),
+                        note.into(),
+                        now().into(),
+                    ]),
+                )
+                .await?;
+            if n == 0 {
+                anyhow::bail!("resource '{}' is already held", resource);
+            }
+
+            Ok::<_, anyhow::Error>(Lease {
+                resource: resource.to_string(),
+                holder: holder.to_string(),
+                acquired,
+                expires,
+                note: note.to_string(),
+            })
+        })
+    }
+
+    fn release_lease(&self, holder: &str, resource: &str) -> Result<bool> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM leases WHERE resource = ?1 AND holder = ?2",
+                    params(vec![resource.into(), holder.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+    }
+
+    fn list_leases(&self, limit: i64) -> Result<Vec<Lease>> {
+        self.rt.block_on(async {
+            // Sweep expired leases inline.
+            self.conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
+            let now = now();
+            let limit = clamp_limit(limit);
+            let mut stmt = self
+                .conn
+                .query(
+                    "SELECT resource, holder, acquired, expires, note
+                     FROM leases WHERE expires > ?1
+                     ORDER BY acquired DESC LIMIT ?2",
+                    params(vec![now.into(), limit.into()]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = stmt.next().await? {
+                out.push(Lease {
+                    resource: row.get(0)?,
+                    holder: row.get(1)?,
+                    acquired: row.get(2)?,
+                    expires: row.get(3)?,
+                    note: row.get(4)?,
+                });
+            }
+            Ok::<_, anyhow::Error>(out)
+        })
+    }
+
+    fn sweep_expired_leases(&self) -> Result<usize> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            let n = self
+                .conn
+                .execute(
+                    "DELETE FROM leases WHERE expires <= ?1",
+                    params(vec![now().into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n as usize)
+        })
+    }
+
+    fn set_message_priority(&self, id: i64, priority: &str) -> Result<()> {
+        let p = crate::model::MessagePriority::parse(priority);
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE messages SET priority = ?1 WHERE id = ?2",
+                    params(vec![p.as_str().into(), id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
+        let p = crate::model::ContactPolicy::parse(policy);
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE peers SET contact_policy = ?1 WHERE name = ?2",
+                    params(vec![p.as_str().into(), name.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn get_peer_policy(&self, name: &str) -> Result<Option<String>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT contact_policy FROM peers WHERE name = ?1",
+                    params(vec![name.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(row) => Ok::<_, anyhow::Error>(Some(row.get::<String>(0)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn permission_verdict(
+        &self,
+        correlation_id: &str,
+        timeout_secs: i64,
+    ) -> Result<(PermissionStatus, Option<String>)> {
+        if !ask_id_valid(correlation_id) {
+            anyhow::bail!("invalid correlation id.");
+        }
+        let ask = self
+            .get_ask(correlation_id)?
+            .ok_or_else(|| anyhow::anyhow!("no ask found for {correlation_id}"))?;
+        if ask.kind != AskKind::ToolPermission {
+            anyhow::bail!("ask {correlation_id} is not a tool permission.");
+        }
+        let answer_body: Option<String> = if let Some(aid) = ask.answer_msg_id {
+            self.rt.block_on(async {
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT body FROM messages WHERE id = ?1",
+                        params(vec![aid.into()]),
+                    )
+                    .await?;
+                match it.next().await? {
+                    Some(r) => Ok::<_, anyhow::Error>(r.get::<String>(0).ok()),
+                    None => Ok(None),
+                }
+            })?
+        } else {
+            None
+        };
+        let timeout = if timeout_secs > 0 {
+            timeout_secs
+        } else {
+            crate::model::PERMISSION_TIMEOUT_SECS
+        };
+        let status = permission_status(&ask, answer_body.as_deref(), now(), timeout);
+        Ok((status, answer_body))
+    }
+
+    fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>> {
+        check_ident("me", me)?;
+        let limit = clamp_limit(limit);
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id
+                     FROM asks
+                     WHERE asker = ?1 AND kind = ?2
+                     ORDER BY opened_ts DESC LIMIT ?3",
+                    params(vec![
+                        me.into(),
+                        AskKind::ToolPermission.as_str().into(),
+                        limit.into(),
+                    ]),
+                )
+                .await?;
+            let mut asks = Vec::new();
+            while let Some(r) = it.next().await? {
+                asks.push(row_to_ask(&r)?);
+            }
+            Ok::<_, anyhow::Error>(asks)
+        })
+    }
+
+    fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
+        let ts = now();
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(root_id) DO UPDATE SET
+                     text = excluded.text,
+                     model = excluded.model,
+                     refreshed_ts = excluded.refreshed_ts",
+                    params(vec![
+                        root_id.into(),
+                        text.into(),
+                        model.into(),
+                        ts.into(),
+                        ts.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT root_id, text, model, created_ts, refreshed_ts
+                     FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            if let Some(r) = it.next().await? {
+                Ok(Some(crate::model::Summary {
+                    root_id: r.get(0)?,
+                    text: r.get(1)?,
+                    model: r.get(2)?,
+                    created_ts: r.get(3)?,
+                    refreshed_ts: r.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn delete_summary(&self, root_id: i64) -> Result<bool> {
+        self.rt.block_on(async {
+            let rows = self
+                .conn
+                .execute(
+                    "DELETE FROM summaries WHERE root_id = ?1",
+                    params(vec![root_id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(rows > 0)
+        })
+    }
 }
 
 /// Count unread messages for `me` against any connection (the live connection or
@@ -3210,7 +4278,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
@@ -3305,7 +4373,17 @@ mod tests {
     #[test]
     fn ask_open_answer_ack_roundtrip() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", Some("help"), "what time?", None).unwrap();
+        let (cid, qid) = s
+            .ask(
+                "a",
+                "b",
+                Some("help"),
+                "what time?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(crate::model::ask_id_valid(&cid));
         let (b_in, _) = s.inbox("b", false, false, 50).unwrap();
         assert!(b_in.iter().any(|m| m.id == qid && m.sender == "a"));
@@ -3331,7 +4409,9 @@ mod tests {
     #[test]
     fn ask_lifecycle_is_monotonic() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         s.ack("b", &cid, None).unwrap();
         assert!(s.ack("b", &cid, None).is_err());
         assert!(s.answer("b", &cid, "late").is_err());
@@ -3342,12 +4422,18 @@ mod tests {
     #[test]
     fn ask_owner_checks_and_caps() {
         let s = mem();
-        let (cid, _) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, _) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         assert!(s.answer("a", &cid, "self").is_err());
         assert!(s.ack("a", &cid, None).is_err());
-        assert!(s.ask("a", "all", None, "q", None).is_err());
+        assert!(s
+            .ask("a", "all", None, "q", AskKind::FreeText, None, None)
+            .is_err());
         let big = "x".repeat(crate::store::MAX_BODY + 1);
-        assert!(s.ask("a", "b", None, &big, None).is_err());
+        assert!(s
+            .ask("a", "b", None, &big, AskKind::FreeText, None, None)
+            .is_err());
         assert!(s.answer("b", "ask;rm -rf", "x").is_err());
         assert!(s.get_ask("bad id").is_err());
     }
@@ -3355,9 +4441,29 @@ mod tests {
     #[test]
     fn ask_reply_to_chains_and_closes_prior() {
         let s = mem();
-        let (c1, q1) = s.ask("a", "b", Some("topic"), "first?", None).unwrap();
+        let (c1, q1) = s
+            .ask(
+                "a",
+                "b",
+                Some("topic"),
+                "first?",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
         s.answer("b", &c1, "first-ans").unwrap();
-        let (c2, q2) = s.ask("a", "b", None, "second?", Some(&c1)).unwrap();
+        let (c2, q2) = s
+            .ask(
+                "a",
+                "b",
+                None,
+                "second?",
+                AskKind::FreeText,
+                None,
+                Some(&c1),
+            )
+            .unwrap();
         assert_eq!(s.get_ask(&c1).unwrap().unwrap().state, AskState::Acked);
         assert_eq!(
             s.get_ask(&c2).unwrap().unwrap().reply_to.as_deref(),
@@ -3365,17 +4471,44 @@ mod tests {
         );
         let thread = s.thread(q1, 50).unwrap();
         assert!(thread.iter().any(|m| m.id == q2));
-        assert!(s.ask("a", "b", None, "x", Some("ask_404_1")).is_err());
+        assert!(s
+            .ask(
+                "a",
+                "b",
+                None,
+                "x",
+                AskKind::FreeText,
+                None,
+                Some("ask_404_1")
+            )
+            .is_err());
     }
 
     #[test]
     fn list_asks_role_filtering() {
         let s = mem();
-        let (c1, _) = s.ask("a", "b", None, "q1", None).unwrap();
-        let (c2, _) = s.ask("b", "a", None, "q2", None).unwrap();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
+        let (c2, _) = s
+            .ask("b", "a", None, "q2", AskKind::FreeText, None, None)
+            .unwrap();
         assert_eq!(s.list_asks("a", AskRole::Asker, 50).unwrap()[0].id, c1);
         assert_eq!(s.list_asks("a", AskRole::Askee, 50).unwrap()[0].id, c2);
         assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 2);
+    }
+
+    /// libsql parity: `has_open_asks` matches the sqlite semantics.
+    #[test]
+    fn has_open_asks_libsql() {
+        let s = mem();
+        let (c1, _) = s
+            .ask("a", "b", None, "q1", AskKind::FreeText, None, None)
+            .unwrap();
+        assert!(s.has_open_asks("b").unwrap(), "b is askee of an open ask");
+        assert!(!s.has_open_asks("a").unwrap(), "a is asker");
+        s.answer("b", &c1, "ans").unwrap();
+        assert!(!s.has_open_asks("b").unwrap(), "answered, no longer open");
     }
 
     /// libsql parity: `list_asks` is bounded (clamped to MAX_LIMIT), and
@@ -3383,7 +4516,9 @@ mod tests {
     #[test]
     fn list_asks_bounded_and_ask_for_message_libsql() {
         let s = mem();
-        let (cid, qid) = s.ask("a", "b", None, "q", None).unwrap();
+        let (cid, qid) = s
+            .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+            .unwrap();
         let aid = s.answer("b", &cid, "a").unwrap();
         assert_eq!(
             s.ask_for_message(qid).unwrap().as_deref(),
@@ -3393,7 +4528,7 @@ mod tests {
             s.ask_for_message(aid).unwrap().as_deref(),
             Some(cid.as_str())
         );
-        let mid = s.send("a", "b", None, "plain").unwrap();
+        let mid = s.send("a", "b", None, "plain", None, None).unwrap();
         assert_eq!(s.ask_for_message(mid).unwrap(), None);
         let huge = s.list_asks("a", AskRole::Any, i64::MAX).unwrap();
         assert!(
@@ -3424,7 +4559,9 @@ mod tests {
                 ..Config::default()
             };
             let rw = LibsqlStore::open(&cfg).unwrap();
-            let (cid, _) = rw.ask("a", "b", None, "q", None).unwrap();
+            let (cid, _) = rw
+                .ask("a", "b", None, "q", AskKind::FreeText, None, None)
+                .unwrap();
             cid
         };
 
@@ -3434,7 +4571,8 @@ mod tests {
         assert_eq!(ro.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
         // All three mutating ops trap (never a silent foreign write, never a panic).
         assert!(
-            ro.ask("a", "b", None, "intruder", None).is_err(),
+            ro.ask("a", "b", None, "intruder", AskKind::FreeText, None, None)
+                .is_err(),
             "ask through a read-only handle must trap"
         );
         assert!(
@@ -3473,7 +4611,7 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            s.send("a", "b", None, "pre-existing").unwrap();
+            s.send("a", "b", None, "pre-existing", None, None).unwrap();
             // Drop the asks table to simulate a DB that predates the migration.
             s.rt.block_on(async { s.conn.execute("DROP TABLE asks", ()).await })
                 .unwrap();
@@ -3501,7 +4639,9 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            let (cid, _) = s.ask("a", "b", Some("subj"), "q?", None).unwrap();
+            let (cid, _) = s
+                .ask("a", "b", Some("subj"), "q?", AskKind::FreeText, None, None)
+                .unwrap();
             s.answer("b", &cid, "ans").unwrap();
             s.ack("b", &cid, Some("closed")).unwrap();
             assert_eq!(s.get_ask(&cid).unwrap().unwrap().state, AskState::Acked);
@@ -3635,7 +4775,7 @@ mod tests {
                 ..Config::default()
             };
             let s = LibsqlStore::open(&cfg).unwrap();
-            s.send("a", "b", None, "q").unwrap();
+            s.send("a", "b", None, "q", None, None).unwrap();
             s.rt
                 .block_on(async {
                     s.conn.execute("DROP TABLE asks", ()).await?;
@@ -3686,8 +4826,9 @@ mod tests {
     #[test]
     fn send_and_read_tracking() {
         let s = mem();
-        s.send("desktop", "envctl", Some("hi"), "body1").unwrap();
-        s.send("desktop", "all", None, "bcast").unwrap();
+        s.send("desktop", "envctl", Some("hi"), "body1", None, None)
+            .unwrap();
+        s.send("desktop", "all", None, "bcast", None, None).unwrap();
 
         let (rows, remaining) = s.inbox("envctl", false, true, 50).unwrap();
         assert_eq!(rows.len(), 2);
@@ -3771,9 +4912,9 @@ mod tests {
     #[test]
     fn history_scoped() {
         let s = mem();
-        s.send("a", "b", None, "1").unwrap();
-        s.send("b", "a", None, "2").unwrap();
-        s.send("c", "d", None, "x").unwrap();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("b", "a", None, "2", None, None).unwrap();
+        s.send("c", "d", None, "x", None, None).unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
     }
@@ -3781,7 +4922,9 @@ mod tests {
     #[test]
     fn reply_addresses_back_and_links() {
         let s = mem();
-        let root = s.send("a", "b", Some("hi"), "question?").unwrap();
+        let root = s
+            .send("a", "b", Some("hi"), "question?", None, None)
+            .unwrap();
         let r1 = s.reply("b", root, "answer.").unwrap();
 
         let (a_inbox, _) = s.inbox("a", true, false, 50).unwrap();
@@ -3807,10 +4950,10 @@ mod tests {
     #[test]
     fn thread_collects_transitive_replies_in_order() {
         let s = mem();
-        let root = s.send("a", "b", Some("topic"), "m0").unwrap();
+        let root = s.send("a", "b", Some("topic"), "m0", None, None).unwrap();
         let c1 = s.reply("b", root, "m1").unwrap();
         let c2 = s.reply("a", c1, "m2").unwrap(); // nested reply-to-a-reply
-        let _other = s.send("a", "b", None, "unrelated").unwrap();
+        let _other = s.send("a", "b", None, "unrelated", None, None).unwrap();
 
         let thread = s.thread(root, 50).unwrap();
         let ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
@@ -3825,7 +4968,7 @@ mod tests {
     #[test]
     fn receipts_reports_readers() {
         let s = mem();
-        let id = s.send("a", "all", None, "ping").unwrap();
+        let id = s.send("a", "all", None, "ping", None, None).unwrap();
         assert!(s.receipts(id).unwrap().is_empty(), "nobody has read yet");
 
         s.inbox("b", false, true, 50).unwrap();
@@ -3841,9 +4984,9 @@ mod tests {
     #[test]
     fn inbox_since_pages_forward_without_dropping_backlog() {
         let s = mem();
-        let id1 = s.send("a", "b", None, "m1").unwrap();
-        let id2 = s.send("a", "b", None, "m2").unwrap();
-        let id3 = s.send("a", "all", None, "bcast").unwrap();
+        let id1 = s.send("a", "b", None, "m1", None, None).unwrap();
+        let id2 = s.send("a", "b", None, "m2", None, None).unwrap();
+        let id3 = s.send("a", "all", None, "bcast", None, None).unwrap();
 
         let all = s.inbox_since("b", 0, 50).unwrap();
         let ids: Vec<i64> = all.iter().map(|m| m.id).collect();
@@ -3864,7 +5007,7 @@ mod tests {
     #[test]
     fn gc_deletes_old_keeps_new() {
         let s = mem();
-        let id_old = s.send("a", "b", None, "old").unwrap();
+        let id_old = s.send("a", "b", None, "old", None, None).unwrap();
         // Backdate the first message well past the threshold.
         s.rt.block_on(async {
             s.conn
@@ -3876,7 +5019,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .unwrap();
-        s.send("a", "b", None, "new").unwrap();
+        s.send("a", "b", None, "new", None, None).unwrap();
         let deleted = s.gc(3600).unwrap(); // older than 1h
         assert_eq!(deleted, 1);
         assert_eq!(s.total_messages().unwrap(), 1);
@@ -3890,7 +5033,9 @@ mod tests {
     fn delivery_log_records_and_lists_oldest_first_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "SECRET-BODY-XYZ").unwrap();
+        let mid = s
+            .send("a", "b", None, "SECRET-BODY-XYZ", None, None)
+            .unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -3922,7 +5067,7 @@ mod tests {
     fn delivery_log_read_is_bounded_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
         let s = mem();
-        let mid = s.send("a", "b", None, "x").unwrap();
+        let mid = s.send("a", "b", None, "x", None, None).unwrap();
         for _ in 0..(MAX_DELIVERY_ROWS + 10) {
             s.record_delivery(
                 mid,
@@ -3944,7 +5089,7 @@ mod tests {
     fn gc_prunes_old_delivery_log_libsql() {
         use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage};
         let s = mem();
-        let mid = s.send("a", "b", None, "m").unwrap();
+        let mid = s.send("a", "b", None, "m", None, None).unwrap();
         s.record_delivery(
             mid,
             DeliveryRefKind::Message.as_str(),
@@ -4033,7 +5178,8 @@ mod tests {
     fn negative_limit_is_not_unbounded() {
         let s = mem();
         for i in 0..5 {
-            s.send("a", "b", None, &format!("m{i}")).unwrap();
+            s.send("a", "b", None, &format!("m{i}"), None, None)
+                .unwrap();
         }
         // A negative limit must NOT behave like SQLite's unbounded LIMIT -1.
         let (rows, _) = s.inbox("b", true, false, -1).unwrap();
@@ -4045,8 +5191,8 @@ mod tests {
     #[test]
     fn clear_inbox_and_clear_all() {
         let s = mem();
-        s.send("a", "b", None, "1").unwrap();
-        s.send("a", "b", None, "2").unwrap();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("a", "b", None, "2", None, None).unwrap();
         // clear_inbox marks b's unread read (returns the count marked).
         assert_eq!(s.clear_inbox("b").unwrap(), 2);
         let (unread, _) = s.inbox("b", false, false, 50).unwrap();
@@ -4060,16 +5206,19 @@ mod tests {
     #[test]
     fn send_rejects_invalid_idents() {
         let s = mem();
-        assert!(s.send("", "b", None, "x").is_err(), "empty sender rejected");
         assert!(
-            s.send("a", "", None, "x").is_err(),
+            s.send("", "b", None, "x", None, None).is_err(),
+            "empty sender rejected"
+        );
+        assert!(
+            s.send("a", "", None, "x", None, None).is_err(),
             "empty recipient rejected"
         );
         assert!(
-            s.send("a", "b\nc", None, "x").is_err(),
+            s.send("a", "b\nc", None, "x", None, None).is_err(),
             "control char in recipient rejected"
         );
-        assert!(s.send("a", "b", None, "x").is_ok());
+        assert!(s.send("a", "b", None, "x", None, None).is_ok());
     }
 
     // ---- A2 (real liveness): mirror of the SqliteStore store-unit tests ----
@@ -4079,20 +5228,22 @@ mod tests {
     #[test]
     fn register_peer_full_roundtrips_pid_and_host() {
         let s = mem();
-        s.register_peer_full(
-            "p",
-            "tmux",
-            "%3",
-            "",
-            Some("/w"),
-            Some(4321),
-            "boxA",
-            "weave",
-            "main",
-            "(main)",
-            "default",
-        )
-        .unwrap();
+        let cert = s
+            .register_peer_full(
+                "p",
+                "tmux",
+                "%3",
+                "",
+                Some("/w"),
+                Some(4321),
+                "boxA",
+                "weave",
+                "main",
+                "(main)",
+                "default",
+                None,
+            )
+            .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
         assert_eq!(p.pid, Some(4321));
         assert_eq!(p.repo, "weave");
@@ -4115,6 +5266,7 @@ mod tests {
             "",
             "",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -4201,6 +5353,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
@@ -4273,13 +5426,29 @@ mod tests {
     #[test]
     fn register_roundtrips_circle_and_preserves_role() {
         let s = mem();
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
+        let cert = s
+            .register_peer_full(
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+            )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
         s.claim_orchestrator_role("p", None, false).unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().role, "orchestrator");
-        s.register_peer_full("p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a")
-            .unwrap();
+        s.register_peer_full(
+            "p",
+            "tmux",
+            "%1",
+            "",
+            None,
+            None,
+            "h",
+            "",
+            "",
+            "",
+            "team-a",
+            Some(&cert),
+        )
+        .unwrap();
         assert_eq!(
             s.get_peer("p").unwrap().unwrap().role,
             "orchestrator",
@@ -4290,20 +5459,32 @@ mod tests {
     /// P4 (libSQL mirror): claim refuses a non-force claim while a LIVE holder
     /// exists, and force steals (demoting the prior holder).
     #[test]
-    fn claim_refuses_live_holder_then_force_steals() {
+    fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
-        s.register_peer_full("a", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
-        s.register_peer_full("b", "tmux", "%2", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
+        s.register_peer_full(
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         assert!(matches!(
             s.claim_orchestrator_role("a", None, false).unwrap(),
             crate::model::ClaimOutcome::Claimed { .. }
         ));
+        // WL-019: b claims without force while a is live ⇒ co-orchestrator.
         match s.claim_orchestrator_role("b", None, false).unwrap() {
-            crate::model::ClaimOutcome::Refused { holder, .. } => assert_eq!(holder, "a"),
-            other => panic!("expected Refused, got {other:?}"),
+            crate::model::ClaimOutcome::Claimed { demoted, .. } => {
+                assert!(
+                    demoted.is_empty(),
+                    "non-force should not demote: {demoted:?}"
+                );
+            }
+            other => panic!("expected Claimed, got {other:?}"),
         }
+        assert_eq!(s.get_peer("a").unwrap().unwrap().role, "orchestrator");
+        assert_eq!(s.get_peer("b").unwrap().unwrap().role, "orchestrator");
         match s.claim_orchestrator_role("b", None, true).unwrap() {
             crate::model::ClaimOutcome::Claimed { demoted, .. } => {
                 assert_eq!(demoted, vec!["a".to_string()])
@@ -4320,12 +5501,14 @@ mod tests {
     #[test]
     fn orchestrator_status_present_and_absent() {
         let s = mem();
-        s.register_peer_full("o", "tmux", "%1", "", None, None, "h", "", "", "", "c1")
-            .unwrap();
+        s.register_peer_full(
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+        )
+        .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
         let st = s.orchestrator_status(Some("c1")).unwrap();
         assert!(st.present);
-        assert_eq!(st.holder.unwrap().name, "o");
+        assert_eq!(st.holders[0].name, "o");
         let st2 = s.orchestrator_status(Some("empty")).unwrap();
         assert!(!st2.present);
     }
@@ -4415,6 +5598,7 @@ mod tests {
             "feat/x",
             "wt-9",
             "default",
+            None,
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -4468,6 +5652,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -4488,6 +5673,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -4510,6 +5696,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -4531,6 +5718,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -4572,6 +5760,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let local = s.get_peer("local").unwrap().unwrap();
@@ -4579,7 +5768,7 @@ mod tests {
 
         // same-host + null pid + recent => AliveLocal (TTL fallback).
         s.register_peer_full(
-            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default",
+            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None,
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -4599,6 +5788,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -4617,6 +5807,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let empty = s.get_peer("empty").unwrap().unwrap();
@@ -4643,6 +5834,7 @@ mod tests {
             "",
             "",
             "default",
+            None,
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -4721,6 +5913,7 @@ mod tests {
                 "",
                 "",
                 "default",
+                None,
             )
             .unwrap();
         }
@@ -4739,13 +5932,13 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
         );
         assert!(
             wr.is_err(),
             "a write through a libsql read-only handle must error"
         );
-        let send = ro.send("a", "b", None, "x");
+        let send = ro.send("a", "b", None, "x", None, None);
         assert!(
             send.is_err(),
             "a send through a libsql read-only handle must error"
@@ -4816,9 +6009,10 @@ mod tests {
                 "",
                 "",
                 "default",
+                None,
             )
             .unwrap();
-            rw.send("seed", "seed", None, "hi").unwrap();
+            rw.send("seed", "seed", None, "hi", None, None).unwrap();
         }
         let before = std::fs::read(&path).expect("read foreign DB bytes (before)");
 
@@ -4839,7 +6033,7 @@ mod tests {
             );
         };
 
-        assert_trapped("send", ro.send("a", "b", None, "x").map(|_| ()));
+        assert_trapped("send", ro.send("a", "b", None, "x", None, None).map(|_| ()));
         assert_trapped(
             "inbox(mark_read)",
             ro.inbox("seed", false, true, 10).map(|_| ()),
@@ -4853,12 +6047,13 @@ mod tests {
         assert_trapped(
             "register_peer_full",
             ro.register_peer_full(
-                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
-            ),
+                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            )
+            .map(|_| ()),
         );
         assert_trapped(
             "enqueue_intent",
-            ro.enqueue_intent("to", "boxB", "from", None, "body", "")
+            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None, None)
                 .map(|_| ()),
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
@@ -4904,7 +6099,7 @@ mod tests {
         };
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default",
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
             )
             .unwrap();
         {
@@ -4916,7 +6111,7 @@ mod tests {
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default",
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
                 )
                 .unwrap();
         }
@@ -4949,12 +6144,32 @@ mod tests {
     fn enqueue_and_list_outbox_roundtrip_libsql() {
         let s = mem();
         let i1 = s
-            .enqueue_intent("bob", "boxB", "alice", Some("hi"), "body1", "")
+            .enqueue_intent(
+                "bob",
+                "boxB",
+                "alice",
+                Some("hi"),
+                "body1",
+                "",
+                None,
+                None,
+                None,
+            )
             .unwrap();
-        s.enqueue_intent("carol", "", "alice", None, "for carol", "")
-            .unwrap();
+        s.enqueue_intent(
+            "carol",
+            "",
+            "alice",
+            None,
+            "for carol",
+            "",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "")
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None)
             .unwrap();
 
         let all = s.outbox_all(50).unwrap();
@@ -5128,8 +6343,18 @@ mod tests {
                 ..Config::default()
             };
             let a = LibsqlStore::open(&cfg).unwrap();
-            a.enqueue_intent("bob", "", "alice", Some("hi"), "hello bob", "")
-                .unwrap();
+            a.enqueue_intent(
+                "bob",
+                "",
+                "alice",
+                Some("hi"),
+                "hello bob",
+                "",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
         // Snapshot A's main DB file BEFORE B pulls (WAL legitimately appears on a
         // read-only open; the invariant is asserted on the main data file + empty WAL).
@@ -5758,6 +6983,7 @@ mod tests {
         s.set_turn_state("a", "working").unwrap();
         s.set_description("a", "deep work").unwrap();
         let ts_before = s.get_peer("a").unwrap().unwrap().description_ts;
+        let cert = s.get_birth_cert("a").unwrap().unwrap();
         s.register_peer_full(
             "a",
             "tmux",
@@ -5770,6 +6996,7 @@ mod tests {
             "br",
             "wt",
             "default",
+            Some(&cert),
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();
@@ -5975,6 +7202,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         assert_eq!(
             s.peer_liveness(&p).unwrap(),
@@ -6003,5 +7232,226 @@ mod tests {
             s.peer_liveness(&p3).unwrap(),
             crate::model::Liveness::Offline
         );
+    }
+
+    // ── WL-016 schedule store tests (libsql mirror) ──────────────────────────
+
+    #[test]
+    fn schedule_one_shot_roundtrip_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "alice",
+                "bob",
+                Some("hi"),
+                "hello",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        let list = s.list_schedules("alice", 50).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].kind, ScheduleKind::OneShot);
+        assert_eq!(list[0].recipient, "bob");
+    }
+
+    #[test]
+    fn schedule_cancel_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        assert!(s.cancel_schedule(id).unwrap());
+        assert!(!s.cancel_schedule(id).unwrap());
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].cancelled);
+    }
+
+    #[test]
+    fn schedule_due_query_libsql() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message("a", "b", None, "x", ScheduleKind::OneShot, "@daily", past)
+            .unwrap();
+        let due = s.get_due_schedules(crate::model::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+    }
+
+    #[test]
+    fn schedule_mark_executed_one_shot_libsql() {
+        let s = mem();
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::OneShot,
+                "@daily",
+                1_700_000_000,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_some());
+    }
+
+    #[test]
+    fn schedule_mark_executed_recurring_libsql() {
+        let s = mem();
+        let past = crate::model::now() - 3600;
+        let id = s
+            .schedule_message(
+                "a",
+                "b",
+                None,
+                "x",
+                ScheduleKind::Recurring,
+                "@hourly",
+                past,
+            )
+            .unwrap();
+        s.mark_schedule_executed(id).unwrap();
+        let list = s.list_schedules("a", 50).unwrap();
+        assert!(list[0].executed_ts.is_none());
+        assert!(list[0].next_run > past);
+    }
+
+    // ---- WL-020: review queue ----
+
+    #[test]
+    fn review_add_list_mark_remove_roundtrip_libsql() {
+        let s = mem();
+        let id = s
+            .add_review_item(
+                "https://github.com/owner/repo/pull/1",
+                "fix bug",
+                "alice",
+                "owner/repo",
+                crate::model::ReviewItemState::Open,
+                None,
+            )
+            .unwrap();
+        assert!(id.starts_with("review_"));
+
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].pr_url, "https://github.com/owner/repo/pull/1");
+
+        let pending = s
+            .review_queue(crate::model::ReviewQueueFilter::Pending, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
+        assert!(s.mark_reviewed(&id, "bob").unwrap());
+        let reviewed = s
+            .review_queue(crate::model::ReviewQueueFilter::Reviewed, 10)
+            .unwrap();
+        assert_eq!(reviewed.len(), 1);
+        assert_eq!(reviewed[0].reviewed_by, Some("bob".to_string()));
+
+        assert!(s.remove_review_item(&id).unwrap());
+        let all = s
+            .review_queue(crate::model::ReviewQueueFilter::All, 10)
+            .unwrap();
+        assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn review_rejects_bad_url_libsql() {
+        let s = mem();
+        assert!(s
+            .add_review_item(
+                "not-a-url",
+                "t",
+                "a",
+                "r",
+                crate::model::ReviewItemState::Open,
+                None
+            )
+            .is_err());
+    }
+
+    // ---- WL-021: permission status ----
+
+    #[test]
+    fn permission_verdict_approved_after_answer_libsql() {
+        let s = mem();
+        let (cid, _qid) = s
+            .ask(
+                "alice",
+                "bob",
+                None,
+                "allow rm?",
+                crate::model::AskKind::ToolPermission,
+                Some("Bash\nrm -rf /"),
+                None,
+            )
+            .unwrap();
+        s.answer("bob", &cid, "approve").unwrap();
+        let (status, body) = s.permission_verdict(&cid, 300).unwrap();
+        assert_eq!(status, crate::model::PermissionStatus::Approved);
+        assert_eq!(body.unwrap(), "approve");
+    }
+
+    #[test]
+    fn permission_list_filters_by_asker_libsql() {
+        let s = mem();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q1",
+            crate::model::AskKind::ToolPermission,
+            None,
+            None,
+        )
+        .unwrap();
+        s.ask(
+            "alice",
+            "bob",
+            None,
+            "q2",
+            crate::model::AskKind::FreeText,
+            None,
+            None,
+        )
+        .unwrap();
+        let perms = s.list_permissions("alice", 10).unwrap();
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].kind, crate::model::AskKind::ToolPermission);
+    }
+
+    #[test]
+    fn summary_roundtrip_libsql() {
+        let s = mem();
+        assert!(s.get_summary(1).unwrap().is_none());
+        s.store_summary(1, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum.root_id, 1);
+        assert_eq!(sum.text, "summary text");
+        assert_eq!(sum.model, "gpt-4");
+        // Upsert refreshes
+        s.store_summary(1, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(1).unwrap().unwrap();
+        assert_eq!(sum2.text, "new text");
+        assert_eq!(sum2.model, "gpt-3");
+        assert!(s.delete_summary(1).unwrap());
+        assert!(!s.delete_summary(1).unwrap());
+        assert!(s.get_summary(1).unwrap().is_none());
     }
 }

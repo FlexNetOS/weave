@@ -19,6 +19,7 @@ default = ["sqlite"]
 sqlite = ["weave-core/sqlite"]
 libsql = ["weave-core/libsql", "weave-mcp/libsql"]
 sign = ["weave-core/sign", "weave-mcp/sign"]
+llm = ["weave-core/llm"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }
@@ -30,6 +31,11 @@ clap_complete = "4.6.1"
 clap_mangen = "0.2.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
+# FrankenNetworkX graph primitives — extracted for peer/message network analysis.
+# These are workspace-internal crates; we reference them by git + path.
+fnx-classes = { git = "https://github.com/Dicklesworthstone/franken_networkx" }
+fnx-algorithms = { git = "https://github.com/Dicklesworthstone/franken_networkx" }
+fnx-runtime = { git = "https://github.com/Dicklesworthstone/franken_networkx" }
 
 [dev-dependencies]
 proptest = "1.8.0"

@@ -51,6 +51,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
 use weave_core::config::Config;
+use weave_core::memory::{self, MemoryScope};
 use weave_core::store::{is_alive, Store};
 use weave_core::{config, model, store};
 use weave_inject::{self as inject, inject_text, Injector};
@@ -86,12 +87,28 @@ fn long_version() -> &'static str {
     })
 }
 
+/// Parse a mux-preference config string into a real `Mux` variant, filtering
+/// out the catch-all `Mux::None` so an unrecognized value falls back to
+/// auto-detection rather than forcing "no mux".
+fn parse_mux_preference(cfg: &Config) -> Option<weave_inject::Mux> {
+    cfg.mux_preference().and_then(|s| {
+        let m = inject::Mux::parse(s);
+        if m == inject::Mux::None {
+            None
+        } else {
+            Some(m)
+        }
+    })
+}
+
 /// Production injector implementation passed to `weave_mcp::serve`.
-struct RealInjector;
+struct RealInjector {
+    preferred_mux: Option<weave_inject::Mux>,
+}
 
 impl Injector for RealInjector {
     fn detect_target(&self) -> weave_inject::Target {
-        weave_inject::detect_target()
+        weave_inject::detect_target_with_preference(self.preferred_mux)
     }
     fn target_alive(&self, target: &weave_inject::Target) -> bool {
         weave_inject::target_alive(target)
@@ -157,7 +174,13 @@ enum Cmd {
         session: Option<String>,
     },
     /// Wire weave into Claude Code (register MCP server + lifecycle hooks).
-    Setup,
+    /// Optionally also install a git pre-commit hook that guards against
+    /// committing files reserved by other peers.
+    Setup {
+        /// Also install the git pre-commit hook in the current repo.
+        #[arg(long)]
+        git_hooks: bool,
+    },
     /// Remove weave's Claude Code wiring.
     Uninstall,
     /// Send a message to another session.
@@ -180,6 +203,16 @@ enum Cmd {
         /// --to-store). Disambiguates the same recipient name across machines.
         #[arg(long)]
         to_host: Option<String>,
+        /// Skip automatic memory context prefixing for this message.
+        #[arg(long)]
+        no_memory: bool,
+        /// Idempotency key: if a message with this key already exists, the existing
+        /// message id is returned instead of creating a new row.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -194,6 +227,53 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
+        /// Idempotency key: if a message with this key already exists, the existing
+        /// message id is returned instead of creating a new row.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
+    },
+    /// Broadcast a notification to all online peers in your circle. Fan-out:
+    /// one message per online peer, plus a live nudge for each injectable peer.
+    /// Returns an aggregated delivery verdict per peer.
+    BroadcastNotify {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Scope to this circle; omit for your own configured circle.
+        #[arg(long)]
+        circle: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Message priority: low, normal, high, urgent (default normal).
+        #[arg(long)]
+        priority: Option<String>,
+    },
+    /// Broadcast an ask to all online peers in your circle. Fan-out via
+    /// ask-many: one tracked question per online peer. Returns a parent id
+    /// and per-child delivery verdicts.
+    BroadcastAsk {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// Scope to this circle; omit for your own configured circle.
+        #[arg(long)]
+        circle: Option<String>,
+        /// Optional message id this broadcast ask replies to (threads the conversation).
+        #[arg(long = "reply-to")]
+        reply_to: Option<i64>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// List pending cross-store intents in your outbox (Tier-2, read-only).
     Outbox {
@@ -220,6 +300,9 @@ enum Cmd {
         from: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
+        /// Skip automatic memory context prefixing for this reply.
+        #[arg(long)]
+        no_memory: bool,
     },
     /// Print a message thread (a root message and everything chained to it).
     Thread {
@@ -228,6 +311,21 @@ enum Cmd {
         root: i64,
         #[arg(long, default_value_t = 200)]
         limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Generate or retrieve a cached LLM summary of the thread.
+        #[arg(long)]
+        summarize: bool,
+        /// Force a fresh LLM summary even if a cached one exists.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Summarize arbitrary text via the configured LLM endpoint.
+    Summarize {
+        /// Text to summarize (inline). If omitted, reads from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -277,6 +375,17 @@ enum Cmd {
         /// do not mark read
         #[arg(long)]
         peek: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Full-text search over messages (FTS5 on sqlite, LIKE fallback on libsql).
+    Search {
+        /// FTS5 query string (sqlite) or substring (libsql)
+        #[arg(long, allow_hyphen_values = true)]
+        query: String,
         #[arg(long, default_value_t = 50)]
         limit: i64,
         /// machine-readable JSON output
@@ -375,6 +484,9 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
+        /// Existing birth certificate for re-registering a previously-registered peer.
+        #[arg(long)]
+        cert: Option<String>,
     },
     /// Probe whether a peer can be reached by a live nudge right now, and report
     /// the verdict. A not-alive / non-injectable peer is NOT an error — its
@@ -403,11 +515,20 @@ enum Cmd {
         body: String,
         #[arg(long, allow_hyphen_values = true)]
         subject: Option<String>,
+        /// structured kind: free_text (default), choice, tool_permission
+        #[arg(long)]
+        kind: Option<String>,
+        /// kind-specific payload: newline-separated choices, or tool_name\ntool_args
+        #[arg(long, allow_hyphen_values = true)]
+        options: Option<String>,
         /// prior correlation id this ask chains/closes
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
         #[arg(long)]
         from: Option<String>,
+        /// Skip automatic memory context prefixing for this ask.
+        #[arg(long)]
+        no_memory: bool,
     },
     /// Answer a tracked ask, replying back to whoever opened it (open -> answered).
     /// Reference the thread by --id (correlation id) OR --in-reply-to (a message id).
@@ -544,12 +665,111 @@ enum Cmd {
         #[arg(long)]
         me: Option<String>,
     },
+    /// Set or get a peer's contact policy (WL-032). open (default), auto,
+    /// contacts_only, block_all. Omit --policy to read the current value.
+    PeerPolicy {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        policy: Option<String>,
+    },
+    /// Schedule a future message delivery (one-shot or recurring).
+    Schedule {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long, allow_hyphen_values = true)]
+        subject: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// One-shot: absolute UNIX timestamp.
+        #[arg(long)]
+        at: Option<i64>,
+        /// Recurring: cron preset or expression.
+        #[arg(long)]
+        every: Option<String>,
+    },
+    /// List your scheduled messages.
+    Schedules {
+        #[arg(long)]
+        me: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a scheduled message.
+    CancelSchedule {
+        #[arg(long)]
+        id: i64,
+    },
+    /// Execute any due scheduled messages now (explicit tick).
+    Tick {
+        #[arg(long)]
+        me: Option<String>,
+        /// also evaluate schedules for other senders (admin/debug)
+        #[arg(long)]
+        all: bool,
+    },
     /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
-    Hook { event: String },
+    Hook {
+        event: String,
+        /// Enable blocking wake on stop: drain inbox, mark read, and emit a
+        /// structured JSON block if unread messages exist. Overrides the default
+        /// peek-only stop behaviour. Also enabled by WEAVE_STOP_WAKE=1.
+        #[arg(long)]
+        wake: bool,
+    },
+    /// Filesystem-backed scoped memory (global, project, persona, orchestrator).
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Presence daemon (v0.2): start, stop, status, or run the heartbeat loop.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+    /// PR review queue (WL-020): track, list, and mark GitHub PRs as reviewed.
+    Review {
+        #[command(subcommand)]
+        cmd: ReviewCmd,
+    },
+    /// Permission approval status (WL-021): check verdict of ToolPermission asks.
+    Permission {
+        #[command(subcommand)]
+        cmd: PermissionCmd,
+    },
+    /// Reservation leases (WL-024): lightweight advisory file locks between agents.
+    Lease {
+        #[command(subcommand)]
+        cmd: LeaseCmd,
+    },
+    /// HTTP MCP server (WL-022): localhost-only JSON-RPC endpoint for remote agents.
+    Serve {
+        /// Port to listen on (default 8787).
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Bearer token for authentication. If omitted, a random token is generated
+        /// and printed to stderr.
+        #[arg(long)]
+        token: Option<String>,
+        /// Enable dangerous/mutating tools (disabled by default for safety).
+        #[arg(long)]
+        dangerous: bool,
+    },
+    /// Build a communication graph from the message store and run graph analytics
+    /// (connected components, centrality). Powered by FrankenNetworkX.
+    Graph {
+        #[arg(long)]
+        me: Option<String>,
+        /// Scope to this circle; omit for mesh-wide.
+        #[arg(long)]
+        circle: Option<String>,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -572,6 +792,141 @@ enum DaemonCmd {
         #[arg(long)]
         me: Option<String>,
     },
+}
+
+/// `weave memory` subcommands — filesystem-backed scoped memory.
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Write a memory entry.
+    Write {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, allow_hyphen_values = true)]
+        title: String,
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+    },
+    /// Read a memory entry.
+    Read {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// Search memory entries.
+    Search {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// List memory entries in a scope.
+    List {
+        #[arg(long)]
+        scope: String,
+    },
+    /// Delete a memory entry.
+    Delete {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// Show available scopes and their resolved paths.
+    Scopes,
+}
+
+/// `weave review` subcommands (WL-020) — PR review queue.
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// List review items.
+    Queue {
+        #[arg(long, default_value = "all")]
+        filter: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Add a PR to the review queue.
+    Add {
+        #[arg(long)]
+        pr_url: String,
+        #[arg(long, allow_hyphen_values = true)]
+        title: Option<String>,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Mark a review item as reviewed.
+    Mark {
+        #[arg(long)]
+        id: String,
+    },
+    /// Remove a review item.
+    Remove {
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// `weave permission` subcommands (WL-021) — ToolPermission ask verdicts.
+#[derive(Subcommand)]
+enum PermissionCmd {
+    /// Check the permission status of a ToolPermission ask.
+    Status {
+        #[arg(long)]
+        id: String,
+        /// timeout in seconds (default 300)
+        #[arg(long)]
+        timeout: Option<i64>,
+    },
+    /// List ToolPermission asks you created.
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+
+/// `weave lease` subcommands (WL-024) — advisory file reservations.
+#[derive(Subcommand)]
+enum LeaseCmd {
+    /// Reserve a lease on a resource. Succeeds only if no active lease exists.
+    Reserve {
+        /// Resource identifier (path, glob, or freeform tag).
+        #[arg(long)]
+        resource: String,
+        /// TTL in seconds (1..86400).
+        #[arg(long)]
+        ttl: i64,
+        /// Optional note.
+        #[arg(long, allow_hyphen_values = true)]
+        note: Option<String>,
+    },
+    /// Release a lease you hold.
+    Release {
+        /// Resource identifier.
+        #[arg(long)]
+        resource: String,
+    },
+    /// List active (non-expired) leases.
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove all expired leases. Returns the count swept.
+    Sweep,
+    /// Check staged git files against active leases. Exits non-zero if any
+    /// staged file conflicts with a lease held by another peer.
+    Guard,
 }
 
 /// `weave audit` subcommands (only compiled with `--features sign`). Read-only,
@@ -905,6 +1260,46 @@ fn resolve_me_explicit(opt: Option<String>, cwd: Option<&str>, cfg: &Config) -> 
     (name, false)
 }
 
+/// Parse a CLI `--scope` string into a `MemoryScope`.
+fn parse_memory_scope(
+    scope: &str,
+    cfg: &Config,
+    from: Option<&str>,
+) -> anyhow::Result<MemoryScope> {
+    match scope {
+        "global" => Ok(MemoryScope::Global),
+        "project" => {
+            let cwd = std::env::current_dir()?;
+            let tags = git::capture_worktree_tags(&cwd);
+            if tags.repo.is_empty() {
+                anyhow::bail!("not in a git repo; specify 'global' or run inside a git repo");
+            }
+            Ok(MemoryScope::Project(tags.repo))
+        }
+        "persona" => {
+            let me = resolve_me(from.map(|s| s.to_string()), None, cfg);
+            Ok(MemoryScope::Persona(me))
+        }
+        "orchestrator" => Ok(MemoryScope::Orchestrator(cfg.circle())),
+        other => anyhow::bail!(
+            "scope must be one of: global, project, persona, orchestrator (got '{other}')"
+        ),
+    }
+}
+
+/// Optionally prepend memory context to a body. Non-fatal: any problem returns the original body.
+fn maybe_prefix_body(cfg: &Config, from: &str, body: &str, no_memory: bool) -> String {
+    if no_memory {
+        return body.to_string();
+    }
+    let prefix = memory::build_context_prefix(from, &cfg.circle(), body, 3);
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
 /// Resolve the effective circle for a `peers`/`sessions`/`scan` listing (P4),
 /// returning `None` for "no filter" (mesh-wide). Precedence (repowire's
 /// list_peers scoping, ported daemon-free):
@@ -1077,6 +1472,93 @@ fn nudge_pulled(
     }
 }
 
+/// WL-014: after a prompt hook drain, if `me` has open asks where they are the
+/// askee, fire a content-free reminder nudge into THIS session's OWN registered
+/// pane. Best-effort: any failure is logged to stderr and never blocks the drain.
+fn nudge_open_asks(store: &dyn Store, me: &str) {
+    let has = match store.has_open_asks(me) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[weave] open-ask check skipped (non-fatal): {e}");
+            return;
+        }
+    };
+    if !has {
+        return;
+    }
+    let Ok(Some(peer)) = store.get_peer(me) else {
+        return;
+    };
+    let target = inject::Target::from_peer(&peer);
+    if !target.injectable() || !inject::target_alive(&target) {
+        return;
+    }
+    match inject::inject_text(&target, "[weave] you have open ask(s) — run weave_asks") {
+        Ok(_) => {}
+        Err(err) => eprintln!("[weave] open-ask nudge failed (non-fatal): {err}"),
+    }
+}
+
+/// WL-015: render open asks as actionable prompts in the prompt hook stdout.
+/// Printed AFTER the message drain so the recipient sees every unanswered ask
+/// with instructions on how to reply. Best-effort: never blocks the drain.
+fn render_open_asks(store: &dyn Store, me: &str) {
+    let asks = match store.list_asks(me, model::AskRole::Askee, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[weave] open-ask render skipped (non-fatal): {e}");
+            return;
+        }
+    };
+    let open: Vec<_> = asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    for ask in &open {
+        let subj = ask.subject.as_deref().unwrap_or("(no subject)");
+        match ask.kind {
+            model::AskKind::Choice => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                if let Some(ref opts) = ask.options {
+                    for (i, line) in opts.lines().enumerate() {
+                        println!("  {}. {}", i + 1, line);
+                    }
+                }
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"<number>\"",
+                    ask.id
+                );
+            }
+            model::AskKind::ToolPermission => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                if let Some(ref opts) = ask.options {
+                    let mut lines = opts.lines();
+                    if let Some(tool) = lines.next() {
+                        println!("  Tool: {tool}");
+                    }
+                    if let Some(args) = lines.next() {
+                        println!("  Args: {args}");
+                    }
+                }
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"yes\" to approve",
+                    ask.id
+                );
+            }
+            model::AskKind::FreeText => {
+                println!("[weave] open ask from {}: {}", ask.asker, subj);
+                println!(
+                    "  Reply with: weave_answer --id {} --body \"<answer>\"",
+                    ask.id
+                );
+            }
+        }
+    }
+}
+
 fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str) -> Result<()> {
     if model::is_broadcast(to) {
         return Ok(());
@@ -1216,7 +1698,7 @@ fn inject_and_trace(
 
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
-    let target = inject::detect_target();
+    let target = inject::detect_target_with_preference(parse_mux_preference(cfg));
     // Tier-1 federation: report the union peer count (local + read-only extra
     // stores). `extra` empty ⇒ exactly the local peers, identical-to-today.
     let extra = cfg.peer_db_sources();
@@ -2045,9 +2527,13 @@ fn main() -> Result<()> {
 
     // Commands that don't need the store.
     match &cli.cmd {
-        Cmd::Setup => {
+        Cmd::Setup { git_hooks } => {
             let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-            return setup::run(&exe);
+            setup::run(&exe)?;
+            if *git_hooks {
+                setup::install_git_precommit_hook(&exe)?;
+            }
+            return Ok(());
         }
         Cmd::Uninstall => return setup::uninstall(),
         Cmd::Config {
@@ -2080,7 +2566,11 @@ fn main() -> Result<()> {
     let store = store.as_ref();
 
     match cli.cmd {
-        Cmd::Setup | Cmd::Uninstall | Cmd::Config { .. } | Cmd::Completions { .. } | Cmd::Man => {
+        Cmd::Setup { .. }
+        | Cmd::Uninstall
+        | Cmd::Config { .. }
+        | Cmd::Completions { .. }
+        | Cmd::Man => {
             unreachable!("handled above")
         }
 
@@ -2121,7 +2611,9 @@ fn main() -> Result<()> {
                 nudge_tpl.as_deref(),
                 extra_dbs,
                 pull,
-                &RealInjector,
+                &RealInjector {
+                    preferred_mux: parse_mux_preference(&cfg),
+                },
             )?;
         }
 
@@ -2132,9 +2624,14 @@ fn main() -> Result<()> {
             body,
             to_store,
             to_host,
+            no_memory,
+            idempotency_key,
+            priority,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
+            let trace_id = model::mint_trace_id();
             match to_store {
                 // Cross-store (Tier-2): the recipient lives in a FOREIGN store, so
                 // we deposit an intent into OUR OWN outbox rather than attempt any
@@ -2155,12 +2652,31 @@ fn main() -> Result<()> {
                     // bind into the row; we sign the SAME value the store stamps so
                     // verification matches. Without the `sign` feature this is "".
                     let sig = sign_intent_if_keyed(&from, &to, &body);
-                    let id =
-                        store.enqueue_intent(&to, host, &from, subject.as_deref(), &body, &sig)?;
+                    let id = store.enqueue_intent(
+                        &to,
+                        host,
+                        &from,
+                        subject.as_deref(),
+                        &body,
+                        &sig,
+                        idempotency_key.as_deref(),
+                        Some(&trace_id),
+                        priority.as_deref(),
+                    )?;
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
                 None => {
-                    let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+                    let mid = store.send(
+                        &from,
+                        &to,
+                        subject.as_deref(),
+                        &body,
+                        idempotency_key.as_deref(),
+                        Some(&trace_id),
+                    )?;
+                    if let Some(p) = priority {
+                        let _ = store.set_message_priority(mid, &p);
+                    }
                     println!("sent #{mid}: {from} -> {to}");
                     let _ = inject_and_trace(
                         store,
@@ -2180,6 +2696,8 @@ fn main() -> Result<()> {
             to,
             subject,
             body,
+            idempotency_key,
+            priority,
         } => {
             // Fire-and-forget point-to-point notification. Persist via the normal send
             // path (no fork), fire the SAME caller-side nudge + trace, and print the
@@ -2192,7 +2710,18 @@ fn main() -> Result<()> {
             }
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
-            let mid = store.send(&from, &to, subject.as_deref(), &body)?;
+            let trace_id = model::mint_trace_id();
+            let mid = store.send(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                idempotency_key.as_deref(),
+                Some(&trace_id),
+            )?;
+            if let Some(p) = priority {
+                let _ = store.set_message_priority(mid, &p);
+            }
             // Trace + nudge (best-effort trace, no store→inject edge). The honest
             // verdict is derived from the SAME inject result that drove the trace, so
             // the printed token and the recorded stage can never disagree.
@@ -2206,6 +2735,166 @@ fn main() -> Result<()> {
                 &body,
             )?;
             println!("notified '{to}' (#{mid}, no reply expected) [{verdict}]");
+        }
+
+        Cmd::BroadcastNotify {
+            from,
+            subject,
+            body,
+            circle,
+            json,
+            priority,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let target_circle = resolve_list_circle(store, &cfg, &from, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let online: Vec<_> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .filter(|p| p.name != from)
+                .filter(store::is_alive)
+                .map(|p| p.name)
+                .collect();
+            if online.is_empty() {
+                if json {
+                    println!("{}", serde_json::json!({ "notified": 0, "peers": [] }));
+                } else {
+                    println!("broadcast-notify: no online peers in circle");
+                }
+            } else {
+                let mut notified = 0usize;
+                let mut child_json = Vec::new();
+                for peer in &online {
+                    let trace_id = model::mint_trace_id();
+                    let mid = store.send(
+                        &from,
+                        peer,
+                        subject.as_deref(),
+                        &body,
+                        None,
+                        Some(&trace_id),
+                    )?;
+                    if let Some(p) = priority.as_ref() {
+                        let _ = store.set_message_priority(mid, p);
+                    }
+                    let verdict = inject_and_trace(
+                        store,
+                        &cfg,
+                        mid,
+                        model::DeliveryRefKind::Notify,
+                        &from,
+                        peer,
+                        &body,
+                    )?;
+                    notified += 1;
+                    if json {
+                        child_json.push(serde_json::json!({
+                            "peer": peer, "message_id": mid, "verdict": verdict
+                        }));
+                    } else {
+                        println!("  {peer}: #{mid} [{verdict}]");
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "notified": notified,
+                            "peers": child_json,
+                        }))?
+                    );
+                } else {
+                    println!("broadcast-notify: {notified} peer(s) notified");
+                }
+            }
+        }
+
+        Cmd::BroadcastAsk {
+            from,
+            subject,
+            body,
+            circle,
+            reply_to: _,
+            json,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            let target_circle = resolve_list_circle(store, &cfg, &from, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let online: Vec<String> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .filter(|p| p.name != from)
+                .filter(store::is_alive)
+                .map(|p| p.name)
+                .collect();
+            if online.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "parent_id": null, "created": 0, "peers": [] })
+                    );
+                } else {
+                    println!("broadcast-ask: no online peers in circle");
+                }
+            } else {
+                let outcome = store.create_ask_many(&from, &online, subject.as_deref(), &body)?;
+                let mut child_json = Vec::new();
+                let mut created = 0usize;
+                let mut failed = 0usize;
+                for (peer, res) in &outcome.children {
+                    match res {
+                        Ok(cid) => {
+                            created += 1;
+                            let verdict = ask_inject_verdict(store, &cfg, &from, peer, &body);
+                            if json {
+                                child_json.push(serde_json::json!({
+                                    "peer": peer, "correlation_id": cid, "verdict": verdict
+                                }));
+                            } else {
+                                println!("  {peer}: {cid} ({verdict})");
+                            }
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            if json {
+                                child_json.push(serde_json::json!({
+                                    "peer": peer, "error": err
+                                }));
+                            } else {
+                                println!("  {peer}: FAILED ({err})");
+                            }
+                        }
+                    }
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "parent_id": outcome.parent_id,
+                            "created": created,
+                            "failed": failed,
+                            "peers": child_json,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "broadcast-ask {}: {created} created, {failed} failed",
+                        outcome.parent_id
+                    );
+                }
+            }
         }
 
         Cmd::Outbox { limit, json } => {
@@ -2269,9 +2958,11 @@ fn main() -> Result<()> {
             in_reply_to,
             from,
             body,
+            no_memory,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             // The store looks up the parent's sender/recipient to address the reply
             // and stores the in_reply_to link; it returns the new message id.
             let mid = store.reply(&from, in_reply_to, &body)?;
@@ -2291,8 +2982,11 @@ fn main() -> Result<()> {
             to,
             body,
             subject,
+            kind,
+            options,
             reply_to,
             from,
+            no_memory,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2301,8 +2995,20 @@ fn main() -> Result<()> {
                     "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
                 );
             }
-            let (cid, _qid) =
-                store.ask(&from, &to, subject.as_deref(), &body, reply_to.as_deref())?;
+            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
+            let ask_kind = kind
+                .as_deref()
+                .map(model::AskKind::parse)
+                .unwrap_or_default();
+            let (cid, _qid) = store.ask(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                ask_kind,
+                options.as_deref(),
+                reply_to.as_deref(),
+            )?;
             // Honest delivery verdict via the caller-side nudge (no store->inject edge).
             let verdict = ask_inject_verdict(store, &cfg, &from, &to, &body);
             println!("opened ask {cid}: {from} -> {to} ({verdict})");
@@ -2518,8 +3224,50 @@ fn main() -> Result<()> {
 
         Cmd::Orchestrator { cmd } => dispatch_orchestrator(store, &cfg, cmd)?,
 
-        Cmd::Thread { root, limit, json } => {
+        Cmd::Thread {
+            root,
+            limit,
+            json,
+            summarize: _summarize,
+            refresh: _refresh,
+        } => {
             let rows = store.thread(root, limit)?;
+            #[cfg(feature = "llm")]
+            if _summarize {
+                let summary = if _refresh {
+                    None
+                } else {
+                    store.get_summary(root)?
+                };
+                let text = match summary {
+                    Some(s) => s.text,
+                    None => {
+                        let thread_text = rows
+                            .iter()
+                            .map(|m| format!("{}: {}", m.sender, m.body))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let sum = weave_core::llm::summarize_text(&cfg, &thread_text)?;
+                        store.store_summary(
+                            root,
+                            &sum,
+                            cfg.llm_model.as_deref().unwrap_or("unknown"),
+                        )?;
+                        sum
+                    }
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "root": root, "summary": text
+                        }))?
+                    );
+                } else {
+                    println!("thread #{root} summary:\n{text}");
+                }
+                return Ok(());
+            }
             if json {
                 println!(
                     "{}",
@@ -2553,6 +3301,37 @@ fn main() -> Result<()> {
                         m.body
                     );
                 }
+            }
+        }
+
+        Cmd::Summarize { text, json } => {
+            #[cfg(feature = "llm")]
+            {
+                let input = match text {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    }
+                };
+                let sum = weave_core::llm::summarize_text(&cfg, &input)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "summary": sum
+                        }))?
+                    );
+                } else {
+                    println!("{sum}");
+                }
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                let _ = text;
+                let _ = json;
+                anyhow::bail!("weave was compiled without the llm feature");
             }
         }
 
@@ -2673,6 +3452,37 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Search { query, limit, json } => {
+            let rows = store.search(&query, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query": query, "messages": rows
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!("search '{query}': no matches");
+            } else {
+                for m in &rows {
+                    let subj = m
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    println!(
+                        "#{} [{}] {} -> {}{}\n  {}",
+                        m.id,
+                        model::fmt_ts(m.ts),
+                        m.sender,
+                        m.recipient,
+                        subj,
+                        m.body
+                    );
+                }
+            }
+        }
+
         Cmd::Peers {
             json,
             circle,
@@ -2786,7 +3596,7 @@ fn main() -> Result<()> {
             // refresh (mirroring `scan`) so the watcher's own row shows current.
             let (me, explicit) = resolve_me_explicit(None, None, &cfg);
             if explicit {
-                let t = inject::detect_target();
+                let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
                 let cwd_val = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
@@ -2803,6 +3613,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    None,
                 ) {
                     eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
                 }
@@ -2977,7 +3788,7 @@ fn main() -> Result<()> {
             // Best-effort: a heartbeat/tag refresh failure must not sink the read.
             let (me, explicit) = resolve_me_explicit(None, None, &cfg);
             if explicit {
-                let t = inject::detect_target();
+                let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
                 let cwd_val = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
@@ -2994,6 +3805,7 @@ fn main() -> Result<()> {
                     &tags.branch,
                     &tags.worktree_id,
                     &cfg.circle(),
+                    None,
                 ) {
                     eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
                 }
@@ -3103,7 +3915,7 @@ fn main() -> Result<()> {
 
         Cmd::Register { name, cwd } => {
             let me = resolve_me(name, cwd.as_deref(), &cfg);
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
             let cwd_val = cwd.or_else(|| {
                 std::env::current_dir()
                     .ok()
@@ -3116,7 +3928,7 @@ fn main() -> Result<()> {
             // session with its repo/branch/worktree id (best-effort from cwd; a git
             // failure never sinks registration — empty tags result).
             let tags = git_tags_for(cwd_val.as_deref());
-            store.register_peer_full(
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -3128,23 +3940,28 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                None,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
             } else {
                 t.id.clone()
             };
-            println!("registered '{me}' [{}] {}", t.mux.as_str(), tgt);
+            println!(
+                "registered '{me}' [{}] {} (save birth-cert: {cert})",
+                t.mux.as_str(),
+                tgt
+            );
         }
 
-        Cmd::Attach { name, cwd } => {
+        Cmd::Attach { name, cwd, cert } => {
             // Bind the row key to OUR OWN resolved identity — attach upserts the
             // caller's own peer row only, never an arg-supplied foreign target.
             let me = resolve_me(name, cwd.as_deref(), &cfg);
             // Validate identity up front (the store also enforces this, but failing
             // here keeps the error close to the input).
             store::check_ident("name", &me)?;
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(&cfg));
             // If a mux was detected, the captured pane id must match that mux's
             // expected shape; a structurally invalid injectable target is refused so
             // we never persist a poisoned, un-injectable registration. A legitimate
@@ -3165,7 +3982,11 @@ fn main() -> Result<()> {
             // Capture this process's PID + host so the adopted peer reflects real
             // liveness (the whole point of zero-restart attach), plus the git tags.
             let tags = git_tags_for(cwd_val.as_deref());
-            store.register_peer_full(
+            // If no --cert provided, try to reuse the stored cert so re-attach is
+            // seamless for the peer owner (the common case).
+            let stored_cert = store.get_birth_cert(&me)?;
+            let cert = cert.as_deref().or(stored_cert.as_deref());
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -3177,6 +3998,7 @@ fn main() -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                cert,
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -3188,7 +4010,10 @@ fn main() -> Result<()> {
             } else {
                 "no-inject"
             };
-            println!("attached '{me}' [{}] {tgt} ({inj})", t.mux.as_str());
+            println!(
+                "attached '{me}' [{}] {tgt} ({inj}) (birth-cert: {cert})",
+                t.mux.as_str()
+            );
         }
 
         Cmd::Connect { to } => {
@@ -3276,9 +4101,246 @@ fn main() -> Result<()> {
             println!("turn_state set for '{me}': {state}");
         }
 
+        Cmd::PeerPolicy { name, policy } => {
+            store::check_ident("name", &name)?;
+            if let Some(p) = policy {
+                let parsed = crate::model::ContactPolicy::parse(&p);
+                store.set_peer_policy(&name, parsed.as_str())?;
+                println!("contact_policy set for '{name}': {}", parsed.as_str());
+            } else {
+                match store.get_peer_policy(&name)? {
+                    Some(p) => println!("{p}"),
+                    None => println!("(no peer '{name}' found)"),
+                }
+            }
+        }
+
+        Cmd::Memory { cmd } => dispatch_memory(&cfg, cmd)?,
+
+        Cmd::Review { cmd } => dispatch_review(store, &cfg, cmd)?,
+
+        Cmd::Permission { cmd } => dispatch_permission(store, &cfg, cmd)?,
+
+        Cmd::Lease { cmd } => dispatch_lease(store, &cfg, cmd)?,
+
         Cmd::Daemon { cmd } => handle_daemon(store, &cfg, cmd)?,
 
-        Cmd::Hook { event } => handle_hook(store, &cfg, &event)?,
+        Cmd::Serve {
+            port,
+            token,
+            dangerous,
+        } => {
+            let token = token.unwrap_or_default();
+            let extra_dbs = cfg.peer_db_sources();
+            let pull = mcp::PullConsent {
+                from: cfg.pull_from_sources(),
+                inject_pulled: cfg.inject_pulled(),
+                allow_inject_from: cfg.allow_inject_from_sources(),
+                policy: verify_policy(&cfg),
+            };
+            let nudge_tpl = cfg.nudge_template().map(str::to_owned);
+            weave_mcp::serve_http(
+                store,
+                cfg.session.clone(),
+                nudge_tpl.as_deref(),
+                extra_dbs,
+                pull,
+                &RealInjector {
+                    preferred_mux: parse_mux_preference(&cfg),
+                },
+                port,
+                &token,
+                dangerous,
+            )?;
+        }
+
+        Cmd::Graph { me, circle, json } => {
+            let (me, _explicit) = resolve_me_explicit(me, None, &cfg);
+            let target_circle = resolve_list_circle(store, &cfg, &me, circle.as_deref(), false);
+            let peers = store.list_peers()?;
+            let peers_in_circle: Vec<_> = peers
+                .into_iter()
+                .filter(|p| {
+                    target_circle
+                        .as_ref()
+                        .map(|c| model::circle_or_default(&p.circle) == c)
+                        .unwrap_or(true)
+                })
+                .map(|p| p.name)
+                .collect();
+            let peer_set: std::collections::HashSet<_> = peers_in_circle.iter().cloned().collect();
+
+            let mut g = fnx_classes::Graph::new(fnx_runtime::CompatibilityMode::Strict);
+            for peer in &peers_in_circle {
+                g.add_node(peer.clone());
+            }
+            // Collect all messages among peers in the circle.
+            let mut seen_edges = std::collections::HashSet::new();
+            for peer in &peers_in_circle {
+                let hist = store.history(peer, None, 10_000)?;
+                for msg in &hist {
+                    if peer_set.contains(&msg.sender)
+                        && peer_set.contains(&msg.recipient)
+                        && msg.sender != msg.recipient
+                    {
+                        let key = if msg.sender <= msg.recipient {
+                            (msg.sender.clone(), msg.recipient.clone())
+                        } else {
+                            (msg.recipient.clone(), msg.sender.clone())
+                        };
+                        if seen_edges.insert(key) {
+                            let _ = g.add_edge(&msg.sender, &msg.recipient);
+                        }
+                    }
+                }
+            }
+
+            let cc = fnx_algorithms::connected_components(&g);
+            let dc = fnx_algorithms::degree_centrality(&g);
+            let dens = fnx_algorithms::density(&g);
+            let comp_count = cc.components.len();
+            let largest = cc.components.iter().map(|c| c.len()).max().unwrap_or(0);
+
+            if json {
+                let components: Vec<Vec<String>> = cc.components;
+                let scores: std::collections::HashMap<String, f64> =
+                    dc.scores.into_iter().map(|s| (s.node, s.score)).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "nodes": g.node_count(),
+                        "edges": g.edge_count(),
+                        "density": dens.density,
+                        "components": components,
+                        "component_count": comp_count,
+                        "largest_component": largest,
+                        "centrality": scores,
+                    }))?
+                );
+            } else {
+                println!(
+                    "communication graph ({} nodes, {} edges)",
+                    g.node_count(),
+                    g.edge_count()
+                );
+                println!("  density: {:.4}", dens.density);
+                println!("  components: {} (largest: {} nodes)", comp_count, largest);
+                for (i, comp) in cc.components.iter().enumerate() {
+                    println!("    component {}: {}", i + 1, comp.join(", "));
+                }
+                println!("  degree centrality:");
+                for s in &dc.scores {
+                    println!("    {}: {:.4}", s.node, s.score);
+                }
+            }
+        }
+
+        Cmd::Schedule {
+            from,
+            to,
+            subject,
+            body,
+            at,
+            every,
+        } => {
+            let (from, explicit) = resolve_me_explicit(from, None, &cfg);
+            refresh_presence(store, &from, explicit);
+            store::check_ident("recipient", &to)?;
+            store::check_body(&body)?;
+            let (kind, cron_expr, next_run) = match (at, every) {
+                (Some(ts), None) => {
+                    if ts <= 0 {
+                        anyhow::bail!("'at' must be a positive UNIX timestamp");
+                    }
+                    (model::ScheduleKind::OneShot, String::new(), ts)
+                }
+                (None, Some(expr)) => {
+                    let expr = expr.trim();
+                    if !model::cron_valid(expr) {
+                        anyhow::bail!("'every' is not a valid cron expression");
+                    }
+                    let next = model::next_occurrence(expr, model::now()).ok_or_else(|| {
+                        anyhow::anyhow!("could not compute next occurrence from cron expression")
+                    })?;
+                    (model::ScheduleKind::Recurring, expr.to_string(), next)
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("provide exactly one of --at or --every, not both");
+                }
+                (None, None) => {
+                    anyhow::bail!("provide exactly one of --at or --every");
+                }
+            };
+            let id = store.schedule_message(
+                &from,
+                &to,
+                subject.as_deref(),
+                &body,
+                kind,
+                &cron_expr,
+                next_run,
+            )?;
+            println!(
+                "scheduled #{id}: {from} -> {to} at {next_run} ({kind})",
+                kind = kind.as_str()
+            );
+        }
+
+        Cmd::Schedules { me, limit, json } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            let rows = store.list_schedules(&me, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "schedules": rows }))?
+                );
+            } else if rows.is_empty() {
+                println!("no scheduled messages for '{me}'");
+            } else {
+                for s in &rows {
+                    let subj = s
+                        .subject
+                        .as_ref()
+                        .map(|s| format!(" | {s}"))
+                        .unwrap_or_default();
+                    let state = if s.cancelled {
+                        "cancelled"
+                    } else if s.executed_ts.is_some() {
+                        "executed"
+                    } else {
+                        "pending"
+                    };
+                    println!(
+                        "#{} [{}] {} -> {}{} ({}) next={}",
+                        s.id,
+                        state,
+                        s.sender,
+                        s.recipient,
+                        subj,
+                        s.kind.as_str(),
+                        s.next_run
+                    );
+                }
+            }
+        }
+
+        Cmd::CancelSchedule { id } => {
+            let cancelled = store.cancel_schedule(id)?;
+            if cancelled {
+                println!("cancelled schedule #{id}");
+            } else {
+                println!("schedule #{id} was already terminal or did not exist");
+            }
+        }
+
+        Cmd::Tick { me, all } => {
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            execute_tick(store, &me, all)?;
+        }
+
+        Cmd::Hook { event, wake } => handle_hook(store, &cfg, &event, wake)?,
     }
     Ok(())
 }
@@ -3315,14 +4377,333 @@ fn dispatch_orchestrator(store: &dyn Store, cfg: &Config, cmd: OrchestratorCmd) 
             // given (so `weave orchestrator status` reports YOUR circle).
             let effective = circle.or_else(|| Some(cfg.circle()));
             let st = store.orchestrator_status(effective.as_deref())?;
-            match st.holder {
-                Some(h) if st.present => {
+            if st.present {
+                let names: Vec<_> = st.holders.iter().map(|h| h.name.as_str()).collect();
+                println!(
+                    "orchestrator(s) present in circle '{}': {} (online)",
+                    st.circle,
+                    names.join(", ")
+                );
+            } else {
+                println!("no live orchestrator in circle '{}'", st.circle);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave memory` handler (WL-017). Filesystem-backed scoped memory with no store
+/// involvement; each subcommand validates its scope and delegates to `memory::`.
+fn dispatch_memory(cfg: &Config, cmd: MemoryCmd) -> Result<()> {
+    match cmd {
+        MemoryCmd::Write {
+            scope,
+            key,
+            title,
+            tag,
+            body,
+        } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            memory::memory_write(&scope, &key, &title, &tag, &body)?;
+            println!("wrote {}/{key}", scope.label());
+        }
+        MemoryCmd::Read { scope, key } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            let e = memory::memory_read(&scope, &key)?;
+            println!("{}\n---\n{}", format_entry_human(&e), e.body);
+        }
+        MemoryCmd::Search {
+            scope,
+            query,
+            limit,
+        } => {
+            let scope = scope
+                .as_deref()
+                .map(|s| parse_memory_scope(s, cfg, None))
+                .transpose()?;
+            let hits = memory::memory_search(scope.as_ref(), &query)?;
+            for e in hits.iter().take(limit) {
+                println!(
+                    "{} | {} | {} | tags={:?}",
+                    e.scope.label(),
+                    e.key,
+                    e.title,
+                    e.tags
+                );
+            }
+        }
+        MemoryCmd::List { scope } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            let list = memory::memory_list(&scope)?;
+            if list.is_empty() {
+                println!("no entries in {}", scope.label());
+            } else {
+                for e in &list {
+                    println!("{} | {} | tags={:?}", e.key, e.title, e.tags);
+                }
+            }
+        }
+        MemoryCmd::Delete { scope, key } => {
+            let scope = parse_memory_scope(&scope, cfg, None)?;
+            if memory::memory_delete(&scope, &key)? {
+                println!("deleted {}/{key}", scope.label());
+            } else {
+                println!("not found: {}/{key}", scope.label());
+            }
+        }
+        MemoryCmd::Scopes => {
+            let scopes = memory::memory_scopes()?;
+            println!(
+                "global: {}",
+                memory::memory_dir(&MemoryScope::Global).display()
+            );
+            if let Some(ps) = memory::project_scope_from_cwd() {
+                println!("project: {} (from cwd)", memory::memory_dir(&ps).display());
+            } else {
+                println!("project: <not in a git repo>");
+            }
+            let me = resolve_me(None, None, cfg);
+            println!(
+                "persona: {} (resolved as '{me}')",
+                memory::memory_dir(&MemoryScope::Persona(me.clone())).display()
+            );
+            let circle = cfg.circle();
+            println!(
+                "orchestrator: {} (circle='{circle}')",
+                memory::memory_dir(&MemoryScope::Orchestrator(circle.clone())).display()
+            );
+            if !scopes.is_empty() {
+                println!("\nscopes with entries:");
+                for s in scopes {
+                    println!("  - {}", s.label());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_entry_human(e: &memory::MemoryEntry) -> String {
+    format!(
+        "title: {}\ntags: {:?}\ncreated: {}\nupdated: {}",
+        e.title,
+        e.tags,
+        model::fmt_ts(e.created_ts),
+        model::fmt_ts(e.updated_ts)
+    )
+}
+
+/// `weave review` handler (WL-020).
+fn dispatch_review(store: &dyn Store, _cfg: &Config, cmd: ReviewCmd) -> Result<()> {
+    match cmd {
+        ReviewCmd::Queue { filter, limit } => {
+            let filter =
+                model::ReviewQueueFilter::from_str(&filter).map_err(|e| anyhow::anyhow!(e))?;
+            let items = store.review_queue(filter, limit)?;
+            if items.is_empty() {
+                println!("no review items");
+            } else {
+                for item in items {
+                    let status = if let Some(ts) = item.reviewed_at {
+                        format!(
+                            "reviewed by {} at {}",
+                            item.reviewed_by.unwrap_or_default(),
+                            model::fmt_ts(ts)
+                        )
+                    } else {
+                        "pending".to_string()
+                    };
                     println!(
-                        "orchestrator present in circle '{}': '{}' (online)",
-                        st.circle, h.name
+                        "{} | {} | {} | {} | {}",
+                        item.id, item.repo, item.author, status, item.pr_url
+                    );
+                    if !item.title.is_empty() {
+                        println!("  title: {}", item.title);
+                    }
+                }
+            }
+        }
+        ReviewCmd::Add {
+            pr_url,
+            title,
+            author,
+            repo,
+        } => {
+            let title = title.unwrap_or_default();
+            let author = author.unwrap_or_default();
+            let repo = repo.unwrap_or_default();
+            let id = store.add_review_item(
+                &pr_url,
+                &title,
+                &author,
+                &repo,
+                model::ReviewItemState::Open,
+                None,
+            )?;
+            println!("added review item {}", id);
+        }
+        ReviewCmd::Mark { id } => {
+            let me = resolve_me(None, None, _cfg);
+            if store.mark_reviewed(&id, &me)? {
+                println!("marked {} as reviewed", id);
+            } else {
+                println!("not found: {}", id);
+            }
+        }
+        ReviewCmd::Remove { id } => {
+            if store.remove_review_item(&id)? {
+                println!("removed {}", id);
+            } else {
+                println!("not found: {}", id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave permission` handler (WL-021).
+fn dispatch_permission(store: &dyn Store, cfg: &Config, cmd: PermissionCmd) -> Result<()> {
+    match cmd {
+        PermissionCmd::Status { id, timeout } => {
+            let (status, answer) = store.permission_verdict(&id, timeout.unwrap_or(0))?;
+            match status {
+                model::PermissionStatus::Pending => println!("{} pending", id),
+                model::PermissionStatus::Approved => {
+                    println!("{} approved (answer: {})", id, answer.unwrap_or_default())
+                }
+                model::PermissionStatus::Denied => {
+                    println!("{} denied (answer: {})", id, answer.unwrap_or_default())
+                }
+                model::PermissionStatus::Timeout => {
+                    println!("{} timeout (denied by default)", id)
+                }
+            }
+        }
+        PermissionCmd::List { limit } => {
+            let me = resolve_me(None, None, cfg);
+            let asks = store.list_permissions(&me, limit)?;
+            if asks.is_empty() {
+                println!("no permission asks");
+            } else {
+                for a in &asks {
+                    let (status, _) = store.permission_verdict(&a.id, 0)?;
+                    let tool = a
+                        .options
+                        .as_ref()
+                        .and_then(|o| o.lines().next())
+                        .unwrap_or("?");
+                    println!(
+                        "{} | {} | {} -> {} | {} | {}",
+                        a.id,
+                        status.as_str(),
+                        a.asker,
+                        a.askee,
+                        tool,
+                        model::fmt_ts(a.opened_ts)
                     );
                 }
-                _ => println!("no live orchestrator in circle '{}'", st.circle),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `weave lease` handler (WL-024). Advisory reservations with TTL.
+fn dispatch_lease(store: &dyn Store, cfg: &Config, cmd: LeaseCmd) -> Result<()> {
+    let me = resolve_me(None, None, cfg);
+    match cmd {
+        LeaseCmd::Reserve {
+            resource,
+            ttl,
+            note,
+        } => match store.reserve_lease(&me, &resource, ttl, note.as_deref()) {
+            Ok(lease) => {
+                println!(
+                    "leased {} (expires {})",
+                    lease.resource,
+                    model::fmt_ts(lease.expires)
+                );
+            }
+            Err(e) => {
+                println!("failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        LeaseCmd::Release { resource } => {
+            let ok = store.release_lease(&me, &resource)?;
+            if ok {
+                println!("released {}", resource);
+            } else {
+                println!("no active lease for {} held by you", resource);
+                std::process::exit(1);
+            }
+        }
+        LeaseCmd::List { limit, json } => {
+            let leases = store.list_leases(limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&leases)?);
+            } else if leases.is_empty() {
+                println!("no active leases");
+            } else {
+                for l in &leases {
+                    println!(
+                        "{} | {} | acquired {} | expires {} | {}",
+                        l.resource,
+                        l.holder,
+                        model::fmt_ts(l.acquired),
+                        model::fmt_ts(l.expires),
+                        if l.note.is_empty() { "-" } else { &l.note }
+                    );
+                }
+            }
+        }
+        LeaseCmd::Sweep => {
+            let n = store.sweep_expired_leases()?;
+            println!("swept {} expired lease(s)", n);
+        }
+        LeaseCmd::Guard => {
+            // Get staged files from git.
+            let out = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only", "--relative"])
+                .stderr(std::process::Stdio::null())
+                .output();
+            let files: Vec<String> = match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                _ => {
+                    println!("warning: could not get staged files from git");
+                    return Ok(());
+                }
+            };
+            if files.is_empty() {
+                return Ok(());
+            }
+            let leases = store.list_leases(1000)?;
+            let mut blocked = Vec::new();
+            for f in &files {
+                let norm = model::lease_path_normalize(f);
+                for l in &leases {
+                    if l.holder == me {
+                        continue;
+                    }
+                    if model::lease_path_conflicts(&l.resource, &norm) {
+                        blocked.push((f.clone(), l.resource.clone(), l.holder.clone()));
+                        break;
+                    }
+                }
+            }
+            if !blocked.is_empty() {
+                println!("Blocked: staged files conflict with active leases:");
+                for (file, res, holder) in &blocked {
+                    println!(
+                        "  {} conflicts with lease '{}' held by {}",
+                        file, res, holder
+                    );
+                }
+                std::process::exit(1);
             }
         }
     }
@@ -3973,25 +5354,75 @@ fn handle_daemon(store: &dyn Store, cfg: &Config, cmd: DaemonCmd) -> Result<()> 
             store::check_ident("name", &name)?;
             let host = config::this_host();
             let pid = std::process::id() as i64;
+            let heartbeat_secs = std::env::var("WEAVE_DAEMON_HEARTBEAT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(15);
+            let evict_secs = std::env::var("WEAVE_DAEMON_EVICT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            let evict_cutoff_secs = std::env::var("WEAVE_DAEMON_EVICT_CUTOFF_SECS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(30);
             let mut last_evict = std::time::Instant::now();
             loop {
                 if let Err(e) = store.heartbeat(&name, &host, Some(pid)) {
                     eprintln!("[weaved] heartbeat error: {e}");
                 }
-                if last_evict.elapsed().as_secs() >= 60 {
-                    if let Err(e) = store.evict_stale_presence(30) {
+                if last_evict.elapsed().as_secs() >= evict_secs {
+                    if let Err(e) = store.evict_stale_presence(evict_cutoff_secs) {
                         eprintln!("[weaved] evict error: {e}");
                     }
                     last_evict = std::time::Instant::now();
                 }
-                std::thread::sleep(std::time::Duration::from_secs(15));
+                std::thread::sleep(std::time::Duration::from_secs(heartbeat_secs));
             }
         }
     }
     Ok(())
 }
 
-fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
+/// WL-016: execute all due schedules for `me` (or every sender when `all=true`).
+/// For each due schedule, fires `store.send`, advances/closes the row via
+/// `mark_schedule_executed`, and records a best-effort delivery trace.
+fn execute_tick(store: &dyn Store, me: &str, all: bool) -> Result<()> {
+    let now_ts = model::now();
+    let due = store.get_due_schedules(now_ts)?;
+    let mut fired = 0usize;
+    let mut skipped = 0usize;
+    for sched in &due {
+        if !all && sched.sender != me {
+            skipped += 1;
+            continue;
+        }
+        let mid = store.send(
+            &sched.sender,
+            &sched.recipient,
+            sched.subject.as_deref(),
+            &sched.body,
+            None,
+            None,
+        )?;
+        store.mark_schedule_executed(sched.id)?;
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Message,
+            &sched.recipient,
+            model::DeliveryStage::Queued,
+            model::DeliveryOutcome::Ok,
+        );
+        fired += 1;
+    }
+    if fired > 0 || skipped > 0 {
+        println!("tick: {fired} schedule(s) fired, {skipped} skipped");
+    }
+    Ok(())
+}
+
+fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
         eprintln!("[weave] hook stdin read error: {e}");
@@ -4021,7 +5452,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
 
     match event {
         "session" => {
-            let t = inject::detect_target();
+            let t = inject::detect_target_with_preference(parse_mux_preference(cfg));
             // Pass the captured kitty control socket through (empty for non-kitty);
             // see the Register arm. A poisoned/empty socket is harmless — only the
             // kitty injector consults it. Capture PID + host so presence reflects
@@ -4030,7 +5461,10 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             // primary + a timeout-bounded best-effort git fallback that never sinks
             // the hook.
             let tags = git_tags_for(cwd);
-            store.register_peer_full(
+            let env_cert = std::env::var("WEAVE_BIRTH_CERT")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
                 &t.id,
@@ -4042,8 +5476,12 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
+                env_cert.as_deref(),
             )?;
-            eprintln!("[weave] registered peer '{me}' [{}]", t.mux.as_str());
+            eprintln!(
+                "[weave] registered peer '{me}' [{}] (birth-cert: {cert})",
+                t.mux.as_str()
+            );
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must
             // never sink the session hook (which also drives presence/registration),
             // so errors are reported and swallowed. A configured retention of 0
@@ -4076,12 +5514,19 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
         // (mark_read=false) so the messages remain unread and the next
         // UserPromptSubmit drain re-surfaces and marks them. Marking them read here
         // would silently consume them — concrete message loss.
+        //
+        // WL-025: with --wake (or WEAVE_STOP_WAKE=1), the stop hook switches to
+        // blocking mode: it drains the inbox with mark_read=true and, if messages
+        // exist, emits a structured JSON block that Claude Code uses as the next
+        // turn's input. The wake IS the delivery, so marking read is correct.
         "prompt" | "stop" => {
             // Tier-2: opportunistically pull cross-store intents into the local
             // inbox BEFORE draining, so a freshly-pulled message is delivered in
             // this same turn. Best-effort: a pull failure never sinks the drain.
             try_pull(store, cfg, &me);
-            let mut mark_read = event == "prompt";
+            let is_wake_stop = event == "stop"
+                && (wake_flag || std::env::var("WEAVE_STOP_WAKE").ok().as_deref() == Some("1"));
+            let mut mark_read = event == "prompt" || is_wake_stop;
             // Never mark messages read under a guessed identity: if we had to fall
             // back to basename(current_dir()) (no config session, no payload cwd),
             // peek instead so we cannot permanently consume another session's inbox.
@@ -4094,14 +5539,39 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
             }
             let (rows, _) = store.inbox(&me, false, mark_read, 50)?;
             if !rows.is_empty() {
-                println!("[weave] {} new message(s) for '{me}':", rows.len());
-                for m in &rows {
-                    let subj = m
-                        .subject
-                        .as_ref()
-                        .map(|s| format!(" ({s})"))
-                        .unwrap_or_default();
-                    println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
+                if is_wake_stop {
+                    // WL-025: blocking wake — render all unread messages into the
+                    // structured JSON that Claude Code uses as the next turn input.
+                    let reason = rows
+                        .iter()
+                        .map(|m| {
+                            let subj = m
+                                .subject
+                                .as_ref()
+                                .map(|s| format!(" ({s})"))
+                                .unwrap_or_default();
+                            format!("#{} from {}{}: {}", m.id, m.sender, subj, m.body)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "decision": "block",
+                            "reason": format!("[weave] {} new message(s) for '{me}':\n{reason}", rows.len()),
+                            "suppressOutput": true,
+                        })
+                    );
+                } else {
+                    println!("[weave] {} new message(s) for '{me}':", rows.len());
+                    for m in &rows {
+                        let subj = m
+                            .subject
+                            .as_ref()
+                            .map(|s| format!(" ({s})"))
+                            .unwrap_or_default();
+                        println!("  #{} from {}{}: {}", m.id, m.sender, subj, m.body);
+                    }
                 }
                 // P6 drain trace: ONLY on the marking-read branch (a peek/Stop does not
                 // "drain"). This is the transport-side proof the message actually landed
@@ -4130,6 +5600,17 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str) -> Result<()> {
                 model::TurnState::Idle
             };
             set_turn_state_best_effort(store, &me, next);
+            // WL-014: remind the recipient of any open asks on every prompt.
+            // WL-015: render open asks as actionable prompts.
+            if event == "prompt" {
+                nudge_open_asks(store, &me);
+                render_open_asks(store, &me);
+                // WL-016: daemon-free schedule tick. Best-effort: a tick failure must
+                // never sink the prompt hook's primary delivery path.
+                if let Err(e) = execute_tick(store, &me, false) {
+                    eprintln!("[weave] tick skipped (non-fatal): {e}");
+                }
+            }
         }
         "wake" => {
             // Wake is a non-consuming guard. When we cannot trust the resolved
@@ -4469,6 +5950,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let cases: &[(&str, Option<i64>, i64)] = &[
             ("h1", None, now),                               // same host, recent, no pid

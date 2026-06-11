@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use weave_core::config::StoreSource;
+use weave_core::memory;
 use weave_core::model::{self, fmt_ts};
 #[cfg(feature = "sign")]
 use weave_core::sign;
@@ -172,7 +173,7 @@ pub fn serve<I: Injector>(
                 continue;
             }
         };
-        if let Some(resp) = handle(
+        if let Some(resp) = dispatch_request(
             store,
             &me_default,
             nudge_template,
@@ -180,6 +181,7 @@ pub fn serve<I: Injector>(
             &pull,
             &req,
             injector as &dyn Injector,
+            true,
         ) {
             // A write/flush failure to a single client read must not tear down
             // the server. BrokenPipe means the client closed its read end → stop
@@ -265,7 +267,47 @@ fn ident(args: &Value, key: &str, def: &Option<String>) -> Result<String, String
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle(
+/// Dangerous/mutating tools that are disabled by default in HTTP transport mode.
+const DANGEROUS_TOOLS: &[&str] = &[
+    "weave_send",
+    "weave_notify",
+    "weave_reply",
+    "weave_ask",
+    "weave_answer",
+    "weave_ack",
+    "weave_clear",
+    "weave_schedule",
+    "weave_schedules",
+    "weave_tick",
+    "weave_job_create",
+    "weave_job_claim",
+    "weave_job_update",
+    "weave_job_cancel",
+    "weave_claim_orchestrator",
+    "weave_review_add",
+    "weave_review_mark",
+    "weave_review_remove",
+    "weave_ask_permission",
+    "weave_permission_resolve",
+    "weave_memory_write",
+    "weave_memory_delete",
+    "weave_setup",
+    "weave_uninstall",
+    "weave_daemon_start",
+    "weave_daemon_stop",
+    "weave_set_message_priority",
+    "weave_set_peer_policy",
+];
+
+/// True if `name` is a dangerous tool that should be filtered in safe mode.
+pub fn is_dangerous_tool(name: &str) -> bool {
+    DANGEROUS_TOOLS.contains(&name)
+}
+
+/// Dispatch a single JSON-RPC request and return the JSON response string.
+/// Notifications (no id) return `None`. Used by both stdio and HTTP transports.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_request(
     store: &dyn Store,
     me_default: &Option<String>,
     nudge_template: Option<&str>,
@@ -273,6 +315,7 @@ fn handle(
     pull: &PullConsent,
     req: &Value,
     injector: &dyn Injector,
+    dangerous: bool,
 ) -> Option<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").cloned();
@@ -314,6 +357,15 @@ fn handle(
         "tools/call" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            if !dangerous && is_dangerous_tool(name) {
+                return Some(reply_err(
+                    &id,
+                    -32603,
+                    &format!(
+                        "Tool '{name}' is disabled in safe HTTP mode. Start with --dangerous to enable."
+                    ),
+                ));
+            }
             match call_tool(
                 store,
                 me_default,
@@ -356,10 +408,17 @@ fn call_tool(
     match name {
         "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
         "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
+        "weave_broadcast_notify" => {
+            tool_broadcast_notify(store, me_default, nudge_template, args, injector)
+        }
+        "weave_broadcast_ask" => {
+            tool_broadcast_ask(store, me_default, nudge_template, args, injector)
+        }
         "weave_delivery" => tool_delivery(store, args),
         "weave_outbox" => tool_outbox(store, args),
         "weave_inbox" => tool_inbox(store, me_default, pull, args, injector),
         "weave_history" => tool_history(store, me_default, args),
+        "weave_search" => tool_search(store, args),
         "weave_sessions" => tool_sessions(store, me_default, extra_dbs, args),
         "weave_clear" => tool_clear(store, me_default, args),
         "weave_peers" => tool_peers(store, me_default, extra_dbs, args, injector),
@@ -372,6 +431,9 @@ fn call_tool(
         "weave_attach" => tool_attach(store, me_default, args, injector),
         "weave_set_description" => tool_set_description(store, me_default, args),
         "weave_set_turn_state" => tool_set_turn_state(store, me_default, args),
+        "weave_set_message_priority" => tool_set_message_priority(store, args),
+        "weave_set_peer_policy" => tool_set_peer_policy(store, args),
+        "weave_get_peer_policy" => tool_get_peer_policy(store, args),
         "weave_connect" => tool_connect(store, args, injector),
         "weave_ask" => tool_ask(store, me_default, nudge_template, args, injector),
         "weave_answer" => tool_answer(store, me_default, nudge_template, args, injector),
@@ -393,6 +455,30 @@ fn call_tool(
         "weave_daemon_start" => tool_daemon_start(me_default, args),
         "weave_daemon_stop" => tool_daemon_stop(),
         "weave_daemon_status" => tool_daemon_status(),
+        "weave_schedule" => tool_schedule(store, me_default, args),
+        "weave_schedules" => tool_schedules(store, me_default, args),
+        "weave_cancel_schedule" => tool_cancel_schedule(store, args),
+        "weave_tick" => tool_tick(store, me_default, args),
+        "weave_memory_write" => tool_memory_write(me_default, args),
+        "weave_memory_read" => tool_memory_read(me_default, args),
+        "weave_memory_search" => tool_memory_search(me_default, args),
+        "weave_memory_list" => tool_memory_list(me_default, args),
+        "weave_memory_delete" => tool_memory_delete(me_default, args),
+        "weave_review_queue" => tool_review_queue(store, args),
+        "weave_review_add" => tool_review_add(store, args),
+        "weave_review_mark" => tool_review_mark(store, me_default, args),
+        "weave_review_remove" => tool_review_remove(store, args),
+        "weave_ask_permission" => {
+            tool_ask_permission(store, me_default, nudge_template, args, injector)
+        }
+        "weave_permission_status" => tool_permission_status(store, args),
+        "weave_permission_list" => tool_permission_list(store, me_default, args),
+        "weave_lease_reserve" => tool_lease_reserve(store, me_default, args),
+        "weave_lease_release" => tool_lease_release(store, me_default, args),
+        "weave_lease_list" => tool_lease_list(store, args),
+        "weave_lease_sweep" => tool_lease_sweep(store),
+        "weave_thread_summarize" => tool_thread_summarize(store, args),
+        "weave_summarize_text" => tool_summarize_text(args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -441,13 +527,27 @@ fn tool_send(
         .ok_or("'to' is required (session name, or 'all' to broadcast).")?;
     let to = bound_ident("to", to_raw)?;
     let to = to.as_str();
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let subject = subject.as_deref();
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
     // lives in a FOREIGN store, so deposit an intent into OUR OWN outbox rather
@@ -474,16 +574,38 @@ fn tool_send(
         // Signed identity (2d): sign the canonical (from,to,body) with this
         // session's key when one is configured (and the `sign` feature is built),
         // so the receiver can verify `from` is unforgeable. "" otherwise (advisory).
-        let sig = sign_intent_if_keyed(&from, to, body);
+        let sig = sign_intent_if_keyed(&from, to, &body);
         let id = store
-            .enqueue_intent(to, to_host, &from, subject, body, &sig)
+            .enqueue_intent(
+                to,
+                to_host,
+                &from,
+                subject,
+                &body,
+                &sig,
+                idempotency_key,
+                trace_id.as_deref(),
+                priority,
+            )
             .map_err(e)?;
         return Ok(format!(
             "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
         ));
     }
 
-    let mid = store.send(&from, to, subject, body).map_err(e)?;
+    let mid = store
+        .send(
+            &from,
+            to,
+            subject,
+            &body,
+            idempotency_key,
+            trace_id.as_deref(),
+        )
+        .map_err(e)?;
+    if let Some(p) = priority {
+        let _ = store.set_message_priority(mid, p);
+    }
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
@@ -508,7 +630,7 @@ fn tool_send(
             // Record the post-inject stage AFTER the inject attempt (no store→inject
             // edge — the store records the outcome we pass it).
             let (stage, outcome) = if target.injectable() {
-                let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                let (nudge, mode) = build_nudge(nudge_template, &from, &body);
                 match injector.inject_mode(&target, &nudge, mode) {
                     Ok(true) => {
                         out.push_str(&format!(
@@ -634,14 +756,33 @@ fn tool_notify(
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let trace_id = Some(model::mint_trace_id());
 
     // Persist via the EXISTING send path (no new persistence — notify is a normal
     // stored message; "no reply" is a caller-intent label, not a schema distinction).
     // `store.send` enforces MAX_BODY via check_body, so an oversized body is a clean
     // error (never a panic / partial persist).
     let mid = store
-        .send(&from, &to, subject.as_deref(), body)
+        .send(
+            &from,
+            &to,
+            subject.as_deref(),
+            body,
+            idempotency_key,
+            trace_id.as_deref(),
+        )
         .map_err(e)?;
+    if let Some(p) = priority {
+        let _ = store.set_message_priority(mid, p);
+    }
 
     // Trace: queued after persist (best-effort, never sinks the path).
     record_delivery_best_effort(
@@ -670,6 +811,130 @@ fn tool_notify(
     Ok(format!(
         "Notified '{to}' (#{mid}, no reply expected). {} [{verdict}]",
         verdict_sentence(verdict, &to)
+    ))
+}
+
+fn tool_broadcast_notify(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let circle = args.get("circle").and_then(|v| v.as_str());
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let peers = store.list_peers().map_err(e)?;
+    let online: Vec<String> = peers
+        .into_iter()
+        .filter(|p| {
+            circle
+                .map(|c| model::circle_or_default(&p.circle) == c)
+                .unwrap_or(true)
+        })
+        .filter(|p| p.name != from)
+        .filter(store::is_alive)
+        .map(|p| p.name)
+        .collect();
+    if online.is_empty() {
+        return Ok("No online peers in circle to notify.".to_string());
+    }
+    let mut lines = Vec::new();
+    for peer in &online {
+        let trace_id = Some(model::mint_trace_id());
+        let mid = store
+            .send(
+                &from,
+                peer,
+                subject.as_deref(),
+                body,
+                None,
+                trace_id.as_deref(),
+            )
+            .map_err(e)?;
+        if let Some(p) = priority {
+            let _ = store.set_message_priority(mid, p);
+        }
+        let verdict = ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
+        let (stage, outcome) = verdict_to_stage(verdict);
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Notify,
+            peer,
+            stage,
+            outcome,
+        );
+        lines.push(format!("{peer}: #{mid} [{verdict}]"));
+    }
+    Ok(format!(
+        "Broadcast-notified {} peer(s):\n{}",
+        online.len(),
+        lines.join("\n")
+    ))
+}
+
+fn tool_broadcast_ask(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let circle = args.get("circle").and_then(|v| v.as_str());
+    let _reply_to = args.get("reply_to").and_then(|v| v.as_i64());
+    let peers = store.list_peers().map_err(e)?;
+    let online: Vec<String> = peers
+        .into_iter()
+        .filter(|p| {
+            circle
+                .map(|c| model::circle_or_default(&p.circle) == c)
+                .unwrap_or(true)
+        })
+        .filter(|p| p.name != from)
+        .filter(store::is_alive)
+        .map(|p| p.name)
+        .collect();
+    if online.is_empty() {
+        return Ok("No online peers in circle to ask.".to_string());
+    }
+    let outcome = store
+        .create_ask_many(&from, &online, subject.as_deref(), body)
+        .map_err(e)?;
+    let mut lines = Vec::new();
+    for (peer, res) in &outcome.children {
+        match res {
+            Ok(cid) => {
+                let verdict =
+                    ask_delivery_verdict(store, nudge_template, &from, peer, body, injector);
+                lines.push(format!("{peer}: {cid} ({verdict})"));
+            }
+            Err(err) => {
+                lines.push(format!("{peer}: FAILED ({err})"));
+            }
+        }
+    }
+    Ok(format!(
+        "Broadcast-ask {} ({} created):\n{}",
+        outcome.parent_id,
+        outcome.children.iter().filter(|(_, r)| r.is_ok()).count(),
+        lines.join("\n")
     ))
 }
 
@@ -882,6 +1147,38 @@ fn tool_history(store: &dyn Store, def: &Option<String>, args: &Value) -> Result
         None => format!("involving '{me}' (incl. broadcasts)"),
     };
     let mut out = format!("History ({label}) — {} message(s):", rows.len());
+    for m in &rows {
+        let subj = m
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n\n#{} [{}] {} -> {}{}\n{}",
+            m.id,
+            fmt_ts(m.ts),
+            m.sender,
+            m.recipient,
+            subj,
+            m.body
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_search(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing or empty 'query' parameter.".to_string())?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let rows = store.search(query, limit).map_err(e)?;
+    if rows.is_empty() {
+        return Ok(format!("Search for '{query}': no matches."));
+    }
+    let mut out = format!("Search ('{query}') — {} message(s):", rows.len());
     for m in &rows {
         let subj = m
             .subject
@@ -1154,6 +1451,7 @@ fn tool_scan(
                 &tags.branch,
                 &tags.worktree_id,
                 &weave_core::config::Config::load().circle(),
+                None,
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -1279,12 +1577,15 @@ fn tool_orchestrator_status(store: &dyn Store, args: &Value) -> Result<String, S
         .map(str::to_string)
         .unwrap_or_else(|| weave_core::config::Config::load().circle());
     let st = store.orchestrator_status(Some(&circle)).map_err(e)?;
-    match st.holder {
-        Some(h) if st.present => Ok(format!(
-            "orchestrator present in circle '{}': '{}' (online)",
-            st.circle, h.name
-        )),
-        _ => Ok(format!("no live orchestrator in circle '{}'", st.circle)),
+    if st.present {
+        let names: Vec<_> = st.holders.iter().map(|h| h.name.as_str()).collect();
+        Ok(format!(
+            "orchestrator(s) present in circle '{}': {} (online)",
+            st.circle,
+            names.join(", ")
+        ))
+    } else {
+        Ok(format!("no live orchestrator in circle '{}'", st.circle))
     }
 }
 
@@ -1306,13 +1607,18 @@ fn tool_reply(
     if in_reply_to <= 0 {
         return Err("'in_reply_to' must be a positive message id.".into());
     }
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
 
-    let mid = store.reply(&from, in_reply_to, body).map_err(e)?;
+    let mid = store.reply(&from, in_reply_to, &body).map_err(e)?;
     let mut out = format!("Replied to #{in_reply_to} as message #{mid} from '{from}'.");
 
     // Native push: nudge the reply's recipient if it resolved to a registered
@@ -1324,7 +1630,7 @@ fn tool_reply(
             if let Ok(Some(peer)) = store.get_peer(&to) {
                 let target = Target::from_peer(&peer);
                 if target.injectable() {
-                    let (nudge, mode) = build_nudge(nudge_template, &from, body);
+                    let (nudge, mode) = build_nudge(nudge_template, &from, &body);
                     match injector.inject_mode(&target, &nudge, mode) {
                         Ok(true) => out.push_str(&format!(
                             " Injected live nudge into {} target '{}'.",
@@ -1705,7 +2011,7 @@ fn tool_attach(
     // real liveness (this is the agent's own process), plus the git session tags
     // derived from the server's cwd (best-effort; a git failure ⇒ empty tags).
     let tags = injector.git_tags_here();
-    store
+    let cert = store
         .register_peer_full(
             &me,
             t.mux.as_str(),
@@ -1718,6 +2024,9 @@ fn tool_attach(
             &tags.branch,
             &tags.worktree_id,
             &weave_core::config::Config::load().circle(),
+            args.get("cert")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -1727,7 +2036,7 @@ fn tool_attach(
         "no-inject"
     };
     Ok(format!(
-        "Attached '{me}' to the store [{}] {tgt} ({inj}). It is now visible to other sessions.",
+        "Attached '{me}' to the store [{}] {tgt} ({inj}). birth-cert: {cert}",
         t.mux.as_str()
     ))
 }
@@ -1777,6 +2086,51 @@ fn tool_set_turn_state(
         .ok_or("'state' is required (pending_first_turn|working|awaiting_input|idle).")?;
     store.set_turn_state(&me, state).map_err(e)?;
     Ok(format!("Set turn_state for '{me}': {state}"))
+}
+
+fn tool_set_message_priority(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let message_id = args
+        .get("message_id")
+        .and_then(|v| v.as_i64())
+        .ok_or("'message_id' is required.")?;
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .ok_or("'priority' is required (low, normal, high, urgent).")?;
+    store
+        .set_message_priority(message_id, priority)
+        .map_err(e)?;
+    Ok(format!(
+        "Set priority of message #{message_id} to '{priority}'."
+    ))
+}
+
+fn tool_set_peer_policy(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("'name' is required.")?;
+    let policy = args
+        .get("policy")
+        .and_then(|v| v.as_str())
+        .ok_or("'policy' is required (open, auto, contacts_only, block_all).")?;
+    let parsed = model::ContactPolicy::parse(policy);
+    store.set_peer_policy(name, parsed.as_str()).map_err(e)?;
+    Ok(format!(
+        "Set contact_policy for '{name}': {}",
+        parsed.as_str()
+    ))
+}
+
+fn tool_get_peer_policy(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("'name' is required.")?;
+    match store.get_peer_policy(name).map_err(e)? {
+        Some(p) => Ok(p),
+        None => Err(format!("No peer '{name}' found.")),
+    }
 }
 
 /// Connect handshake: capability-probe `peer` before sending. Reports a structured
@@ -1895,11 +2249,16 @@ fn tool_ask(
                 .to_string(),
         );
     }
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the question).")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let reply_to = args
         .get("reply_to")
@@ -1911,8 +2270,22 @@ fn tool_ask(
             return Err("'reply_to' is not a valid correlation id.".to_string());
         }
     }
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(model::AskKind::parse)
+        .unwrap_or_default();
+    let options = args.get("options").and_then(|v| v.as_str());
     let (cid, qid) = store
-        .ask(&from, &to, subject.as_deref(), body, reply_to)
+        .ask(
+            &from,
+            &to,
+            subject.as_deref(),
+            &body,
+            kind,
+            options,
+            reply_to,
+        )
         .map_err(e)?;
     // P6: queued trace keyed by the QUESTION message id so `weave_delivery <qid>`
     // works uniformly. Best-effort; never sinks the ask.
@@ -1924,7 +2297,7 @@ fn tool_ask(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, body, injector);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, &body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(store, qid, model::DeliveryRefKind::Ask, &to, stage, outcome);
     Ok(format!(
@@ -1943,18 +2316,23 @@ fn tool_answer(
     injector: &dyn Injector,
 ) -> Result<String, String> {
     let from = ident(args, "from", def)?;
-    let body = args
+    let no_memory = args
+        .get("no_memory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let body_raw = args
         .get("body")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the answer).")?;
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
     let cid = resolve_correlation_id(store, args)?;
     let ask = store
         .get_ask(&cid)
         .map_err(e)?
         .ok_or_else(|| format!("No tracked ask '{cid}'."))?;
     let asker = ask.asker.clone();
-    let ans_id = store.answer(&from, &cid, body).map_err(e)?;
+    let ans_id = store.answer(&from, &cid, &body).map_err(e)?;
     record_delivery_best_effort(
         store,
         ans_id,
@@ -1963,7 +2341,7 @@ fn tool_answer(
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
     );
-    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, body, injector);
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &asker, &body, injector);
     let (stage, outcome) = verdict_to_stage(verdict);
     record_delivery_best_effort(
         store,
@@ -2527,7 +2905,10 @@ fn tools() -> Value {
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
                 "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
-                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."}
+                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
             },"required":["to","body"]}
         },
         {
@@ -2537,8 +2918,32 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"Recipient session name (point-to-point; broadcast is not supported)."},
                 "subject":{"type":"string"},
-                "body":{"type":"string"}
+                "body":{"type":"string"},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
             },"required":["to","body"]}
+        },
+        {
+            "name": "weave_broadcast_notify",
+            "description": "Broadcast a fire-and-forget notification to all online peers in your circle. Fan-out: one message per online peer, plus a live nudge for each injectable peer. Returns an aggregated delivery verdict per peer. Offline peers are skipped.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "subject":{"type":"string"},
+                "body":{"type":"string"},
+                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
+            },"required":["body"]}
+        },
+        {
+            "name": "weave_broadcast_ask",
+            "description": "Broadcast a tracked ask to all online peers in your circle. Fan-out via ask-many: one tracked question per online peer. Returns a parent id and per-child delivery verdicts. Offline peers are skipped.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "subject":{"type":"string"},
+                "body":{"type":"string"},
+                "circle":{"type":"string","description":"Scope to this circle; omit for your own configured circle."},
+                "reply_to":{"type":"integer","description":"Optional message id this broadcast ask replies to."}
+            },"required":["body"]}
         },
         {
             "name": "weave_delivery",
@@ -2571,6 +2976,14 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "me":{"type":"string"},"peer":{"type":"string"},"limit":{"type":"integer"}
             },"required":[]}
+        },
+        {
+            "name": "weave_search",
+            "description": "Full-text search over messages (FTS5 on sqlite, LIKE fallback on libsql). Returns matching messages newest-first.",
+            "inputSchema": {"type":"object","properties":{
+                "query":{"type":"string","description":"Search query string (FTS5 syntax on sqlite, substring on libsql)."},
+                "limit":{"type":"integer"}
+            },"required":["query"]}
         },
         {
             "name": "weave_sessions",
@@ -2608,7 +3021,8 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "in_reply_to":{"type":"integer","description":"The message id you're replying to."},
-                "body":{"type":"string"}
+                "body":{"type":"string"},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["in_reply_to","body"]}
         },
         {
@@ -2660,6 +3074,29 @@ fn tools() -> Value {
             },"required":["state"]}
         },
         {
+            "name": "weave_set_message_priority",
+            "description": "Set the priority of an existing message. low, normal, high, urgent (default normal).",
+            "inputSchema": {"type":"object","properties":{
+                "message_id":{"type":"integer","description":"The message id to update."},
+                "priority":{"type":"string","description":"Priority level: low, normal, high, urgent."}
+            },"required":["message_id","priority"]}
+        },
+        {
+            "name": "weave_set_peer_policy",
+            "description": "Set a peer's contact policy. open (default), auto, contacts_only, block_all.",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The peer session name."},
+                "policy":{"type":"string","description":"Policy: open, auto, contacts_only, block_all."}
+            },"required":["name","policy"]}
+        },
+        {
+            "name": "weave_get_peer_policy",
+            "description": "Get a peer's current contact policy. Returns open, auto, contacts_only, block_all, or an error if the peer is not found.",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The peer session name."}
+            },"required":["name"]}
+        },
+        {
             "name": "weave_connect",
             "description": "Probe whether a peer can be reached by a live nudge right now, and report the verdict (live / registered-but-not-alive / not-injectable). A not-alive or non-injectable peer is NOT an error — its messages are still delivered via the store on its next turn; only a non-existent peer is an error.",
             "inputSchema": {"type":"object","properties":{
@@ -2674,7 +3111,8 @@ fn tools() -> Value {
                 "to":{"type":"string","description":"The peer session name to ask."},
                 "body":{"type":"string","description":"The question."},
                 "subject":{"type":"string"},
-                "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."}
+                "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["to","body"]}
         },
         {
@@ -2684,7 +3122,8 @@ fn tools() -> Value {
                 "from":{"type":"string","description":"Your session name (must be the askee)."},
                 "correlation_id":{"type":"string","description":"The ask's correlation_id."},
                 "in_reply_to":{"type":"integer","description":"Alternatively, a message id belonging to the ask."},
-                "body":{"type":"string","description":"The answer."}
+                "body":{"type":"string","description":"The answer."},
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["body"]}
         },
         {
@@ -2845,6 +3284,193 @@ fn tools() -> Value {
             "name": "weave_daemon_status",
             "description": "Show whether the optional presence daemon is running. Returns running:true + pid when active, or running:false when stopped. A stale pidfile is automatically cleaned up.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_schedule",
+            "description": "Schedule a future message delivery (one-shot or recurring). Provide exactly one of 'at' (absolute UNIX timestamp) or 'every' (cron preset like @hourly/@daily/@weekly/@monthly or a 5-field cron expression). The scheduled message is sent to the recipient's inbox and behaves like a normal message on delivery.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "to":{"type":"string","description":"Recipient session name."},
+                "subject":{"type":"string"},
+                "body":{"type":"string","description":"Message body (required)."},
+                "at":{"type":"integer","description":"One-shot: absolute UNIX timestamp."},
+                "every":{"type":"string","description":"Recurring: cron preset (@hourly, @daily, @weekly, @monthly) or 5-field cron expression."}
+            },"required":["to","body"]}
+        },
+        {
+            "name": "weave_schedules",
+            "description": "List your scheduled messages (one-shot and recurring). Includes cancelled and executed rows so you see the full state.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "limit":{"type":"integer"}
+            },"required":[]}
+        },
+        {
+            "name": "weave_cancel_schedule",
+            "description": "Soft-cancel a scheduled message by its id. Idempotent: cancelling an already-cancelled or executed row is a no-op, not an error.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"integer","description":"The schedule id to cancel."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_tick",
+            "description": "Execute any due scheduled messages now (explicit tick). Self-only by default: only schedules you created are fired. Pass all=true to fire every due schedule (admin/debug).",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "all":{"type":"boolean","description":"Fire schedules for all senders, not just yourself."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_memory_write",
+            "description": "Write a memory entry to a scope. Scopes: global, project (derived from cwd), persona (derived from identity), orchestrator (derived from circle). Optional 'name' overrides derivation.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"],"description":"Scope kind."},
+                "name":{"type":"string","description":"Optional explicit scope name (overrides derivation)."},
+                "key":{"type":"string","description":"Entry key (alphanumeric, hyphen, underscore; max 128)."},
+                "title":{"type":"string","description":"Entry title (max 256 chars)."},
+                "tags":{"type":"array","items":{"type":"string"},"description":"Optional tags (max 16, each max 64 chars)."},
+                "body":{"type":"string","description":"Entry body (max 64KiB)."}
+            },"required":["scope","key","title","body"]}
+        },
+        {
+            "name": "weave_memory_read",
+            "description": "Read a memory entry by scope and key.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "key":{"type":"string","description":"Entry key."}
+            },"required":["scope","key"]}
+        },
+        {
+            "name": "weave_memory_search",
+            "description": "Search memory entries. Simple substring search over tags, title, and body. Omit scope to search across all scopes with entries.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "query":{"type":"string","description":"Search substring."},
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":["query"]}
+        },
+        {
+            "name": "weave_memory_list",
+            "description": "List all memory entries in a scope.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."}
+            },"required":["scope"]}
+        },
+        {
+            "name": "weave_memory_delete",
+            "description": "Delete a memory entry by scope and key.",
+            "inputSchema": {"type":"object","properties":{
+                "scope":{"type":"string","enum":["global","project","persona","orchestrator"]},
+                "name":{"type":"string","description":"Optional explicit scope name."},
+                "key":{"type":"string","description":"Entry key."}
+            },"required":["scope","key"]}
+        },
+        {
+            "name": "weave_review_queue",
+            "description": "List PR review items. Filter by all, open, pending (unreviewed), or reviewed.",
+            "inputSchema": {"type":"object","properties":{
+                "filter":{"type":"string","enum":["all","open","pending","reviewed"],"description":"Filter by review state."},
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_review_add",
+            "description": "Add a GitHub PR to the review queue.",
+            "inputSchema": {"type":"object","properties":{
+                "pr_url":{"type":"string","description":"GitHub pull request URL."},
+                "title":{"type":"string","description":"PR title."},
+                "author":{"type":"string","description":"PR author."},
+                "repo":{"type":"string","description":"Repository name (owner/repo)."}
+            },"required":["pr_url"]}
+        },
+        {
+            "name": "weave_review_mark",
+            "description": "Mark a review item as reviewed.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Review item id."},
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_review_remove",
+            "description": "Remove a review item from the queue.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Review item id."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_ask_permission",
+            "description": "Request approval for a mutating tool (Bash, Edit, Write) from a peer. Creates a ToolPermission ask. The peer answers with 'approve' or 'deny'. Unanswered asks timeout after 300s and are treated as denied.",
+            "inputSchema": {"type":"object","properties":{
+                "to":{"type":"string","description":"Peer session name to ask for approval."},
+                "tool":{"type":"string","description":"Tool name (e.g. Bash, Edit, Write)."},
+                "args":{"type":"string","description":"Tool arguments / command."},
+                "body":{"type":"string","description":"Optional explanatory message."},
+                "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["to","tool"]}
+        },
+        {
+            "name": "weave_permission_status",
+            "description": "Check the permission status of a ToolPermission ask. Returns pending, approved, denied, or timeout.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"Permission ask correlation id."},
+                "timeout":{"type":"integer","description":"Custom timeout in seconds (default 300)."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_permission_list",
+            "description": "List ToolPermission asks you created, with their current verdict.",
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer","description":"Max results (bounded by server)."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_lease_reserve",
+            "description": "Reserve an advisory lease on a resource. Succeeds only if no active lease exists (or it has expired).",
+            "inputSchema": {"type":"object","properties":{
+                "resource":{"type":"string","description":"Resource identifier (path, glob, or freeform tag)."},
+                "ttl":{"type":"integer","description":"TTL in seconds (1..86400)."},
+                "note":{"type":"string","description":"Optional note."}
+            },"required":["resource","ttl"]}
+        },
+        {
+            "name": "weave_lease_release",
+            "description": "Release a lease you hold on a resource.",
+            "inputSchema": {"type":"object","properties":{
+                "resource":{"type":"string","description":"Resource identifier."},
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
+            },"required":["resource"]}
+        },
+        {
+            "name": "weave_lease_list",
+            "description": "List active (non-expired) leases.",
+            "inputSchema": {"type":"object","properties":{
+                "limit":{"type":"integer","description":"Max results (bounded by server)."}
+            },"required":[]}
+        },
+        {
+            "name": "weave_lease_sweep",
+            "description": "Remove all expired leases and return the count swept.",
+            "inputSchema": {"type":"object","properties":{},"required":[]}
+        },
+        {
+            "name": "weave_thread_summarize",
+            "description": "Generate or retrieve a cached LLM summary for a message thread. If a cached summary exists and refresh is not requested, it is returned immediately.",
+            "inputSchema": {"type":"object","properties":{
+                "root_id":{"type":"integer","description":"The message id at the root of the thread."},
+                "refresh":{"type":"boolean","description":"Force a fresh summary even if a cached one exists."}
+            },"required":["root_id"]}
+        },
+        {
+            "name": "weave_summarize_text",
+            "description": "Summarize arbitrary text via the configured LLM endpoint. Does not persist the summary.",
+            "inputSchema": {"type":"object","properties":{
+                "text":{"type":"string","description":"The text to summarize."}
+            },"required":["text"]}
         }
     ])
 }
@@ -2911,6 +3537,649 @@ fn tool_daemon_status() -> Result<String, String> {
         let _ = std::fs::remove_file(&pidfile);
         Ok(r#"{"running":false}"#.to_string())
     }
+}
+
+fn tool_schedule(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (recipient session name).")?;
+    let to = bound_ident("to", to_raw)?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?;
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let at = args.get("at").and_then(|v| v.as_i64());
+    let every = args.get("every").and_then(|v| v.as_str());
+
+    let (kind, cron_expr, next_run) = match (at, every) {
+        (Some(ts), None) => {
+            if ts <= 0 {
+                return Err("'at' must be a positive UNIX timestamp".to_string());
+            }
+            (model::ScheduleKind::OneShot, String::new(), ts)
+        }
+        (None, Some(expr)) => {
+            let expr = expr.trim();
+            if !model::cron_valid(expr) {
+                return Err("'every' is not a valid cron expression".to_string());
+            }
+            let next = model::next_occurrence(expr, model::now()).ok_or_else(|| {
+                "could not compute next occurrence from cron expression".to_string()
+            })?;
+            (model::ScheduleKind::Recurring, expr.to_string(), next)
+        }
+        (Some(_), Some(_)) => {
+            return Err("provide exactly one of 'at' or 'every', not both".to_string());
+        }
+        (None, None) => {
+            return Err("provide exactly one of 'at' or 'every'".to_string());
+        }
+    };
+
+    let id = store
+        .schedule_message(
+            &from,
+            &to,
+            subject.as_deref(),
+            body,
+            kind,
+            &cron_expr,
+            next_run,
+        )
+        .map_err(e)?;
+    Ok(format!(
+        "Scheduled message #{id}: {from} -> {to} at {next_run} ({})",
+        kind.as_str()
+    ))
+}
+
+fn tool_schedules(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let rows = store.list_schedules(&me, limit).map_err(e)?;
+    if rows.is_empty() {
+        return Ok(format!("No scheduled messages for '{me}'."));
+    }
+    let mut out = format!("Scheduled messages for '{me}':\n");
+    for s in &rows {
+        let subj = s
+            .subject
+            .as_ref()
+            .map(|s| format!(" | {s}"))
+            .unwrap_or_default();
+        let state = if s.cancelled {
+            "cancelled"
+        } else if s.executed_ts.is_some() {
+            "executed"
+        } else {
+            "pending"
+        };
+        out.push_str(&format!(
+            "#{} [{}] {} -> {}{} ({}) next={}\n",
+            s.id,
+            state,
+            s.sender,
+            s.recipient,
+            subj,
+            s.kind.as_str(),
+            s.next_run
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_cancel_schedule(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or("'id' is required (the schedule id to cancel).")?;
+    let cancelled = store.cancel_schedule(id).map_err(e)?;
+    if cancelled {
+        Ok(format!("Cancelled schedule #{id}."))
+    } else {
+        Ok(format!(
+            "Schedule #{id} was already terminal or did not exist."
+        ))
+    }
+}
+
+fn tool_tick(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let now_ts = model::now();
+    let due = store.get_due_schedules(now_ts).map_err(e)?;
+    let mut fired = 0usize;
+    let mut skipped = 0usize;
+    for sched in &due {
+        if !all && sched.sender != me {
+            skipped += 1;
+            continue;
+        }
+        let _mid = store
+            .send(
+                &sched.sender,
+                &sched.recipient,
+                sched.subject.as_deref(),
+                &sched.body,
+                None,
+                None,
+            )
+            .map_err(e)?;
+        store.mark_schedule_executed(sched.id).map_err(e)?;
+        fired += 1;
+    }
+    Ok(format!(
+        "Tick: {fired} schedule(s) fired, {skipped} skipped."
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Memory helpers (WL-017)
+// ---------------------------------------------------------------------------
+
+/// Optionally prepend memory context to a body. Non-fatal: any problem returns the original body.
+fn maybe_prefix_body_mcp(identity: &str, body: &str, no_memory: bool) -> String {
+    if no_memory {
+        return body.to_string();
+    }
+    let circle = weave_core::config::Config::load().circle();
+    let prefix = memory::build_context_prefix(identity, &circle, body, 3);
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
+fn parse_memory_scope_mcp(
+    scope: &str,
+    name: Option<&str>,
+    identity: &str,
+) -> Result<memory::MemoryScope, String> {
+    match scope {
+        "global" => Ok(memory::MemoryScope::Global),
+        "project" => {
+            if let Some(n) = name {
+                Ok(memory::MemoryScope::Project(n.to_string()))
+            } else {
+                memory::project_scope_from_cwd().ok_or_else(|| {
+                    "not in a git repo; specify 'name' or run inside a git repo".to_string()
+                })
+            }
+        }
+        "persona" => {
+            let id = name.unwrap_or(identity);
+            Ok(memory::MemoryScope::Persona(id.to_string()))
+        }
+        "orchestrator" => {
+            let circle = name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| weave_core::config::Config::load().circle());
+            Ok(memory::MemoryScope::Orchestrator(circle))
+        }
+        other => Err(format!(
+            "unknown scope '{other}'; must be global, project, persona, or orchestrator"
+        )),
+    }
+}
+
+fn tool_memory_write(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required (global, project, persona, orchestrator).")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or("'title' is required.")?;
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or("'body' is required.")?;
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    memory::memory_write(&scope, key, title, &tags, body).map_err(|e| e.to_string())?;
+    Ok(format!("wrote {}/{key}", scope.label()))
+}
+
+fn tool_memory_read(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    let entry = memory::memory_read(&scope, key).map_err(|e| e.to_string())?;
+    let tags = if entry.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" | tags={:?}", entry.tags)
+    };
+    Ok(format!(
+        "scope: {} | key: {} | title: {} | updated: {}{}\n---\n{}",
+        entry.scope.label(),
+        entry.key,
+        entry.title,
+        fmt_ts(entry.updated_ts),
+        tags,
+        entry.body
+    ))
+}
+
+fn tool_memory_search(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            parse_memory_scope_mcp(s, name, &me)
+        })
+        .transpose()?;
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("'query' is required.")?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50) as usize;
+    let hits = memory::memory_search(scope.as_ref(), query).map_err(|e| e.to_string())?;
+    if hits.is_empty() {
+        return Ok("No memory entries matched.".to_string());
+    }
+    let mut out = format!("{} memory entr(y/ies) matched:\n", hits.len().min(limit));
+    for e in hits.iter().take(limit) {
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | tags={:?}", e.tags)
+        };
+        out.push_str(&format!(
+            "{} | {} | {}{}\n",
+            e.scope.label(),
+            e.key,
+            e.title,
+            tags
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_memory_list(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let list = memory::memory_list(&scope).map_err(|e| e.to_string())?;
+    if list.is_empty() {
+        return Ok(format!("no entries in {}", scope.label()));
+    }
+    let mut out = format!("Entries in {}:\n", scope.label());
+    for e in &list {
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | tags={:?}", e.tags)
+        };
+        out.push_str(&format!("{} | {}{}\n", e.key, e.title, tags));
+    }
+    Ok(out)
+}
+
+fn tool_memory_delete(def: &Option<String>, args: &Value) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let scope_raw = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or("'scope' is required.")?;
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let scope = parse_memory_scope_mcp(scope_raw, name, &me)?;
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("'key' is required.")?;
+    if memory::memory_delete(&scope, key).map_err(|e| e.to_string())? {
+        Ok(format!("deleted {}/{key}", scope.label()))
+    } else {
+        Ok(format!("not found: {}/{key}", scope.label()))
+    }
+}
+
+fn tool_review_queue(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let filter_str = args.get("filter").and_then(|v| v.as_str()).unwrap_or("all");
+    let filter = model::ReviewQueueFilter::from_str(filter_str)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let items = store
+        .review_queue(filter, limit)
+        .map_err(|e| e.to_string())?;
+    if items.is_empty() {
+        return Ok("no review items".to_string());
+    }
+    let mut out = format!("{} review item(s):\n", items.len());
+    for item in items {
+        let status = if let Some(ref by) = item.reviewed_by {
+            format!("reviewed by {by}")
+        } else {
+            "pending".to_string()
+        };
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {}\n",
+            item.id, item.repo, item.author, status, item.pr_url
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_review_add(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let pr_url = args
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .ok_or("'pr_url' is required.")?;
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let author = args.get("author").and_then(|v| v.as_str()).unwrap_or("");
+    let repo = args.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+    let id = store
+        .add_review_item(
+            pr_url,
+            title,
+            author,
+            repo,
+            model::ReviewItemState::Open,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!("added review item {id}"))
+}
+
+fn tool_review_mark(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    let reviewer = ident(args, "from", def)?;
+    if store
+        .mark_reviewed(id, &reviewer)
+        .map_err(|e| e.to_string())?
+    {
+        Ok(format!("marked {id} as reviewed"))
+    } else {
+        Ok(format!("not found: {id}"))
+    }
+}
+
+fn tool_review_remove(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    if store.remove_review_item(id).map_err(|e| e.to_string())? {
+        Ok(format!("removed {id}"))
+    } else {
+        Ok(format!("not found: {id}"))
+    }
+}
+
+fn tool_ask_permission(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let from = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the peer session name to ask).")?;
+    let to = bound_ident("to", to_raw)?;
+    if model::is_broadcast(&to) {
+        return Err(
+            "tracked ask is point-to-point; use weave_send for broadcast (broadcast ask is P2)."
+                .to_string(),
+        );
+    }
+    let tool = args
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or("'tool' is required.")?;
+    let tool_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
+    let options = format!("{}\n{}", tool, tool_args);
+    let body_raw = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let body = if body_raw.is_empty() {
+        format!("Requesting permission to run {} {}", tool, tool_args)
+    } else {
+        body_raw.to_string()
+    };
+    let (cid, qid) = store
+        .ask(
+            &from,
+            &to,
+            None,
+            &body,
+            model::AskKind::ToolPermission,
+            Some(&options),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    record_delivery_best_effort(
+        store,
+        qid,
+        model::DeliveryRefKind::Ask,
+        &to,
+        model::DeliveryStage::Queued,
+        model::DeliveryOutcome::Ok,
+    );
+    let verdict = ask_delivery_verdict(store, nudge_template, &from, &to, &body, injector);
+    let (stage, outcome) = verdict_to_stage(verdict);
+    record_delivery_best_effort(store, qid, model::DeliveryRefKind::Ask, &to, stage, outcome);
+    Ok(format!(
+        "Opened permission ask {cid} from '{from}' to '{to}'. {}",
+        verdict_sentence(verdict, &to)
+    ))
+}
+
+fn tool_permission_status(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("'id' is required.")?;
+    let timeout = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(0);
+    let (status, answer) = store
+        .permission_verdict(id, timeout)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}: {} (answer: {})",
+        id,
+        status.as_str(),
+        answer.unwrap_or_default()
+    ))
+}
+
+fn tool_permission_list(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let asks = store
+        .list_permissions(&me, limit)
+        .map_err(|e| e.to_string())?;
+    if asks.is_empty() {
+        return Ok("no permission asks".to_string());
+    }
+    let mut out = format!("{} permission ask(s):\n", asks.len());
+    for a in asks {
+        let (status, _) = store
+            .permission_verdict(&a.id, 0)
+            .map_err(|e| e.to_string())?;
+        let tool = a
+            .options
+            .as_ref()
+            .and_then(|o| o.lines().next())
+            .unwrap_or("?");
+        out.push_str(&format!(
+            "{} | {} | {} -> {} | {}\n",
+            a.id,
+            status.as_str(),
+            a.asker,
+            a.askee,
+            tool
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_lease_reserve(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let resource = args
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .ok_or("resource required")?;
+    let ttl = args
+        .get("ttl")
+        .and_then(|v| v.as_i64())
+        .ok_or("ttl required")?;
+    let note = args.get("note").and_then(|v| v.as_str());
+    match store.reserve_lease(&me, resource, ttl, note) {
+        Ok(lease) => Ok(format!(
+            "leased {} (expires {})",
+            lease.resource, lease.expires
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn tool_lease_release(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    let resource = args
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .ok_or("resource required")?;
+    let ok = store
+        .release_lease(&me, resource)
+        .map_err(|e| e.to_string())?;
+    if ok {
+        Ok(format!("released {}", resource))
+    } else {
+        Err(format!("no active lease for {} held by you", resource))
+    }
+}
+
+fn tool_lease_list(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let leases = store.list_leases(limit).map_err(|e| e.to_string())?;
+    if leases.is_empty() {
+        return Ok("no active leases".to_string());
+    }
+    let mut out = format!("{} lease(s):\n", leases.len());
+    for l in leases {
+        out.push_str(&format!(
+            "{} | {} | expires {} | {}\n",
+            l.resource,
+            l.holder,
+            l.expires,
+            if l.note.is_empty() { "-" } else { &l.note }
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_lease_sweep(store: &dyn Store) -> Result<String, String> {
+    let n = store.sweep_expired_leases().map_err(|e| e.to_string())?;
+    Ok(format!("swept {} expired lease(s)", n))
+}
+
+#[cfg(feature = "llm")]
+fn tool_thread_summarize(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let root_id = args["root_id"]
+        .as_i64()
+        .ok_or("root_id must be an integer")?;
+    let refresh = args["refresh"].as_bool().unwrap_or(false);
+    let summary = if refresh {
+        None
+    } else {
+        store.get_summary(root_id).map_err(|e| e.to_string())?
+    };
+    let text = match summary {
+        Some(s) => s.text,
+        None => {
+            let rows = store.thread(root_id, 200).map_err(|e| e.to_string())?;
+            let _thread_text = rows
+                .iter()
+                .map(|m| format!("{}: {}", m.sender, m.body))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err("LLM summarization not yet available via MCP".to_string());
+        }
+    };
+    Ok(text)
+}
+
+#[cfg(not(feature = "llm"))]
+fn tool_thread_summarize(_store: &dyn Store, _args: &Value) -> Result<String, String> {
+    Err("weave was compiled without the llm feature".to_string())
+}
+
+#[cfg(feature = "llm")]
+fn tool_summarize_text(_args: &Value) -> Result<String, String> {
+    Err("weave_summarize_text requires config access not yet wired in MCP".to_string())
+}
+
+#[cfg(not(feature = "llm"))]
+fn tool_summarize_text(_args: &Value) -> Result<String, String> {
+    Err("weave was compiled without the llm feature".to_string())
 }
 
 #[cfg(test)]

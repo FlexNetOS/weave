@@ -817,3 +817,17 @@ v0.1.0 — both backends build clean (clippy `-D warnings`), **38 tests green** 
 integration), MCP + CLI + injector + setup automation working; libSQL backend runtime-verified.
 Live pane injection is validated by construction (pure command-builder unit tests + fake-mux
 integration test); end-to-end mux injection on real tmux/zellij is to be confirmed on the target box.
+
+## See also
+
+- **[Stalwart](https://github.com/stalwartlabs/stalwart)** — A Rust-native, secure mail &
+  collaboration server (JMAP, IMAP, SMTP, CalDAV, CardDAV, WebDAV). Stalwart's pluggable
+  storage abstraction, JMAP protocol design, and observability stack are prior art for
+  any future weave external-API work. Note: Stalwart is AGPL-3.0; weave does not embed
+  its code and references it only as architectural inspiration.
+
+- **[FrankenNetworkX](https://github.com/Dicklesworthstone/franken_networkx)** — A
+  memory-safe, deterministic Rust reimplementation of NetworkX with a Canonical Graph
+  Semantics Engine (CGSE). weave embeds three `fnx-*` crates via Cargo git dependencies
+  (`fnx-classes`, `fnx-algorithms`, `fnx-runtime`) to power the `weave graph` command:
+  peer/message network analysis with connected components, degree centrality, and density.

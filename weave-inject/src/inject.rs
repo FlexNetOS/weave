@@ -78,6 +78,10 @@ pub enum Mux {
     Kitty,
     Wezterm,
     Screen,
+    /// iTerm2 (macOS). Uses AppleScript `osascript`; injection targets the
+    /// current session of the current window. `id` is a placeholder (the
+    /// `TERM_SESSION_ID` when available); pane-level targeting is not supported.
+    ITerm2,
     /// The absence of an injectable multiplexer — also the `Default`, so a
     /// `Target::default()` is the same inert, non-injectable target as
     /// `Target::none()`.
@@ -93,6 +97,7 @@ impl Mux {
             Mux::Kitty => "kitty",
             Mux::Wezterm => "wezterm",
             Mux::Screen => "screen",
+            Mux::ITerm2 => "iterm2",
             Mux::None => "none",
         }
     }
@@ -104,6 +109,7 @@ impl Mux {
             "kitty" => Mux::Kitty,
             "wezterm" => Mux::Wezterm,
             "screen" => Mux::Screen,
+            "iterm2" | "iterm" => Mux::ITerm2,
             _ => Mux::None,
         }
     }
@@ -116,6 +122,7 @@ impl Mux {
             Mux::Kitty => "kitten",
             Mux::Wezterm => "wezterm",
             Mux::Screen => "screen",
+            Mux::ITerm2 => "osascript",
             Mux::None => "",
         }
     }
@@ -123,11 +130,16 @@ impl Mux {
 
 /// Where a session can be injected.
 ///
-/// `socket` is an OPTIONAL kitty remote-control socket address (the value of
-/// `KITTY_LISTEN_ON`, e.g. `unix:/tmp/mykitty` or `tcp:localhost:12345`). It is
-/// empty for every other backend and ignored by them; only kitty's `commands_for`
-/// arm consults it, passing `--to <socket>` so `kitten @` reaches a kitty that was
-/// launched with `--listen-on` rather than relying on the default control path.
+/// `socket` is an OPTIONAL backend-specific auxiliary identifier:
+///   - kitty: remote-control socket address (`KITTY_LISTEN_ON`, e.g.
+///     `unix:/tmp/mykitty` or `tcp:localhost:12345`). Only kitty's `commands_for`
+///     arm consults it, passing `--to <socket>` so `kitten @` reaches a kitty
+///     launched with `--listen-on`.
+///   - zellij: pane id (`ZELLIJ_PANE_ID`, e.g. `13` or `terminal_1`). When
+///     present, `commands_for` passes `--pane-id <socket>` so `write-chars`
+///     hits the correct pane instead of the currently focused one.
+///   - every other backend: empty and ignored.
+///
 /// Defaulting it to empty keeps every existing constructor/caller working unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct Target {
@@ -154,11 +166,10 @@ impl Target {
         Target {
             mux: Mux::parse(&p.mux),
             id: p.target.clone(),
-            // Carry the peer's stored kitty remote-control socket (the value of
-            // KITTY_LISTEN_ON captured at register time) so a cross-session inject
-            // can reach a kitty launched with `--listen-on`. Empty for every other
-            // backend (and for a kitty on its default control path), which keeps the
-            // legacy `kitten @` shaping byte-for-byte unchanged.
+            // Carry the peer's stored auxiliary identifier:
+            //   - kitty: remote-control socket (`KITTY_LISTEN_ON`)
+            //   - zellij: pane id (`ZELLIJ_PANE_ID`)
+            //   - every other backend: empty (ignored).
             socket: p.socket.clone(),
         }
     }
@@ -167,6 +178,61 @@ impl Target {
 /// Detect the *current* process's injectable target from environment variables
 /// set by the multiplexer/terminal. Probed most- to least-specific.
 pub fn detect_target() -> Target {
+    detect_target_with_preference(None)
+}
+
+/// Detect the current multiplexer target, with an optional preference override.
+///
+/// If `preferred` is `Some(mux)`, check ONLY that mux's env var and return the
+/// corresponding target (or `Target::none()` if the env var is absent).
+/// If `preferred` is `None`, use the normal auto-detection order:
+/// tmux → zellij → wezterm → kitty → screen.
+pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
+    // When a preference is set, check only that mux.
+    if let Some(mux) = preferred {
+        return match mux {
+            Mux::Tmux => nonempty_env("TMUX_PANE").map(|id| Target {
+                mux: Mux::Tmux,
+                id,
+                socket: String::new(),
+            }),
+            Mux::Zellij => nonempty_env("ZELLIJ_SESSION_NAME").map(|id| Target {
+                mux: Mux::Zellij,
+                id,
+                socket: nonempty_env("ZELLIJ_PANE_ID").unwrap_or_default(),
+            }),
+            Mux::Wezterm => nonempty_env("WEZTERM_PANE").map(|id| Target {
+                mux: Mux::Wezterm,
+                id,
+                socket: String::new(),
+            }),
+            Mux::Kitty => nonempty_env("KITTY_WINDOW_ID").map(|id| Target {
+                mux: Mux::Kitty,
+                id,
+                socket: nonempty_env("KITTY_LISTEN_ON").unwrap_or_default(),
+            }),
+            Mux::Screen => nonempty_env("STY").map(|id| Target {
+                mux: Mux::Screen,
+                id,
+                socket: String::new(),
+            }),
+            Mux::ITerm2 => {
+                // iTerm2 sets TERM_PROGRAM to "iTerm.app". The session id comes from
+                // TERM_SESSION_ID (e.g. "w0t0p0:ABC123"); when absent we still register
+                // as injectable so the peer can receive next-turn delivery even though
+                // we can't target a specific pane.
+                let id = nonempty_env("TERM_SESSION_ID").unwrap_or_else(|| "iterm2".to_string());
+                Some(Target {
+                    mux: Mux::ITerm2,
+                    id,
+                    socket: String::new(),
+                })
+            }
+            Mux::None => Some(Target::none()),
+        }
+        .unwrap_or_else(Target::none);
+    }
+
     // Order matters: a process can be inside tmux *and* a terminal; prefer the
     // multiplexer that owns the input line.
     if let Some(id) = nonempty_env("TMUX_PANE") {
@@ -180,7 +246,7 @@ pub fn detect_target() -> Target {
         return Target {
             mux: Mux::Zellij,
             id,
-            socket: String::new(),
+            socket: nonempty_env("ZELLIJ_PANE_ID").unwrap_or_default(),
         };
     }
     if let Some(id) = nonempty_env("WEZTERM_PANE") {
@@ -194,16 +260,20 @@ pub fn detect_target() -> Target {
         return Target {
             mux: Mux::Kitty,
             id,
-            // kitty only answers remote-control requests when launched with
-            // `--listen-on`; it then exports the address as KITTY_LISTEN_ON.
-            // Capture it so we can pass `--to <socket>`; absent it, `kitten @`
-            // falls back to kitty's default control path (unchanged behavior).
             socket: nonempty_env("KITTY_LISTEN_ON").unwrap_or_default(),
         };
     }
     if let Some(id) = nonempty_env("STY") {
         return Target {
             mux: Mux::Screen,
+            id,
+            socket: String::new(),
+        };
+    }
+    if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("iTerm.app") {
+        let id = nonempty_env("TERM_SESSION_ID").unwrap_or_else(|| "iterm2".to_string());
+        return Target {
+            mux: Mux::ITerm2,
             id,
             socket: String::new(),
         };
@@ -300,18 +370,26 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
         // zellij: write the literal chars, then write byte 13 (carriage return).
         // `--` ends option parsing so a body beginning with `-`/`--` is treated as
         // content, not as a flag to `write-chars`.
-        Mux::Zellij => vec![
-            argv(&[
-                "zellij",
-                "--session",
-                id,
-                "action",
-                "write-chars",
-                "--",
-                text,
-            ]),
-            argv(&["zellij", "--session", id, "action", "write", "13"]),
-        ],
+        // When a pane id was captured at registration, pass `--pane-id` so the
+        // text reaches the correct pane instead of whichever pane happens to be
+        // focused in the target session.
+        Mux::Zellij => {
+            let pane = &target.socket;
+            let mut wc = vec!["zellij", "--session", id, "action", "write-chars"];
+            if !pane.is_empty() {
+                wc.push("--pane-id");
+                wc.push(pane);
+            }
+            wc.push("--");
+            wc.push(text);
+            let mut wr = vec!["zellij", "--session", id, "action", "write"];
+            if !pane.is_empty() {
+                wr.push("--pane-id");
+                wr.push(pane);
+            }
+            wr.push("13");
+            vec![argv(&wc), argv(&wr)]
+        }
         // kitty: requires remote control. Match the target window by id; send the
         // text, then a carriage return as a separate send-text. `--` guards against
         // a body beginning with `-` being parsed as a `send-text` option.
@@ -369,6 +447,19 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
             "stuff",
             &format!("{text}{CR}"),
         ])],
+        // iTerm2: AppleScript `write text` sends the literal string followed by Enter.
+        // We escape backslashes and double quotes so the AppleScript string is safe.
+        // The text is already sanitized (control chars stripped) before reaching here.
+        Mux::ITerm2 => {
+            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+            vec![argv(&[
+                "osascript",
+                "-e",
+                &format!(
+                    "tell application \"iTerm2\" to tell current session of current window to write text \"{escaped}\""
+                ),
+            ])]
+        }
         Mux::None => vec![],
     }
 }
@@ -401,7 +492,7 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
         Mux::Tmux => Some(argv(&["tmux", "has-session", "-t", id])),
         // zellij has no per-session "exists" verb; `list-sessions` enumerates them
         // and we scan stdout for the name in `target_alive`.
-        Mux::Zellij => Some(argv(&["zellij", "list-sessions"])),
+        Mux::Zellij => Some(argv(&["zellij", "list-sessions", "--no-formatting"])),
         // wezterm: `cli list` prints all panes; we scan stdout for the pane id.
         Mux::Wezterm => Some(argv(&["wezterm", "cli", "list"])),
         // kitty: `kitten @ ls` (honoring --to) reports the window tree as JSON; a
@@ -415,8 +506,8 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
             a.extend_from_slice(&["@", "ls"]);
             Some(argv(&a))
         }
-        // screen has no cheap, scriptable existence check we trust here.
-        Mux::Screen | Mux::None => None,
+        // screen and iTerm2 have no cheap, scriptable existence check we trust here.
+        Mux::Screen | Mux::ITerm2 | Mux::None => None,
     }
 }
 
@@ -453,7 +544,7 @@ pub fn target_alive(target: &Target) -> bool {
             }
         }
         // Unreachable (liveness_probe returned None for these), but be explicit.
-        Mux::Screen | Mux::None => true,
+        Mux::Screen | Mux::ITerm2 | Mux::None => true,
     }
 }
 
@@ -529,7 +620,7 @@ fn id_present(mux: Mux, out: &str, id: &str) -> bool {
                 .any(|tok| tok.trim_matches(|c| c == ',' || c == ':') == id)
         }
         // The remaining backends never reach here (target_alive handles them).
-        Mux::Tmux | Mux::Screen | Mux::None => out.contains(id),
+        Mux::Tmux | Mux::Screen | Mux::ITerm2 | Mux::None => out.contains(id),
     }
 }
 
@@ -696,6 +787,13 @@ pub fn id_valid(mux: Mux, id: &str) -> bool {
                 && pid.bytes().all(|b| b.is_ascii_digit())
                 && !rest.is_empty()
                 && rest.chars().all(|c| word(c) || c == '.')
+        }
+        // iTerm2 session ids are of the form "w0t0p0:ABC123" (window, tab, pane).
+        Mux::ITerm2 => {
+            id.len() <= 128
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':')
         }
         Mux::None => false,
     }
@@ -939,6 +1037,7 @@ mod tests {
 
     #[test]
     fn zellij_writes_cr() {
+        // No pane-id captured: falls back to the focused pane.
         let c = commands_for(&t(Mux::Zellij, "envctl"), "hi");
         assert_eq!(
             c[0],
@@ -955,6 +1054,40 @@ mod tests {
         assert_eq!(
             c[1],
             argv(&["zellij", "--session", "envctl", "action", "write", "13"])
+        );
+    }
+
+    #[test]
+    fn zellij_targets_pane_when_socket_set() {
+        let mut target = t(Mux::Zellij, "envctl");
+        target.socket = "13".into();
+        let c = commands_for(&target, "hi");
+        assert_eq!(
+            c[0],
+            argv(&[
+                "zellij",
+                "--session",
+                "envctl",
+                "action",
+                "write-chars",
+                "--pane-id",
+                "13",
+                "--",
+                "hi"
+            ])
+        );
+        assert_eq!(
+            c[1],
+            argv(&[
+                "zellij",
+                "--session",
+                "envctl",
+                "action",
+                "write",
+                "--pane-id",
+                "13",
+                "13"
+            ])
         );
     }
 
@@ -1230,6 +1363,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -1255,6 +1390,8 @@ mod tests {
             turn_state: String::new(),
             description: String::new(),
             description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");
@@ -1276,6 +1413,39 @@ mod tests {
                 "hi"
             ])
         );
+    }
+
+    /// `from_peer` copies a peer's stored zellij pane id (held in `socket`)
+    /// into the Target so cross-session injection targets the correct pane.
+    #[test]
+    fn from_peer_carries_zellij_pane_id() {
+        let p = Peer {
+            name: "z".into(),
+            mux: "zellij".into(),
+            target: "wise-tomato".into(),
+            cwd: None,
+            socket: "terminal_3".into(),
+            last_seen: 0,
+            pid: None,
+            host: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: weave_core::model::DEFAULT_CIRCLE.to_string(),
+            role: weave_core::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
+        };
+        let target = Target::from_peer(&p);
+        assert_eq!(target.socket, "terminal_3");
+        assert_eq!(target.mux, Mux::Zellij);
+        assert_eq!(target.id, "wise-tomato");
+        let c = commands_for(&target, "hi");
+        assert!(c[0].contains(&"--pane-id".to_string()));
+        assert!(c[0].contains(&"terminal_3".to_string()));
     }
 
     /// `Nudge::Full` injects the body verbatim; `Nudge::Nudge` injects only the
@@ -1323,7 +1493,7 @@ mod tests {
         );
         assert_eq!(
             liveness_probe(&t(Mux::Zellij, "envctl")),
-            Some(argv(&["zellij", "list-sessions"]))
+            Some(argv(&["zellij", "list-sessions", "--no-formatting"]))
         );
         assert_eq!(
             liveness_probe(&t(Mux::Wezterm, "2")),
@@ -1540,6 +1710,81 @@ mod tests {
     /// mutation against `trusted_dirs()` reads. N threads × K iterations each take
     /// `weave_core::testenv::lock_env()`, set a UNIQUE `WEAVE_MUX_DIR` via `EnvVarGuard`,
     /// then assert the dir they just set is the FIRST entry of `trusted_dirs()`. With
+    #[test]
+    fn detect_target_with_preference_honors_kitty_over_tmux() {
+        let _lock = weave_core::testenv::lock_env();
+        let _t = weave_core::testenv::EnvVarGuard::set("TMUX_PANE", "%0");
+        let _k = weave_core::testenv::EnvVarGuard::set("KITTY_WINDOW_ID", "42");
+        // Without preference, tmux wins (higher priority).
+        let auto = detect_target_with_preference(None);
+        assert_eq!(auto.mux, Mux::Tmux);
+        // With kitty preference, kitty wins.
+        let pref = detect_target_with_preference(Some(Mux::Kitty));
+        assert_eq!(pref.mux, Mux::Kitty);
+        assert_eq!(pref.id, "42");
+        // With tmux preference, tmux wins.
+        let pref_tmux = detect_target_with_preference(Some(Mux::Tmux));
+        assert_eq!(pref_tmux.mux, Mux::Tmux);
+        assert_eq!(pref_tmux.id, "%0");
+    }
+
+    #[test]
+    fn detect_target_with_preference_returns_none_when_missing() {
+        let _lock = weave_core::testenv::lock_env();
+        std::env::remove_var("WEZTERM_PANE");
+        std::env::remove_var("TMUX_PANE");
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("KITTY_WINDOW_ID");
+        std::env::remove_var("STY");
+        let pref = detect_target_with_preference(Some(Mux::Wezterm));
+        assert_eq!(pref.mux, Mux::None);
+    }
+
+    #[test]
+    fn iterm2_commands_use_osascript() {
+        let c = commands_for(&t(Mux::ITerm2, "w0t0p0"), "hello world");
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0],
+            argv(&[
+                "osascript",
+                "-e",
+                "tell application \"iTerm2\" to tell current session of current window to write text \"hello world\"",
+            ])
+        );
+    }
+
+    #[test]
+    fn iterm2_escapes_quotes_and_backslashes() {
+        let c = commands_for(&t(Mux::ITerm2, "x"), "say \"hi\"");
+        assert_eq!(c.len(), 1);
+        let script = &c[0][2];
+        assert!(script.contains("\\\"hi\\\""), "quotes escaped: {script}");
+    }
+
+    #[test]
+    fn iterm2_detect_target_from_term_program() {
+        let _lock = weave_core::testenv::lock_env();
+        std::env::remove_var("TMUX_PANE");
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("WEZTERM_PANE");
+        std::env::remove_var("KITTY_WINDOW_ID");
+        std::env::remove_var("STY");
+        let _g = weave_core::testenv::EnvVarGuard::set("TERM_PROGRAM", "iTerm.app");
+        let _g2 = weave_core::testenv::EnvVarGuard::set("TERM_SESSION_ID", "w0t0p0:ABC123");
+        let target = detect_target();
+        assert_eq!(target.mux, Mux::ITerm2);
+        assert_eq!(target.id, "w0t0p0:ABC123");
+    }
+
+    #[test]
+    fn iterm2_no_probe_so_always_alive() {
+        let target = t(Mux::ITerm2, "x");
+        assert!(liveness_probe(&target).is_none());
+        assert!(target_alive(&target));
+        assert_eq!(capability(&target), Capability::Live);
+    }
+
     /// the unified lock every critical section is exclusive, so the read always sees
     /// the writer's own value; without it, another thread's set/remove could
     /// interleave and the assertion would observe the wrong (or no) leading dir —

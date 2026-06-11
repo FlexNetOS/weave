@@ -1,13 +1,19 @@
-docs/sessions-handoff.md
-docs/sessions-handoff.pdf
-examples/hf-resume-output.json
-manifest.txt
-roadmap/backlog.yaml
-schemas/packet.schema.json
-schemas/session.schema.json
-schemas/task.schema.json
-templates/.handoff/hooks/hooks.toml
-templates/.handoff/policies/rules.toml
-templates/.handoff/skills/session-resume.skill.md
-templates/.handoff/tasks/TASK-0001.task.yaml
-templates/AGENTS.md
+sessions-handoff/ — weave-loop session handoff documentation
+=============================================================
+
+This directory documents the ACTUAL session handoff process used by the weave
+project. It is a living document — update after every cycle.
+
+docs/sessions-handoff.md          ← Main handoff process documentation
+roadmap/backlog.yaml              ← Machine-readable backlog (WL-001..WL-042)
+templates/AGENTS.md               ← Agent orientation for weave resumption
+templates/.handoff/skills/session-resume.skill.md  ← Resume skill definition
+templates/.handoff/tasks/         ← Task card templates
+schemas/                          ← JSON schemas for packet/session/task
+
+NOTES:
+- The earlier "hf" (Handoff Ledger) CLI system described in sessions-handoff.md v1
+  is NOT implemented. The working system is the weave-loop skill.
+- All state lives in _workspace/ (HANDOFF.md, loop_state.md, backlog.md, DONE).
+- The authoritative resume signal is the committed HANDOFF.md file.
+- Update this directory whenever the handoff process or backlog changes.

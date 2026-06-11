@@ -2572,6 +2572,51 @@ fn ask_oversized_identity_is_rejected() {
     );
 }
 
+#[test]
+fn idempotency_key_oversized_is_rejected() {
+    let db = TestDb::new();
+    let giant = "x".repeat(100_000);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "x",
+            "--idempotency-key",
+            &giant,
+        ],
+    );
+    assert!(!ok, "oversized idempotency key must be rejected");
+    assert!(!err.contains("panicked"), "clean rejection: {err:?}");
+}
+
+#[test]
+fn idempotency_key_hostile_is_rejected() {
+    let db = TestDb::new();
+    for bad in ["key\nline", ""] {
+        let (ok, _out, err) = run(
+            &db,
+            &[
+                "send",
+                "--from",
+                "a",
+                "--to",
+                "b",
+                "--body",
+                "x",
+                "--idempotency-key",
+                bad,
+            ],
+        );
+        assert!(!ok, "hostile idempotency key {bad:?} must be rejected");
+        assert!(!err.contains("panicked"), "clean rejection: {err:?}");
+    }
+}
+
 /// A hostile correlation id (shell metacharacters / oversized) is rejected by
 /// `ask_id_valid` BEFORE any DB bind on every reference path
 /// (`answer`/`ack`/`ask-get`). The metachar string never reaches a `Command`
@@ -3138,4 +3183,316 @@ fn mcp_delivery_trace_is_secret_free() {
         "MCP delivery trace leaked the body: {dtext}"
     );
     mcp.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// WL-016 scheduler security / hardening
+// ---------------------------------------------------------------------------
+
+/// An oversized cron expression ( > MAX_CRON_EXPR_LEN = 64 ) must be rejected
+/// by the MCP layer with an isError result rather than being persisted.
+#[test]
+fn mcp_schedule_oversized_cron_is_rejected() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let huge_cron = "x".repeat(100);
+    let (is_err, text) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "hi",
+            "every": huge_cron
+        }),
+    );
+    assert!(
+        is_err,
+        "weave_schedule with oversized cron must be rejected (isError), got ok: {}",
+        &text[..text.len().min(200)]
+    );
+
+    mcp.shutdown();
+}
+
+/// Schedule with both 'at' and 'every' is rejected (xor requirement).
+#[test]
+fn mcp_schedule_both_at_and_every_is_rejected() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "hi",
+            "at": 1234567890,
+            "every": "@daily"
+        }),
+    );
+    assert!(
+        is_err,
+        "weave_schedule with both at and every must be rejected, got ok: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("not both"),
+        "rejection should mention 'not both': {text}"
+    );
+
+    mcp.shutdown();
+}
+
+/// Schedule with neither 'at' nor 'every' is rejected.
+#[test]
+fn mcp_schedule_neither_at_nor_every_is_rejected() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "hi"
+        }),
+    );
+    assert!(
+        is_err,
+        "weave_schedule with neither at nor every must be rejected, got ok: {text}"
+    );
+
+    mcp.shutdown();
+}
+
+/// An invalid cron expression is rejected by the MCP layer.
+#[test]
+fn mcp_schedule_invalid_cron_is_rejected() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_schedule",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "body": "hi",
+            "every": "not-a-cron"
+        }),
+    );
+    assert!(
+        is_err,
+        "weave_schedule with invalid cron must be rejected, got ok: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("not a valid cron"),
+        "rejection should mention invalid cron: {text}"
+    );
+
+    mcp.shutdown();
+}
+
+/// CLI: an oversized body scheduled via the CLI must be rejected (body cap).
+#[test]
+fn cli_schedule_oversized_body_is_rejected() {
+    let db = TestDb::new();
+    let huge_body = "x".repeat(70_000);
+    let (ok, out, err) = run(
+        &db,
+        &[
+            "schedule",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            &huge_body,
+            "--at",
+            "1234567890",
+        ],
+    );
+    assert!(
+        !ok,
+        "schedule with oversized body must fail (non-zero exit): {out}\n{err}"
+    );
+    assert!(
+        (out.to_lowercase().contains("too long") || err.to_lowercase().contains("too long")),
+        "rejection should mention length cap: stdout={out}\nstderr={err}"
+    );
+}
+
+/// CLI: schedule --at with a non-positive timestamp is rejected.
+#[test]
+fn cli_schedule_non_positive_at_is_rejected() {
+    let db = TestDb::new();
+    let (ok, out, err) = run(
+        &db,
+        &[
+            "schedule", "--from", "alice", "--to", "bob", "--body", "hi", "--at", "0",
+        ],
+    );
+    assert!(!ok, "schedule with at=0 must fail: {out}\n{err}");
+    assert!(
+        (out.to_lowercase().contains("positive") || err.to_lowercase().contains("positive")),
+        "rejection should mention positive: stdout={out}\nstderr={err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Memory security (WL-017)
+// ---------------------------------------------------------------------------
+
+/// CLI: memory write with a path-traversal key is rejected.
+#[test]
+fn cli_memory_path_traversal_key_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+
+    for bad_key in ["../etc", "foo/bar", "foo\\bar", "..", ""] {
+        let (ok, out, err) = run_env(
+            &db,
+            &[
+                "memory", "write", "--scope", "global", "--key", bad_key, "--title", "T", "--body",
+                "B",
+            ],
+            &[("XDG_CONFIG_HOME", cfg_s)],
+        );
+        assert!(
+            !ok,
+            "memory write with key '{bad_key}' must fail: {out}\n{err}"
+        );
+        assert!(
+            (out.to_lowercase().contains("traversal")
+                || err.to_lowercase().contains("traversal")
+                || out.to_lowercase().contains("key")
+                || err.to_lowercase().contains("key")),
+            "rejection should mention key/traversal: stdout={out}\nstderr={err}"
+        );
+    }
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// CLI: memory write with an oversized key is rejected.
+#[test]
+fn cli_memory_oversized_key_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let huge_key = "x".repeat(200);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "memory", "write", "--scope", "global", "--key", &huge_key, "--title", "T", "--body",
+            "B",
+        ],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        !ok,
+        "memory write with oversized key must fail: {out}\n{err}"
+    );
+    assert!(
+        (out.to_lowercase().contains("key") || err.to_lowercase().contains("key")),
+        "rejection should mention key: stdout={out}\nstderr={err}"
+    );
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// CLI: memory write with an oversized body is rejected.
+#[test]
+fn cli_memory_oversized_body_rejected() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let huge_body = "x".repeat(70_000);
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "memory", "write", "--scope", "global", "--key", "k", "--title", "T", "--body",
+            &huge_body,
+        ],
+        &[("XDG_CONFIG_HOME", cfg_s)],
+    );
+    assert!(
+        !ok,
+        "memory write with oversized body must fail: {out}\n{err}"
+    );
+    assert!(
+        (out.to_lowercase().contains("body") || err.to_lowercase().contains("body")),
+        "rejection should mention body: stdout={out}\nstderr={err}"
+    );
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory write with a path-traversal key returns isError.
+#[test]
+fn mcp_memory_path_traversal_key_is_error() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-mcp-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+
+    for bad_key in ["../etc", "foo/bar", "foo\\bar", ".."] {
+        let (err, text) = mcp.call_tool(
+            "weave_memory_write",
+            serde_json::json!({
+                "me": "alice",
+                "scope": "global",
+                "key": bad_key,
+                "title": "T",
+                "body": "B",
+            }),
+        );
+        assert!(
+            err,
+            "mcp memory write with key '{bad_key}' must be isError: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("traversal") || text.to_lowercase().contains("key"),
+            "mcp rejection should mention traversal/key: {text}"
+        );
+    }
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
+}
+
+/// MCP: memory write with an oversized body returns isError.
+#[test]
+fn mcp_memory_oversized_body_is_error() {
+    let db = TestDb::new();
+    let cfg = std::env::temp_dir().join(format!("weave-mem-mcp-sec-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg).unwrap();
+    let cfg_s = cfg.to_str().unwrap();
+    let mut mcp = McpServer::spawn_env(&db, &[("XDG_CONFIG_HOME", cfg_s)]);
+    let huge_body = "x".repeat(70_000);
+
+    let (err, text) = mcp.call_tool(
+        "weave_memory_write",
+        serde_json::json!({
+            "me": "alice",
+            "scope": "global",
+            "key": "k",
+            "title": "T",
+            "body": huge_body,
+        }),
+    );
+    assert!(
+        err,
+        "mcp memory write with oversized body must be isError: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("body"),
+        "mcp rejection should mention body: {text}"
+    );
+
+    mcp.shutdown();
+    std::fs::remove_dir_all(&cfg).ok();
 }

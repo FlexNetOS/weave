@@ -54,7 +54,7 @@ pub fn fmt_ts(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -98,6 +98,20 @@ pub struct Message {
     /// deserializable.
     #[serde(default)]
     pub in_reply_to: Option<i64>,
+    /// Per-message idempotency key. Globally unique: a duplicate key anywhere in
+    /// the store returns the existing message id instead of creating a new row.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Distributed trace id for end-to-end debugging across stores and backends.
+    /// Auto-minted by CLI/MCP when not provided by the caller.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// Message priority: low, normal, high, urgent. Default normal.
+    /// Additive + backward-compatible: pre-existing rows read back as "normal".
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
@@ -135,6 +149,17 @@ pub struct Intent {
     /// older JSON payloads (which omit the field) deserializable.
     #[serde(default)]
     pub sig: String,
+    /// Idempotency key carried on cross-store intents so the receiver's commit
+    /// is idempotent. `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Trace id carried on cross-store intents for end-to-end debugging.
+    /// `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    /// Message priority carried on cross-store intents.
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 /// Hard upper bound (in chars) on a tracked-ask correlation id. The id is always
@@ -234,6 +259,131 @@ impl AskState {
     }
 }
 
+/// The structured kind of a tracked ask (WL-015). Stored as TEXT in `asks.kind`;
+/// `FreeText` is the default for every legacy/pre-WL-015 row. New variants can be
+/// added without a schema migration because the column is free-form TEXT validated
+/// at the store seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// Plain free-text question (today's default).
+    #[default]
+    FreeText,
+    /// Multiple-choice question; options are stored newline-separated in
+    /// `asks.options`.
+    Choice,
+    /// Tool-use permission request; `options` holds `tool_name\ntool_args`.
+    ToolPermission,
+}
+
+impl AskKind {
+    /// Canonical label stored in `asks.kind`. The only inlined SQL literals are
+    /// derived from this (compile-time constants, never user input).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskKind::FreeText => "free_text",
+            AskKind::Choice => "choice",
+            AskKind::ToolPermission => "tool_permission",
+        }
+    }
+
+    /// Parse a stored kind string. An unknown value falls back to `FreeText` so a
+    /// corrupt/foreign row degrades gracefully rather than blocking reads.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "choice" => AskKind::Choice,
+            "tool_permission" => AskKind::ToolPermission,
+            _ => AskKind::FreeText,
+        }
+    }
+
+    /// Parse a caller-supplied kind string; empty/unknown defaults to `FreeText`
+    /// (the safest superset — never narrows unexpectedly).
+    pub fn parse(s: &str) -> Self {
+        Self::from_str(s.trim().to_ascii_lowercase().as_str())
+    }
+}
+
+/// WL-031: message priority levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessagePriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+
+impl MessagePriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessagePriority::Low => "low",
+            MessagePriority::Normal => "normal",
+            MessagePriority::High => "high",
+            MessagePriority::Urgent => "urgent",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => MessagePriority::Low,
+            "high" => MessagePriority::High,
+            "urgent" => MessagePriority::Urgent,
+            _ => MessagePriority::Normal,
+        }
+    }
+    /// Numeric rank for filtering: higher = more important.
+    pub fn rank(self) -> u8 {
+        match self {
+            MessagePriority::Low => 0,
+            MessagePriority::Normal => 1,
+            MessagePriority::High => 2,
+            MessagePriority::Urgent => 3,
+        }
+    }
+}
+
+pub fn default_priority() -> String {
+    MessagePriority::Normal.as_str().to_string()
+}
+
+/// WL-032: per-peer contact policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContactPolicy {
+    /// Accept all messages (default).
+    #[default]
+    Open,
+    /// Accept from known contacts; unknown senders get an auto-approval ask.
+    Auto,
+    /// Accept only from explicitly allowed contacts; block others.
+    ContactsOnly,
+    /// Block all incoming messages.
+    BlockAll,
+}
+
+impl ContactPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContactPolicy::Open => "open",
+            ContactPolicy::Auto => "auto",
+            ContactPolicy::ContactsOnly => "contacts_only",
+            ContactPolicy::BlockAll => "block_all",
+        }
+    }
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => ContactPolicy::Open,
+            "auto" => ContactPolicy::Auto,
+            "contacts_only" | "contacts-only" | "contactsonly" => ContactPolicy::ContactsOnly,
+            "block_all" | "block-all" | "blockall" => ContactPolicy::BlockAll,
+            _ => ContactPolicy::Open,
+        }
+    }
+}
+
+pub fn default_contact_policy() -> String {
+    ContactPolicy::Open.as_str().to_string()
+}
+
 /// Which side of an ask a `list_asks` query filters on. `Asker` = asks I opened;
 /// `Askee` = asks addressed to me; `Any` = either. Pure data (no I/O), shared by
 /// the store + the mcp/main consumers.
@@ -279,6 +429,13 @@ pub struct Ask {
     #[serde(default)]
     pub subject: Option<String>,
     pub state: AskState,
+    /// Structured kind of this ask (WL-015). Defaults to `FreeText` for legacy rows.
+    #[serde(default)]
+    pub kind: AskKind,
+    /// Kind-specific payload: newline-separated choices for `Choice`, or
+    /// `tool_name\ntool_args` for `ToolPermission`. `None` for `FreeText`.
+    #[serde(default)]
+    pub options: Option<String>,
     /// Prior ask id this one chains/closes (`None` for a root ask).
     #[serde(default)]
     pub reply_to: Option<String>,
@@ -426,6 +583,71 @@ pub struct AskManyResult {
     pub failed: i64,
     pub state: AskManyState,
     pub children: Vec<AskManyChildView>,
+}
+
+/// The resolved status of a ToolPermission ask (WL-021). Derived at read time
+/// from the ask state, answer body, and age. Pure; no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionStatus {
+    /// Awaiting an answer; within the timeout window.
+    Pending,
+    /// The askee answered with body "approve" (case-insensitive, trimmed).
+    Approved,
+    /// The askee answered with anything other than "approve", or the ask was
+    /// explicitly denied.
+    Denied,
+    /// Still open but older than the timeout — treated as denied by default.
+    Timeout,
+}
+
+impl PermissionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionStatus::Pending => "pending",
+            PermissionStatus::Approved => "approved",
+            PermissionStatus::Denied => "denied",
+            PermissionStatus::Timeout => "timeout",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "pending" => Ok(PermissionStatus::Pending),
+            "approved" => Ok(PermissionStatus::Approved),
+            "denied" => Ok(PermissionStatus::Denied),
+            "timeout" => Ok(PermissionStatus::Timeout),
+            other => Err(format!("unknown permission status '{other}'")),
+        }
+    }
+}
+
+/// Default timeout for ToolPermission asks (seconds). After this window an
+/// unanswered permission ask is treated as [`PermissionStatus::Timeout`].
+pub const PERMISSION_TIMEOUT_SECS: i64 = 300;
+
+/// Resolve the permission status of an ask at read time. Requires the answer
+/// body (when present) and the current wall-clock time. Totality: never panics.
+pub fn permission_status(
+    ask: &Ask,
+    answer_body: Option<&str>,
+    now: i64,
+    timeout_secs: i64,
+) -> PermissionStatus {
+    // Terminal states (answered or acked) → inspect the answer body.
+    if ask.state == AskState::Answered || ask.state == AskState::Acked {
+        if let Some(body) = answer_body {
+            if body.trim().eq_ignore_ascii_case("approve") {
+                return PermissionStatus::Approved;
+            }
+        }
+        return PermissionStatus::Denied;
+    }
+    // Still open → check age against timeout.
+    if now.saturating_sub(ask.opened_ts) >= timeout_secs {
+        PermissionStatus::Timeout
+    } else {
+        PermissionStatus::Pending
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -811,11 +1033,231 @@ pub struct JobResultView {
     pub completed_ts: Option<i64>,
 }
 
+// ---- WL-020: review queue ----
+
+/// Hard upper bound (in chars) on a review item id. `review_<seed>_<nonce>`.
+pub const MAX_REVIEW_ID_LEN: usize = 80;
+
+/// Hard upper bound (in chars) on a review item title.
+pub const MAX_REVIEW_TITLE_LEN: usize = 256;
+
+/// Hard upper bound (in chars) on a review item author/repo.
+pub const MAX_REVIEW_IDENT_LEN: usize = 64;
+
+/// WL-024: max resource string length for a lease reservation.
+pub const MAX_LEASE_RESOURCE_LEN: usize = 512;
+/// WL-024: max note length for a lease reservation.
+pub const MAX_LEASE_NOTE_LEN: usize = 1024;
+/// WL-024: max TTL for a lease in seconds (≈ 24 hours).
+pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
+
+/// The lifecycle state of a PR in the review queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewItemState {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+}
+
+impl ReviewItemState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewItemState::Open => "open",
+            ReviewItemState::Merged => "merged",
+            ReviewItemState::Closed => "closed",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "open" => Ok(ReviewItemState::Open),
+            "merged" => Ok(ReviewItemState::Merged),
+            "closed" => Ok(ReviewItemState::Closed),
+            other => Err(format!("unknown review state '{other}'")),
+        }
+    }
+}
+
+/// Filter for review queue listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewQueueFilter {
+    #[default]
+    All,
+    Open,
+    Pending,
+    Reviewed,
+}
+
+impl ReviewQueueFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewQueueFilter::All => "all",
+            ReviewQueueFilter::Open => "open",
+            ReviewQueueFilter::Pending => "pending",
+            ReviewQueueFilter::Reviewed => "reviewed",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "all" => Ok(ReviewQueueFilter::All),
+            "open" => Ok(ReviewQueueFilter::Open),
+            "pending" => Ok(ReviewQueueFilter::Pending),
+            "reviewed" => Ok(ReviewQueueFilter::Reviewed),
+            other => Err(format!("unknown review filter '{other}'")),
+        }
+    }
+}
+
+/// A single PR review item tracked across peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewItem {
+    pub id: String,
+    pub pr_url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub repo: String,
+    pub state: ReviewItemState,
+    #[serde(default)]
+    pub review_requested_at: Option<i64>,
+    #[serde(default)]
+    pub reviewed_at: Option<i64>,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    pub created_at: i64,
+}
+
+/// Validate a review id: `review_<seed>_<nonce>`.
+pub fn review_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REVIEW_ID_LEN
+        && id.starts_with("review_")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Hard upper bound (in chars) on an idempotency key. 128 is generous for
+/// caller-minted keys (UUIDs, ULIDs, or namespaced application keys).
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+/// Hard upper bound (in chars) on a trace id. 128 is generous for
+/// caller-supplied correlation ids.
+pub const MAX_TRACE_ID_LEN: usize = 128;
+
+/// Validate an idempotency key: non-empty, <= MAX_IDEMPOTENCY_KEY_LEN chars,
+/// no control characters, no NUL. Rejects overly long or hostile keys before
+/// any DB bind.
+pub fn idempotency_key_valid(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
+        && !key.bytes().any(|b| b.is_ascii_control())
+        && !key.contains('\0')
+}
+
+/// Validate a trace id: non-empty, <= MAX_TRACE_ID_LEN chars, no control
+/// characters, no NUL. More permissive than idempotency keys — the format is
+/// caller-defined.
+pub fn trace_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TRACE_ID_LEN
+        && !id.bytes().any(|b| b.is_ascii_control())
+        && !id.contains('\0')
+}
+
+/// Mint a trace id for end-to-end debugging: `trace_<timestamp>_<6 random hex>`.
+pub fn mint_trace_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut buf = [0u8; 3];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        format!("trace_{ts}_{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2])
+    } else {
+        format!("trace_{ts}_000000")
+    }
+}
+
+/// Validate a GitHub PR URL (basic check: https://github.com/owner/repo/pull/N).
+pub fn pr_url_valid(url: &str) -> bool {
+    !url.is_empty()
+        && url.len() <= crate::store::MAX_BODY
+        && url.starts_with("https://github.com/")
+        && url.contains("/pull/")
+}
+
+/// Mint an opaque review id.
+pub fn new_review_id(seed: i64) -> String {
+    format!("review_{seed}_{}", mint_nonce(3_141_592_653))
+}
+
+/// WL-024: a lightweight advisory lease reservation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lease {
+    pub resource: String,
+    pub holder: String,
+    pub acquired: i64,
+    pub expires: i64,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// WL-024: validate a lease resource string.
+pub fn lease_resource_valid(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= MAX_LEASE_RESOURCE_LEN
+        && !r.contains('\0')
+        && r.chars().all(|c| !c.is_control())
+}
+
+/// WL-024: validate a lease TTL in seconds.
+pub fn lease_ttl_valid(ttl: i64) -> bool {
+    ttl > 0 && ttl <= MAX_LEASE_TTL_SECS
+}
+
+/// WL-029: normalize a lease resource path for conflict detection.
+/// Strips trailing slashes, collapses multiple slashes, rejects `..` and empty
+/// segments. Returns the normalized path (always without trailing slash).
+pub fn lease_path_normalize(r: &str) -> String {
+    let mut out = Vec::new();
+    for seg in r.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            out.pop();
+            continue;
+        }
+        out.push(seg);
+    }
+    out.join("/")
+}
+
+/// WL-029: check whether two normalized resource paths conflict.
+/// Conflicts are: exact match, or one is a strict ancestor of the other
+/// (prefix match followed by a path separator).
+pub fn lease_path_conflicts(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_slash = format!("{a}/");
+    let b_slash = format!("{b}/");
+    b.starts_with(&a_slash) || a.starts_with(&b_slash)
+}
+
 /// Hard upper bound (in chars) on a circle label. A circle is a small grouping
 /// tag (a visibility-scoping label), never a path or shell token, so 64 is more
 /// than enough; the cap exists to reject a hostile/oversized value before it is
 /// bound into a query or stored (the `MAX_IDENT`/`MAX_ASK_ID_LEN` analog).
 pub const MAX_CIRCLE_LEN: usize = 64;
+
+/// Hard upper bound (in chars) on a birth certificate nonce. The cert is 32
+/// random bytes hex-encoded = exactly 64 chars. The cap rejects a hostile or
+/// pasted oversized value before it is bound into a query.
+pub const MAX_BIRTH_CERT_LEN: usize = 64;
 
 /// The semantic default circle. Legacy rows, empty values, and any peer that
 /// never set `WEAVE_CIRCLE`/`config.circle` classify here, so a single-circle
@@ -1004,15 +1446,15 @@ pub enum ClaimOutcome {
 }
 
 /// The result of an [`orchestrator_status`](crate::store::Store::orchestrator_status)
-/// query for a circle. `present` is true iff a LIVE (`role='orchestrator'` AND
-/// `is_alive`) holder exists; `holder` is the most-recently-seen live one. Pure
-/// data (no I/O), shared by the store + the mcp/main consumers.
+/// query for a circle. `present` is true iff at least one LIVE (`role='orchestrator'`
+/// AND `is_alive`) holder exists; `holders` lists all live ones. Pure data (no I/O),
+/// shared by the store + the mcp/main consumers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorStatus {
     pub circle: String,
     pub present: bool,
     #[serde(default)]
-    pub holder: Option<Peer>,
+    pub holders: Vec<Peer>,
 }
 
 /// A session that has registered itself, with where (if anywhere) it can be
@@ -1112,6 +1554,14 @@ pub struct Peer {
     /// rows read `0`. `#[serde(default)]` keeps older JSON payloads deserializable.
     #[serde(default)]
     pub description_ts: i64,
+    /// Birth certificate nonce for identity takeover protection (WL-018).
+    /// Nullable; None means "not yet enrolled". Additive + backward-compatible.
+    #[serde(default)]
+    pub birth_cert: Option<String>,
+    /// Contact policy: open, auto, contacts_only, block_all. Default open.
+    /// Additive + backward-compatible: pre-existing rows read back as "open".
+    #[serde(default = "default_contact_policy")]
+    pub contact_policy: String,
 }
 
 /// Daemon-tier liveness classification (v0.2 presence seam).  Three tiers:
@@ -1277,6 +1727,212 @@ pub struct DeliveryTrace {
     pub stage: String,
     pub outcome: String,
     pub ts: i64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// WL-016 — Scheduler / cron for messages
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Hard upper bound on a cron expression string (chars). Expressions are echoed
+/// into listings and stored per-row; an unbounded one is a token/RAM/DoS hazard.
+pub const MAX_CRON_EXPR_LEN: usize = 64;
+
+/// The lifecycle of a schedule row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleState {
+    Pending,
+    Executed,
+    Cancelled,
+}
+
+/// One-shot vs recurring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    OneShot,
+    Recurring,
+}
+
+impl ScheduleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleKind::OneShot => "one_shot",
+            ScheduleKind::Recurring => "recurring",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "one_shot" => Ok(ScheduleKind::OneShot),
+            "recurring" => Ok(ScheduleKind::Recurring),
+            other => Err(format!("unknown schedule kind '{other}'")),
+        }
+    }
+}
+
+/// A persisted scheduled message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: i64,
+    pub kind: ScheduleKind,
+    pub cron_expr: String,
+    pub next_run: i64,
+    pub sender: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub created_ts: i64,
+    pub executed_ts: Option<i64>,
+    pub cancelled: bool,
+}
+
+/// Validate a cron expression before storage. Accepts presets (`@hourly`, `@daily`,
+/// `@weekly`, `@monthly`) and a restricted 5-field subset (`min hour day month dow`).
+/// Rejects empty, over-length, control-character-bearing, or unsupported forms.
+pub fn cron_valid(expr: &str) -> bool {
+    if expr.is_empty() || expr.len() > MAX_CRON_EXPR_LEN {
+        return false;
+    }
+    if expr.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
+    match expr {
+        "@hourly" | "@daily" | "@weekly" | "@monthly" => return true,
+        _ => {}
+    }
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    for (i, part) in parts.iter().enumerate() {
+        let (min, max) = match i {
+            0 => (0, 59),
+            1 => (0, 23),
+            2 => (1, 31),
+            3 => (1, 12),
+            4 => (0, 6),
+            _ => unreachable!(),
+        };
+        if !field_valid(part, min, max) {
+            return false;
+        }
+    }
+    true
+}
+
+fn field_valid(part: &str, min: i64, max: i64) -> bool {
+    if part == "*" {
+        return true;
+    }
+    if let Some((a, b)) = part.split_once('-') {
+        let Ok(a) = a.parse::<i64>() else {
+            return false;
+        };
+        let Ok(b) = b.parse::<i64>() else {
+            return false;
+        };
+        return a >= min && b <= max && a <= b;
+    }
+    let Ok(n) = part.parse::<i64>() else {
+        return false;
+    };
+    n >= min && n <= max
+}
+
+/// Internal representation of one cron field after parsing.
+#[derive(Debug, Clone)]
+enum CronField {
+    Star,
+    Exact(i64),
+    Range(i64, i64),
+}
+
+fn parse_field(part: &str) -> Option<CronField> {
+    if part == "*" {
+        return Some(CronField::Star);
+    }
+    if let Some((a, b)) = part.split_once('-') {
+        let a = a.parse::<i64>().ok()?;
+        let b = b.parse::<i64>().ok()?;
+        return Some(CronField::Range(a, b));
+    }
+    let n = part.parse::<i64>().ok()?;
+    Some(CronField::Exact(n))
+}
+
+fn field_matches(cf: &CronField, value: i64) -> bool {
+    match cf {
+        CronField::Star => true,
+        CronField::Exact(n) => *n == value,
+        CronField::Range(a, b) => value >= *a && value <= *b,
+    }
+}
+
+/// Parse a preset or 5-field expression into five [`CronField`]s.
+fn parse_cron(expr: &str) -> Option<[CronField; 5]> {
+    let s = match expr {
+        "@hourly" => "0 * * * *",
+        "@daily" => "0 0 * * *",
+        "@weekly" => "0 0 * * 0",
+        "@monthly" => "0 0 1 * *",
+        _ => expr,
+    };
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some([
+        parse_field(parts[0])?,
+        parse_field(parts[1])?,
+        parse_field(parts[2])?,
+        parse_field(parts[3])?,
+        parse_field(parts[4])?,
+    ])
+}
+
+/// Returns the NEXT UNIX timestamp **strictly after** `after` for the given
+/// expression, or `None` if no occurrence falls within 366 days of `after`.
+///
+/// Supports presets (`@hourly`, `@daily`, `@weekly`, `@monthly`) and a
+/// restricted 5-field cron (`min hour day month dow`) with `*` and `-` ranges.
+/// Scans forward in 60-second increments — deterministic, dependency-free, and
+/// fast enough for the coarse granularity weave needs.
+pub fn next_occurrence(cron_expr: &str, after: i64) -> Option<i64> {
+    let fields = parse_cron(cron_expr)?;
+    // Start from the next whole minute strictly after `after`.
+    let mut ts = after - after.rem_euclid(60) + 60;
+    let max_ts = after + 366 * 86_400;
+
+    while ts <= max_ts {
+        let secs = ts.rem_euclid(86_400);
+        let minute = (secs / 60) % 60;
+        let hour = secs / 3_600;
+        let days = ts.div_euclid(86_400);
+        let (_y, month, day) = civil_from_days(days);
+        let dow = (days + 4).rem_euclid(7); // 1970-01-01 was Thursday = 4
+
+        if field_matches(&fields[0], minute)
+            && field_matches(&fields[1], hour)
+            && field_matches(&fields[2], day as i64)
+            && field_matches(&fields[3], month as i64)
+            && field_matches(&fields[4], dow)
+        {
+            return Some(ts);
+        }
+        ts += 60;
+    }
+    None
+}
+
+/// A cached LLM-generated summary for a message thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub root_id: i64,
+    pub text: String,
+    pub model: String,
+    pub created_ts: i64,
+    pub refreshed_ts: i64,
 }
 
 #[cfg(test)]
@@ -1531,6 +2187,28 @@ mod tests {
         ] {
             assert!(!circle_valid(bad), "must reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn idempotency_key_valid_bounds() {
+        assert!(idempotency_key_valid("uuid-123"));
+        assert!(idempotency_key_valid(&"x".repeat(MAX_IDEMPOTENCY_KEY_LEN)));
+        assert!(!idempotency_key_valid(""));
+        assert!(!idempotency_key_valid(
+            &"x".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1)
+        ));
+        assert!(!idempotency_key_valid("has\ncontrol"));
+        assert!(!idempotency_key_valid("has\0nul"));
+    }
+
+    #[test]
+    fn trace_id_valid_bounds() {
+        assert!(trace_id_valid("trace-abc"));
+        assert!(trace_id_valid(&"x".repeat(MAX_TRACE_ID_LEN)));
+        assert!(!trace_id_valid(""));
+        assert!(!trace_id_valid(&"x".repeat(MAX_TRACE_ID_LEN + 1)));
+        assert!(!trace_id_valid("has\ncontrol"));
+        assert!(!trace_id_valid("has\0nul"));
     }
 
     #[test]
@@ -1841,6 +2519,8 @@ mod tests {
             turn_state: String::new(),
             description: desc.to_string(),
             description_ts: ts,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
         }
     }
 
@@ -1955,5 +2635,354 @@ mod tests {
     fn job_ids_are_unique_per_mint() {
         assert_ne!(new_job_id(1), new_job_id(1));
         assert_ne!(new_attempt_id(1), new_attempt_id(1));
+    }
+
+    // ---- WL-016: cron evaluator ----
+
+    #[test]
+    fn schedule_kind_roundtrip() {
+        assert_eq!(
+            ScheduleKind::from_str("one_shot"),
+            Ok(ScheduleKind::OneShot)
+        );
+        assert_eq!(
+            ScheduleKind::from_str("recurring"),
+            Ok(ScheduleKind::Recurring)
+        );
+        assert!(ScheduleKind::from_str("bogus").is_err());
+        assert_eq!(ScheduleKind::OneShot.as_str(), "one_shot");
+        assert_eq!(ScheduleKind::Recurring.as_str(), "recurring");
+    }
+
+    #[test]
+    fn cron_valid_presets() {
+        assert!(cron_valid("@hourly"));
+        assert!(cron_valid("@daily"));
+        assert!(cron_valid("@weekly"));
+        assert!(cron_valid("@monthly"));
+    }
+
+    #[test]
+    fn cron_valid_5field() {
+        assert!(cron_valid("0 9 * * 1-5"));
+        assert!(cron_valid("* * * * *"));
+        assert!(cron_valid("30 12 15 * *"));
+    }
+
+    #[test]
+    fn cron_valid_rejections() {
+        assert!(!cron_valid(""));
+        assert!(!cron_valid("* * * *")); // 4 fields
+        assert!(!cron_valid("* * * * * *")); // 6 fields
+        assert!(!cron_valid("60 * * * *")); // minute out of range
+        assert!(!cron_valid("0 24 * * *")); // hour out of range
+        assert!(!cron_valid("0 0 32 * *")); // day out of range
+        assert!(!cron_valid("0 0 * 13 *")); // month out of range
+        assert!(!cron_valid("0 0 * * 7")); // dow out of range
+        assert!(!cron_valid(&"x".repeat(MAX_CRON_EXPR_LEN + 1)));
+        assert!(!cron_valid("0\t0 * * *")); // control char
+    }
+
+    /// Helper: build a UNIX timestamp from civil fields (UTC).
+    fn ts(y: i64, m: u32, d: u32, hh: i64, mm: i64) -> i64 {
+        // Simple conversion for test data only; not the production path.
+        // Parse via chrono if available in tests, otherwise approximate.
+        // weave deliberately has no date crate, so we use a naive day-count
+        // approximation for the test fixture.  This is test-only and only
+        // needs to be consistent with civil_from_days.
+        //
+        // We'll use the reverse of civil_from_days: count days from 1970-01-01.
+        // This is a test helper, not production code.
+        let mut days = 0i64;
+        for year in 1970..y {
+            days += if is_leap_year(year) { 366 } else { 365 };
+        }
+        for month in 1..m {
+            days += days_in_month(y, month);
+        }
+        days += (d as i64) - 1;
+        days * 86_400 + hh * 3_600 + mm * 60
+    }
+
+    fn is_leap_year(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    }
+
+    fn days_in_month(y: i64, m: u32) -> i64 {
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn next_occurrence_presets() {
+        let midnight = ts(2024, 1, 1, 0, 0);
+        // @daily from midnight → next day midnight
+        assert_eq!(
+            next_occurrence("@daily", midnight),
+            Some(ts(2024, 1, 2, 0, 0))
+        );
+        // @hourly from 09:00 → 10:00
+        assert_eq!(
+            next_occurrence("@hourly", ts(2024, 1, 1, 9, 0)),
+            Some(ts(2024, 1, 1, 10, 0))
+        );
+        // @weekly from Monday → next Sunday
+        assert_eq!(
+            next_occurrence("@weekly", ts(2024, 1, 1, 0, 0)),
+            Some(ts(2024, 1, 7, 0, 0))
+        );
+        // @monthly from Jan 1 → Feb 1
+        assert_eq!(
+            next_occurrence("@monthly", ts(2024, 1, 1, 0, 0)),
+            Some(ts(2024, 2, 1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn next_occurrence_cron_ranges() {
+        // 0 9 * * 1-5  => next weekday 09:00
+        let fri_noon = ts(2024, 1, 5, 12, 0); // Fri 12:00
+        assert_eq!(
+            next_occurrence("0 9 * * 1-5", fri_noon),
+            Some(ts(2024, 1, 8, 9, 0))
+        ); // Mon
+
+        let mon_0800 = ts(2024, 1, 8, 8, 0); // Mon 08:00
+        assert_eq!(
+            next_occurrence("0 9 * * 1-5", mon_0800),
+            Some(ts(2024, 1, 8, 9, 0))
+        ); // same Mon
+    }
+
+    #[test]
+    fn next_occurrence_no_past() {
+        // A missed daily schedule advances to the NEXT future day.
+        let jan3 = ts(2024, 1, 3, 0, 0);
+        assert_eq!(next_occurrence("@daily", jan3), Some(ts(2024, 1, 4, 0, 0)));
+    }
+
+    #[test]
+    fn next_occurrence_rejects_bad_expr() {
+        assert_eq!(next_occurrence("garbage", 0), None);
+        assert_eq!(next_occurrence("* * * *", 0), None);
+    }
+
+    // ---- WL-020: review queue ----
+
+    #[test]
+    fn review_item_state_roundtrip() {
+        assert_eq!(ReviewItemState::Open.as_str(), "open");
+        assert_eq!(ReviewItemState::Merged.as_str(), "merged");
+        assert_eq!(ReviewItemState::Closed.as_str(), "closed");
+        assert_eq!(ReviewItemState::from_str("open"), Ok(ReviewItemState::Open));
+        assert_eq!(
+            ReviewItemState::from_str("merged"),
+            Ok(ReviewItemState::Merged)
+        );
+        assert_eq!(
+            ReviewItemState::from_str("closed"),
+            Ok(ReviewItemState::Closed)
+        );
+        assert!(ReviewItemState::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn review_queue_filter_roundtrip() {
+        assert_eq!(ReviewQueueFilter::All.as_str(), "all");
+        assert_eq!(
+            ReviewQueueFilter::from_str("all"),
+            Ok(ReviewQueueFilter::All)
+        );
+        assert_eq!(
+            ReviewQueueFilter::from_str("pending"),
+            Ok(ReviewQueueFilter::Pending)
+        );
+        assert_eq!(
+            ReviewQueueFilter::from_str("reviewed"),
+            Ok(ReviewQueueFilter::Reviewed)
+        );
+        assert!(ReviewQueueFilter::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn pr_url_valid_accepts_github_rejects_others() {
+        assert!(pr_url_valid("https://github.com/owner/repo/pull/1"));
+        assert!(pr_url_valid("https://github.com/owner/repo/pull/123"));
+        assert!(!pr_url_valid("https://example.com/pull/1"));
+        assert!(!pr_url_valid("not-a-url"));
+        assert!(!pr_url_valid(""));
+    }
+
+    #[test]
+    fn review_id_valid_shape() {
+        assert!(review_id_valid("review_1_123"));
+        assert!(!review_id_valid("bad_1_123"));
+        assert!(!review_id_valid(""));
+    }
+
+    #[test]
+    fn new_review_id_is_unique() {
+        assert_ne!(new_review_id(1), new_review_id(1));
+    }
+
+    // ---- WL-021: permission status ----
+
+    #[test]
+    fn permission_status_pending_open_within_timeout() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: None,
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Open,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1000,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, None, 1200, 300),
+            PermissionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn permission_status_timeout_open_expired() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: None,
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Open,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1000,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, None, 2000, 300),
+            PermissionStatus::Timeout
+        );
+    }
+
+    #[test]
+    fn permission_status_approved_on_approve_body() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: Some(2),
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Answered,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1200,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, Some("approve"), 1200, 300),
+            PermissionStatus::Approved
+        );
+        assert_eq!(
+            permission_status(&ask, Some("Approve"), 1200, 300),
+            PermissionStatus::Approved
+        );
+    }
+
+    #[test]
+    fn permission_status_denied_on_non_approve() {
+        let ask = Ask {
+            id: "ask_1_1".to_string(),
+            question_msg_id: 1,
+            answer_msg_id: Some(2),
+            asker: "a".to_string(),
+            askee: "b".to_string(),
+            subject: None,
+            state: AskState::Answered,
+            kind: AskKind::ToolPermission,
+            options: None,
+            reply_to: None,
+            close_note: None,
+            opened_ts: 1000,
+            updated_ts: 1200,
+            closed_ts: None,
+            parent_id: None,
+        };
+        assert_eq!(
+            permission_status(&ask, Some("deny"), 1200, 300),
+            PermissionStatus::Denied
+        );
+        assert_eq!(
+            permission_status(&ask, Some("no"), 1200, 300),
+            PermissionStatus::Denied
+        );
+    }
+
+    #[test]
+    fn lease_resource_valid_accepts_good_rejects_bad() {
+        assert!(lease_resource_valid("crates/foo/src/lib.rs"));
+        assert!(lease_resource_valid("migrations/"));
+        assert!(!lease_resource_valid(""));
+        assert!(!lease_resource_valid("has\0null"));
+        assert!(!lease_resource_valid("has\nnewline"));
+        let oversize = "a".repeat(MAX_LEASE_RESOURCE_LEN + 1);
+        assert!(!lease_resource_valid(&oversize));
+    }
+
+    #[test]
+    fn lease_ttl_valid_bounds() {
+        assert!(lease_ttl_valid(1));
+        assert!(lease_ttl_valid(3600));
+        assert!(lease_ttl_valid(MAX_LEASE_TTL_SECS));
+        assert!(!lease_ttl_valid(0));
+        assert!(!lease_ttl_valid(-1));
+        assert!(!lease_ttl_valid(MAX_LEASE_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn lease_path_normalize_collapses_and_strips() {
+        assert_eq!(lease_path_normalize("/foo/bar/"), "foo/bar");
+        assert_eq!(lease_path_normalize("//foo//bar//"), "foo/bar");
+        assert_eq!(lease_path_normalize("foo/./bar"), "foo/bar");
+        assert_eq!(lease_path_normalize("foo/bar/../baz"), "foo/baz");
+        assert_eq!(lease_path_normalize("foo"), "foo");
+        assert_eq!(lease_path_normalize(""), "");
+    }
+
+    #[test]
+    fn lease_path_conflicts_detects_exact_and_ancestor() {
+        assert!(lease_path_conflicts("foo/bar", "foo/bar"));
+        assert!(lease_path_conflicts("foo/bar", "foo/bar/baz"));
+        assert!(lease_path_conflicts("foo/bar/baz", "foo/bar"));
+        assert!(!lease_path_conflicts("foo/bar", "foo/baz"));
+        assert!(!lease_path_conflicts("foo/bar", "foo/barbie"));
+        assert!(!lease_path_conflicts("foo", "foobar"));
     }
 }

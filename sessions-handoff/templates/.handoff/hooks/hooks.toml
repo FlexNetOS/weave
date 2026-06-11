@@ -1,37 +1,36 @@
-schema = "handoff.hooks.v1"
+# weave-loop lifecycle hooks
+#
+# These are NOT executable hooks — they are documentation of the hook events
+# that the weave binary handles via `weave hook <session|prompt|stop|wake|notification>`.
+#
+# The actual hook wiring is in Claude Code settings.json (managed by `weave setup`).
 
 [[hooks]]
 event = "SessionStart"
-command = "hf resume --compact"
-timeout_seconds = 10
-fail_mode = "warn"
+command = "weave hook session"
+description = "Auto-register peer, drain inbox, set turn_state to pending_first_turn"
 
 [[hooks]]
-event = "TaskClaim"
-command = "hf policy check-claim --json"
-timeout_seconds = 15
-fail_mode = "block"
+event = "UserPromptSubmit"
+command = "weave hook prompt"
+description = "Drain inbox (mark read), set turn_state to working, check for unacked asks"
 
 [[hooks]]
-event = "PreEdit"
-command = "hf policy check-edit --json"
-timeout_seconds = 5
-fail_mode = "block"
+event = "Stop"
+command = "weave hook stop"
+description = "Peek inbox (mark_read=false), set turn_state to idle"
 
 [[hooks]]
-event = "PostEdit"
-command = "hf checkpoint --auto --changed-files"
-timeout_seconds = 30
-fail_mode = "warn"
+event = "SubagentStop"
+command = "weave hook stop"
+description = "Same as Stop — peek only"
 
 [[hooks]]
-event = "PreHandoff"
-command = "hf drift --json && hf policy check-handoff --json"
-timeout_seconds = 30
-fail_mode = "block"
+event = "Notification"
+command = "weave hook notification"
+description = "Drain inbox, set turn_state to awaiting_input"
 
 [[hooks]]
-event = "SessionStop"
-command = "hf checkpoint --auto && hf handoff --auto"
-timeout_seconds = 60
-fail_mode = "warn"
+event = "Wake"
+command = "weave hook wake"
+description = "Blocking drain — used after stop-boundary wake (future: WL-025)"

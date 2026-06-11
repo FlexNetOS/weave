@@ -5,6 +5,7 @@
 //! backend        = "sqlite"       # "sqlite" (default) | "libsql"
 //! db             = "/path/to/messages.db"
 //! nudge_template = "[weave] msg from {from}: {body} — run weave_inbox"
+//! mux_preference = "zellij"        # override auto-detection: tmux|zellij|wezterm|kitty|screen
 //! libsql_url        = "libsql://..."   # only for backend = "libsql"
 //! libsql_auth_token = "..."
 //! ```
@@ -517,6 +518,11 @@ pub struct Config {
     pub backend: Option<String>,
     pub db: Option<String>,
     pub nudge_template: Option<String>,
+    /// Preferred multiplexer to use for injection, overriding the auto-detection
+    /// order. Accepts `"tmux"`, `"zellij"`, `"wezterm"`, `"kitty"`, `"screen"`.
+    /// When set, `detect_target` checks ONLY this mux's env var. `None` or
+    /// unrecognized ⇒ normal auto-detection. Overlaid by `WEAVE_MUX_PREFERENCE`.
+    pub mux_preference: Option<String>,
     pub libsql_url: Option<String>,
     pub libsql_auth_token: Option<String>,
     /// Age threshold (seconds) for the opportunistic GC run at SessionStart.
@@ -616,6 +622,24 @@ pub struct Config {
     /// omit the key loading unchanged.
     #[serde(default)]
     pub circle: Option<String>,
+    /// LLM API endpoint for thread summarization (WL-033). e.g.
+    /// `https://api.openai.com/v1/chat/completions`. Overlaid by `WEAVE_LLM_ENDPOINT`.
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    /// LLM API key. Treated as a secret: redacted in Debug. Overlaid by
+    /// `WEAVE_LLM_API_KEY`.
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    /// Model name to request from the LLM endpoint. Overlaid by `WEAVE_LLM_MODEL`.
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// Timeout in seconds for a single LLM request. Overlaid by `WEAVE_LLM_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub llm_timeout_secs: Option<i64>,
+    /// Maximum characters of thread text to send to the LLM. Overlaid by
+    /// `WEAVE_LLM_MAX_INPUT_CHARS`.
+    #[serde(default)]
+    pub llm_max_input_chars: Option<i64>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -645,6 +669,14 @@ impl std::fmt::Debug for Config {
                 &self.pull_token.as_ref().map(|_| "<redacted>"),
             )
             .field("circle", &self.circle)
+            .field("llm_endpoint", &self.llm_endpoint)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("llm_model", &self.llm_model)
+            .field("llm_timeout_secs", &self.llm_timeout_secs)
+            .field("llm_max_input_chars", &self.llm_max_input_chars)
             .finish()
     }
 }
@@ -670,11 +702,15 @@ pub fn default_db_path() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// The weave configuration directory (`$XDG_CONFIG_HOME/weave/`, else `~/.config/weave/`).
+pub fn config_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".config"))
         .join("weave")
-        .join("config.toml")
 }
 
 /// Upper bound (chars) on a derived host identifier. A host label is persisted on
@@ -1405,6 +1441,13 @@ impl Config {
     /// `None` ⇒ the server uses its built-in default nudge text.
     pub fn nudge_template(&self) -> Option<&str> {
         self.nudge_template.as_deref()
+    }
+
+    /// The configured mux preference, if any. Returned as the raw config string
+    /// so the caller (in `weave` or `weave-inject`) can parse it via `Mux::parse`.
+    /// `None` or an unrecognized value ⇒ normal auto-detection.
+    pub fn mux_preference(&self) -> Option<&str> {
+        self.mux_preference.as_deref()
     }
 
     pub fn backend(&self) -> String {
@@ -3097,5 +3140,17 @@ mod tests {
             let second = cfg2.pull_from_sources();
             prop_assert_eq!(first, second);
         }
+    }
+
+    #[test]
+    fn mux_preference_roundtrips_via_config() {
+        let cfg: Config = toml::from_str(r#"mux_preference = "kitty""#).unwrap();
+        assert_eq!(cfg.mux_preference(), Some("kitty"));
+    }
+
+    #[test]
+    fn mux_preference_missing_is_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.mux_preference(), None);
     }
 }

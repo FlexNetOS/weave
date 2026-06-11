@@ -31,7 +31,7 @@ WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 | `WEAVE_BUDGET`   | `3` | Cycles per session before handoff |
 | `WEAVE_MAX_ITERS`| `50` | Hard cap on respawns (backstop) |
 | `WEAVE_SLEEP`    | `5` | Seconds between respawns |
-| `WEAVE_GUARDIAN_CMD` | `ollama launch claude --model minimax-m3:cloud --` | MiniMax guardian command |
+| `WEAVE_GUARDIAN_CMD` | *(required)* | Guardian command (e.g. `claude --agent guardian`). Must be set explicitly. |
 | `WEAVE_AGENT_CMD` | `claude` | Local agent command (plan+implement+verify+deliver) |
 | `WEAVE_APPLY`    | `0` | `1` → `--dangerously-skip-permissions` |
 

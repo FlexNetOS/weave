@@ -294,7 +294,7 @@ environment variable used for detection:
 | `Mux` | CLI binary | Detect env var | Target meaning |
 |---|---|---|---|
 | `Tmux` | `tmux` | `TMUX_PANE` | pane id (e.g. `%3`) |
-| `Zellij` | `zellij` | `ZELLIJ_SESSION_NAME` | session name |
+| `Zellij` | `zellij` | `ZELLIJ_SESSION_NAME` + `ZELLIJ_PANE_ID` | session name + pane id |
 | `Kitty` | `kitten` | `KITTY_WINDOW_ID` | window id |
 | `Wezterm` | `wezterm` | `WEZTERM_PANE` | pane id |
 | `Screen` | `screen` | `STY` | session |
@@ -358,8 +358,8 @@ the paste-safe submission idiom for its terminal:
   hex sequence `ESC [ 2 0 1 ~` (`send-keys -t <pane> -H 1b 5b 32 30 31 7e`), then
   send `Enter`. Closing the paste before Enter is what stops the TUI from
   treating the newline as a cancel.
-- **zellij** — write the literal chars (`action write-chars <text>`), then write
-  byte 13 (`action write 13`).
+- **zellij** — write the literal chars (`action write-chars <text>`), optionally
+  scoped to a specific pane via `--pane-id`, then write byte 13 (`action write 13`).
 - **kitty** — match the target window by id and send the text, then send a
   carriage return as a separate `send-text`.
 - **wezterm** — `send-text --no-paste` avoids bracketed paste entirely, then
@@ -394,7 +394,7 @@ multiplexer can target an arbitrary pane/session from *any* process:
 So the **sender injects directly into the recipient's registered pane** — there
 is no relay and no broker process in the middle. The `peers` table is the
 registry that maps `name → (mux, pane/session id)`, captured from the
-environment (`$TMUX_PANE`, `$ZELLIJ_SESSION_NAME`, etc.) at `SessionStart`.
+environment (`$TMUX_PANE`, `$ZELLIJ_SESSION_NAME`/`$ZELLIJ_PANE_ID`, etc.) at `SessionStart`.
 
 **Registration / adoption seam.** Registration is an upsert keyed on the
 session's *own* resolved identity, so it can run at three moments:
@@ -1048,6 +1048,12 @@ keep what worked and drop the operational weight.
   **dual-backend additive migration**, **no `store → inject` edge**, and **no new dependency**
   (a `#![recursion_limit = "256"]` compile-time attribute was added for the larger MCP tool
   registry — an attribute, not a crate). Local-mesh only.
+- **Retirement decision (2026-06).** weave has achieved functional parity with repowire
+  (P1–P5) and subsumes mcp-broker's core mailbox semantics. On this box,
+  **mcp-broker and repowire are considered retired**. New work and active automation
+  should target weave exclusively. Runtime coexistence is preserved only where
+  `weave setup` merges hooks rather than clobbering them, so legacy hooks continue to
+  function until manually removed.
 
 ---
 

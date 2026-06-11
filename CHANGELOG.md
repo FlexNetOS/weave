@@ -1,5 +1,109 @@
 # Changelog
 
+## [Unreleased] — thread summarization via LLM (WL-033)
+
+> **LLM-powered thread summarization.** Generate concise summaries of message
+> threads using an OpenAI-compatible chat-completion endpoint. Summaries are
+> cached in-store and can be refreshed on demand.
+
+### Added
+- **model:** `Summary` struct with `root_id`, `text`, `model`, `created_ts`,
+  `refreshed_ts`; new `summaries` table in both backends with additive migration.
+- **store (both backends):** `Store::store_summary`, `Store::get_summary`,
+  `Store::delete_summary`.
+- **config:** `llm_endpoint`, `llm_api_key` (redacted in Debug), `llm_model`,
+  `llm_timeout_secs`, `llm_max_input_chars`; all overlayable via env vars.
+- **CLI:** `weave thread --root <id> --summarize [--refresh]`; new
+  `weave summarize --text "..."` command.
+- **MCP:** `weave_thread_summarize` and `weave_summarize_text` tools
+  (feature-gated behind `llm`; return graceful errors when unconfigured).
+- **LLM client:** new `weave-core/src/llm.rs` module using `reqwest::blocking`,
+  gated behind the `llm` Cargo feature (off by default). Caps input text and
+  `max_tokens` for safety.
+- **Tests:** store round-trip tests for both backends; unconfigured-endpoint and
+  secret-redaction tests for the LLM module.
+
+## [Unreleased] — message priority & contact policies (WL-031 + WL-032)
+
+> **Message importance levels and per-peer contact policies.** Senders can tag
+> messages with `low`/`normal`/`high`/`urgent` priority. Recipients can set a
+> contact policy (`open`, `auto`, `contacts_only`, `block_all`) on each peer row.
+> Priority propagates through cross-store intents so pulled messages retain it.
+
+### Added
+- **model:** `MessagePriority` enum (`Low`/`Normal`/`High`/`Urgent`) and
+  `ContactPolicy` enum (`Open`/`Auto`/`ContactsOnly`/`BlockAll`); `priority`
+  column on `Message`/`Intent` with serde defaults for backward compatibility.
+- **store (both backends):** `priority` column on `messages` and `outbox`,
+  `contact_policy` column on `peers`, all via guarded additive migration;
+  `Store::set_message_priority`, `Store::set_peer_policy`, `Store::get_peer_policy`.
+- **CLI:** `--priority` on `weave send`, `weave notify`, and
+  `weave broadcast-notify`; new `weave peer-policy --name <peer> [--policy <policy>]`
+  command (omit `--policy` to read).
+- **MCP:** `priority` optional parameter on `weave_send`, `weave_notify`, and
+  `weave_broadcast_notify`; three new tools: `weave_set_message_priority`,
+  `weave_set_peer_policy`, `weave_get_peer_policy`.
+- **Tier-2:** `Intent` carries `priority`; `enqueue_intent` writes it to the
+  outbox and `commit_pulled` applies it to the receiver's local message.
+- **Tests:** CLI + MCP roundtrip tests for send/notify priority, broadcast
+  notify priority, set-message-priority, peer-policy set/get, and tools/list
+  presence.
+
+### Fixed
+- libsql `inbox` unread SELECT was missing `m.priority`, causing unread messages
+  to always read back as `normal` regardless of stored value.
+
+## [Unreleased] — idempotency & tracing (WL-026)
+
+> **Per-message idempotency keys and distributed trace IDs.** Callers can supply
+> an `idempotency_key` to deduplicate retries (duplicate keys return the existing
+> message id). A `trace_id` is auto-minted for every message for end-to-end
+> debugging across stores and backends. Both fields propagate through cross-store
+> intents (Tier-2) so pulled messages retain their original trace context.
+
+### Added
+- **model:** `idempotency_key` and `trace_id` on `Message` and `Intent`;
+  `MAX_IDEMPOTENCY_KEY_LEN = 128`, `MAX_TRACE_ID_LEN = 128`,
+  `idempotency_key_valid()`, `trace_id_valid()`, and `mint_trace_id()`.
+- **store (both backends):** `idempotency_key` and `trace_id` columns on
+  `messages` and `outbox` via guarded additive migration; `Store::send` and
+  `Store::enqueue_intent` accept both fields; idempotency guard returns existing
+  `id` on duplicate key.
+- **CLI:** `--idempotency-key` on `weave send` and `weave notify`; trace ID
+  auto-minted and surfaced in JSON output.
+- **MCP:** `idempotencyKey` optional parameter on `weave_send` and
+  `weave_notify`.
+- **Tests:** idempotency dedup, trace ID roundtrip, outbox field carry,
+  integration JSON shape, and security tests for oversized/hostile keys.
+
+## [Unreleased] — scheduler (WL-016)
+
+> **Daemon-free message scheduling.** One-shot (`--at <unix_ts>`) and recurring
+> (`--every <cron>`) message deliveries, evaluated implicitly on every
+> `weave hook prompt` and explicitly via `weave tick`. No background process;
+> the tick is a cheap read of due schedules + `store.send` per row.
+> Mirrored across both storage backends with a guarded additive migration.
+
+### Added
+- **model:** `Schedule`, `ScheduleKind` (`OneShot`/`Recurring`), `ScheduleState`
+  (`Pending`/`Executed`/`Cancelled`), `MAX_CRON_EXPR_LEN = 64`,
+  `cron_valid()`, and `next_occurrence()` — a pure, dependency-free cron
+  evaluator supporting presets (`@hourly`, `@daily`, `@weekly`, `@monthly`)
+  and simple 5-field cron expressions (`min hour day month dow`).
+- **store (both backends):** `schedules` table via guarded idempotent additive
+  migration; `schedule_message`, `list_schedules`, `cancel_schedule`
+  (soft-cancel), `get_due_schedules`, and `mark_schedule_executed` on the
+  `Store` trait. GC prunes old terminal schedule rows.
+- **CLI:** `weave schedule`, `weave schedules`, `weave cancel-schedule`,
+  `weave tick`. Tick filters self-only by default; `--all` fires every due
+  schedule (admin/debug).
+- **MCP:** four new tools: `weave_schedule`, `weave_schedules`,
+  `weave_cancel_schedule`, `weave_tick`.
+- **Hook integration:** `execute_tick` is called best-effort inside
+  `handle_hook` `"prompt"` after inbox drain and open-ask nudges.
+- **Tests:** CLI roundtrip (schedule → tick → inbox), MCP tool roundtrip,
+  cancel idempotency, tick `--all`, and security tests for body/cron/at caps.
+
 ## [Unreleased] — workspace split
 
 > Mechanical refactor: the previous single crate is now a Cargo workspace with four
@@ -72,6 +176,21 @@
   `WEAVE_PIDFILE`.
 - **Docs:** README daemon subsection; ARCHITECTURE.md optional-daemon section;
   docs/TESTING.md daemon lifecycle test notes.
+
+## [Unreleased] — zellij pane targeting (WL-003)
+
+> **Zellij injection now targets the correct pane instead of the focused one.**
+> `detect_target()` captures `ZELLIJ_PANE_ID` (stored in `Peer.socket`, reusing the
+> existing auxiliary-id column with no DB migration). `commands_for` threads it through
+> as `zellij action write-chars --pane-id <id>` (and `write --pane-id <id>`). When the
+> pane id is absent (legacy peers or pre-change registrations), behaviour falls back to
+> the focused pane unchanged.
+
+### Changed
+- **inject (`weave-inject`):** zellij `commands_for` arm now accepts `--pane-id` when
+  `Target.socket` is non-empty.
+- **detect (`weave-inject`):** `ZELLIJ_PANE_ID` is read alongside `ZELLIJ_SESSION_NAME`.
+- **Docs:** `ARCHITECTURE.md` mux table and paste-safe notes updated.
 
 ## [Unreleased] — notify_peer + delivery observability (weave⊇repowire parity, epic 6 / P6)
 

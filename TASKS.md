@@ -11,12 +11,12 @@
 - [x] Builds clean (dev + release); MCP stdio smoke test passes
 
 ## M1 — Make it real on the box
-- [ ] `weave setup` — auto-register the MCP server (`claude mcp add`) + write Claude hooks (SessionStart→`weave hook session`, UserPromptSubmit→`weave hook prompt`, Stop→`weave hook stop`), merging with existing hooks (rtk, etc.)
-- [ ] Bracketed-paste hardening for tmux: close paste mode with hex `ESC[201~` instead of bare Enter, so injection never triggers a TUI cancel mid-tool-call (repowire's documented bug)
-- [ ] zellij injection: verify `--session <name> action write-chars` targets the right pane (vs focused pane); add `--pane`/focus handling if needed
-- [ ] **Validate live injection on the zellij target box** (no mux on the build host)
-- [ ] Wizard integration: build `weave` in the RTX-5090 image, run `weave setup`
-- [ ] Decide retirement of `mcp-broker` / `repowire` once weave is proven
+- [x] `weave setup` — auto-register the MCP server (`claude mcp add`) + write Claude hooks (SessionStart→`weave hook session`, UserPromptSubmit→`weave hook prompt`, Stop→`weave hook stop`), merging with existing hooks (rtk, etc.)
+- [x] Bracketed-paste hardening for tmux: close paste mode with hex `ESC[201~` instead of bare Enter, so injection never triggers a TUI cancel mid-tool-call (repowire's documented bug)
+- [x] zellij injection: capture `ZELLIJ_PANE_ID`, pass `--pane-id` to `write-chars`/`write` so injection hits the correct pane instead of the focused one
+- [x] **Validate live injection on the zellij target box** (no mux on the build host) — validated 2026-06-07; bug fixed (zellij liveness probe ANSI codes)
+- [x] Wizard integration: build `weave` in the RTX-5090 image, run `weave setup` — validated 2026-06-07 on 2× RTX 5090 box
+- [x] Decide retirement of `mcp-broker` / `repowire` once weave is proven
 
 ## M2 — Storage backend (DONE ✅)
 - [x] Extract a `Store` trait (backend-agnostic; app holds `Box<dyn Store>`)
@@ -30,10 +30,10 @@
 - [x] Verified: both backends build, clippy `-D`, run (send/inbox/read-tracking/broadcast/sessions match).
 
 ## M3 — Robustness & reach
-- [ ] Optional `weaved` presence daemon: online/offline, lifecycle eviction (pane-exited/session-closed), so `weave_peers` shows live status
-- [ ] More mux adapters: kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`)
-- [ ] Workspace split: `weave-core`, `weave-inject`, `weave-mcp`, `weave` (bin)
-- [ ] Config file (`~/.config/weave/config.toml`): default identity, nudge template, mux preference
+- [x] Optional `weaved` presence daemon: online/offline, lifecycle eviction (pane-exited/session-closed), so `weave_peers` shows live status (implemented in WL-002)
+- [x] More mux adapters: kitty (`kitten @ send-text`), wezterm (`wezterm cli send-text`), GNU screen (`screen -X stuff`) (implemented in inject.rs)
+- [x] Workspace split: `weave-core`, `weave-inject`, `weave-mcp`, `weave` (bin)
+- [x] Config file (`~/.config/weave/config.toml`): default identity, nudge template, mux preference
 
 ## M4 — Cross-machine (maybe; only if needed)
 - [ ] libSQL embedded replicas (Turso/sqld) for a shared mailbox across machines — this is the concrete trigger to adopt the `libsql` crate

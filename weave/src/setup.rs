@@ -511,6 +511,70 @@ fn prune_hooks() -> Result<usize> {
     Ok(removed)
 }
 
+/// Install (or merge) a weave pre-commit hook in `.git/hooks/pre-commit`
+/// that calls `weave lease guard` to block commits on reserved files.
+/// Idempotent: skips if the weave guard line is already present.
+pub fn install_git_precommit_hook(exe: &str) -> Result<()> {
+    let git_dir = find_git_dir().ok_or_else(|| anyhow::anyhow!("not inside a git repository"))?;
+    let hooks_dir = git_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+    let hook_path = hooks_dir.join("pre-commit");
+
+    let guard_line = format!("{} lease guard", shell_single_quote(exe));
+
+    let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+    if existing.contains(&guard_line) || existing.contains("weave lease guard") {
+        println!("  git hook: pre-commit already contains weave lease guard");
+        return Ok(());
+    }
+
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o755)
+        .open(&hook_path)?;
+
+    // If the file is non-empty but missing a trailing newline, add one.
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(f)?;
+    }
+
+    if existing.is_empty() {
+        writeln!(f, "#!/bin/sh")?;
+    }
+    writeln!(f, "# weave lease guard — blocks commits on reserved files")?;
+    writeln!(f, "{guard_line}")?;
+
+    println!(
+        "  git hook: installed pre-commit guard -> {}",
+        hook_path.display()
+    );
+    Ok(())
+}
+
+/// Walk upward from cwd looking for a `.git` directory or file.
+fn find_git_dir() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let git = dir.join(".git");
+        if git.exists() {
+            if git.is_dir() {
+                return Some(git);
+            }
+            // .git file (linked worktree) — parse gitdir line.
+            let contents = std::fs::read_to_string(&git).ok()?;
+            let gitdir = contents
+                .lines()
+                .map(str::trim)
+                .find_map(|l| l.strip_prefix("gitdir:"))?;
+            return Some(PathBuf::from(gitdir.trim()));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hook_command, is_weave_command, shell_single_quote};
