@@ -19,37 +19,46 @@ fmt + clippy -D warnings + test on BOTH sqlite and libsql).
 ## Where things stand
 
 **M1/M3 backlog complete (WL-001..WL-013).**
-**Gaps backlog heavily progressed (WL-014..WL-027 done).**
+**Gaps backlog heavily progressed (WL-014..WL-032 done).**
 
 Recently delivered:
 - WL-014..WL-025 — Reminder injection, structured questions, scheduler, mesh memory,
   birth certificates, co-orchestrator, review queue, tool approval, HTTP MCP transport,
   iTerm2 backend, reservation leases, stop-boundary wake.
-- WL-026 — Idempotency keys & trace IDs (PR #57, auto-merge).
+- WL-026 — Idempotency keys & trace IDs.
 - WL-027 — Broadcast notify / broadcast ask (`weave_broadcast_notify` + `weave_broadcast_ask`
   MCP tools; `weave broadcast-notify` + `weave broadcast-ask` CLI commands).
+- WL-028 — FTS5 full-text search on messages, threads, and subjects.
+- WL-029 — Advisory file leases with TTL expiry and conflict detection.
+- WL-030 — Pre-commit Git hook for file reservation guard.
+- WL-031 — Message importance / priority levels. `--priority` on `weave send`/`notify`/
+  `broadcast-notify`; priority field on MCP `weave_send`/`weave_notify`/
+  `weave_broadcast_notify`; cross-store priority carried through `Intent`/`outbox`
+  and applied on pull; `weave_set_message_priority` MCP tool.
+- WL-032 — Per-peer contact policies. `ContactPolicy` enum (open/auto/contacts_only/block_all);
+  `weave peer-policy` CLI; `weave_set_peer_policy` / `weave_get_peer_policy` MCP tools.
 - FrankenNetworkX crate extraction — `fnx-classes` + `fnx-algorithms` + `fnx-runtime`
   wired in via Cargo git dependencies. `weave graph` command runs connected_components,
   degree_centrality, and density on the peer/message communication network.
 
-**Current gate:** 510 tests sqlite, 470 tests libsql, fmt + clippy clean.
+**Current gate:** 528 tests sqlite, 488 passed + 1 ignored libsql, fmt + clippy clean.
 
 ## Current worktree
 - **Path:** `/home/drdave/Desktop/meta/weave-mcp-daemon-tools`
 - **Branch:** `feat/zellij-pane-targeting`
-- **Next item:** WL-028 — FTS5 full-text search on messages, threads, and subjects
-- **Alternative next items:** WL-029 (advisory file leases), WL-030 (pre-commit Git hook),
-  WL-031 (message importance/priority levels)
+- **Next item:** WL-033 — Thread summarization via LLM integration
+- **Alternative next items:** WL-034 (static mailbox export), WL-035 (mailbox backup/restore),
+  WL-036 (post-send hooks)
 
 ## Top remaining gaps (ranked by impact)
-1. **WL-028** — FTS5 full-text search on messages (P0)
-2. **WL-029** — Advisory file leases with TTL expiry and conflict detection (P0)
-3. **WL-030** — Pre-commit Git hook for file reservation guard (P1)
-4. **WL-031** — Message importance / priority levels (P1)
-5. **WL-032** — Per-peer contact policies (P1)
-6. **WL-033** — Thread summarization via LLM (P1)
-7. **WL-035** — Mailbox backup / restore (P1)
-8. **WL-036** — Post-send hooks (P1)
+1. **WL-033** — Thread summarization via LLM integration (P1)
+2. **WL-034** — Static mailbox export — self-contained portable HTML bundle with search (P2)
+3. **WL-035** — Mailbox backup / restore (P1)
+4. **WL-036** — Post-send hooks — trigger external commands on send/ack (P1)
+5. **WL-037** — Message supersede / successor chains (P1)
+6. **WL-038** — Ephemeral messages with TTL and auto-sweep (P1)
+7. **WL-039** — Idle notification deduplication (P1)
+8. **WL-040** — Session export/import in canonical format (P1)
 
 See `_workspace/backlog.md` for the complete list (WL-001..WL-042).
 
@@ -66,7 +75,7 @@ See `_workspace/backlog.md` for the complete list (WL-001..WL-042).
 Start by reading `_workspace/HANDOFF.md` (authoritative resume signal), then
 `_workspace/backlog.md` for the full backlog. Run `bash _workspace/verify-on-resume.sh`
 to confirm the baseline is green. Ask the user which item to pick — or, if they said
-nothing specific, propose WL-028 (FTS5 full-text search) as the highest-impact next feature.
+nothing specific, propose WL-033 (thread summarization via LLM) as the highest-impact next feature.
 ```
 
 ---
@@ -76,7 +85,7 @@ nothing specific, propose WL-028 (FTS5 full-text search) as the highest-impact n
 - **Branch:** `feat/zellij-pane-targeting` (loop worktree)
 - **Remote:** `https://github.com/FlexNetOS/weave.git`
 - **M1/M3 tasks:** DONE ✅ (WL-001..WL-013)
-- **Gaps delivered:** WL-014..WL-027 ✅
-- **Next:** WL-028 (FTS5 search)
+- **Gaps delivered:** WL-014..WL-032 ✅
+- **Next:** WL-033 (thread summarization via LLM)
 - **Reference tracking:** `_workspace/references/MANIFEST.md`
 - **Verify on resume:** `bash _workspace/verify-on-resume.sh`

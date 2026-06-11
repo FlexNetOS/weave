@@ -1,55 +1,64 @@
-# Plan: WL-029 — Advisory file leases with TTL expiry and conflict detection
+# Plan: WL-031 + WL-032 — Message priority levels & per-peer contact policies
 
-## Objective
-Extend the WL-024 lease system with file-path-aware conflict detection (parent/child prefix matching), automatic expiry sweep, and explicit sweep tooling.
+## WL-031: Message importance / priority levels
 
-## Architecture
+### Schema (both backends)
+- `messages` table: add `priority TEXT NOT NULL DEFAULT 'normal'`
+- `outbox` table: add `priority TEXT NOT NULL DEFAULT 'normal'` (for cross-store intents)
+- Migration: guarded `ALTER TABLE ADD COLUMN` for legacy DBs
 
 ### Model
-- `lease_path_normalize(r: &str) -> String` — strip trailing slashes, collapse multiple slashes, reject `..` and empty segments.
-- `lease_path_conflicts(existing: &str, candidate: &str) -> bool` — true if exact match, or one is a parent/ancestor of the other (prefix + '/').
+- `MessagePriority` enum: `Low`, `Normal`, `High`, `Urgent` (default `Normal`)
+- `parse_priority(s: &str) -> MessagePriority`
 
 ### Store trait
-- `sweep_expired_leases(&self) -> Result<usize>` — delete all rows where `expires <= now()`, return count deleted.
-- `reserve_lease` already checks exact-match conflicts; extend it to check prefix conflicts via `lease_path_conflicts`.
-  - On conflict, error message includes holder name and expiry time of the conflicting lease.
-- `list_leases` should auto-sweep before listing (defensive hygiene).
-
-### Schema
-No schema change — `leases` table already has `expires` (WL-024).
-
-### sqlite backend
-- `sweep_expired_leases`: `DELETE FROM leases WHERE expires <= ?1`
-- `reserve_lease`: after exact-match check, run prefix-conflict query:
-  ```sql
-  SELECT holder, expires FROM leases WHERE expires > ?1
-    AND (resource = ?2 OR resource || '/' = SUBSTR(?2, 1, LENGTH(resource) + 1)
-         OR ?2 || '/' = SUBSTR(resource, 1, LENGTH(?2) + 1))
-  ```
-  If any row returned, bail with conflict info.
-- Auto-sweep at top of `list_leases` and `reserve_lease`.
-
-### libsql backend
-- Mirror all sqlite changes (async-over-block_on bridge).
+- `send` and related methods gain `priority: Option<MessagePriority>` param
+- `inbox` gains `min_priority: Option<MessagePriority>` filter
+- `history` gains `min_priority: Option<MessagePriority>` filter
+- `search` gains `min_priority: Option<MessagePriority>` filter
 
 ### CLI
-- New `LeaseCmd::Sweep` variant — `weave lease sweep` prints count of expired leases removed.
-- `weave lease reserve` failure already prints error; conflict info will now include holder + expiry.
+- `weave send --priority low|normal|high|urgent`
+- `weave notify --priority ...`
+- `weave broadcast-notify --priority ...`
+- `weave inbox --min-priority ...`
+- `weave history --min-priority ...`
+- `weave search --min-priority ...`
 
 ### MCP
-- New `weave_lease_sweep` tool in schema + dispatch.
+- `priority` param on `weave_send`, `weave_notify`, `weave_broadcast_notify`
+- `min_priority` param on `weave_inbox`, `weave_history`, `weave_search`
 
-### Test layers
-- Unit: `lease_path_normalize` and `lease_path_conflicts` edge cases.
-- Integration:
-  - `cli_lease_path_conflict_parent_child` — reserve `/foo/bar`, fail to reserve `/foo/bar/baz`.
-  - `cli_lease_path_conflict_child_parent` — reserve `/foo/bar/baz`, fail to reserve `/foo/bar`.
-  - `cli_lease_sweep_removes_expired` — reserve with 1s TTL, wait, sweep removes it.
-  - `mcp_lease_sweep_roundtrip` — MCP tool call.
-- Full gate on both backends.
+## WL-032: Per-peer contact policies
 
-## Invariants
-- No shell: all external programs via `Command::new(bin)` with explicit argv.
-- Dual-backend: every Store trait change mirrored in sqlite + libsql.
-- Input caps: paths capped at `MAX_LEASE_RESOURCE_LEN` (512), already enforced.
-- Parameterized SQL only.
+### Schema (both backends)
+- `peers` table: add `contact_policy TEXT NOT NULL DEFAULT 'open'`
+- Migration: guarded `ALTER TABLE ADD COLUMN`
+
+### Model
+- `ContactPolicy` enum: `Open`, `Auto`, `ContactsOnly`, `BlockAll` (default `Open`)
+- `parse_contact_policy(s: &str) -> ContactPolicy`
+
+### Store trait
+- `set_peer_policy(peer: &str, policy: ContactPolicy) -> Result<bool>`
+- `get_peer_policy(peer: &str) -> Result<ContactPolicy>`
+- `list_peers` returns policy in the peer view
+
+### Policy enforcement
+- `send`: check recipient's policy before creating message
+  - `BlockAll` → reject
+  - `ContactsOnly` → check if sender is in recipient's contacts (simplified: allow if sender has ever sent to recipient, or use a contacts list)
+  - `Auto` / `Open` → allow
+- `inbox`: filter out messages from blocked senders at read time
+
+### CLI
+- `weave peers --set-policy <peer> --policy open|auto|contacts_only|block_all`
+- `weave peers` human output shows policy
+
+### MCP
+- `weave_set_peer_policy` tool
+
+## Test layers
+- Unit: enum parsing, policy logic
+- Integration: send blocked by policy, inbox filtered by priority, policy roundtrip
+- Full gate on both backends

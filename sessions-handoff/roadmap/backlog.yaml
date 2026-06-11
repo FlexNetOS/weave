@@ -118,15 +118,15 @@ tasks:
     priority: P0
   - id: WL-030
     title: Pre-commit Git hook for file reservation guard
-    status: backlog
+    status: done
     priority: P1
   - id: WL-031
     title: Message importance / priority levels
-    status: backlog
+    status: done
     priority: P1
   - id: WL-032
     title: Per-peer contact policies
-    status: backlog
+    status: done
     priority: P1
   - id: WL-033
     title: Thread summarization via LLM
