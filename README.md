@@ -811,6 +811,23 @@ counts, the registered-key count, the number of registered keys currently revoke
 the recorded revocation-event count, and this session's own fingerprint — counts
 and the local fingerprint only, never a peer key.
 
+## Codex 7-layer harness
+
+The checked-in autonomous weave-loop can be driven through the binary:
+
+```bash
+weave harness ide-merge-ide            # dry-run: print the seven layers + exact env
+weave harness ide-merge-ide --execute  # run the loop (ralph-weave.sh)
+```
+
+Dry-run is the default and prints the seven layers plus the exact `WEAVE_*`
+environment handed to the runner. It wraps
+`.claude/skills/weave-loop/scripts/ralph-weave.sh`: Kimi Code plans/reviews,
+Ollama launches Claude MiniMax for the implementation pass, and durable
+`_workspace` sentinels control resume/handoff. `--json` emits the plan
+machine-readably; `--safe` keeps destructive applies disabled inside the loop.
+The script is spawned argv-only (`bash <script>`), never via a shell string.
+
 ## Status
 
 v0.1.0 — both backends build clean (clippy `-D warnings`), **38 tests green** (22 unit + 16

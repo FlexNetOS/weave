@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased] — Codex 7-layer harness (`weave harness ide-merge-ide`)
+
+> **Autonomous orchestration surface in the binary.** `weave harness
+> ide-merge-ide` dry-runs (default) or `--execute`s the checked-in seven-layer
+> Ralph loop: Kimi Code preflight/review around an Ollama-launched Claude
+> MiniMax implementation pass, with durable `_workspace` sentinels for
+> resume/handoff. The script is spawned argv-only (`bash <script>`, no shell
+> string); dry-run prints the layers + exact `WEAVE_*` environment, and
+> `--json` emits it machine-readably.
+
+### Added
+- **cli (`weave`):** `weave harness ide-merge-ide` subcommand with worktree /
+  budget / max-iters / sleep / execute / safe / json flags plus agent-model and
+  Kimi Code overrides.
+- **harness (`weave`):** `weave/src/harness.rs` builds the plan and runs the
+  loop script; dry-run integration test in `weave/tests/integration.rs`.
+
 ## [Unreleased] — thread summarization via LLM (WL-033)
 
 > **LLM-powered thread summarization.** Generate concise summaries of message
