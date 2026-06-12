@@ -22,6 +22,7 @@
 //!   weave completions    print a shell completion script (bash|zsh|fish)
 //!   weave man            print a roff man page to stdout
 //!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|wake|notification
+//!   weave harness        dry-run/run autonomous orchestration harnesses (Codex 7-layer)
 
 // The MCP `tools()` registry is a single large `json!([...])` literal; each added
 // tool deepens the `serde_json::json!` macro recursion. Raising the crate recursion
@@ -39,6 +40,7 @@ compile_error!(
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
 mod git;
+mod harness;
 mod setup;
 #[cfg(feature = "sign")]
 use weave_core::sign;
@@ -183,6 +185,11 @@ enum Cmd {
     },
     /// Remove weave's Claude Code wiring.
     Uninstall,
+    /// Autonomous orchestration harnesses (Codex seven-layer ide-merge-ide).
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
     /// Send a message to another session.
     Send {
         #[arg(long)]
@@ -2521,6 +2528,114 @@ fn watch(
     }
 }
 
+/// Autonomous orchestration harnesses. Wraps the checked-in Ralph loop script;
+/// the Rust CLI owns discovery, defaults, dry-run output, and process execution.
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Seven-layer Codex IDE-merge-IDE loop: Kimi Code plans/reviews, Ollama
+    /// launches Claude MiniMax for implementation, durable workspace sentinels
+    /// control resume/handoff. Defaults to dry-run; pass --execute to run.
+    IdeMergeIde {
+        /// Worktree that contains Cargo.toml and the checked-in weave-loop script.
+        #[arg(long)]
+        worktree: Option<std::path::PathBuf>,
+        /// Number of backlog cycles a fresh MiniMax pass may close before handoff.
+        #[arg(long, default_value_t = 3)]
+        budget: u32,
+        /// External runner hard stop.
+        #[arg(long, default_value_t = 50)]
+        max_iters: u32,
+        /// Seconds between fresh MiniMax sessions.
+        #[arg(long, default_value_t = 5)]
+        sleep: u64,
+        /// Execute the harness. Without this flag the command only prints the plan.
+        #[arg(long)]
+        execute: bool,
+        /// Keep destructive applies disabled inside the loop.
+        #[arg(long)]
+        safe: bool,
+        /// Print machine-readable JSON plan in dry-run mode.
+        #[arg(long)]
+        json: bool,
+        /// Command prefix used for the implementation agent.
+        #[arg(
+            long,
+            default_value = "ollama launch claude --model minimax-m3:cloud --"
+        )]
+        agent_cmd: String,
+        /// Label passed through to the existing runner for logs.
+        #[arg(long, default_value = "minimax-m3:cloud")]
+        model: String,
+        /// Extra args appended after the implementation prompt.
+        #[arg(long, default_value = "")]
+        agent_model_args: String,
+        /// Disable Kimi Code preflight.
+        #[arg(long)]
+        no_kimi_plan: bool,
+        /// Disable Kimi Code review.
+        #[arg(long)]
+        no_kimi_review: bool,
+        /// Kimi Code command.
+        #[arg(long, default_value = "kimi-legacy")]
+        kimi_cmd: String,
+        /// Kimi Code model label.
+        #[arg(long, default_value = "kimi-code/kimi-for-coding")]
+        kimi_model: String,
+        /// Reused logged-in Kimi Code session id.
+        #[arg(long, default_value = "3c6e42cf-090d-4553-a84b-e63fb9c511c1")]
+        kimi_session: String,
+        /// Kimi session-resume flag (`-r` for kimi-legacy).
+        #[arg(long, default_value = "-r")]
+        kimi_session_flag: String,
+        /// Extra Kimi args.
+        #[arg(long, default_value = "--quiet")]
+        kimi_extra_args: String,
+    },
+}
+
+fn run_harness(cmd: &HarnessCmd) -> Result<()> {
+    match cmd {
+        HarnessCmd::IdeMergeIde {
+            worktree,
+            budget,
+            max_iters,
+            sleep,
+            execute,
+            safe,
+            json,
+            agent_cmd,
+            model,
+            agent_model_args,
+            no_kimi_plan,
+            no_kimi_review,
+            kimi_cmd,
+            kimi_model,
+            kimi_session,
+            kimi_session_flag,
+            kimi_extra_args,
+        } => {
+            let mut opts = harness::IdeMergeIde::with_defaults(worktree.clone());
+            opts.budget = *budget;
+            opts.max_iters = *max_iters;
+            opts.sleep_secs = *sleep;
+            opts.execute = *execute;
+            opts.apply = !*safe;
+            opts.json = *json;
+            opts.agent_cmd = agent_cmd.clone();
+            opts.model = model.clone();
+            opts.agent_model_args = agent_model_args.clone();
+            opts.no_kimi_plan = *no_kimi_plan;
+            opts.no_kimi_review = *no_kimi_review;
+            opts.kimi_cmd = kimi_cmd.clone();
+            opts.kimi_model = kimi_model.clone();
+            opts.kimi_session = kimi_session.clone();
+            opts.kimi_session_flag = kimi_session_flag.clone();
+            opts.kimi_extra_args = kimi_extra_args.clone();
+            harness::run_ide_merge_ide(opts)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
@@ -2559,6 +2674,7 @@ fn main() -> Result<()> {
         }
         Cmd::Completions { shell } => return print_completions(*shell),
         Cmd::Man => return print_man(),
+        Cmd::Harness { cmd } => return run_harness(cmd),
         _ => {}
     }
 
@@ -2570,7 +2686,8 @@ fn main() -> Result<()> {
         | Cmd::Uninstall
         | Cmd::Config { .. }
         | Cmd::Completions { .. }
-        | Cmd::Man => {
+        | Cmd::Man
+        | Cmd::Harness { .. } => {
             unreachable!("handled above")
         }
 
