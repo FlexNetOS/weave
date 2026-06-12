@@ -26,15 +26,19 @@ weave-core/          library: model + config + Store trait + both backends + sig
   src/sign.rs          OPTIONAL Ed25519 sign/verify + keyfile (cfg(feature="sign"))
   src/store.rs         Store trait + bundled SQLite backend (cfg(feature="sqlite"))
   src/store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
+  src/memory.rs        agent memory store (write/read/search/list/delete)
+  src/llm.rs           OPTIONAL chat-completion client for thread summarization (cfg(feature="llm"))
   src/testenv.rs       test-only env lock / guard helpers
 weave-inject/        library: native multi-mux injector + `Injector` trait
   src/inject.rs        pure command tables + runner
 weave-mcp/           library: MCP stdio JSON-RPC 2.0 server (weave_* tools)
   src/mcp.rs           `serve<I: Injector>` — generic over the injector trait
-weave/               binary crate: CLI, setup, hooks, git tagging
+  src/http.rs          OPTIONAL HTTP surface
+weave/               binary crate: CLI, setup, hooks, git tagging, harness
   src/main.rs          clap CLI; wires core + inject + mcp
   src/git.rs           best-effort git session tagging
   src/setup.rs         `weave setup` / `weave uninstall`
+  src/harness.rs       `weave harness ide-merge-ide` Codex 7-layer orchestration
   tests/               black-box integration / security / property tests
   benches/weave_bench.rs  criterion throughput benchmarks
 ```
