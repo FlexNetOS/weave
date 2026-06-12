@@ -1,0 +1,10 @@
+{
+  "schema": "handoff.context_capsule.v1",
+  "project_name": "weave",
+  "role": "Rust-native agent-to-agent session mesh: one static binary (interim 4-crate workspace weave-core/weave-inject/weave-mcp/weave) giving coding-agent sessions a shared SQLite/libSQL mailbox, an MCP server (weave_* tools incl. jobs, leases, schedules, orchestrator claim), and native push-injection into tmux/zellij/kitty/wezterm/screen panes. Claude Code lifecycle hooks auto-register sessions and drain messages, making it the inter-session messaging/orchestration backbone of the workspace.",
+  "plane": "continuity-orchestration",
+  "tier": "B",
+  "northstar": "NO HUMAN IN THE LOOP: witnessed work-orders, leases, fail-closed native auto-merge; Git > ledger > cards.",
+  "next_command": "W3: re-verify ADR-0002 five surfaces post-merges; session continuity feeds HFTASK-0007",
+  "source": "ARCHITECTURE-TRUTH.md census 2026-06-12"
+}
