@@ -168,3 +168,15 @@ tasks:
     title: Multi-provider lifecycle hook templates
     status: backlog
     priority: P2
+  - id: WL-043
+    title: Collapse multi-crate workspace back to single crate (deferred until meta workspace aligned)
+    status: backlog
+    priority: P1
+  - id: WL-044
+    title: Resolve Dependabot vulnerabilities (5; 1 high) on master
+    status: backlog
+    priority: P1
+  - id: WL-045
+    title: Refresh README Status section (stale v0.1.0 / 38 tests)
+    status: backlog
+    priority: P2
