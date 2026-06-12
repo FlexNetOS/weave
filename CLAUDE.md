@@ -14,10 +14,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 2026-06-04 | Initial harness build | All agents/skills | - |
 | 2026-06-04 | Removed ECC auto-generated `weave` skill | `.claude/skills/weave/` | Misinformation drift: it falsely claimed camelCase filenames, relative imports, `*.test.*` files, freeform commits — none true of this repo |
 | 2026-06-04 | Confirmed 4-agent team (kept `weave-guardian` separate from `weave-verifier`) | Team composition | Phase 7 feedback: user opted to keep the dedicated guardian for invariant + Rust-native drift review rather than fold it into the verifier |
+| 2026-06-11 | Sanctioned the multi-crate Cargo workspace (`weave-core` ← `weave-inject` ← `weave-mcp` ← `weave`) as the official structure; synced the architecture + "Where things live" sections to it | CLAUDE.md, ARCHITECTURE.md | The loop's `WL-001 workspace split` carved the original single crate into four **without updating the docs** (silent structural drift). User decided to **keep** the workspace — it still links to one static binary and now *compiler-enforces* the module layering — rather than collapse it back. Docs now match the code; adding a *further* crate remains a justified decision like any dependency. |
 
 ## What weave is
 
 A single static **Rust** binary that lets coding-agent sessions message each other over a shared SQLite mailbox and **push** a message into a recipient's live terminal pane via a native multi-mux injector (tmux, zellij, kitty, wezterm, screen). No Python, no daemon, no runtime dependency on `repowire`. The DB file *is* the broker.
+
+The binary is assembled from a **small internal Cargo workspace** — `weave-core` ← `weave-inject` ← `weave-mcp` ← `weave` (bin), with no upward deps — that still links to **one** dependency-light static binary (`target/release/weave`). The split is deliberate: it makes the module layering *compiler-enforced* (see "Architecture in one screen"). It is **not** a license to add crates freely — a *new* workspace crate is a justified decision like any dependency.
 
 Deep design lives in `ARCHITECTURE.md`; contributor rules in `CONTRIBUTING.md`; test strategy in `docs/TESTING.md`. Read those before non-trivial changes — this file is the operating contract, not a duplicate of them.
 
@@ -33,13 +36,13 @@ git worktree add ../weave-<task-slug> -b <task-branch> origin/develop  # isolate
 Then operate inside that worktree. This keeps concurrent agent sessions from colliding on the working tree (weave's whole reason to exist is multi-session work) and keeps each session's diff reviewable in isolation. Remove the worktree when the branch is merged (`git worktree remove`).
 
 **Branch model (`develop` mirrors `master`):**
-- **`master`** is the protected trunk and the **PR target**. It requires the four CI checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)` — to be green and the branch to be up to date before merge (admins may bypass in emergencies). Do not push to `master` directly.
+- **`master`** is the protected trunk and the **PR target**. It requires the six CI checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)`, `sign`, `libsql + sign` — to be green and the branch to be up to date before merge (admins may bypass in emergencies). Do not push to `master` directly.
 - **`develop`** is a long-lived branch kept **fast-forwarded to `master`**. It exists solely as the always-current base sessions branch their worktrees from, so a stale local checkout can never seed a session with outdated code. Always create worktrees from `origin/develop` after a `git fetch` (as above).
-- **Flow:** worktree off `origin/develop` → work → open a PR **into `master`** → merge once the four checks pass → fast-forward `develop` to the new `master` (`git push origin master:develop`). Keep `develop` at or behind `master`, never ahead.
+- **Flow:** worktree off `origin/develop` → work → open a PR **into `master`** → merge once the six checks pass → fast-forward `develop` to the new `master` (`git push origin master:develop`). Keep `develop` at or behind `master`, never ahead.
 
 ## CRITICAL: keep weave Rust-native — guard against language drift
 
-weave's core invariant is **one dependency-light Rust binary**. This repo is also wired to external agent tooling (`ecc-tools`, the `.codex/`, `.agents/`, `.claude/` bundles, and the `handoff/` framework) that **auto-generates and auto-pushes config/package artifacts** — `.codex/*.toml`, `.agents/**/*.yaml`, `.claude/*.json`, `handoff/**` (YAML/JSON), and potentially new files in other languages or formats (e.g. an `.omc` artifact or an ecc-pushed package).
+weave's core invariant is **one dependency-light Rust binary** — assembled from the sanctioned internal workspace (`weave-core`/`weave-inject`/`weave-mcp`/`weave`), still *one* static binary with no extra runtime deps. This repo is also wired to external agent tooling (`ecc-tools`, the `.codex/`, `.agents/`, `.claude/` bundles, and the `handoff/` framework) that **auto-generates and auto-pushes config/package artifacts** — `.codex/*.toml`, `.agents/**/*.yaml`, `.claude/*.json`, `handoff/**` (YAML/JSON), and potentially new files in other languages or formats (e.g. an `.omc` artifact or an ecc-pushed package).
 
 On **every session start, verify there has been no drift away from Rust-native**, and treat any drift as a critical concern to fix:
 
@@ -48,7 +51,7 @@ On **every session start, verify there has been no drift away from Rust-native**
    - add a non-Rust package/dependency to the shippable binary, or
    - become a source of truth that Rust code is expected to mirror by hand.
 2. **If drift is found, verify it first** (don't assume — confirm the file actually feeds the build/runtime, e.g. referenced by `Cargo.toml`, `build.rs`, CI, or `src/`). A generated sidecar that nothing builds against is not drift.
-3. **If it is real drift, transform it to Rust-native** — port the logic into the appropriate `src/` module behind the existing abstractions (`Store`, `Mux`/`Target`, the MCP tool table) — **and sync it properly with the codebase**: update `Cargo.toml`, both backend builds, tests, and the docs (`ARCHITECTURE.md` / `CONTRIBUTING.md` / `docs/TESTING.md`) in the same change. No silent forks of behavior between a generated artifact and the Rust implementation.
+3. **If it is real drift, transform it to Rust-native** — port the logic into the appropriate crate/module behind the existing abstractions (`weave-core` for `Store`/`model`, `weave-inject` for `Mux`/`Target`, `weave-mcp` for the MCP tool table) — **and sync it properly with the codebase**: update `Cargo.toml`, both backend builds, tests, and the docs (`ARCHITECTURE.md` / `CONTRIBUTING.md` / `docs/TESTING.md`) in the same change. No silent forks of behavior between a generated artifact and the Rust implementation.
 4. **No new heavyweight dependencies in the default build.** Date/time is handled without a date crate on purpose. Anything pulling `tokio` or a large tree belongs behind a feature flag (as `libsql` is). Adding a dep is a deliberate, justified decision — note why it's unavoidable.
 
 ## Build / test / lint / format — the full gate
@@ -66,7 +69,7 @@ cargo fmt --all --check                  # CI form; use `cargo fmt --all` to app
 
 ### Dual backend — both must stay green
 
-The two storage backends are **mutually exclusive** (each statically links its own SQLite C core; a `compile_error!` in `main.rs` guards against enabling both). If you touch anything in the `Store` trait or its implementations, build/lint/**test** the libSQL backend too — CI gates it as a blocking job:
+The two storage backends are **mutually exclusive** (each statically links its own SQLite C core; a `compile_error!` in `weave/src/main.rs` guards against enabling both). Backend/feature flags (`sqlite` default, `libsql`, `sign`, `llm`) are defined in `weave-core` and re-exported by the `weave` bin crate, so the commands below run from the workspace root. If you touch anything in the `Store` trait or its implementations, build/lint/**test** the libSQL backend too — CI gates it as a blocking job:
 
 ```bash
 cargo clippy --no-default-features --features libsql -- -D warnings
@@ -74,21 +77,26 @@ cargo build  --no-default-features --features libsql
 cargo test   --no-default-features --features libsql      # full black-box suite, libSQL backend
 ```
 
-`cargo bench` runs the criterion harness (`benches/weave_bench.rs`).
+The `sign` feature (ed25519 message signing) is **also** CI-gated — alone (`cargo clippy/test --features sign`) and combined with libSQL (`cargo … --no-default-features --features "libsql sign"`). `cargo bench` runs the criterion harness (`weave/benches/weave_bench.rs`).
 
 ## Architecture in one screen
 
-Single binary; strictly layered modules (top depends only on layers below — never add upward deps):
+A small Cargo **workspace** that links to one binary; strictly layered **crates** — each depends only on the crates below it, so "never add an upward dep" is **compiler-enforced**, not just convention:
 
 ```
-main.rs   clap CLI + glue; resolve_me() = explicit flag > $WEAVE_SESSION > basename(cwd)
-  └ mcp.rs        MCP stdio JSON-RPC 2.0 server (weave_* tools); does the live nudge-inject on send
-  └ setup.rs      `weave setup` / `weave uninstall`: MCP register + idempotent settings.json hook merge
-      └ store.rs        Store trait + bundled SqliteStore (default) + schema
-      └ store_libsql.rs feature-gated libSQL/Turso backend (cfg(feature="libsql"))
-      └ inject.rs       native multi-mux injector: pure command tables (commands_for) + runner
-          └ config.rs   config.toml + env overlay (WEAVE_*)
-          └ model.rs    core types, no I/O (Message, Peer, now(), fmt_ts, BROADCAST)
+weave (bin)        main.rs    clap CLI + glue; resolve_me() = explicit flag > $WEAVE_SESSION > basename(cwd)
+                   setup.rs   `weave setup`/`uninstall`: MCP register + idempotent settings.json hook merge
+                   harness.rs `weave harness ide-merge-ide`: dry-run/execute the Codex 7-layer loop
+                   git.rs     worktree / cwd-derived session git tagging
+  └ weave-mcp      mcp.rs     MCP stdio JSON-RPC 2.0 server (weave_* tools); live nudge-inject on send
+                   http.rs    optional HTTP surface
+      └ weave-inject  inject.rs  native multi-mux injector: pure command tables (commands_for) + runner
+          └ weave-core  model.rs         core types, no I/O (Message, Peer, now(), fmt_ts, BROADCAST)
+                        store.rs          Store trait + bundled SqliteStore (default) + schema
+                        store_libsql.rs   feature-gated libSQL/Turso backend (cfg(feature="libsql"))
+                        memory.rs         agent memory store
+                        config.rs         config.toml + env overlay (WEAVE_*)
+                        sign.rs / llm.rs  features `sign` (ed25519) / `llm` (thread summarization)
 ```
 
 Key mental models:
@@ -110,12 +118,14 @@ Key mental models:
 
 | Want to change… | Edit |
 |---|---|
-| Message/Peer shape, timestamp/broadcast helpers | `src/model.rs` |
-| Schema, queries, a `Store` method/backend | `src/store.rs` (and mirror in `src/store_libsql.rs`) |
-| A mux adapter or submission idiom | `src/inject.rs` (then update injector tables in README/ARCHITECTURE) |
-| An MCP tool or its JSON schema | `src/mcp.rs` |
-| A CLI subcommand or hook behavior | `src/main.rs` |
-| Config keys / env overlay | `src/config.rs` |
+| Message/Peer shape, timestamp/broadcast helpers | `weave-core/src/model.rs` |
+| Schema, queries, a `Store` method/backend | `weave-core/src/store.rs` (and mirror in `weave-core/src/store_libsql.rs`) |
+| Agent memory store | `weave-core/src/memory.rs` |
+| A mux adapter or submission idiom | `weave-inject/src/inject.rs` (then update injector tables in README/ARCHITECTURE) |
+| An MCP tool or its JSON schema | `weave-mcp/src/mcp.rs` |
+| A CLI subcommand or hook behavior | `weave/src/main.rs` |
+| The `weave harness` orchestration surface | `weave/src/harness.rs` |
+| Config keys / env overlay | `weave-core/src/config.rs` |
 
 Changing a `Store` method signature means updating **every** backend so both the default and `--features libsql` builds compile.
 
