@@ -4041,4 +4041,45 @@ done
             "child stderr secret leaked into weave stderr: {err}"
         );
     }
+
+    /// MCP stdout discipline: `weave_web` driven over the real `weave mcp` stdio
+    /// server returns ONLY a clean JSON-RPC result frame — the obscura child's
+    /// stdout/stderr noise must never bleed into weave's own protocol stream. The
+    /// `McpServer` harness panics on any non-JSON stdout line, so a single parseable
+    /// frame with the canned text (and no child secret) is the discipline proof.
+    #[test]
+    fn web_over_mcp_stdout_is_pure_jsonrpc() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let mut mcp = McpServer::spawn_env(
+            &db,
+            &[
+                ("WEAVE_MUX_DIR", dir_s.as_str()),
+                ("WEAVE_OBSCURA_BIN", "obscura"),
+                ("WEAVE_OBSCURA_ALLOW_OPS", "navigate"),
+                ("WEAVE_SESSION", "tester"),
+            ],
+        );
+        let (is_err, text) = mcp.call_tool(
+            "weave_web",
+            serde_json::json!({
+                "me": "tester",
+                "action": "navigate",
+                "args": {"url": "https://example.com"}
+            }),
+        );
+        // The fake stub leaks OBSCURA-STDERR-SECRET-TOKEN on its stderr; weave must
+        // surface only the canned content text, in a single clean result frame.
+        assert!(!is_err, "navigate via MCP should succeed: {text}");
+        assert_eq!(
+            text, "ok",
+            "expected the canned obscura payload, got: {text:?}"
+        );
+        assert!(
+            !text.contains("OBSCURA-STDERR-SECRET-TOKEN"),
+            "child stderr secret leaked into the MCP result frame: {text}"
+        );
+        mcp.shutdown();
+    }
 }

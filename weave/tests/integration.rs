@@ -10324,4 +10324,107 @@ done
             "expected the op list, got: {stdout}"
         );
     }
+
+    /// A fake `obscura` that TOUCHES a marker file the instant it is exec'd, so a
+    /// test can prove whether the binary was ever spawned. Returns (trusted_dir,
+    /// marker_path). The marker exists iff weave actually launched obscura.
+    fn make_marking_obscura() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = common::unique_db().with_extension("obscurabin-mark");
+        std::fs::create_dir_all(&dir).expect("create fake-obscura dir");
+        let marker = dir.join("SPAWNED");
+        let script = dir.join("obscura");
+        let body = format!(
+            r#"#!/bin/sh
+: > "{marker}"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"serverInfo":{{"name":"obscura-mcp"}}}}}}\n' "$id" ;;
+    *'notifications/initialized'*) : ;;
+    *'"tools/call"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"MARKED-OK"}}]}}}}\n' "$id" ;;
+    *)
+      printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"x"}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            marker = marker.display()
+        );
+        std::fs::write(&script, body).expect("write marking obscura");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat marking obscura")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x marking obscura");
+        (dir, marker)
+    }
+
+    /// Deny-by-default must refuse BEFORE obscura is even spawned: the marker file
+    /// the fake binary touches on exec must NOT exist after a denied op.
+    #[test]
+    fn web_deny_by_default_never_spawns_obscura() {
+        let db = TestDb::new();
+        let (dir, marker) = make_marking_obscura();
+        // No allow-ops ⇒ deny-by-default.
+        let out = web_cmd(
+            &db,
+            &dir,
+            &["web", "navigate", "--url", "https://example.com"],
+        )
+        .env("WEAVE_SESSION", "tester")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run weave web navigate");
+        assert!(!out.status.success(), "deny-by-default must fail");
+        assert!(
+            !marker.exists(),
+            "obscura was spawned despite a denied op (SPAWNED marker exists)"
+        );
+    }
+
+    /// The allowed path DOES spawn obscura (the marker appears) — the negative
+    /// control proving the marker mechanism actually detects a spawn.
+    #[test]
+    fn web_allowed_op_does_spawn_obscura() {
+        let db = TestDb::new();
+        let (dir, marker) = make_marking_obscura();
+        let out = web_cmd(
+            &db,
+            &dir,
+            &["web", "navigate", "--url", "https://example.com"],
+        )
+        .env("WEAVE_OBSCURA_ALLOW_OPS", "navigate")
+        .env("WEAVE_SESSION", "tester")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run weave web navigate");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "allowed nav should succeed: {stdout}");
+        assert!(stdout.contains("MARKED-OK"), "got: {stdout}");
+        assert!(marker.exists(), "an allowed op must have spawned obscura");
+    }
+
+    /// `weave web --stop` shuts the (cached) child down cleanly and exits 0, even
+    /// when no child was ever spawned (best-effort reap, never a panic).
+    #[test]
+    fn web_stop_succeeds() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let out = web_cmd(&db, &dir, &["web", "--stop"])
+            .env("WEAVE_SESSION", "tester")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run weave web --stop");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "--stop must exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("obscura stopped"),
+            "expected stop confirmation, got: {stdout}"
+        );
+    }
 }

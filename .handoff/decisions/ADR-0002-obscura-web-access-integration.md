@@ -75,10 +75,15 @@ this integration implements:
    (cheatsheetseries.owasp.org) and the OWASP Web Security Testing Guide recommend blocking requests
    to loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16` incl. the `169.254.169.254` cloud
    metadata endpoint), and RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) **by default**,
-   allowing only an explicit allow-list of public hosts. weave's `webpolicy::web_url_ok` does exactly
-   this for every URL-bearing op (default-deny internal/localhost/link-local/private/`*.local`/bare-IP
-   unless `obscura_policy.allow_internal=true`), so a meshed obscura cannot be used to reach internal
-   services or the cloud-metadata endpoint.
+   allowing only an explicit allow-list of public hosts. weave's `webpolicy::check_url` →
+   `host_is_internal` does exactly this for every URL-bearing op (default-deny
+   internal/localhost/link-local/private/`*.local`/bare-IP unless `obscura_policy.allow_internal=true`).
+   The validator additionally normalizes the **encoded-loopback forms** a browser canonicalizes to the
+   same internal address — decimal (`2130706433`), hex (`0x7f000001`), octal (`017700000001`),
+   trailing-dot FQDN (`localhost.`), and IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — so those are blocked
+   too; any non-DNS-name numeric/hex/octal authority fails closed into the bare-IP deny branch. A meshed
+   obscura therefore cannot be used to reach internal services or the cloud-metadata endpoint via a
+   static URL.
 3. *Process isolation + least privilege of the downstream server.* General defense-in-depth guidance
    (PortSwigger Web Security Academy SSRF material; GHSA advisories on headless-browser SSRF in
    automation tools) recommends running the browser as a separate, isolated process rather than
@@ -88,10 +93,11 @@ this integration implements:
 
 **Finding:** the deny-by-default policy + SSRF/loopback validator + isolated argv-only child process
 are the standard, sufficient mitigations for this composition. *Residual:* SSRF allow-listing is only
-as good as the configured allow-list, and DNS-rebinding to an internal IP after the policy check is a
-known residual for any URL-string validator (the check sees the hostname, the browser resolves it);
-operators reaching truly sensitive internal services should additionally network-isolate the obscura
-host. This is documented, not silently accepted.
+as good as the configured allow-list, and — now that the encoded-loopback forms above are blocked —
+the one remaining residual is **DNS-rebinding**: a normal-looking public hostname that resolves to an
+internal IP at fetch time, which any URL-string validator cannot catch (weave validates the URL host,
+the browser resolves it). Operators reaching truly sensitive internal services should additionally
+network-isolate the obscura host. This is documented, not silently accepted.
 
 *Sources consulted:* MCP specification & Anthropic MCP security guidance (modelcontextprotocol.io);
 OWASP SSRF Prevention Cheat Sheet & Web Security Testing Guide (owasp.org); PortSwigger Web Security

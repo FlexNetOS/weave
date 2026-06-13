@@ -4833,6 +4833,43 @@ mod tests {
         assert!(has, "weave_web must be in tools() under --features obscura");
         // …and is gated as dangerous (blocked in safe HTTP mode).
         assert!(is_dangerous_tool("weave_web"));
+        // The standing table grew by exactly ONE entry — the whole point of the
+        // single dispatcher is that the 35 browser_* ops are NOT 35 standing tools.
+        let web_entries = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n == "weave_web")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(web_entries, 1, "obscura must add ONE tool, not 35");
+        // No per-op browser_* tool leaked into the standing table.
+        let leaked_browser = listed.as_array().unwrap().iter().any(|t| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.starts_with("browser_"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !leaked_browser,
+            "no per-op browser_* tool may appear in the standing table"
+        );
+        // The schema's properties match what tool_web actually reads.
+        let schema = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("weave_web"))
+            .unwrap();
+        let props = schema["inputSchema"]["properties"].as_object().unwrap();
+        for k in ["me", "action", "args", "describe", "lease_ttl", "audit"] {
+            assert!(props.contains_key(k), "weave_web schema must expose {k:?}");
+        }
+        assert_eq!(schema["inputSchema"]["required"][0], "action");
     }
 
     #[cfg(feature = "obscura")]
@@ -4917,6 +4954,70 @@ mod tests {
         )
         .expect_err("SSRF target must be refused");
         assert!(err.contains("SSRF guard"), "got: {err}");
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_unknown_action_is_error_no_spawn() {
+        // An unknown op is refused by the deny-by-default parse gate (even with a
+        // wildcard allow-list) BEFORE any obscura spawn — a clean error, never a
+        // panic or a spawn of a binary that does not resolve.
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let empty_cfg =
+            std::env::temp_dir().join(format!("weave-noconf-unk-{}", std::process::id()));
+        let _xdg =
+            weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
+        let _ops = weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_ALLOW_OPS", "*");
+        let _bin =
+            weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_BIN", "definitely-not-a-binary");
+        let st = store();
+        let inj = no_injector();
+        let err = call(
+            "weave_web",
+            json!({"me": "tester", "action": "browser_exec_shell"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("unknown op must be refused");
+        assert!(
+            err.contains("unknown web op"),
+            "expected unknown-op refusal, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_obscura_missing_is_graceful_error() {
+        // Op IS allowed (and URL is SSRF-safe) so the gate passes — but the obscura
+        // binary does not resolve to a trusted dir. weave must surface a clean error
+        // (binary not found), never a panic. This is the "allowed but obscura-missing"
+        // path distinct from deny-by-default.
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let empty_cfg =
+            std::env::temp_dir().join(format!("weave-noconf-miss-{}", std::process::id()));
+        let _xdg =
+            weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
+        let _ops = weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_ALLOW_OPS", "navigate");
+        // A bin name that cannot resolve in any trusted dir.
+        let _bin = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_OBSCURA_BIN",
+            "weave-no-such-obscura-binary-xyz",
+        );
+        // Ensure no stale trusted-dir override leaks the bin in.
+        let _mux = weave_core::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", "/nonexistent-weave-dir");
+        let st = store();
+        let inj = no_injector();
+        let err = call(
+            "weave_web",
+            json!({"me": "tester", "action": "navigate", "args": {"url": "https://example.com"}}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("a missing obscura binary must be a clean error");
+        assert!(
+            err.contains("not found in a trusted directory") || err.contains("obscura"),
+            "expected a clean obscura-missing error, got: {err}"
+        );
     }
 
     /// A no-op injector for the web-tool tests (the governance path never injects).
