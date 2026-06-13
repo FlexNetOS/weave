@@ -299,6 +299,10 @@ const DANGEROUS_TOOLS: &[&str] = &[
     "weave_set_peer_policy",
     "weave_spawn_peer",
     "weave_kill_peer",
+    // WL-049 / ADR-0002: stealth web access is powerful + abuse-prone → dangerous,
+    // so it is blocked in safe HTTP mode (only available over the trusted stdio
+    // transport or with --dangerous). It is additionally deny-by-default by policy.
+    "weave_web",
 ];
 
 /// True if `name` is a dangerous tool that should be filtered in safe mode.
@@ -483,6 +487,7 @@ fn call_tool(
         "weave_lease_sweep" => tool_lease_sweep(store),
         "weave_thread_summarize" => tool_thread_summarize(store, args),
         "weave_summarize_text" => tool_summarize_text(args),
+        "weave_web" => tool_web(store, me_default, args, injector),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -3106,7 +3111,8 @@ fn reply_err(id: &Value, code: i64, message: &str) -> String {
 }
 
 fn tools() -> Value {
-    json!([
+    #[allow(unused_mut)]
+    let mut list = json!([
         {
             "name": "weave_send",
             "description": "Send a message to another agent session. 'to' = a session name, or 'all'/'*' to broadcast. If the recipient is a registered injectable peer (tmux/zellij), a live nudge is pushed into its pane immediately; otherwise it arrives on the recipient's next turn. Cross-store (Tier-2): pass 'to_store' = a path to another store to queue the message as an intent in YOUR OWN outbox; the recipient pulls and commits it on its next drain (no foreign write, no broadcast).",
@@ -3702,7 +3708,26 @@ fn tools() -> Value {
                 "text":{"type":"string","description":"The text to summarize."}
             },"required":["text"]}
         }
-    ])
+    ]);
+    // WL-049 / ADR-0002: ONE token-light governed web-access dispatcher (proxies all
+    // 35 obscura browser_* ops; per-op schemas fetched on demand via describe). Only
+    // present in an `--features obscura` build, so the default tool table is unchanged.
+    #[cfg(feature = "obscura")]
+    if let Some(arr) = list.as_array_mut() {
+        arr.push(json!({
+            "name": "weave_web",
+            "description": "Governed stealth web access via obscura (deny-by-default). ONE dispatcher proxying all browser_* ops behind weave's permission/lease/job gate. 'action' = the op (e.g. 'navigate','snapshot','click','extract'); 'args' = that op's arguments (e.g. {\"url\":\"https://…\"}). action='list' enumerates the ops; describe=true returns an op's forwarding note without running it. URL-bearing ops are SSRF-guarded (internal/localhost/private hosts denied by default). Optional 'lease_ttl' rate-limits per host; 'audit'=true records a durable job.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "action":{"type":"string","description":"The browser op to run (e.g. 'navigate'); or 'list' to enumerate ops."},
+                "args":{"type":"object","description":"Arguments for the op, forwarded opaquely to obscura (e.g. {\"url\":\"https://example.com\"})."},
+                "describe":{"type":"boolean","description":"Return the op's forwarding note instead of running it (progressive disclosure)."},
+                "lease_ttl":{"type":"integer","description":"Optional: reserve a per-host lease for this many seconds (rate / mutual-exclusion)."},
+                "audit":{"type":"boolean","description":"Optional: record a durable job row auditing this web op."}
+            },"required":["action"]}
+        }));
+    }
+    list
 }
 
 fn tool_daemon_start(me_default: &Option<String>, args: &Value) -> Result<String, String> {
@@ -4412,6 +4437,219 @@ fn tool_summarize_text(_args: &Value) -> Result<String, String> {
     Err("weave was compiled without the llm feature".to_string())
 }
 
+/// WL-049 / ADR-0002: the single token-light `weave_web` dispatcher. ONE tool
+/// proxies all 35 `browser_*` obscura ops behind weave's governance plane
+/// (deny-by-default permission / lease / job gating). See ADR-0002.
+///
+/// Governance flow (§4 of the plan):
+///   (a) resolve the caller identity;
+///   (b) **policy gate (deny-by-default)** — parse `action` → `WebOp`, run the
+///       `webpolicy::WebPolicy` decision (op allow-list + SSRF/loopback URL guard).
+///       A refused op returns `Err` WITHOUT spawning obscura;
+///   (c) optional **lease** (rate / mutual-exclusion) keyed on `web:<host>`;
+///   (d) optional **job** record for a durable audit trail (created before forward,
+///       terminally stamped after — the append-only event log is the audit);
+///   (e) **forward** to obscura via the spawn-and-speak MCP client;
+///   (f) return the obscura `content[0].text` (capped).
+///
+/// `describe:true` returns weave's thin description of the op (args forwarded
+/// opaquely; the authoritative schema lives in obscura) WITHOUT spawning obscura or
+/// touching the gate — progressive disclosure keeps the 35 schemas out of the
+/// standing tool table (ADR-0003).
+#[cfg(feature = "obscura")]
+fn tool_web(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    use weave_core::webpolicy::{self, WebPolicy};
+
+    // (a) Identity.
+    let me = ident(args, "me", def)?;
+
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'action' is required (a browser op, e.g. \"navigate\").")?;
+
+    // `action:"list"` / `describe` are pure metadata — no spawn, no gate.
+    if action == "list" {
+        let ops = webpolicy::WEB_OPS.join(", ");
+        return Ok(format!(
+            "{} web ops available: {ops}",
+            webpolicy::WEB_OPS.len()
+        ));
+    }
+    let op_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+    if args
+        .get("describe")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let op =
+            webpolicy::WebOp::parse(action).ok_or_else(|| format!("unknown web op {action:?}"))?;
+        return Ok(format!(
+            "web op {:?} → obscura tool {:?}. Args are forwarded opaquely as a JSON object; \
+             the authoritative per-op arg schema lives in obscura (run `obscura mcp` tools/list). \
+             Common nav arg: {{\"url\": \"https://…\"}}.",
+            op.name(),
+            op.obscura_tool()
+        ));
+    }
+
+    // (b) Policy gate (deny-by-default).
+    let cfg = weave_core::config::Config::load();
+    let policy = WebPolicy::from_config(&cfg);
+    let url = op_args.get("url").and_then(|v| v.as_str());
+    let op = policy.decide(action, url).map_err(|d| d.message())?;
+
+    // Defense-in-depth: cap every string arg value (they ride a JSON-RPC frame to
+    // the child). Non-string args are forwarded unchanged.
+    if let Some(obj) = op_args.as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                webpolicy::check_arg(k, s).map_err(|d| d.message())?;
+            }
+        }
+    }
+
+    // (c) Optional lease: when a `lease_ttl` is supplied, reserve a per-host lease so
+    // concurrent sessions can mutually-exclude / rate-limit on a target. Released
+    // after the op regardless of outcome. Keyed on the validated host (or the op).
+    let lease_ttl = args.get("lease_ttl").and_then(|v| v.as_i64());
+    let lease_resource = url
+        .and_then(webpolicy::url_host)
+        .map(|h| format!("web:{h}"))
+        .unwrap_or_else(|| format!("web:{}", op.name()));
+    if let Some(ttl) = lease_ttl {
+        store
+            .reserve_lease(&me, &lease_resource, ttl, Some("weave_web"))
+            .map_err(|e| format!("web resource lease failed: {e}"))?;
+    }
+
+    // (d) Optional job audit: when `audit:true`, record a durable job row before the
+    // forward and stamp it terminally after (the append-only event log is the trail).
+    let audit = args.get("audit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let job_id = if audit {
+        let spec = model::JobSpec {
+            title: format!("web {} {}", op.name(), url.unwrap_or("")),
+            description: None,
+            kind: Some("web".to_string()),
+            owner: Some(me.clone()),
+            assignee: None,
+            circle: None,
+            prompt: None,
+            correlation_id: None,
+            source_kind: Some("weave_web".to_string()),
+            source_id: url.map(str::to_string),
+            scope: None,
+            visibility: None,
+            deadline_at: None,
+            expires_at: None,
+        };
+        match store.create_job(&me, spec) {
+            Ok(job) => Some(job.id),
+            Err(e) => {
+                log(&format!("web audit job creation failed (continuing): {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // (e) Forward to obscura (spawn-and-speak; lazy spawn + reuse).
+    let outcome = crate::obscura::call(&cfg, &op.obscura_tool(), &op_args);
+
+    // (c′) release the lease (best-effort).
+    if lease_ttl.is_some() {
+        let _ = store.release_lease(&me, &lease_resource);
+    }
+
+    // (d′) stamp the audit job terminally.
+    if let Some(jid) = job_id {
+        let (state, note) = match &outcome {
+            Ok(_) => (model::JobState::Completed, "web op ok".to_string()),
+            Err(e) => (model::JobState::Failed, format!("web op failed: {e}")),
+        };
+        let patch = model::JobPatch {
+            state: Some(state),
+            state_reason: None,
+            phase: None,
+            progress_note: Some(note),
+            result_summary: None,
+            result_json: None,
+            error_json: None,
+            artifacts_json: None,
+        };
+        let _ = store.update_job(&jid, None, patch);
+    }
+
+    let _ = injector; // governance path does not inject; signature parity with peers.
+
+    // (f) return the obscura payload, capped to a weave body-class limit.
+    let text = outcome?;
+    let capped: String = text.chars().take(store::MAX_BODY).collect();
+    Ok(capped)
+}
+
+#[cfg(not(feature = "obscura"))]
+fn tool_web(
+    _store: &dyn Store,
+    _def: &Option<String>,
+    _args: &Value,
+    _injector: &dyn Injector,
+) -> Result<String, String> {
+    Err("weave was compiled without the obscura feature (governed web access).".to_string())
+}
+
+/// WL-049: CLI entrypoint for `weave web` — routes through the SAME `tool_web`
+/// governance path as the MCP tool (deny-by-default policy / lease / job gate). The
+/// bin builds the `args` Value (action/args/lease_ttl/audit) and weave-mcp runs it,
+/// so the CLI and MCP surfaces share ONE code path (ADR-0003 CLI parity). The
+/// governance path ignores the injector, so a no-op stand-in is supplied here rather
+/// than threading the bin's `RealInjector` through.
+#[cfg(feature = "obscura")]
+pub fn run_web(store: &dyn Store, me: &Option<String>, args: &Value) -> Result<String, String> {
+    struct NoInjector;
+    impl Injector for NoInjector {
+        fn detect_target(&self) -> Target {
+            Target::default()
+        }
+        fn target_alive(&self, _t: &Target) -> bool {
+            false
+        }
+        fn inject_mode(&self, _t: &Target, _b: &str, _m: Nudge) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn capability(&self, _t: &Target) -> Capability {
+            Capability::NotInjectable
+        }
+        fn have(&self, _name: &str) -> bool {
+            false
+        }
+        fn id_valid(&self, _mux: weave_inject::Mux, _id: &str) -> bool {
+            false
+        }
+        fn git_tags(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> anyhow::Result<weave_core::model::WorktreeTags> {
+            Ok(weave_core::model::WorktreeTags::default())
+        }
+    }
+    tool_web(store, me, args, &NoInjector)
+}
+
+/// WL-049: stop and reap the cached obscura child (`weave web --stop`).
+#[cfg(feature = "obscura")]
+pub fn stop_web() {
+    crate::obscura::stop();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4579,6 +4817,140 @@ mod tests {
     /// `WEAVE_SPAWN_DIRS` is process-global; serialize the env-touching spawn tests so
     /// parallel cases can't clobber each other's allowlist.
     static SPAWN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // ---- WL-049 / ADR-0002 governed web access (weave_web) -------------------
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_is_registered_and_dangerous() {
+        // The single token-light dispatcher is present in the standing tool table…
+        let listed = tools();
+        let has = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("weave_web"));
+        assert!(has, "weave_web must be in tools() under --features obscura");
+        // …and is gated as dangerous (blocked in safe HTTP mode).
+        assert!(is_dangerous_tool("weave_web"));
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_list_action_needs_no_obscura() {
+        // `action:"list"` is pure metadata: it must succeed without any obscura
+        // binary present and enumerate the 35 ops.
+        let st = store();
+        let inj = no_injector();
+        let out = call(
+            "weave_web",
+            json!({"me": "tester", "action": "list"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("list action should succeed");
+        assert!(out.contains("35 web ops"), "got: {out}");
+        assert!(out.contains("navigate"), "got: {out}");
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_describe_needs_no_obscura() {
+        let st = store();
+        let inj = no_injector();
+        let out = call(
+            "weave_web",
+            json!({"me": "tester", "action": "navigate", "describe": true}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("describe should succeed");
+        assert!(out.contains("browser_navigate"), "got: {out}");
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_deny_by_default_does_not_spawn() {
+        // With no allow-ops policy configured, a real web op is refused BEFORE any
+        // obscura spawn. Point config discovery at an empty dir (no config.toml) so
+        // the policy is genuinely unset, and the obscura bin at a name that does not
+        // resolve — proving the deny happens first (a spawn would error differently).
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let empty_cfg = std::env::temp_dir().join(format!("weave-noconf-{}", std::process::id()));
+        let _xdg =
+            weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
+        let _bin =
+            weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_BIN", "definitely-not-a-binary");
+        let st = store();
+        let inj = no_injector();
+        let err = call(
+            "weave_web",
+            json!({"me": "tester", "action": "navigate", "args": {"url": "https://example.com"}}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("deny-by-default must refuse");
+        assert!(
+            err.contains("not allowed by policy"),
+            "expected a policy refusal (not a spawn error), got: {err}"
+        );
+    }
+
+    #[cfg(feature = "obscura")]
+    #[test]
+    fn weave_web_ssrf_blocked_before_spawn() {
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let empty_cfg =
+            std::env::temp_dir().join(format!("weave-noconf-ssrf-{}", std::process::id()));
+        let _xdg =
+            weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
+        let _ops = weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_ALLOW_OPS", "navigate");
+        let _bin =
+            weave_core::testenv::EnvVarGuard::set("WEAVE_OBSCURA_BIN", "definitely-not-a-binary");
+        let st = store();
+        let inj = no_injector();
+        let err = call(
+            "weave_web",
+            json!({"me": "tester", "action": "navigate", "args": {"url": "http://127.0.0.1"}}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("SSRF target must be refused");
+        assert!(err.contains("SSRF guard"), "got: {err}");
+    }
+
+    /// A no-op injector for the web-tool tests (the governance path never injects).
+    #[cfg(feature = "obscura")]
+    fn no_injector() -> impl Injector {
+        struct N;
+        impl Injector for N {
+            fn detect_target(&self) -> Target {
+                Target::none()
+            }
+            fn target_alive(&self, _t: &Target) -> bool {
+                false
+            }
+            fn inject_mode(&self, _t: &Target, _b: &str, _m: Nudge) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn capability(&self, _t: &Target) -> Capability {
+                Capability::NotInjectable
+            }
+            fn have(&self, _n: &str) -> bool {
+                false
+            }
+            fn id_valid(&self, _mux: weave_inject::Mux, _id: &str) -> bool {
+                false
+            }
+            fn git_tags(
+                &self,
+                _cwd: &std::path::Path,
+            ) -> anyhow::Result<weave_core::model::WorktreeTags> {
+                Ok(weave_core::model::WorktreeTags::default())
+            }
+        }
+        N
+    }
 
     /// Happy path: `weave_spawn_peer` records the spawn with the exact child argv, the
     /// resolved cwd, the minted cert, and — since the fake echoes a target id — the

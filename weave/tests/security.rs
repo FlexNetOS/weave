@@ -3873,3 +3873,172 @@ mod surfaces_security {
 // in the `weave-core` config Debug-redaction unit test and the `weave` bin's
 // telegram/slack error-path unit tests — see `secret_redacted_in_debug` and
 // `error_log_never_contains_token`.
+
+// ---------------------------------------------------------------------------
+// WL-049 / ADR-0002: governed web access hardening.
+//
+// All tests drive the real binary; none require (or contact) a real browser. The
+// obscura child is either a fake stub or never spawned (policy refuses first).
+// ---------------------------------------------------------------------------
+#[cfg(feature = "obscura")]
+mod obscura_security {
+    use super::*;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    fn make_fake_obscura() -> std::path::PathBuf {
+        let dir = common::unique_db().with_extension("obscurabin-sec");
+        std::fs::create_dir_all(&dir).expect("create fake-obscura dir");
+        let script = dir.join("obscura");
+        // Echoes the request id back; for tools/call it leaks a SECRET-looking
+        // marker on stderr — the test asserts weave never surfaces the child stderr
+        // (child output redaction; WL-048 lesson).
+        let body = r#"#!/bin/sh
+echo "OBSCURA-STDERR-SECRET-TOKEN abcdef" 1>&2
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"obscura-mcp"}}}\n' "$id"
+      ;;
+    *'notifications/initialized'*) : ;;
+    *'"tools/call"'*)
+      echo "OBSCURA-STDERR-SECRET-TOKEN per-op" 1>&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id"
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"x"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script, body).expect("write fake obscura");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat fake obscura")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x fake obscura");
+        dir
+    }
+
+    fn web_cmd(db: &TestDb, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = common::weave_cmd(db, args);
+        cmd.env("WEAVE_MUX_DIR", dir);
+        cmd.env("WEAVE_OBSCURA_BIN", "obscura");
+        cmd
+    }
+
+    /// A run helper: returns (ok, stdout, stderr).
+    fn run_web(
+        db: &TestDb,
+        dir: &Path,
+        web_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> (bool, String, String) {
+        let mut args = vec!["web"];
+        args.extend_from_slice(web_args);
+        let mut cmd = web_cmd(db, dir, &args);
+        cmd.env("WEAVE_SESSION", "tester");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.stdin(Stdio::null()).output().expect("run weave web");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Deny-by-default holds under an adversarial action value.
+    #[test]
+    fn web_deny_by_default_under_adversarial_action() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        for action in [
+            "navigate",
+            "evaluate",
+            "../../etc/passwd",
+            "browser_navigate; rm -rf",
+        ] {
+            let (ok, _out, err) = run_web(&db, &dir, &[action], &[]);
+            assert!(!ok, "deny-by-default must refuse {action:?}");
+            assert!(
+                err.contains("not allowed by policy") || err.contains("unknown web op"),
+                "expected a policy/unknown refusal for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A shell-metacharacter / non-trusted obscura bin name is never interpreted as
+    /// a shell command — it simply fails to resolve to a trusted binary (no spawn).
+    #[test]
+    fn web_obscura_bin_is_not_shell_interpreted() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let mut cmd = common::weave_cmd(&db, &["web", "navigate", "--url", "https://example.com"]);
+        cmd.env("WEAVE_MUX_DIR", dir);
+        // A hostile "binary" that, if it ever reached a shell, would be a command.
+        cmd.env("WEAVE_OBSCURA_BIN", "obscura; touch /tmp/weave-pwned");
+        cmd.env("WEAVE_OBSCURA_ALLOW_OPS", "navigate");
+        cmd.env("WEAVE_SESSION", "tester");
+        let out = cmd.stdin(Stdio::null()).output().expect("run weave web");
+        assert!(
+            !out.status.success(),
+            "a non-trusted/metachar obscura bin must not run"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("not found in a trusted directory"),
+            "expected trusted-dir refusal, got: {err}"
+        );
+    }
+
+    /// SSRF/localhost is blocked before any spawn.
+    #[test]
+    fn web_ssrf_localhost_blocked() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        for url in [
+            "http://127.0.0.1",
+            "http://localhost:9000/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+        ] {
+            let (ok, _out, err) = run_web(
+                &db,
+                &dir,
+                &["navigate", "--url", url],
+                &[("WEAVE_OBSCURA_ALLOW_OPS", "navigate")],
+            );
+            assert!(!ok, "{url} must be refused");
+            assert!(
+                err.contains("SSRF guard"),
+                "expected SSRF refusal for {url}, got: {err}"
+            );
+        }
+    }
+
+    /// The obscura child's stderr (a leaked secret) must NEVER appear in weave's
+    /// own stdout or stderr.
+    #[test]
+    fn web_child_stderr_not_leaked() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let (ok, out, err) = run_web(
+            &db,
+            &dir,
+            &["navigate", "--url", "https://example.com"],
+            &[("WEAVE_OBSCURA_ALLOW_OPS", "navigate")],
+        );
+        assert!(ok, "navigate should succeed.\nstdout: {out}\nstderr: {err}");
+        assert!(
+            !out.contains("OBSCURA-STDERR-SECRET-TOKEN"),
+            "child stderr secret leaked into weave stdout: {out}"
+        );
+        assert!(
+            !err.contains("OBSCURA-STDERR-SECRET-TOKEN"),
+            "child stderr secret leaked into weave stderr: {err}"
+        );
+    }
+}

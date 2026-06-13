@@ -8,6 +8,9 @@ pub mod testenv;
 #[cfg(feature = "libsql")]
 pub mod store_libsql;
 
+#[cfg(feature = "obscura")]
+pub mod webpolicy;
+
 #[cfg(feature = "llm")]
 pub mod llm;
 

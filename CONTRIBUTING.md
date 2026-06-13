@@ -55,6 +55,25 @@ cargo build  --no-default-features --features "libsql surfaces"
 cargo tree | grep reqwest    # default tree: expect NO output (reqwest only under surfaces/llm)
 ```
 
+If you touch the optional `obscura` feature (governed web access, WL-049 /
+ADR-0002), build/lint/test it on **both** backends — and the default `cargo tree`
+must stay **byte-identical** (the obscura client is std + serde_json only, zero new
+deps; no V8/tokio/obscura crate):
+
+```bash
+cargo clippy --all-targets --features obscura -- -D warnings
+cargo test   --features obscura
+cargo build  --no-default-features --features "libsql obscura"
+cargo tree   --features obscura | grep -iE 'v8|tokio|obscura' \
+  | grep -v 'weave-'           # expect NO external v8/tokio/obscura crate (only weave-* paths)
+```
+
+The obscura test layers use a **fake `obscura` binary** — a chmod-755 stub written
+to a temp dir, trusted via `WEAVE_MUX_DIR` and pointed at by `WEAVE_OBSCURA_BIN`,
+that speaks the MCP stdio framing and echoes canned replies (mirror the
+`make_fake_tmux` / `weave_with_fake_path` pattern in `tests/integration.rs`). **No
+real browser in CI** — a real-obscura smoke test, if any, is `#[ignore]`d.
+
 CI runs all of these as separate jobs (`rustfmt`, `clippy`, `test`, `build (libsql
 backend)`, `sign`, `libsql + sign`), so the optional crypto path and the libSQL
 test suite are gated on every PR — not just locally.

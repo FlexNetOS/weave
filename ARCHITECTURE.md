@@ -70,10 +70,14 @@ capabilities themselves remain in scope, to land **Rust-native**:
   Python/async runtime**, behind a `--features surfaces` flag — **shipped in
   WL-048** (ADR-0004; see "Human surfaces" below). WL-052 extends multi-surface
   parity further.
-- **Governed web reach** — register the separate `obscura-mcp` binary as a
-  weave-governed web-access capability (permission/lease/job-gated stealth
-  browsing); **NO V8 in weave's core** — **WL-049**, decided in **ADR-0002**
-  (`.handoff/decisions/ADR-0002-obscura-web-access-integration.md`).
+- **Governed web reach** — ✅ **shipped (WL-049, ADR-0002 accepted).** weave is
+  the governance plane for the separate `obscura` browser binary: behind a
+  default-OFF `--features obscura`, it spawns `obscura mcp` (argv-only, no shell)
+  and speaks JSON-RPC over its stdio as a hand-rolled MCP client; all 35
+  `browser_*` ops are reachable through ONE token-light `weave_web` dispatcher +
+  `weave web` CLI, **deny-by-default** + SSRF-guarded, gated by the existing
+  permission/lease/job primitives. **NO V8/tokio/obscura crate in weave's core**
+  (zero new default deps). See "Governance plane: stealth web access" below.
 - **token-light surface** — replace the 70 eager flat MCP tools with
   progressive-disclosure dispatchers / a meta-tool (≤ ~2k standing tokens, zero
   capability loss) and add a guarded standing-token budget — **WL-050..052**,
@@ -277,6 +281,39 @@ MCP tools** (ADR-0003 token-light), so the standing MCP surface is unchanged.
   configured `bridge_identity` (idents sanitized + `check_ident`-validated, bodies
   capped at `MAX_BODY` first); outbound, the loop relays the bridge inbox to the
   chat. Bot tokens are SECRETS (config/env, Debug-redacted, never logged).
+
+### Governance plane: stealth web access (`--features obscura`, WL-049 / ADR-0002)
+
+weave does **not** link a browser. Behind a default-OFF `--features obscura`, it
+governs the separate `obscura` binary via a **spawn-and-speak MCP-client** model:
+
+- **`weave-core/src/webpolicy.rs`** (core, no I/O): the pure deny-by-default
+  decision (`WebPolicy::decide` over the 35-op `WEB_OPS` allow-list) and the
+  **SSRF/loopback URL validator** (`web_url_ok` / `host_is_internal` — denies
+  loopback / `localhost` / link-local incl. `169.254.169.254` / RFC1918 / `*.local`
+  / bare-IP unless `obscura_allow_internal`), plus `MAX_WEB_ARG_LEN` caps. Pure ⇒
+  unit-tested exhaustively like `model.rs`.
+- **`weave-mcp/src/obscura.rs`** (mcp): a minimal hand-rolled **MCP client**. It
+  resolves `obscura` to a trusted absolute path (`weave_inject::resolve_trusted` —
+  never ambient `$PATH`), spawns `obscura mcp [--stealth] [--proxy P]
+  [--user-agent UA]` **argv-only**, and speaks newline-delimited JSON-RPC over the
+  child's stdio (`initialize` → `notifications/initialized` → `tools/call`),
+  matching replies by monotonic id and extracting `result.content[0].text` /
+  mapping `isError`. Built on `std::io` + `serde_json` — **no tokio, no async, no
+  new dependency**. One cached child per process (lazy spawn, reuse), bounded
+  per-op read deadline + line cap, and a `Drop`/`stop()` that kills+reaps the
+  child (no zombies). The child's stdout is a pipe weave READS (never re-emitted on
+  weave's own stdout); its stderr is `null`'d and never logged.
+- **`weave-mcp/src/mcp.rs`** — ONE token-light dispatcher `weave_web {action, args,
+  describe?}` (in `DANGEROUS_TOOLS`): resolve caller → `WebPolicy` gate → optional
+  lease (`reserve_lease`/`release_lease`) → optional audit job
+  (`create_job`/`update_job`) → forward to obscura → return. Per-op schemas are
+  fetched on demand (`describe`), so the standing tool table grows by ~1, not 35
+  (ADR-0003). Governance **reuses the existing permission/lease/job Store methods**
+  — no new Store method, no schema change, dual-backend unaffected.
+- **`weave/src/main.rs`** — `weave web <op> [--url …] [--arg k=v] [--list]
+  [--stop] [--lease-ttl N] [--audit]` routes through the SAME `tool_web` path (CLI
+  parity, zero standing tokens).
 
 ### `setup.rs` — Claude Code wiring
 
@@ -1136,6 +1173,27 @@ injected and stored text is handled**, not on network attackers.
   env vars. Inbound bot text is bounded (`MAX_BODY`) and the inbound sender is
   sanitized to a valid `check_ident` weave ident before any `Store::send`. The bots
   and dashboard **spawn nothing** (no-shell invariant intact); all logging is stderr.
+- **Governed web access is an egress + child-process surface (`obscura` feature,
+  WL-049).** Forwarding `browser_*` ops to a spawned obscura makes weave a potential
+  confused-deputy / SSRF vector, so the seam is hardened on four axes. **(1) SSRF /
+  loopback:** every URL-bearing op runs through `webpolicy::web_url_ok`, which
+  default-denies loopback / `localhost` / link-local (incl. the cloud-metadata
+  endpoint `169.254.169.254`) / RFC1918 private / `*.local` / bare-IP targets unless
+  `obscura_allow_internal=true`; a residual is DNS-rebinding to an internal IP after
+  the host check (operators reaching sensitive internal services should also
+  network-isolate the obscura host). **(2) Child-process trust:** `obscura` is
+  resolved to a **trusted absolute path** (never ambient `$PATH`) and spawned
+  **argv-only** (no shell, no built command string), each argv element bounded by
+  `spawn_arg_ok`; the child is reaped on `Drop`/`--stop` (no orphans). **(3) Child
+  output / secret redaction:** the child's stdout is a pipe weave reads but never
+  re-emits on its own (JSON-RPC) stdout, the child's stderr is `null`'d, and the
+  obscura proxy URL / auth token are SECRETS (Debug-redacted, passed via env/argv but
+  never logged). **(4) Deny-by-default + non-ambient:** no web op runs unless the
+  operator explicitly allow-lists it, and `weave_web` is a **dangerous** tool
+  (blocked in safe HTTP mode); access is gated/leased/audited like any other mesh
+  work. **Residual (documented, not a code gate):** stealth-scraping ToS/legal
+  exposure is the operator's responsibility — weave provides governance and audit,
+  not a legal shield (ADR-0002 "Residual risk").
 
 ---
 

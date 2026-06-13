@@ -830,6 +830,35 @@ enum Cmd {
     /// the weave mesh. Token from config/`WEAVE_SLACK_TOKEN`.
     #[cfg(feature = "surfaces")]
     Slack,
+    /// WL-049 / ADR-0002: governed stealth web access via obscura (deny-by-default).
+    /// `weave web <op> [--url …] [--arg k=v …]` runs a single browser op through the
+    /// same policy/lease/job gate as the `weave_web` MCP tool. `weave web --list`
+    /// enumerates the ops; `weave web --stop` reaps the cached obscura child.
+    #[cfg(feature = "obscura")]
+    Web {
+        /// The browser op to run (e.g. `navigate`, `snapshot`, `extract`). Omit with
+        /// `--list`/`--stop`.
+        op: Option<String>,
+        /// URL for a nav-class op (`--url https://example.com`). SSRF-guarded.
+        #[arg(long)]
+        url: Option<String>,
+        /// Extra op argument(s) as `key=value` (repeatable). Values are forwarded
+        /// opaquely to obscura as a JSON string field.
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        args: Vec<String>,
+        /// List the available web ops and exit (no spawn).
+        #[arg(long)]
+        list: bool,
+        /// Stop and reap the cached obscura child, then exit.
+        #[arg(long)]
+        stop: bool,
+        /// Optional: reserve a per-host lease for N seconds (rate / mutual-exclusion).
+        #[arg(long)]
+        lease_ttl: Option<i64>,
+        /// Optional: record a durable job auditing this web op.
+        #[arg(long)]
+        audit: bool,
+    },
 }
 
 /// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
@@ -4543,6 +4572,61 @@ fn main() -> Result<()> {
         #[cfg(feature = "surfaces")]
         Cmd::Slack => {
             slack::run(store, &cfg)?;
+        }
+
+        #[cfg(feature = "obscura")]
+        Cmd::Web {
+            op,
+            url,
+            args,
+            list,
+            stop,
+            lease_ttl,
+            audit,
+        } => {
+            // `--stop` reaps the cached obscura child and exits.
+            if stop {
+                weave_mcp::mcp::stop_web();
+                println!("obscura stopped");
+                return Ok(());
+            }
+            // `--list` enumerates the ops (no spawn).
+            let action = if list {
+                "list".to_string()
+            } else {
+                op.ok_or_else(|| {
+                    anyhow::anyhow!("a web op is required (e.g. `weave web navigate --url …`)")
+                })?
+            };
+            // Build the op args object: --url plus repeated --arg key=value. Values
+            // are forwarded opaquely to obscura. Never a shell — this is structured
+            // JSON, not a command string.
+            let mut op_args = serde_json::Map::new();
+            if let Some(u) = url {
+                op_args.insert("url".to_string(), serde_json::Value::String(u));
+            }
+            for kv in args {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--arg must be KEY=VALUE (got {kv:?})"))?;
+                op_args.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+            let (me, _explicit) = resolve_me_explicit(None, None, &cfg);
+            let mut req = serde_json::Map::new();
+            req.insert("me".to_string(), serde_json::Value::String(me.clone()));
+            req.insert("action".to_string(), serde_json::Value::String(action));
+            req.insert("args".to_string(), serde_json::Value::Object(op_args));
+            if let Some(ttl) = lease_ttl {
+                req.insert("lease_ttl".to_string(), serde_json::json!(ttl));
+            }
+            if audit {
+                req.insert("audit".to_string(), serde_json::Value::Bool(true));
+            }
+            let req = serde_json::Value::Object(req);
+            match weave_mcp::mcp::run_web(store, &Some(me), &req) {
+                Ok(text) => println!("{text}"),
+                Err(e) => anyhow::bail!("{e}"),
+            }
         }
 
         Cmd::Schedule {

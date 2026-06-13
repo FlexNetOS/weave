@@ -3,6 +3,8 @@
 pub mod dashboard;
 pub mod http;
 pub mod mcp;
+#[cfg(feature = "obscura")]
+pub mod obscura;
 
 #[cfg(feature = "surfaces")]
 pub use http::serve_dashboard;
