@@ -1,13 +1,21 @@
 # .handoff — continuity layer (weave)
 
-This repo is a member of the FlexNetOS meta workspace. This directory is its continuity layer
-(META-ORG-POLICY.md **P7**; design: handoff ADR-0003 + ADR-0004). It supersedes the deprecated
-`_workspace/`, `_workspace_prev/`, `sessions-handoff/`, and stray root handoff files — all
-**migrated here via `git mv` (history preserved), archived not deleted** (heal not harm; never
-downgrade; never delete).
+This repo is a member of the FlexNetOS meta workspace. This directory is its continuity layer and
+**only** continuity path — the **full Tier-B design** of the Continuity Ledger Kernel
+(META-ORG-POLICY.md **P7**; design: handoff ADR-0003 + ADR-0004; adoption: `decisions/ADR-0001`). It
+supersedes the deprecated `_workspace/`, `_workspace_prev/`, `sessions-handoff/`, and stray root
+handoff files — all **migrated here via `git mv` (history preserved), archived not deleted** (heal not
+harm; never downgrade; never delete).
 
-- `context/capsule.json` — who this repo is and what's next (keep accurate).
+- `context/capsule.json` — who this repo is and what's next; REQUIRED `handoff.context_capsule.v1`
+  fields. Kept **in sync** with the kernel's fleet registry (`meta/handoff/.handoff/fleet/weave/`).
 - `context/PRD.md` — weave Product Requirements (migrated from the repo root).
+- `tasks/*.task.json` — canonical `handoff.task.v1` cards (minted, schema-conformant).
+- `decisions/` — ADRs (`ADR-0001` records this adoption; fleet ADRs live in `meta/handoff/docs/`).
+- `hooks/hooks.toml` (`handoff.hooks.v1`), `policies/rules.toml` (`handoff.policy.rules.v1`),
+  `policy.toml` (`handoff.policy.v1`) — the loop-automation contract, adopted from the kernel and
+  specialized to weave's branch model (develop→master) + dual-backend gate. The shared `hf` binary
+  resolves these against this repo.
 - State precedence: **Git > witnessed ledger > task cards**. The fleet ledger lives at
   `meta/handoff/.handoff/ledger.db` — no binary state in this directory, git-committed text only.
 - `loop/` — autonomous weave-loop state, migrated from the deprecated `_workspace/`:

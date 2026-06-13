@@ -1,0 +1,26 @@
+{
+  "schema": "handoff.task.v1",
+  "id": "TASK-0001",
+  "title": "Refresh canonical docs (ARCHITECTURE.md + CHANGELOG.md) to the real feature set/vision",
+  "status": "backlog",
+  "priority": "P1",
+  "objective": "Owner-flagged during the .handoff adoption (2026-06-13): ARCHITECTURE.md and CHANGELOG.md stay at the repo root (canonical living docs, source-of-truth per CLAUDE.md) but have drifted — they are NOT updating with proper feature additions or the current vision. Bring both back in sync with what weave actually does today, against the code (not from memory). Upgrade-only: expand, never truncate; no content lost vs prior versions.",
+  "path_scope": [
+    "ARCHITECTURE.md",
+    "CHANGELOG.md"
+  ],
+  "acceptance_criteria": [
+    "ARCHITECTURE.md reconciled against shipped code: interim 4-crate workspace section, MCP tool table, injector mux table, and every feature added since last edit",
+    "CHANGELOG.md [Unreleased] + released sections reconciled against actual merged WL items / PRs (ground truth: .handoff/loop/backlog.md WL-001..WL-045)",
+    "Current vision/northstar captured accurately in ARCHITECTURE.md intro (single-crate-is-the-goal; no-daemon push; one dependency-light binary)",
+    "Both docs reviewed against the code via git-kb code intelligence, not memory",
+    "No content lost vs prior versions (upgrade-only)"
+  ],
+  "test_commands": [],
+  "dependencies": [],
+  "blocked_by": [],
+  "allows_network": false,
+  "allows_dependency_addition": false,
+  "correlation_id": "weave-handoff-adoption",
+  "role": "implementer"
+}

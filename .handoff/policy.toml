@@ -1,0 +1,37 @@
+# handoff.policy.v1 — loop policy for weave's .handoff continuity layer.
+# Adopted from the Continuity Ledger Kernel (meta/handoff, ADR-0004 §2). Read by the
+# shared `hf` binary (`hf session` preflight + worktree, `hf ship`/merge, `hf sync`)
+# when it operates on this repo. Missing keys fall back to the kernel's compiled
+# defaults (hf/src/policy.rs). Values below mirror weave's documented branch model
+# (CLAUDE.md): develop mirrors master; PRs target the protected master trunk.
+
+[remote]
+model        = "clone"            # "clone" | "fork"
+origin       = "FlexNetOS/weave"
+base_branch  = "develop"          # branch sessions/worktrees start from
+trunk_branch = "master"           # protected trunk PRs target
+develop_mirrors_trunk = true      # ff develop -> master after merge (CLAUDE.md)
+
+[loop]
+cycle_flush     = 3               # tasks per cycle before ship (weave-loop cycle_budget)
+batch_checkout  = true
+worktree_prefix = "weave-"        # session worktree/branch prefix (CLAUDE.md ritual)
+
+[merge]
+require_review = true
+reviewer       = "cloud_ultra"    # /code-review ultra; Phase 2 = "swarm_local"
+auto_merge     = "on_approve"
+permission_gate = true            # transitional → AI gatekeeper
+
+[preflight]
+require_clean_tree  = true        # refuse session start on a dirty tree
+require_synced_base = true        # refuse if base behind origin/develop (drift)
+
+[sync]
+kb_enabled   = true               # one-way ledger → .kb write-back
+kb_slugs     = ["context/overridable/active", "context/overridable/progress"]
+meta_register = true              # weave is registered in ../.meta.yaml
+
+# weave-specific: the six required CI checks the protected master trunk gates on.
+[ci]
+required_checks = ["rustfmt", "clippy", "test", "build (libsql backend)", "sign", "libsql + sign"]
