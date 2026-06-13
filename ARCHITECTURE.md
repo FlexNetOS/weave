@@ -78,7 +78,7 @@ capabilities themselves remain in scope, to land **Rust-native**:
   (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
 
 The provable have/superset/gap parity matrix against repowire's inventory is
-**WL-046**. Structurally, the four-crate workspace below is **interim** —
+`docs/REPOWIRE-PARITY.md` (**WL-046**). Structurally, the four-crate workspace below is **interim** —
 single-crate remains the goal (WL-043).
 
 ---

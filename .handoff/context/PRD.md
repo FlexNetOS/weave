@@ -182,7 +182,8 @@ multi-mux, paste-safe vs. tmux-only), structured asks/answers/acks, broadcast an
 ask-many, tool-permission gating, presence + turn-state, circles + orchestrator
 role, durable job board, leases, review queue, scheduling, agent memory, plus
 extras repowire lacks (ed25519 signed identity, LLM summarization, cross-store
-federation + Tier-2 pull, FTS search). The provable parity matrix is **WL-046**.
+federation + Tier-2 pull, FTS search). The provable parity matrix is
+`docs/REPOWIRE-PARITY.md` (**WL-046**).
 
 The remaining mission gaps — **in scope, not dropped**:
 - **Agent spawn/kill** (`weave_spawn_peer`/`weave_kill_peer`, argv-only, per-mux,
