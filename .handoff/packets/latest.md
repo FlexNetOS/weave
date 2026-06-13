@@ -1,16 +1,16 @@
 # HANDOFF — weave (repowire-superset mission session, COMPLETE)
 
-closed_utc: 2026-06-13T20:30Z
-branch: develop @ 7413553 (== master — converged)
+closed_utc: 2026-06-13T21:10Z
+branch: develop @ 1a9bc1f (== master — converged)
 worktree: main checkout /home/drdave/Desktop/meta/weave (all session worktrees removed)
 cycle_budget: n/a (interactive, owner-driven one card at a time)
-cycles_total: 5 cards + 1 verify-fix
-cycles_this_session: WL-046, WL-047, WL-048, WL-049, + kill-fix + SSRF-fix
-last_item: WL-049 (obscura governed web access) — merged + hardened
+cycles_total: 4 cards (WL-046..049) + 4 runtime /verify fixes
+cycles_this_session: WL-046, WL-047, WL-048, WL-049, + kill-fix + SSRF-fix + SSRF-QA + domain-wildcard
+last_item: WL-049 (obscura governed web access) — merged, hardened, and /verify-audited
 next_item: WL-050 (token-light progressive-disclosure MCP, ADR-0003) — owner's call
 orchestrator_phase: complete (plan→implement→verify→guard ran for WL-047/048/049)
-gate_status: PASS — master==develop==7413553, all six required checks green on the tip
-pr_url: (none open) — PRs #72–#78 all merged
+gate_status: PASS — master==develop==1a9bc1f, all six required checks green on the tip
+pr_url: (none open) — PRs #72–#80 all merged
 
 ## Landed this session (all merged to develop; master fast-forwarded)
 - #72 docs: restate canonical docs to the repowire-superset north star (WL-046)
@@ -20,6 +20,8 @@ pr_url: (none open) — PRs #72–#78 all merged
 - #76 fix(inject): `weave kill` no longer falsely reports success on mux failure (found by /verify)
 - #77 feat(weave): WL-049/ADR-0002 governed obscura web-access seam  ⚠️ agent-self-delivered pre-review
 - #78 fix(webpolicy): close SSRF encoded-loopback bypass + WL-049 QA layers (closes #77's hole)
+- #79 chore(handoff): session checkpoint at WL-049
+- #80 fix(webpolicy): support `*` wildcard in obscura_allow_domains (found by /verify — domain `*` footgun)
 
 ## State (verified)
 - master == develop == **7413553**, working tree clean, 0 open PRs, only the main worktree.
@@ -37,7 +39,8 @@ pr_url: (none open) — PRs #72–#78 all merged
 - **tmux/zellij socket not captured** (backlog WL-053): peer targets carry the pane id, not the mux socket, so inject/spawn/kill rely on ambient $TMUX → wrong server from a non-default socket / different session. The #76 fix makes kill *fail honestly*; the underlying limitation is WL-053 (dual-backend schema add).
 
 ## icm_stored
-- context-weave (01KV19N7…), errors-resolved (01KV19NA…), decisions-weave (01KV19ND…)
+- context-weave (01KV19N7…, 01KV1DQG…), errors-resolved (01KV19NA…, 01KV1DQD…), decisions-weave (01KV19ND…)
+- /verify found 4 runtime bugs tests missed: kill false-success, SSRF encoded-loopback bypass, SSRF QA-coverage gap, domain-`*` footgun. Lesson: drive the real CLI; mirror `*` across sibling allowlists.
 
 ## Open backlog (next session — owner's pick)
 - WL-050 token-light progressive-disclosure MCP refactor (ADR-0003) — the natural next mission card.
@@ -46,7 +49,7 @@ pr_url: (none open) — PRs #72–#78 all merged
 - Two standing process fixes the owner was offered: (a) deny git/gh to subagents; (b) CI concurrency fix.
 
 ## verify_on_resume
-- `git fetch origin && [ "$(git rev-parse origin/master)" = "$(git rev-parse origin/develop)" ] && echo converged`  # expect converged @ 7413553 or later
+- `git fetch origin && [ "$(git rev-parse origin/master)" = "$(git rev-parse origin/develop)" ] && echo converged`  # expect converged @ 1a9bc1f or later
 - `git status --porcelain` empty
 - `cargo test --all-targets` (default sqlite) and `cargo test --no-default-features --features libsql`
 
