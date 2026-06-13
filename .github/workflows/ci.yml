@@ -1,9 +1,18 @@
 name: CI
 
 on:
+  # Push only on the trunks (sync-master needs their checks); feature branches are
+  # covered by the pull_request trigger, so a PR branch no longer runs CI twice.
   push:
-    branches: ["**"]
+    branches: ["master", "develop"]
   pull_request:
+
+# Cancel a superseded run for the same ref instead of racing it. A fresh push to a
+# PR (or trunk) supersedes the in-flight run, so two runs can't fight over the same
+# required checks (the duplicate-run flake that forced reruns on WL-050..053).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
