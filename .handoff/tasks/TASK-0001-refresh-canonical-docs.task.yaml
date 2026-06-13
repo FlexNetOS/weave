@@ -1,0 +1,25 @@
+schema: weave.task.v1
+id: TASK-0001
+title: Refresh canonical docs (ARCHITECTURE.md + CHANGELOG.md) to the real feature set/vision
+status: backlog
+priority: P1
+objective: >
+  Owner-flagged during the .handoff migration (2026-06-13): ARCHITECTURE.md and CHANGELOG.md
+  are kept at the repo root (canonical living docs, source-of-truth per CLAUDE.md) but have
+  drifted — they are NOT updating with proper feature additions or the current vision. This
+  card tracks bringing them back in sync with what weave actually does today. Continuity state
+  moved to .handoff/; these two docs deliberately did NOT move (moving them would be a
+  downgrade), but their staleness is the real issue to fix.
+path_scope:
+  - ARCHITECTURE.md
+  - CHANGELOG.md
+acceptance_criteria:
+  - Audit shipped features vs. ARCHITECTURE.md — reconcile the interim 4-crate workspace
+    section, the MCP tool table, the injector mux table, and any feature added since last edit
+  - Reconcile CHANGELOG.md [Unreleased] + released sections against actual merged WL items /
+    PRs (loop backlog at .handoff/loop/backlog.md is the ground truth for WL-001..WL-045)
+  - Capture the current vision/northstar (single-crate-is-the-goal; no-daemon push; one
+    dependency-light binary) accurately in ARCHITECTURE.md's intro
+  - Both docs reviewed against the code, not from memory (use git-kb code intelligence)
+  - No content lost vs. prior versions (upgrade-only; expand, don't truncate)
+next_command: "Audit ARCHITECTURE.md/CHANGELOG.md against the code; draft the diff for owner review."
