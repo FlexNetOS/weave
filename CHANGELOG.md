@@ -23,6 +23,14 @@
   (`WEAVE_MCP_EAGER=1`) restores the full flat `tools/list` for harnesses that need it.
   Pure `weave-mcp` refactor: no `Store`/schema/dependency change; default `cargo tree`
   byte-identical; both backends green.
+- **Multi-surface parity matrix (WL-052, ADR-0003).** `docs/MULTI-SURFACE-PARITY.md`
+  maps every capability domain onto each surface (CLI / MCP / dashboard / bots) with a
+  per-cell verdict, making "full multi-surface parity" **measurable** rather than asserted.
+  Result: **CLI and MCP are at full parity** (the agent-facing surfaces); the dashboard
+  (read-only) and bots (relay) are the WL-048 v1 baseline. The remaining human-surface
+  write-parity is decomposed into tracked cards **WL-052a** (dashboard write/read views)
+  and **WL-052b** (bot command grammar), under a single design law: a human surface must
+  route to the *same* capability handler as CLI/MCP, never a parallel implementation.
 - **obscura governed web access (WL-049, ADR-0002), behind `--features obscura`
   (default OFF):** weave becomes the governance plane for obscura's stealth web
   access. It spawns the separate `obscura mcp` binary (argv-only, trusted-path

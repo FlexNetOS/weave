@@ -85,11 +85,18 @@ capabilities themselves remain in scope, to land **Rust-native**:
   first-class invariant with a CI-enforced standing-token budget
   (`MAX_STANDING_TOOLS_BYTES` ≈ 2k tokens, guarded by
   `standing_mcp_surface_is_within_token_budget`) — adding a capability must not add
-  standing tokens. Remaining: full multi-surface write/parity (**WL-052**). Decided in
+  standing tokens. **WL-052 (foundation done):** the multi-surface parity matrix
+  (`docs/MULTI-SURFACE-PARITY.md`) proves CLI + MCP are at full parity; remaining
+  human-surface write-parity is tracked as **WL-052a** (dashboard write) / **WL-052b**
+  (bot commands). Decided in
   **ADR-0003** (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
 
 The provable have/superset/gap parity matrix against repowire's inventory is
-`docs/REPOWIRE-PARITY.md` (**WL-046**). Structurally, the four-crate workspace below is **interim** —
+`docs/REPOWIRE-PARITY.md` (**WL-046**); the **multi-surface** parity matrix —
+every capability mapped onto CLI / MCP / dashboard / bots, with the remaining
+human-surface write-parity tracked as WL-052a/b — is `docs/MULTI-SURFACE-PARITY.md`
+(**WL-052**, ADR-0003): CLI and MCP are at **full** parity; the dashboard (read-only)
+and bots (relay) are the v1 baseline. Structurally, the four-crate workspace below is **interim** —
 single-crate remains the goal (WL-043).
 
 ---
