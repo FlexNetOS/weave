@@ -1,5 +1,5 @@
 ---
-description: Resume the weave-loop from _workspace/HANDOFF.md in a fresh session. Use when the user says "resume the weave loop", "pick up the loop", "continue in a new session", "/weave-loop resume from _workspace/HANDOFF.md", or the prior session hit the cycle budget and committed a handoff.
+description: Resume the weave-loop from .handoff/packets/latest.md in a fresh session. Use when the user says "resume the weave loop", "pick up the loop", "continue in a new session", "/weave-loop resume from .handoff/packets/latest.md", or the prior session hit the cycle budget and committed a handoff.
 metadata:
   type: slash-command
   owner: weave-harness
@@ -8,25 +8,25 @@ metadata:
 # /weave-loop resume
 
 Resume the **weave-loop** in a fresh session, cold-starting from the committed
-`_workspace/HANDOFF.md`. This is the slash-command half of the envctl-pattern
+`.handoff/packets/latest.md`. This is the slash-command half of the envctl-pattern
 "short-session chain": the prior session hit its cycle budget, the
-`session-relay` skill wrote `HANDOFF.md`, and now a new process picks it up.
+`session-relay` skill wrote `.handoff/packets/latest.md`, and now a new process picks it up.
 
 The committed file is the **authoritative** resume signal — not the weave inbox.
 (See the `session-relay` skill, "Failure modes".)
 
 ## Arguments
 
-- `from _workspace/HANDOFF.md` — the canonical phrasing. Tells the skill the
+- `from .handoff/packets/latest.md` — the canonical phrasing. Tells the skill the
   checkpoint is the source of truth, not a fresh DISCOVER.
 - (optional) `budget=N` — override the per-session cycle budget (default from
   `loop_state.md`).
 
 ## Steps
 
-1. **Locate the worktree.** Read `HANDOFF.md` and `cd` to `resume.worktree`. If
-   `HANDOFF.md` is missing, fall back to the `weave-loop` skill's **DISCOVER**
-   entry point (it will rebuild `backlog.md` from `TASKS.md` M1/M3 and stop).
+1. **Locate the worktree.** Read `.handoff/packets/latest.md` and `cd` to `resume.worktree`. If
+   `.handoff/packets/latest.md` is missing, fall back to the `weave-loop` skill's **DISCOVER**
+   entry point (it will rebuild `backlog.md` from `.handoff/loop/TASKS.md` M1/M3 and stop).
 2. **Invoke `session-relay` skill, RESUME mode.** It runs `verify-on-resume.sh`,
    does the bootstrap-hazard check, broadcasts `relay:resumed` (if safe),
    resets `cycles_this_session=0`, commits, and hands back to the `weave-loop`
@@ -47,10 +47,10 @@ The committed file is the **authoritative** resume signal — not the weave inbo
 
 ## One-liner test
 
-In a fresh shell, with a `HANDOFF.md` already committed in the worktree:
+In a fresh shell, with a `.handoff/packets/latest.md` already committed in the worktree:
 
 ```bash
-/weave-loop resume from _workspace/HANDOFF.md
+/weave-loop resume from .handoff/packets/latest.md
 ```
 
 The orchestrator should land in CYCLE mode at `next_item` within a few tool

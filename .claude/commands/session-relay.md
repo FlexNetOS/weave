@@ -1,5 +1,5 @@
 ---
-description: Session boundary primitive for the weave-loop. Two modes: HAND OFF writes a committed _workspace/HANDOFF.md and stops; RESUME reads the checkpoint, runs verify-on-resume, and continues the loop. Use at cycle budget, STOP, or cold-start.
+description: Session boundary primitive for the weave-loop. Two modes: HAND OFF writes a committed .handoff/packets/latest.md and stops; RESUME reads the checkpoint, runs verify-on-resume, and continues the loop. Use at cycle budget, STOP, or cold-start.
 metadata:
   type: slash-command
   owner: weave-harness
@@ -17,26 +17,26 @@ Two modes, both idempotent.
 
 Called by the `weave-loop` skill when `cycles_this_session >= cycle_budget`.
 
-1. **Stop-checks.** If `_workspace/STOP` or `_workspace/NEEDS-HUMAN` exists,
+1. **Stop-checks.** If `.handoff/loop/STOP` or `.handoff/loop/NEEDS-HUMAN` exists,
    skip — already terminated.
-2. **Write `_workspace/HANDOFF.md`** with the orchestrator state
+2. **Write `.handoff/packets/latest.md`** with the orchestrator state
    (`orchestrator_phase`, `verifier_status`, `guardian_verdict`, `pr_url`,
    `landed_this_session`, `open_findings`, `decisions`).
 3. **Commit** it: `weave-loop: handoff (at WL-NNN)`.
 4. **Best-effort heartbeat** — broadcast `relay:handoff` via `weave send`.
    Skip if bootstrap hazard (last commit touched mcp.rs/store.rs/inject.rs/setup.rs).
 5. **Best-effort one-shot cron** — `CronCreate {recurring:false}` ~3 min out
-   with prompt: `"/weave-loop resume from _workspace/HANDOFF.md"`.
+   with prompt: `"/weave-loop resume from .handoff/packets/latest.md"`.
 6. **Stop.** No `ScheduleWakeup`. The Ralph runner spawns the next session.
 
 ## /session-relay resume
 
 Called by `/weave-loop resume` or directly on cold start.
 
-1. `cd` to the worktree in `HANDOFF.md`. If missing, fall back to `weave-loop`
+1. `cd` to the worktree in `.handoff/packets/latest.md`. If missing, fall back to `weave-loop`
    DISCOVER.
-2. **Run** `bash _workspace/verify-on-resume.sh`. If it fails, write
-   `_workspace/NEEDS-HUMAN` with output and halt.
+2. **Run** `bash .handoff/loop/verify-on-resume.sh`. If it fails, write
+   `.handoff/loop/NEEDS-HUMAN` with output and halt.
 3. **Bootstrap hazard check** — if last commit touches mcp.rs/store.rs/inject.rs/setup.rs,
    pin a known-good `weave` or skip heartbeat.
 4. **Broadcast** `relay:resumed` via `weave send` (if safe).
@@ -48,12 +48,12 @@ Called by `/weave-loop resume` or directly on cold start.
 
 - `handoff` — running session → checkpoint → stop (default at cycle budget).
 - `resume` — fresh session → verify → continue (default on cold start).
-- `from _workspace/HANDOFF.md` — canonical path (default if omitted).
+- `from .handoff/packets/latest.md` — canonical path (default if omitted).
 
 ## One-liner tests
 
 ```bash
 /session-relay handoff              # at cycle budget
 /session-relay resume               # cold start
-/weave-loop resume from _workspace/HANDOFF.md   # equivalent
+/weave-loop resume from .handoff/packets/latest.md   # equivalent
 ```

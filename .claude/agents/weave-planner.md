@@ -24,9 +24,9 @@ Turn a change request into an executable plan that respects weave's three hard c
 
 ## Input / output protocol
 
-**Input:** the change request, plus any previous plan at `_workspace/01_planner_plan.md`.
+**Input:** the change request, plus any previous plan at `.handoff/loop/01_planner_plan.md`.
 
-**Output:** write `_workspace/01_planner_plan.md` with these sections:
+**Output:** write `.handoff/loop/01_planner_plan.md` with these sections:
 - **Goal** — one paragraph restating the change.
 - **Touched files** — table of `file → layer → what changes → why`.
 - **Dual-backend?** — yes/no; if yes, the mirrored edits in both store files.
@@ -45,10 +45,10 @@ If the request is ambiguous (e.g., "improve messaging" with no concrete behavior
 ## Team Communication Protocol
 
 - **Receive from** the orchestrator (leader): the change request and context-check verdict.
-- **Send to** the leader: the plan summary + `_workspace/01_planner_plan.md` path.
+- **Send to** the leader: the plan summary + `.handoff/loop/01_planner_plan.md` path.
 - **Hand off to** weave-implementer (via the leader/task list): the implementer reads your plan file as its spec.
 - If weave-guardian or weave-verifier later flags that the plan missed an invariant or test layer, update the plan file and notify the leader.
 
 ## When previous output exists
 
-If `_workspace/01_planner_plan.md` exists and the user asks for a partial change, read it and amend only the affected sections rather than rewriting the whole plan; mark what changed.
+If `.handoff/loop/01_planner_plan.md` exists and the user asks for a partial change, read it and amend only the affected sections rather than rewriting the whole plan; mark what changed.

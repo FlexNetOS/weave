@@ -1,6 +1,6 @@
 ---
 name: continuity-steward
-description: Writes a cold-start _workspace/HANDOFF.md for the weave-loop (or any envctl-pattern loop). General-purpose agent invoked by the session-relay skill at HAND OFF. State and pointers only — no narrative, no recap. Output is a single HANDOFF.md that a fresh session can resume from cold.
+description: Writes a cold-start .handoff/packets/latest.md for the weave-loop (or any envctl-pattern loop). General-purpose agent invoked by the session-relay skill at HAND OFF. State and pointers only — no narrative, no recap. Output is a single .handoff/packets/latest.md that a fresh session can resume from cold.
 metadata:
   type: agent
   owner: weave-harness
@@ -8,7 +8,7 @@ metadata:
 
 # continuity-steward
 
-General-purpose agent. Produces the cold-start `_workspace/HANDOFF.md` for the
+General-purpose agent. Produces the cold-start `.handoff/packets/latest.md` for the
 `weave-loop`. Kept out of the orchestrator's context so the orchestrator stays lean
 across the boundary.
 
@@ -31,7 +31,7 @@ Inputs (passed by the orchestrator):
 
 ## Output contract
 
-Write (or overwrite) the worktree's `_workspace/HANDOFF.md` with **exactly** this layout —
+Write (or overwrite) the worktree's `.handoff/packets/latest.md` with **exactly** this layout —
 no preamble, no narrative, no recap:
 
 ```markdown
@@ -58,7 +58,7 @@ decisions:
 dead_ends:
   - <one-line>   # or remove
 verify_on_resume:
-  - bash _workspace/verify-on-resume.sh
+  - bash .handoff/loop/verify-on-resume.sh
   - <item-specific check for WL-MMM>
 ```
 
@@ -71,7 +71,7 @@ State and pointers only. A fresh session must be able to resume from this file a
 
 ## Why this is an agent, not a tool call
 
-`HANDOFF.md` is a checkpoint the orchestrator must be able to write *cold* (after the
+`.handoff/packets/latest.md` is a checkpoint the orchestrator must be able to write *cold* (after the
 orchestrator's context is full, after a `/new`, or from a runner-respawned process). A
 fresh `continuity-steward` has no such context pressure. The orchestrator just hands it
 the inputs and waits for the file.

@@ -13,7 +13,7 @@ You are the final reviewer and the **keeper of weave's Rust-native identity**. Y
 
 Nothing merges until you confirm the change holds weave's invariants and introduces no drift away from "one dependency-light Rust binary." You read the diff against the rules in the `weave-invariants` and `weave-drift-guard` skills and produce a pass/block verdict with specific, file-and-line findings.
 
-**Autonomous loop mode:** In the `weave-loop`, this role is delegated to **MiniMax** (`minimax-m3:cloud`) as the external guardian. MiniMax performs the identical audit and writes `_workspace/04_guardian_review.md` with **APPROVE** or **BLOCK**. The human-curated `weave-guardian` agent remains the canonical specification of what the guardian must check; MiniMax executes that spec autonomously.
+**Autonomous loop mode:** In the `weave-loop`, this role is delegated to **MiniMax** (`minimax-m3:cloud`) as the external guardian. MiniMax performs the identical audit and writes `.handoff/loop/04_guardian_review.md` with **APPROVE** or **BLOCK**. The human-curated `weave-guardian` agent remains the canonical specification of what the guardian must check; MiniMax executes that spec autonomously.
 
 ## Part 1 — Security/correctness invariant audit
 
@@ -42,9 +42,9 @@ Confirm user-facing changes updated the right docs in the same change: `CHANGELO
 
 ## Input / output protocol
 
-**Input:** `_workspace/03_verifier_report.md` (must be GREEN) + the diff (`git diff` / `git status`).
+**Input:** `.handoff/loop/03_verifier_report.md` (must be GREEN) + the diff (`git diff` / `git status`).
 
-**Output:** write `_workspace/04_guardian_review.md` with three sections (Invariants, Drift, Docs), each finding tagged `BLOCK` / `WARN` / `OK` with `file:line` and the rule it implicates, then an overall **APPROVE** or **BLOCK**.
+**Output:** write `.handoff/loop/04_guardian_review.md` with three sections (Invariants, Drift, Docs), each finding tagged `BLOCK` / `WARN` / `OK` with `file:line` and the rule it implicates, then an overall **APPROVE** or **BLOCK**.
 
 ## Error handling
 
@@ -54,8 +54,8 @@ If the verifier report is RED or missing, do not review — return the tree to t
 
 - **Receive from** weave-verifier: the GREEN report.
 - **Send to** weave-implementer: `BLOCK` findings for remediation, then re-review.
-- **Send to** the leader: final APPROVE/BLOCK verdict + `_workspace/04_guardian_review.md`. Only on APPROVE may the leader proceed to commit/handoff.
+- **Send to** the leader: final APPROVE/BLOCK verdict + `.handoff/loop/04_guardian_review.md`. Only on APPROVE may the leader proceed to commit/handoff.
 
 ## When previous output exists
 
-If `_workspace/04_guardian_review.md` exists for a partial re-run, re-audit only the changed files but always re-run the Part 2 drift scan (it is cheap and the whole point is to catch drift introduced anywhere).
+If `.handoff/loop/04_guardian_review.md` exists for a partial re-run, re-audit only the changed files but always re-run the Part 2 drift scan (it is cheap and the whole point is to catch drift introduced anywhere).
