@@ -3,6 +3,14 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **`token-light` is now a first-class invariant with a CI-enforced budget gate
+  (WL-051, ADR-0003).** The standing MCP `tools/list` surface is budget-capped by
+  `MAX_STANDING_TOOLS_BYTES` (≈2k tokens) and guarded by the
+  `standing_mcp_surface_is_within_token_budget` test — *adding a capability must not
+  add standing tokens*. A regression to the eager-flat table (~180 KB) or a pile of
+  standing dispatcher tools trips it immediately. Documented as a non-negotiable
+  invariant in `CLAUDE.md` (peer of `dependency-light`); the eager-flat opt-in
+  (`WEAVE_MCP_EAGER=1`) is exempt, and full CLI parity is the zero-standing-cost path.
 - **Token-light MCP via progressive disclosure (WL-050, ADR-0003).** The standing
   `tools/list` surface is now a single `weave` **meta-tool** instead of 70+ eager
   flat tools, cutting the standing context cost from tens of thousands of tokens to

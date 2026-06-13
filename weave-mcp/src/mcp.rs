@@ -209,6 +209,17 @@ const MAX_IDENT_LEN: usize = 128;
 /// single-line metadata, not the payload (that's `body`), so they stay short.
 const MAX_SUBJECT_LEN: usize = 256;
 
+/// WL-051 / ADR-0003: the **standing-token budget** for the MCP surface. The
+/// serialized bytes of the default `tools/list` payload must stay under this ceiling
+/// **regardless of how many operations exist** — `token-light` is a first-class
+/// invariant, a peer of `dependency-light`: *adding a feature must not add standing
+/// tokens*. ~8 KB ≈ the ADR's ≤~2k-token target (the progressive-disclosure meta-tool
+/// is currently ~1.4 KB). Reverting to an eager-flat table, or piling on standing
+/// dispatcher tools, trips the [`standing_mcp_surface_is_within_token_budget`] guard.
+/// (The eager-flat compatibility mode, `WEAVE_MCP_EAGER=1`, is exempt — it is an
+/// explicit opt-in, not the standing default.)
+pub const MAX_STANDING_TOOLS_BYTES: usize = 8192;
+
 /// Validate and bound an identity string (sender/recipient). Rejects empty /
 /// whitespace-only values and anything over [`MAX_IDENT_LEN`] characters, with a
 /// clear, actionable error. Returns the trimmed identity on success.
@@ -5494,6 +5505,33 @@ mod tests {
         assert!(
             tool_catalog().len() > 1,
             "catalog holds the full operation set"
+        );
+    }
+
+    /// WL-051 / ADR-0003: the **standing-token budget** is enforced. The default
+    /// `tools/list` payload must serialize under [`MAX_STANDING_TOOLS_BYTES`] no matter
+    /// how many operations exist — this is the automated half of the `token-light`
+    /// invariant. A regression that puts flat tools back into the standing table (≈180 KB)
+    /// or piles on standing dispatchers trips this immediately.
+    #[test]
+    fn standing_mcp_surface_is_within_token_budget() {
+        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        std::env::remove_var("WEAVE_MCP_EAGER");
+        let listed = tools();
+        let bytes = serde_json::to_string(&listed)
+            .expect("serialize tools")
+            .len();
+        assert!(
+            bytes <= MAX_STANDING_TOOLS_BYTES,
+            "standing MCP surface is {bytes} bytes, over the {MAX_STANDING_TOOLS_BYTES}-byte \
+             token-light budget (ADR-0003). Adding a feature must not add standing tokens — \
+             expose new ops via the `weave` meta-tool's catalog, not new standing tools."
+        );
+        // It is the meta-tool, not a flat table: a tiny tool count.
+        let n = listed.as_array().map(|a| a.len()).unwrap_or(usize::MAX);
+        assert!(
+            n <= 3,
+            "standing surface should be a handful of tools (progressive disclosure), got {n}"
         );
     }
 
