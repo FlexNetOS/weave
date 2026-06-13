@@ -81,8 +81,14 @@ capabilities themselves remain in scope, to land **Rust-native**:
 - **token-light surface** — **WL-050 (done):** the 70+ eager flat MCP tools are
   replaced by the `weave` **meta-tool** (search/describe/call/list) as the default
   standing surface (≈ a few hundred tokens, zero capability loss), with an eager-flat
-  fallback (`WEAVE_MCP_EAGER=1`). Remaining: a guarded standing-token budget
-  (**WL-051**) and full multi-surface write/parity (**WL-052**). Decided in
+  fallback (`WEAVE_MCP_EAGER=1`). **WL-051 (done):** `token-light` is now a
+  first-class invariant with a CI-enforced standing-token budget
+  (`MAX_STANDING_TOOLS_BYTES` ≈ 2k tokens, guarded by
+  `standing_mcp_surface_is_within_token_budget`) — adding a capability must not add
+  standing tokens. **WL-052 (foundation done):** the multi-surface parity matrix
+  (`docs/MULTI-SURFACE-PARITY.md`) proves CLI + MCP are at full parity; remaining
+  human-surface write-parity is tracked as **WL-052a** (dashboard write) / **WL-052b**
+  (bot commands). Decided in
   **ADR-0003** (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
 
 The provable have/superset/gap parity matrix against repowire's inventory is
