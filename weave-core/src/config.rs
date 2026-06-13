@@ -652,6 +652,33 @@ pub struct Config {
     /// keeps configs that omit the key loading unchanged.
     #[serde(default)]
     pub spawn_allowed_dirs: Option<Vec<String>>,
+    /// WL-048 / ADR-0004 (only meaningful in a `--features surfaces` build):
+    /// Telegram bot token for the `weave telegram` bridge. A SECRET — redacted in
+    /// Debug, never logged / placed in a logged URL or argv. Prefer the
+    /// `WEAVE_TELEGRAM_TOKEN` env var (envctl can inject it) over the config file.
+    /// `None` ⇒ the bridge refuses to start. Bounded + control-char-rejected before
+    /// use (mirrors `pull_token`). Inert without the `surfaces` feature.
+    #[serde(default)]
+    pub telegram_token: Option<String>,
+    /// WL-048: default Telegram chat id the bridge posts outbound weave messages to.
+    /// NOT a secret. Overlaid by `WEAVE_TELEGRAM_CHAT_ID`. Inert without `surfaces`.
+    #[serde(default)]
+    pub telegram_chat_id: Option<String>,
+    /// WL-048: Slack bot token for the `weave slack` bridge. A SECRET — same
+    /// handling as `telegram_token`. Overlaid by `WEAVE_SLACK_TOKEN`. Inert without
+    /// the `surfaces` feature.
+    #[serde(default)]
+    pub slack_token: Option<String>,
+    /// WL-048: default Slack channel id the bridge posts outbound weave messages to.
+    /// NOT a secret. Overlaid by `WEAVE_SLACK_CHANNEL`. Inert without `surfaces`.
+    #[serde(default)]
+    pub slack_channel: Option<String>,
+    /// WL-048: the weave peer name a bridge posts AS when relaying a human reply
+    /// from Telegram/Slack into the mesh (validated via `check_ident` before
+    /// `Store::send`). NOT a secret. Overlaid by `WEAVE_BRIDGE_IDENTITY`. `None` ⇒
+    /// the bridge falls back to a fixed default identity. Inert without `surfaces`.
+    #[serde(default)]
+    pub bridge_identity: Option<String>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -690,6 +717,17 @@ impl std::fmt::Debug for Config {
             .field("llm_timeout_secs", &self.llm_timeout_secs)
             .field("llm_max_input_chars", &self.llm_max_input_chars)
             .field("spawn_allowed_dirs", &self.spawn_allowed_dirs)
+            .field(
+                "telegram_token",
+                &self.telegram_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field(
+                "slack_token",
+                &self.slack_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("slack_channel", &self.slack_channel)
+            .field("bridge_identity", &self.bridge_identity)
             .finish()
     }
 }
@@ -898,6 +936,25 @@ impl Config {
                 merged.extend(env_dirs);
                 cfg.spawn_allowed_dirs = Some(merged);
             }
+        }
+        // WL-048 human surfaces (only meaningful in a `--features surfaces` build).
+        // Bot tokens are SECRETS: env-preferred over the config file (envctl injects
+        // them), and the value is never echoed here. Chat/channel/identity are not
+        // secrets. Same overlay discipline as WEAVE_PULL_TOKEN above.
+        if let Some(v) = nonempty("WEAVE_TELEGRAM_TOKEN") {
+            cfg.telegram_token = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_TELEGRAM_CHAT_ID") {
+            cfg.telegram_chat_id = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_SLACK_TOKEN") {
+            cfg.slack_token = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_SLACK_CHANNEL") {
+            cfg.slack_channel = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_BRIDGE_IDENTITY") {
+            cfg.bridge_identity = Some(v);
         }
         cfg
     }
@@ -2313,6 +2370,34 @@ mod tests {
             cdbg.contains("<redacted>"),
             "Config Debug should redact pull_token: {cdbg}"
         );
+    }
+
+    /// WL-048: the Telegram/Slack bot tokens are secrets — Config's Debug must
+    /// redact them (never leak via a log line, panic, or error context) while the
+    /// non-secret chat/channel/identity fields render verbatim.
+    #[test]
+    fn config_debug_redacts_bot_tokens() {
+        const TG_SECRET: &str = "telegram-bot-token-123:ABC";
+        const SLACK_SECRET: &str = "xoxb-slack-secret-456";
+
+        let cfg = Config {
+            telegram_token: Some(TG_SECRET.to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            slack_token: Some(SLACK_SECRET.to_string()),
+            slack_channel: Some("C0XYZ".to_string()),
+            bridge_identity: Some("bridge".to_string()),
+            ..Config::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains(TG_SECRET), "leaked telegram_token: {dbg}");
+        assert!(!dbg.contains(SLACK_SECRET), "leaked slack_token: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "bot tokens should be redacted: {dbg}"
+        );
+        // Non-secret identifiers are shown.
+        assert!(dbg.contains("-100123"), "chat id shown: {dbg}");
+        assert!(dbg.contains("C0XYZ"), "channel shown: {dbg}");
     }
 
     /// TOKEN CAP / CONTROL-CHAR REJECTION: an over-long token and a control-char

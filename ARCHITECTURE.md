@@ -65,9 +65,11 @@ capabilities themselves remain in scope, to land **Rust-native**:
 - **Agent spawn/kill** — `weave_spawn_peer` / `weave_kill_peer`, argv-only,
   per-mux, birth-cert identity, two-layer gated (trusted child program + cwd
   allowlist) — **shipped in WL-047** (§3 spawn/kill table, §7 spawn allowlist).
-- **Rust-native human surfaces** — dashboard / Telegram / Slack over
-  `weave-mcp/http.rs`, **no Next.js/Python**, behind a `--features surfaces`
-  flag — **WL-048 / WL-052**.
+- **Rust-native human surfaces** — read-only web dashboard + Telegram / Slack
+  bridges over `weave-mcp/http.rs`, server-rendered HTML + SSE, **no Next.js/
+  Python/async runtime**, behind a `--features surfaces` flag — **shipped in
+  WL-048** (ADR-0004; see "Human surfaces" below). WL-052 extends multi-surface
+  parity further.
 - **Governed web reach** — register the separate `obscura-mcp` binary as a
   weave-governed web-access capability (permission/lease/job-gated stealth
   browsing); **NO V8 in weave's core** — **WL-049**, decided in **ADR-0002**
@@ -244,6 +246,37 @@ stdout is reserved for protocol frames; **all logging goes to stderr**.
 caller's own peer row) and `weave_connect` (the §4 capability verdict) sit
 alongside the messaging tools; the peers/sessions/doctor tools also surface
 read-only federation (§9) when extra stores are configured.
+
+### Human surfaces (`--features surfaces`, WL-048 / ADR-0004)
+
+Three optional **human** surfaces, all Rust-native and behind a single
+`--features surfaces` flag (default OFF ⇒ the default binary links **zero** extra
+deps; the bots reuse the same optional `reqwest` blocking+rustls client `llm`
+carries, so Cargo unifies it to **one** copy). These are **CLI subcommands, not
+MCP tools** (ADR-0003 token-light), so the standing MCP surface is unchanged.
+
+- **Read-only web dashboard** (`weave dashboard`) — server-rendered HTML + SSE
+  over the **existing** hand-rolled `std::net` HTTP transport in
+  `weave-mcp/http.rs`. The render layer is the new **pure** `dashboard.rs`
+  (`html_escape`, `render_dashboard(snapshot, now, host)`, `sse_event` /
+  `sse_keepalive`, a `route(method, path)` classifier) — socket-free and DB-free,
+  so it unit-tests with no listener. `http.rs::serve_dashboard(port, token,
+  store_factory)` owns the listener and spawns a **short-lived `std::thread` per
+  accepted connection** (each opens its own read-only `Store` handle — `Store:
+  Send` but not `Sync`) so a long-lived `GET /events` SSE stream cannot starve
+  other requests (still **no async runtime**). The dashboard is **read-only**
+  (`GET /` HTML, `GET /events` SSE — never mutates), **localhost-bound**, and
+  **bearer-gated** (WL-022). `handle_connection` (the MCP port) also answers those
+  GET routes under the feature, with the **POST/JSON-RPC path byte-identical**.
+- **Telegram bridge** (`weave telegram`) / **Slack bridge** (`weave slack`) —
+  `weave/src/telegram.rs` / `slack.rs`, **poll-only v1** (no inbound webhook
+  server). Each factors a **pure** payload-builder (`telegram_send_payload` /
+  `slack_post_payload`) and inbound-parser (`parse_telegram_update` /
+  `parse_slack_message`) tested with no network, plus a blocking `reqwest` poll
+  loop on the CLI thread: inbound human messages become `Store::send` from the
+  configured `bridge_identity` (idents sanitized + `check_ident`-validated, bodies
+  capped at `MAX_BODY` first); outbound, the loop relays the bridge inbox to the
+  chat. Bot tokens are SECRETS (config/env, Debug-redacted, never logged).
 
 ### `setup.rs` — Claude Code wiring
 
@@ -1088,6 +1121,21 @@ injected and stored text is handled**, not on network attackers.
   cross-store `from` is advisory, exactly like a same-store send. A `--features
   sign` build (Ed25519, §10) makes a signed `from` unforgeable and **always**
   rejects a tampered or spoofed signature; the default build links no crypto.
+- **Human surfaces add an exposed read surface + new secrets (`surfaces` feature,
+  WL-048).** The web dashboard is the one surface that renders **stored** text back
+  out, so it is an **XSS** target: every Store-derived string (peer names, message
+  bodies/subjects, job titles, lease holders, schedule bodies, repo/branch tags)
+  passes through the single `dashboard::html_escape` (`& < > " '`) before it reaches
+  the HTML — there is no `format!("…{body}…")` of raw Store text, and a regression
+  test asserts an injected `<script>` does not survive unescaped. The dashboard is
+  additionally **read-only** (GET only, never mutates), **localhost-bound**, and
+  **bearer-gated** (WL-022; a generated token printed to stderr when none is given).
+  The Telegram/Slack **bot tokens are new secrets**: config/env only, **Debug-
+  redacted**, never logged and never placed in a logged URL or argv (the Bearer
+  header / URL path carry them but are never echoed); envctl can inject the token
+  env vars. Inbound bot text is bounded (`MAX_BODY`) and the inbound sender is
+  sanitized to a valid `check_ident` weave ident before any `Store::send`. The bots
+  and dashboard **spawn nothing** (no-shell invariant intact); all logging is stderr.
 
 ---
 

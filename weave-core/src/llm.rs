@@ -145,30 +145,7 @@ mod tests {
 
     #[test]
     fn unconfigured_endpoint_errors() {
-        let cfg = Config {
-            session: None,
-            backend: None,
-            db: None,
-            nudge_template: None,
-            mux_preference: None,
-            libsql_url: None,
-            libsql_auth_token: None,
-            retention_secs: None,
-            peer_dbs: None,
-            pull_from: None,
-            inject_pulled: None,
-            allow_inject_from: None,
-            strict_verify: None,
-            trust: None,
-            revoked: None,
-            pull_token: None,
-            circle: None,
-            llm_endpoint: None,
-            llm_api_key: None,
-            llm_model: None,
-            llm_timeout_secs: None,
-            llm_max_input_chars: None,
-        };
+        let cfg = Config::default();
         let err = summarize_text(&cfg, "hello").unwrap_err().to_string();
         assert!(err.contains("LLM endpoint not configured"), "{err}");
     }
@@ -176,28 +153,9 @@ mod tests {
     #[test]
     fn secret_redacted_in_debug() {
         let cfg = Config {
-            session: None,
-            backend: None,
-            db: None,
-            nudge_template: None,
-            mux_preference: None,
-            libsql_url: None,
-            libsql_auth_token: None,
-            retention_secs: None,
-            peer_dbs: None,
-            pull_from: None,
-            inject_pulled: None,
-            allow_inject_from: None,
-            strict_verify: None,
-            trust: None,
-            revoked: None,
-            pull_token: None,
-            circle: None,
             llm_endpoint: Some("https://example.com".to_string()),
             llm_api_key: Some("secret123".to_string()),
-            llm_model: None,
-            llm_timeout_secs: None,
-            llm_max_input_chars: None,
+            ..Config::default()
         };
         let dbg = format!("{:?}", cfg);
         assert!(

@@ -11,6 +11,10 @@ sqlite = ["dep:rusqlite"]
 libsql = ["dep:libsql", "dep:tokio"]
 sign = ["dep:ed25519-dalek", "dep:sha2"]
 llm = ["dep:reqwest"]
+# WL-048 / ADR-0004: human surfaces (dashboard + Telegram/Slack bridges). Shares
+# the optional `reqwest` blocking client with `llm` (Cargo unions the feature ⇒
+# one reqwest copy). Default OFF ⇒ the default build gains zero compiled deps.
+surfaces = ["dep:reqwest"]
 
 [dependencies]
 anyhow = "1.0.102"

@@ -44,6 +44,17 @@ cargo clippy --no-default-features --features "libsql sign" --all-targets -- -D 
 cargo test   --no-default-features --features "libsql sign"
 ```
 
+If you touch the optional `surfaces` feature (human dashboard + Telegram/Slack
+bridges, WL-048 / ADR-0004), build/lint/test it on **both** backends too — it
+composes with each, and the default build must stay free of its `reqwest` dep:
+
+```bash
+cargo clippy --all-targets --features surfaces -- -D warnings
+cargo test   --features surfaces
+cargo build  --no-default-features --features "libsql surfaces"
+cargo tree | grep reqwest    # default tree: expect NO output (reqwest only under surfaces/llm)
+```
+
 CI runs all of these as separate jobs (`rustfmt`, `clippy`, `test`, `build (libsql
 backend)`, `sign`, `libsql + sign`), so the optional crypto path and the libSQL
 test suite are gated on every PR — not just locally.

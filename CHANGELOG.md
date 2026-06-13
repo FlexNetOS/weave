@@ -35,6 +35,53 @@
 > MCP refactor + budget invariant + multi-surface parity (WL-050..052 / ADR-0003).
 > Structural: collapse the interim 4-crate workspace to single-crate (WL-043).
 
+## [Unreleased] — Rust-native human surfaces (WL-048)
+
+> **feat(mcp/cli/config): read-only web dashboard + Telegram/Slack bridges behind
+> `--features surfaces` (WL-048 / ADR-0004).** weave regains repowire's three human
+> surfaces — a live **read-only web dashboard** (sessions/presence, recent messages,
+> jobs, leases, schedules) served as server-rendered HTML + SSE over the EXISTING
+> hand-rolled `std::net` HTTP transport, and **Telegram** + **Slack** bridges (poll-
+> only v1) — all **Rust-native, no Next.js, no Python, no async runtime**, behind a
+> single new `--features surfaces` Cargo feature (**default OFF** ⇒ the default build
+> gains **zero** compiled deps). The bots reuse the **same** optional
+> `reqwest` blocking+rustls client `llm` already carries (Cargo unions the feature ⇒
+> **one** reqwest copy; `cargo tree` shows none in the default build). The dashboard
+> is read-only, localhost-bound, bearer-gated (WL-022), and **HTML-escapes every
+> Store-derived string** (the central XSS defense). Surfaces are **CLI subcommands,
+> not MCP tools** (ADR-0003 token-light preserved). Closes the last repowire-parity
+> gap (`docs/REPOWIRE-PARITY.md` §6).
+
+### Added
+- **mcp (`weave-mcp`):** new pure `dashboard` module — `html_escape`,
+  `render_dashboard(snapshot, now, host)`, `sse_event`/`sse_keepalive`, and a
+  `route(method, path)` classifier (socket-free, unit-tested incl. an XSS-escape
+  regression). `http.rs` gains a `serve_dashboard(port, token, store_factory)`
+  entrypoint that spawns a **short-lived `std::thread` per connection** (each opens
+  its own read-only `Store` handle — `Store: Send` not `Sync`) so a long-lived SSE
+  stream cannot starve the MCP port; `handle_connection` additionally answers
+  `GET /` (HTML) and `GET /events` (SSE) under the feature, with the **POST/JSON-RPC
+  path byte-identical**.
+- **cli (`weave`):** `weave dashboard [--port 8788] [--token]` (random token printed
+  to **stderr** when omitted), `weave telegram`, `weave slack` subcommands (all
+  `#[cfg(feature = "surfaces")]`).
+- **bots (`weave`):** `telegram.rs` / `slack.rs` — pure payload-builders
+  (`telegram_send_payload` / `slack_post_payload`) and inbound-parsers
+  (`parse_telegram_update` / `parse_slack_message`, unit-tested incl.
+  missing-field/oversized-body), plus blocking poll loops (`getUpdates` long-poll /
+  `conversations.history` poll → `Store::send`; bridge-inbox poll → `sendMessage` /
+  `chat.postMessage`). Inbound idents are sanitized + `check_ident`-validated and
+  bodies capped at `MAX_BODY` before the store write.
+- **config (`weave-core`):** `telegram_token` / `slack_token` (SECRETS — Debug-
+  redacted, never logged), `telegram_chat_id` / `slack_channel` / `bridge_identity`
+  config keys + `WEAVE_TELEGRAM_TOKEN` / `WEAVE_TELEGRAM_CHAT_ID` /
+  `WEAVE_SLACK_TOKEN` / `WEAVE_SLACK_CHANNEL` / `WEAVE_BRIDGE_IDENTITY` env overlays
+  (envctl can inject the secrets).
+- **features:** `surfaces` added to `weave-core` (`["dep:reqwest"]`), `weave-mcp`
+  (`["weave-core/surfaces"]`), and `weave` (`["weave-core/surfaces",
+  "weave-mcp/surfaces", "dep:reqwest"]`) — mirroring the `sign`/`libsql` propagation.
+  No `Store` change; the feature compiles + serves on **both** backends.
+
 ## [Unreleased] — agent spawn/kill (WL-047)
 
 > **feat(inject/mcp/cli): agent spawn/kill (`weave_spawn_peer` /

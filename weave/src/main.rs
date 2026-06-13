@@ -42,6 +42,10 @@ compile_error!("no storage backend selected: enable `sqlite` (default) or `libsq
 mod git;
 mod harness;
 mod setup;
+#[cfg(feature = "surfaces")]
+mod slack;
+#[cfg(feature = "surfaces")]
+mod telegram;
 #[cfg(feature = "sign")]
 use weave_core::sign;
 #[cfg(test)]
@@ -807,6 +811,25 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// WL-048: serve the read-only human web dashboard (sessions, messages, jobs,
+    /// leases, schedules) over HTTP + SSE. Localhost-bound, bearer-gated, GET-only.
+    #[cfg(feature = "surfaces")]
+    Dashboard {
+        /// Port to listen on (default 8788).
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        /// Bearer token. If omitted, a random token is generated and printed to stderr.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// WL-048: run the Telegram bridge (poll-only): relay between a Telegram chat
+    /// and the weave mesh. Token from config/`WEAVE_TELEGRAM_TOKEN`.
+    #[cfg(feature = "surfaces")]
+    Telegram,
+    /// WL-048: run the Slack bridge (poll-only): relay between a Slack channel and
+    /// the weave mesh. Token from config/`WEAVE_SLACK_TOKEN`.
+    #[cfg(feature = "surfaces")]
+    Slack,
 }
 
 /// `weave daemon` subcommands (v0.2).  The optional presence daemon writes
@@ -4487,6 +4510,34 @@ fn main() -> Result<()> {
                     println!("    {}: {:.4}", s.node, s.score);
                 }
             }
+        }
+
+        #[cfg(feature = "surfaces")]
+        Cmd::Dashboard { port, token } => {
+            // Reuse WL-022 bearer auth: generate a random token if none given and
+            // print it to stderr (never stdout — MCP stdout discipline), like Serve.
+            let token = match token {
+                Some(t) => t,
+                None => {
+                    let t = store::mint_birth_cert()?;
+                    eprintln!("[weave] dashboard bearer token: {t}");
+                    t
+                }
+            };
+            // Each accepted connection thread opens its OWN read-only store handle
+            // (Store is Send, not Sync) — the factory clones the resolved Config.
+            let cfg_for_factory = cfg.clone();
+            weave_mcp::serve_dashboard(port, &token, move || open_store(&cfg_for_factory))?;
+        }
+
+        #[cfg(feature = "surfaces")]
+        Cmd::Telegram => {
+            telegram::run(store, &cfg)?;
+        }
+
+        #[cfg(feature = "surfaces")]
+        Cmd::Slack => {
+            slack::run(store, &cfg)?;
         }
 
         Cmd::Schedule {
