@@ -61,9 +61,10 @@ gap is never mistaken for "covered":
   `call_tool` handler as MCP/CLI — no parallel path; every invariant inherited. Read-only is the
   default (POST → 403). Remaining polish: an in-page HTML send form + per-message/job read views
   (the API is the substrate; the form is a leaf, per the agent-first stance).
-- **WL-052b — Bot command grammar.** Structured commands on Telegram/Slack (`/inbox`, `/ask`,
-  `/peers`, …) mapping to the same handlers, with the existing identity-sanitization + secret-free
-  logging guarantees. Currently the bots relay free text only.
+- **WL-052b — Bot command grammar (Telegram v1 DONE).** The Telegram bridge answers `/inbox`,
+  `/peers`, `/sessions`, `/help` by dispatching through the **same** `dispatch_request` handler as
+  MCP/CLI (read-only v1; mutating commands hit the safe gate). Pure parser/mapper/formatter,
+  unit-tested. Remaining: wire the same grammar into the Slack bridge; add `/ask`/`/send` (write).
 - **Design law for both:** a human surface must call the **same** capability handler as CLI/MCP —
   parity is achieved by *routing to one implementation*, not by re-implementing per surface. That
   is what keeps this matrix honest and the behavior identical everywhere.

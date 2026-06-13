@@ -3,6 +3,14 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **Bot command grammar (WL-052b), `--features surfaces`:** the Telegram bridge now
+  answers structured `/`-commands — `/inbox`, `/peers`, `/sessions`, `/help` — by
+  dispatching through the **same** `dispatch_request` → `call_tool` handler as MCP/CLI
+  (the one-handler-many-surfaces law), formatting the result back to the chat. Ordinary
+  (non-`/`) text still relays into the mesh as before. Read-only in v1 (mutating commands
+  are not exposed to chat by default; they hit the safe `dangerous=false` gate). The
+  parser, RPC mapping, and reply formatter are pure + unit-tested; the Slack bridge reuses
+  the same grammar (wiring is a follow).
 - **Dashboard write surface (WL-052a), behind `weave dashboard --write` (default
   read-only):** a bearer-gated `POST /api` action route that accepts a JSON-RPC body
   and dispatches through the **same** `dispatch_request` → `call_tool` handler the MCP
