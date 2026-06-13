@@ -1,5 +1,40 @@
 # Changelog
 
+> **What weave is (v0.2.0).** weave is the **Rust-native superset of repowire** —
+> a full agent-to-agent **orchestration mesh** in one dependency-light static
+> binary, Python-free, no daemon (the DB is the broker): **70 `weave_*` MCP
+> tools** with full CLI parity, dual `Store` backends (**sqlite** default +
+> **libSQL/Turso**), optional `sign` (ed25519) and `llm` (summarization)
+> features, a five-mux native paste-safe injector (tmux/zellij/kitty/wezterm/
+> screen) + iTerm2, and a CI gate of six required checks across both backends
+> (≈531 sqlite / ≈491 libsql tests). The per-feature `[Unreleased]` blocks below
+> are the running log; this header is the reconciled summary so the entries are
+> read as the shipped mesh, not the v0.1.0 seed at the foot of this file.
+>
+> **Shipped orchestration surface (WL-001..033, all merged; ground truth:
+> `.handoff/loop/backlog.md`):** workspace split (WL-001); presence daemon +
+> MCP tools (WL-002); zellij pane targeting (WL-003); daemon lifecycle tests +
+> hardened loop + `weave setup` + tmux bracketed-paste (WL-004..007); live
+> injection validation (WL-008/009); mcp-broker/repowire retirement decision
+> (WL-010); kitty/wezterm/screen adapters (WL-012); config file (WL-013);
+> reminder injection + structured question types (WL-014/015); scheduler
+> (WL-016); mesh agent memory (WL-017); birth-certificate identity (WL-018);
+> co-orchestrator (WL-019); GitHub review queue (WL-020); PreToolUse permission
+> gating (WL-021); streamable-HTTP MCP transport (WL-022); iTerm2 injector
+> (WL-023); reservation leases + TTL sweep + pre-commit guard (WL-024/029/030);
+> stop-boundary wake (WL-025); idempotency + trace IDs (WL-026); broadcast
+> notify/ask (WL-027); FTS5 search (WL-028); message priority + contact policies
+> (WL-031/032); LLM thread summarization (WL-033); plus the bonus
+> FrankenNetworkX graph extraction. Cross-store federation + Tier-2 pull and the
+> ed25519 `sign` path are logged in their own blocks below.
+>
+> **Mission gaps (in scope, not shipped):** repowire parity audit (WL-046),
+> agent spawn/kill (WL-047), Rust-native human surfaces (WL-048,
+> dashboard/Telegram/Slack, no Next.js/Python), governed obscura web access
+> (WL-049 / ADR-0002, no V8 in core), and the token-light progressive-disclosure
+> MCP refactor + budget invariant + multi-surface parity (WL-050..052 / ADR-0003).
+> Structural: collapse the interim 4-crate workspace to single-crate (WL-043).
+
 ## [Unreleased] — Codex 7-layer harness (`weave harness ide-merge-ide`)
 
 > **Autonomous orchestration surface in the binary.** `weave harness

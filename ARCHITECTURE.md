@@ -1,15 +1,85 @@
 # weave — Architecture
 
-`weave` is a single static Rust binary that lets coding-agent sessions (Claude
-Code and friends) message each other over a shared mailbox, and — when a
-recipient is running inside a terminal multiplexer — **pushes** the message into
-that recipient's live pane via a native injector. No Python, no daemon, no
-external dependency on `repowire`.
+`weave` is a single static Rust binary that is the **Rust-native superset of
+repowire** — a full agent-to-agent **orchestration mesh** for coding-agent
+sessions (Claude Code and friends). Sessions message each other over a shared
+mailbox and — when a recipient is running inside a terminal multiplexer —
+**push** the message into that recipient's live pane via a native, paste-safe
+injector. But messaging is only the seed: weave coordinates real work through
+**structured asks/answers/acks**, **broadcast** and **ask-many** fan-out,
+**tool-permission gating**, a **durable job board**, **advisory leases**,
+**orchestrator turn-state**, a **review queue**, **scheduling**, **agent
+memory**, optional **ed25519 signing**, and optional **LLM thread
+summarization** — **70 `weave_*` MCP tools** with full CLI parity. No Python, no
+daemon (the DB *is* the broker), no external dependency on `repowire`.
 
 This document describes the modules, the `Store` trait and its backends, the
 native injector, the no-daemon push model, lifecycle-hook auto-delivery, the
 data model, the threat model, and how weave compares to the two prior tools on
-this box (`mcp-broker` and `repowire`).
+this box (`mcp-broker` and `repowire`). For the mission and the full surface
+read §0 first; the early "message each other + inject" framing described the
+v0.1.0 seed, not today's mesh.
+
+---
+
+## 0. Mission: the repowire-superset orchestration mesh
+
+weave is the **DEFINITIVE Rust-native SUPERSET of repowire — MORE than repowire,
+not less** — in one dependency-light static binary, Python-free. Three
+properties are non-negotiable and shape every section below:
+
+- **dependency-light** — one small static binary; heavyweight deps (the
+  libSQL/tokio tree, the LLM client) live behind feature flags only.
+- **no-daemon** — there is no relay process; the SQLite/libSQL file is the
+  broker, and any mux CLI can push into any pane, so the *sender* injects.
+- **token-light** (ADR-0003, a first-class invariant peer of dependency-light) —
+  the standing context cost of the MCP surface must stay small regardless of how
+  many capabilities exist; *adding a feature must not add standing tokens*.
+
+### The shipped surface (WL-001..033, merged)
+
+The orchestration mesh is **already built** — 70 `weave_*` MCP tools, each with a
+CLI equivalent, backed by the `Store` trait on both backends:
+
+| Subsystem | What it does | Where |
+|---|---|---|
+| Messaging + inject | send/notify/reply/inbox/history/thread; native push, paste-safe, 5 muxes + iTerm2 | `weave-inject`, `mcp.rs`, `store.rs` §3 |
+| Asks / answers / acks | tracked correlation-ID ask/answer/ack, structured question types | `asks`/`ask_groups` tables §6 |
+| Broadcast / ask-many | fan-out notify + ask to all online peers in a circle | `mcp.rs`, §6 |
+| Permissions | PreToolUse tool-approval gating, deny-by-default on timeout | `permission_*`, §7 |
+| Job board | durable poll-only create/claim/update/result/cancel | `jobs` table §6 |
+| Leases | advisory path leases, TTL expiry, conflict detection, pre-commit guard | `leases` table §6 |
+| Orchestrator | circles + orchestrator role, turn-state machine, co-orchestrator | `peers.turn_state`, §6 |
+| Review queue | track PR review state across peers | `review_queue` table |
+| Scheduling | one-shot + recurring scheduled deliveries, drift-safe `tick` | `schedules` table |
+| Agent memory | filesystem-backed scoped memory (global/project/persona/orchestrator) | `memory.rs` |
+| Summarization | LLM thread summaries, cached in-store (`llm` feature) | `llm.rs`, `summaries` table |
+| Signing | optional ed25519 signed sender identity + rotation/revocation | `sign.rs`, §6/§10 |
+| Federation / Tier-2 | read-only multi-store federation + cross-store / cross-machine pull | §9, §10 |
+
+### The mission gaps (in scope, not dropped)
+
+weave deliberately dropped repowire's *Python* daemon and human surfaces; the
+capabilities themselves remain in scope, to land **Rust-native**:
+
+- **Agent spawn/kill** — `weave_spawn_peer` / `weave_kill_peer`, argv-only,
+  per-mux, birth-cert identity — repowire parity weave currently lacks — **WL-047**.
+- **Rust-native human surfaces** — dashboard / Telegram / Slack over
+  `weave-mcp/http.rs`, **no Next.js/Python**, behind a `--features surfaces`
+  flag — **WL-048 / WL-052**.
+- **Governed web reach** — register the separate `obscura-mcp` binary as a
+  weave-governed web-access capability (permission/lease/job-gated stealth
+  browsing); **NO V8 in weave's core** — **WL-049**, decided in **ADR-0002**
+  (`.handoff/decisions/ADR-0002-obscura-web-access-integration.md`).
+- **token-light surface** — replace the 70 eager flat MCP tools with
+  progressive-disclosure dispatchers / a meta-tool (≤ ~2k standing tokens, zero
+  capability loss) and add a guarded standing-token budget — **WL-050..052**,
+  decided in **ADR-0003**
+  (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
+
+The provable have/superset/gap parity matrix against repowire's inventory is
+**WL-046**. Structurally, the four-crate workspace below is **interim** —
+single-crate remains the goal (WL-043).
 
 ---
 
