@@ -15,6 +15,11 @@ llm = ["dep:reqwest"]
 # the optional `reqwest` blocking client with `llm` (Cargo unions the feature ⇒
 # one reqwest copy). Default OFF ⇒ the default build gains zero compiled deps.
 surfaces = ["dep:reqwest"]
+# WL-049 / ADR-0002: obscura governed web access. weave-core holds only the pure
+# web-access policy + SSRF/loopback URL validator (no I/O, no new dep — std + the
+# already-present serde_json suffice). Default OFF ⇒ the default build gains zero
+# compiled deps. The MCP client that spawns the `obscura` binary lives in weave-mcp.
+obscura = []
 
 [dependencies]
 anyhow = "1.0.102"

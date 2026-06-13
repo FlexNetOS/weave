@@ -390,6 +390,18 @@ const PEER_DBS_LIST_SEP: char = ':';
 /// `MYDB=libsql` + `//h/db` and the label feature would silently never engage via the
 /// env path. We recognize it with the SAME canonical label rule the resolver uses:
 /// a valid label left of the first `=` and a remote-scheme URL on the right.
+/// Split a simple comma-separated policy list (web ops / domains — WL-049). Unlike
+/// [`split_source_list`] this does NOT also split on the path-list separator (`:`),
+/// because a domain/op value never carries one and splitting on `:` would corrupt
+/// e.g. a `host:port`. Blank entries are dropped; surrounding whitespace trimmed.
+fn split_csv_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn split_source_list(v: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for comma_part in v.split(',') {
@@ -679,6 +691,56 @@ pub struct Config {
     /// the bridge falls back to a fixed default identity. Inert without `surfaces`.
     #[serde(default)]
     pub bridge_identity: Option<String>,
+    /// WL-049 / ADR-0002 (only meaningful in a `--features obscura` build): the
+    /// `obscura` browser binary name/path weave spawns as a governed web-access
+    /// child. Resolved to a TRUSTED absolute path via the injector's trusted-dir
+    /// logic (never ambient `$PATH`). `None` ⇒ the default `"obscura"`. Overlaid by
+    /// `WEAVE_OBSCURA_BIN`. Inert without the `obscura` feature.
+    #[serde(default)]
+    pub obscura_bin: Option<String>,
+    /// WL-049: pass `--stealth` to `obscura mcp` (CDP anti-detection). NOT a secret.
+    /// `None`/`false` ⇒ no stealth flag. Overlaid by `WEAVE_OBSCURA_STEALTH`
+    /// (truthy/falsy). Inert without the `obscura` feature.
+    #[serde(default)]
+    pub obscura_stealth: Option<bool>,
+    /// WL-049: optional upstream proxy URL passed to `obscura mcp --proxy`. May
+    /// carry credentials, so treat as a SECRET — redacted in Debug, never logged.
+    /// Overlaid by `WEAVE_OBSCURA_PROXY`. Inert without the `obscura` feature.
+    #[serde(default)]
+    pub obscura_proxy: Option<String>,
+    /// WL-049: optional User-Agent string passed to `obscura mcp --user-agent`. NOT
+    /// a secret. Overlaid by `WEAVE_OBSCURA_USER_AGENT`. Inert without `obscura`.
+    #[serde(default)]
+    pub obscura_user_agent: Option<String>,
+    /// WL-049: per-op read timeout (seconds) for the obscura MCP client. Web
+    /// navigation is slower than mux injection, so this defaults higher (~30s).
+    /// Overlaid by `WEAVE_OBSCURA_TIMEOUT_SECS`. Inert without `obscura`.
+    #[serde(default)]
+    pub obscura_timeout_secs: Option<i64>,
+    /// WL-049: deny-by-default web-access allow-list — the `browser_*` ops this
+    /// install permits (without the `browser_` prefix, e.g. `["navigate","snapshot"]`),
+    /// or `["*"]` for all ops. Empty/`None` ⇒ **deny every web op** (the secure
+    /// default). Overlaid by `WEAVE_OBSCURA_ALLOW_OPS` (comma/path-separated). Inert
+    /// without the `obscura` feature.
+    #[serde(default)]
+    pub obscura_allow_ops: Option<Vec<String>>,
+    /// WL-049: optional domain allow-list for URL-bearing ops. When non-empty, a
+    /// navigated URL's host must match (exact or `.suffix`) an entry. Empty/`None` ⇒
+    /// no domain restriction beyond the SSRF/loopback guard. Overlaid by
+    /// `WEAVE_OBSCURA_ALLOW_DOMAINS` (comma/path-separated). Inert without `obscura`.
+    #[serde(default)]
+    pub obscura_allow_domains: Option<Vec<String>>,
+    /// WL-049: allow obscura to reach loopback / link-local / RFC1918 / `*.local` /
+    /// bare-IP internal hosts. `None`/`false` ⇒ **deny internal hosts** (SSRF guard).
+    /// Set `true` only when an internal-host use case is required. Overlaid by
+    /// `WEAVE_OBSCURA_ALLOW_INTERNAL` (truthy/falsy). Inert without `obscura`.
+    #[serde(default)]
+    pub obscura_allow_internal: Option<bool>,
+    /// WL-049: optional auth token passed to obscura via the `OBSCURA_TOKEN` child
+    /// env var (never argv, never logged). A SECRET — redacted in Debug. Overlaid by
+    /// `WEAVE_OBSCURA_TOKEN`. Inert without the `obscura` feature.
+    #[serde(default)]
+    pub obscura_token: Option<String>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -728,6 +790,21 @@ impl std::fmt::Debug for Config {
             )
             .field("slack_channel", &self.slack_channel)
             .field("bridge_identity", &self.bridge_identity)
+            .field("obscura_bin", &self.obscura_bin)
+            .field("obscura_stealth", &self.obscura_stealth)
+            .field(
+                "obscura_proxy",
+                &self.obscura_proxy.as_ref().map(|_| "<redacted>"),
+            )
+            .field("obscura_user_agent", &self.obscura_user_agent)
+            .field("obscura_timeout_secs", &self.obscura_timeout_secs)
+            .field("obscura_allow_ops", &self.obscura_allow_ops)
+            .field("obscura_allow_domains", &self.obscura_allow_domains)
+            .field("obscura_allow_internal", &self.obscura_allow_internal)
+            .field(
+                "obscura_token",
+                &self.obscura_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -955,6 +1032,40 @@ impl Config {
         }
         if let Some(v) = nonempty("WEAVE_BRIDGE_IDENTITY") {
             cfg.bridge_identity = Some(v);
+        }
+        // WL-049 / ADR-0002 obscura governed web access (only meaningful in a
+        // `--features obscura` build). The proxy URL and token are SECRETS — env is
+        // preferred over the config file and the value is never echoed here. The
+        // allow-lists are comma-separated; an env value REPLACES the config list
+        // (these are policy allow-lists, not additive source unions — a tighter env
+        // override must never be silently widened by a stale config list).
+        if let Some(v) = nonempty("WEAVE_OBSCURA_BIN") {
+            cfg.obscura_bin = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_STEALTH").and_then(|s| parse_bool(&s)) {
+            cfg.obscura_stealth = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_PROXY") {
+            cfg.obscura_proxy = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_USER_AGENT") {
+            cfg.obscura_user_agent = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_TIMEOUT_SECS").and_then(|s| s.parse::<i64>().ok())
+        {
+            cfg.obscura_timeout_secs = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_ALLOW_OPS") {
+            cfg.obscura_allow_ops = Some(split_csv_list(&v));
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_ALLOW_DOMAINS") {
+            cfg.obscura_allow_domains = Some(split_csv_list(&v));
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_ALLOW_INTERNAL").and_then(|s| parse_bool(&s)) {
+            cfg.obscura_allow_internal = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_OBSCURA_TOKEN") {
+            cfg.obscura_token = Some(v);
         }
         cfg
     }

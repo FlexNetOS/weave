@@ -10176,3 +10176,152 @@ mod surfaces_dashboard {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WL-049 / ADR-0002: governed web access via a FAKE `obscura` binary.
+//
+// The stub is a chmod-755 `obscura` script that speaks the obscura MCP framing on
+// stdio: it echoes a canned `initialize` reply, ignores `notifications/initialized`,
+// and answers each `tools/call` with a canned `content[0].text` carrying the request
+// id back (so weave's id-matching reader resolves it). NO real browser, no network.
+// The dir is trusted via WEAVE_MUX_DIR + pointed at by WEAVE_OBSCURA_BIN.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "obscura")]
+mod obscura_web {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Write a chmod-755 fake `obscura` script that talks the MCP stdio framing.
+    /// Returns the trusted dir containing it.
+    fn make_fake_obscura() -> std::path::PathBuf {
+        let dir = common::unique_db().with_extension("obscurabin");
+        std::fs::create_dir_all(&dir).expect("create fake-obscura dir");
+        let script = dir.join("obscura");
+        // POSIX sh: read each JSON-RPC line; reply per method. The id is grepped out
+        // of the line so the reply id matches what weave sent. `browser_navigate`
+        // returns canned page text; an unknown action would never reach here (the
+        // policy gate rejects it before spawn).
+        let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"obscura-mcp","version":"test"}}}\n' "$id"
+      ;;
+    *'notifications/initialized'*)
+      : # notification, no reply
+      ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"FAKE-OBSCURA-OK example.com"}]}}\n' "$id"
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Unknown method"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script, body).expect("write fake obscura");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat fake obscura")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x fake obscura");
+        dir
+    }
+
+    /// `weave web` with the fake obscura trusted + an allow-policy via env.
+    fn web_cmd(db: &TestDb, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = common::weave_cmd(db, args);
+        // Trust the fake-obscura dir (the same opt-in muxes use) and point the bin
+        // resolution at our stub.
+        cmd.env("WEAVE_MUX_DIR", dir);
+        cmd.env("WEAVE_OBSCURA_BIN", "obscura");
+        cmd
+    }
+
+    #[test]
+    fn web_navigate_drives_fake_obscura() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let out = web_cmd(
+            &db,
+            &dir,
+            &["web", "navigate", "--url", "https://example.com"],
+        )
+        .env("WEAVE_OBSCURA_ALLOW_OPS", "navigate")
+        .env("WEAVE_SESSION", "tester")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run weave web navigate");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "weave web navigate should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("FAKE-OBSCURA-OK"),
+            "expected the fake obscura payload, got stdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn web_denied_by_default_no_policy() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        // No allow-ops env ⇒ deny-by-default; obscura must NOT be driven.
+        let out = web_cmd(
+            &db,
+            &dir,
+            &["web", "navigate", "--url", "https://example.com"],
+        )
+        .env("WEAVE_SESSION", "tester")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run weave web navigate");
+        assert!(
+            !out.status.success(),
+            "deny-by-default must fail the command"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not allowed by policy"),
+            "expected deny-by-default message, got stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn web_ssrf_blocks_localhost() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let out = web_cmd(&db, &dir, &["web", "navigate", "--url", "http://127.0.0.1"])
+            .env("WEAVE_OBSCURA_ALLOW_OPS", "navigate")
+            .env("WEAVE_SESSION", "tester")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run weave web navigate");
+        assert!(!out.status.success(), "SSRF target must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("SSRF guard") || stderr.contains("internal/loopback"),
+            "expected SSRF refusal, got stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn web_list_enumerates_ops_without_spawn() {
+        let db = TestDb::new();
+        let dir = make_fake_obscura();
+        let out = web_cmd(&db, &dir, &["web", "--list"])
+            .env("WEAVE_SESSION", "tester")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run weave web --list");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "--list should succeed");
+        assert!(
+            stdout.contains("navigate") && stdout.contains("35 web ops"),
+            "expected the op list, got: {stdout}"
+        );
+    }
+}

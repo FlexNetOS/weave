@@ -14,6 +14,10 @@ sign = ["weave-core/sign"]
 llm = ["weave-core/llm"]
 # WL-048 / ADR-0004: the dashboard render/route/SSE module lives in this crate.
 surfaces = ["weave-core/surfaces"]
+# WL-049 / ADR-0002: the obscura MCP client (spawns the `obscura` binary, speaks
+# newline-delimited JSON-RPC over its stdio) lives in this crate. std + the already-
+# present serde_json only — NO new dependency. Default OFF.
+obscura = ["weave-core/obscura"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }

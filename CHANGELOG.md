@@ -2,6 +2,23 @@
 
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
+### Added
+- **obscura governed web access (WL-049, ADR-0002), behind `--features obscura`
+  (default OFF):** weave becomes the governance plane for obscura's stealth web
+  access. It spawns the separate `obscura mcp` binary (argv-only, trusted-path
+  resolved, no shell) and speaks newline-delimited JSON-RPC over its stdio as a
+  hand-rolled MCP **client** — **no V8/tokio/obscura crate linked**, and the
+  default `cargo tree` is byte-identical (zero new deps; std + serde_json only).
+  One token-light `weave_web {action,args,describe?}` MCP dispatcher + a
+  `weave web <op>` CLI proxy all 35 `browser_*` ops (ADR-0003), not 35 eager
+  tools; `weave_web` is gated as dangerous. Access is **deny-by-default** via a
+  pure `weave-core::webpolicy` allow-policy with an **SSRF/loopback URL
+  validator** (internal/localhost/link-local/RFC1918/`*.local`/bare-IP denied
+  unless `obscura_allow_internal`). Governance reuses the existing
+  permission/lease/job Store methods (no new Store method, no schema change). The
+  obscura child is lazily spawned, reused, and reaped on `Drop` / `weave web
+  --stop` (no zombies); its stderr and any proxy/token secrets are never logged.
+
 ### Fixed
 - **inject/cli/mcp:** `weave kill` (and `weave_kill_peer`) no longer falsely
   report `killed …` when the mux `kill-pane`/`kill` command actually failed

@@ -34,13 +34,16 @@ the code.
 
 **Conclusion: the superset claim holds.** Every repowire *messaging,
 orchestration, scheduling, memory, presence, security, and transport* primitive
-is present or exceeded. With **agent spawn/kill shipped** (WL-047) **and the
-human surfaces shipped** (WL-048 — Rust-native web dashboard + Telegram/Slack
-behind `--features surfaces`), the remaining gaps are **two minor conveniences**
-only. weave additionally ships **13** capabilities
-repowire never had (signing, summarization, leases, FTS, federation, dual
-backend, graph analytics, …), and adds governed web reach via obscura (WL-049 /
-ADR-0002) that repowire's relay never offered.
+is present or exceeded. With **agent spawn/kill shipped** (WL-047), **the human
+surfaces shipped** (WL-048 — Rust-native web dashboard + Telegram/Slack behind
+`--features surfaces`), **and governed web reach shipped** (WL-049 — stealth
+browsing via obscura behind `--features obscura`), the remaining gaps are **two
+minor conveniences** only. weave additionally ships **13** capabilities repowire
+never had (signing, summarization, leases, FTS, federation, dual backend, graph
+analytics, …), and now **EXCEEDS** repowire's hosted-relay web reach with
+*governed stealth browsing* (WL-049 / ADR-0002): web access **without a daemon**,
+gated + leased + audited + SSRF-guarded, where repowire offered only an
+ungoverned hosted relay.
 
 ---
 
@@ -140,10 +143,12 @@ These have **no repowire equivalent** — they are why weave is a *superset*, no
 12. **`weave_doctor`** federation-health + signature verify rollup.
 13. **One dependency-light static Rust binary, Python-free, no daemon** — the whole thing, vs repowire's Python runtime + daemon + Next.js stack.
 
-Beyond parity, weave's roadmap **extends past repowire entirely** with **governed
-web access via obscura** (WL-049 / **ADR-0002**) — stealth headless browsing
-gated by weave's permission/lease/job system, no V8 in weave's core — a
-capability repowire's hosted relay never provided.
+Beyond parity, weave **extends past repowire entirely** with **governed web
+access via obscura** (WL-049 / **ADR-0002**, ✅ shipped behind `--features
+obscura`) — stealth headless browsing gated by weave's permission/lease/job system
+and SSRF-guarded, **no V8/tokio in weave's core** (zero new default deps) — a
+capability repowire's hosted relay never provided, and one weave delivers
+**without a daemon**.
 
 ---
 
@@ -155,7 +160,7 @@ capability repowire's hosted relay never provided.
 | Rust-native human surfaces (dashboard/Telegram/Slack) | **WL-048 / WL-052** | over `weave-mcp/http.rs`, `--features surfaces`, no Next.js/Python |
 | `agents create` folder scaffolding | *(candidate WL)* | minor convenience; `weave config init` already scaffolds config |
 | `SOUL.md` persona-file precedence | *(candidate WL)* | persona memory **scope** already exists; only the file convention is missing |
-| Governed web reach (beyond repowire) | **WL-049** | ADR-0002 — obscura-as-capability, no V8 in core |
+| ~~Governed web reach (beyond repowire)~~ | **WL-049** ✅ done | ADR-0002 (accepted) — obscura-as-capability via spawn-and-speak MCP client, `weave_web`/`weave web`, deny-by-default + SSRF-guarded, no V8/tokio in core (§7, §9) |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
 
 **Net:** with agent spawn/kill shipped (WL-047), weave supersets repowire on every

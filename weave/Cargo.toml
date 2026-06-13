@@ -25,6 +25,10 @@ llm = ["weave-core/llm"]
 # pulls reqwest into THIS crate (the bots' HTTP client). Cargo unifies it with the
 # `weave-core/surfaces`+`llm` reqwest ⇒ still ONE reqwest copy in the binary.
 surfaces = ["weave-core/surfaces", "weave-mcp/surfaces", "dep:reqwest"]
+# WL-049 / ADR-0002: obscura governed web access. Threads to core (policy/config) +
+# mcp (the spawn-and-speak client). No new dep in THIS crate either — the CLI routes
+# through the same mcp client. Default OFF ⇒ default build is byte-identical.
+obscura = ["weave-core/obscura", "weave-mcp/obscura"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }

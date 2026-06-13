@@ -576,6 +576,41 @@ them); they are Debug-redacted and never logged. The bridge posts inbound human
 replies into the mesh as the configured `bridge_identity` (`WEAVE_BRIDGE_IDENTITY`,
 default `telegram`/`slack`). See ADR-0004 for the locked stack decision.
 
+## Governed web access (`--features obscura`)
+
+weave is the **governance plane** for stealth web access — it does **not** link a
+browser. Behind a default-OFF `--features obscura`, weave spawns the separate
+[`obscura`](https://github.com/FlexNetOS/obscura) browser binary (`obscura mcp`) as
+a child via **argv-only `std::process::Command` (never a shell)** and speaks
+newline-delimited JSON-RPC over its stdio as a hand-rolled MCP **client**. No
+V8/tokio/obscura crate is linked — the default `cargo build` adds **zero** deps
+(std + the already-present `serde_json` carry the whole client). obscura is a
+*runtime* dependency (a separate installed binary), not a compile-time one.
+
+```bash
+cargo build --release --features obscura          # composes: --features "libsql obscura"
+
+# Deny-by-default: configure an allow-list first (config.toml or env), then drive a
+# browser op. ONE op per call; all 35 obscura browser_* ops are reachable.
+WEAVE_OBSCURA_ALLOW_OPS=navigate,snapshot,extract \
+  weave web navigate --url https://example.com
+weave web --list                                  # enumerate the ops (no spawn)
+weave web --stop                                  # reap the cached obscura child
+```
+
+The agent-facing MCP surface grows by **one** token-light tool, not 35:
+`weave_web {action, args, describe?}` (ADR-0003 — per-op schemas fetched on demand
+via `describe`). Every web op is **deny-by-default**: refused unless the operator
+explicitly allows it (`obscura_allow_ops` / `WEAVE_OBSCURA_ALLOW_OPS`, or `"*"`),
+and every URL is **SSRF-guarded** — loopback / `localhost` / link-local
+(`169.254.*` incl. the cloud-metadata endpoint) / RFC1918 private / `*.local` /
+bare-IP targets are blocked unless `obscura_allow_internal=true`. Optional
+`obscura_allow_domains` narrows to a domain allow-list; `--lease-ttl` rate-limits per
+host; `--audit` records a durable job. Web access reuses weave's existing
+permission/lease/job primitives (the same gate as any other mesh work) and
+`weave_web` is gated as a **dangerous** tool (blocked in safe HTTP mode). The
+obscura child's stderr and any proxy/token secrets are never logged. See ADR-0002.
+
 ## Storage
 
 SQLite (rusqlite, bundled) at `~/.local/share/weave/messages.db` (override with `WEAVE_DB`),
