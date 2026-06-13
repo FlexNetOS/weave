@@ -41,7 +41,7 @@ Then operate inside that worktree. This keeps concurrent agent sessions from col
 **Branch model (`develop` is the integration branch; `master`/`main` is the protected default):**
 - **`develop`** is the **PR target** and the always-current base sessions branch their worktrees from. Open **every PR into `develop`** — never into `master` directly.
 - **Gates green → auto-merge.** Arm `gh pr merge <n> --auto --squash`; the PR merges once CI is green. The six checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)`, `sign`, `libsql + sign` — run on the PR and are the gate.
-- **`master`/`main`** is the protected default branch; **`develop` syncs into it** via org-level automation (being built out across all FlexNetOS repos). Do not push `master` directly. Until that sync automation lands, `develop` may legitimately run *ahead* of `master`.
+- **`master`/`main`** is the protected default branch; **`develop` syncs into it** via the `sync-master` workflow (`.github/workflows/sync-master.yml`): on every push to `develop` it waits for the six required checks to go green on the develop tip, then fast-forwards `master` to it (no-downgrade ancestor guard; refuses a diverged master). Do not push `master` directly.
 - **Flow:** worktree off `origin/develop` → work → PR **into `develop`** → auto-merge on green → `develop` syncs to the protected `master`/`main`.
 
 ## CRITICAL: keep weave Rust-native — guard against language drift

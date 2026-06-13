@@ -1,0 +1,93 @@
+name: sync-master
+
+# Promote develop → master after develop's six required checks pass.
+#
+# develop is the integration / PR-gated branch; master is the protected default
+# mirror. weave's master requires the six checks (rustfmt, clippy, test,
+# build (libsql backend), sign, libsql + sign) — so unlike a blind ff, this
+# WAITS for those checks to be green on the develop tip, then fast-forwards.
+# Because check-runs are commit-scoped, the same green runs that pass on develop
+# satisfy master's branch protection on the fast-forward, so master stays
+# genuinely gated and no bypass token / PAT is needed.
+#
+# No-downgrade invariant: develop must be a strict descendant of master, else the
+# job refuses (a diverged master is a human reconciliation, never an auto-sync).
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # fast-forward push to master
+  checks: read      # read check-runs while waiting
+
+concurrency:
+  group: sync-master
+  cancel-in-progress: false   # let each promotion finish; the ancestor guard blocks out-of-order syncs
+
+jobs:
+  ff-master:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout develop (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: develop
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for the six required checks on the develop tip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          required=("rustfmt" "clippy" "test" "build (libsql backend)" "sign" "libsql + sign")
+          echo "Waiting for ${#required[@]} required check(s) on $SHA"
+          deadline=$(( $(date +%s) + 2700 ))   # 45 min budget
+          while :; do
+            runs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
+                      -q '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')"
+            pending=0; failed=""
+            for ctx in "${required[@]}"; do
+              line="$(printf '%s\n' "$runs" | awk -F'\t' -v c="$ctx" '$1==c{print; exit}')"
+              if [ -z "$line" ]; then pending=$((pending+1)); continue; fi
+              status="$(printf '%s' "$line" | cut -f2)"
+              concl="$(printf '%s' "$line" | cut -f3)"
+              if [ "$status" != "completed" ]; then
+                pending=$((pending+1))
+              elif [ "$concl" != "success" ]; then
+                failed="${failed} ${ctx}(${concl})"
+              fi
+            done
+            if [ -n "$failed" ]; then
+              echo "::error::required check(s) not green:${failed} — refusing to sync master"
+              exit 1
+            fi
+            if [ "$pending" -eq 0 ]; then
+              echo "All required checks green on ${SHA}."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out after 45m waiting for required checks (${pending} pending)"
+              exit 1
+            fi
+            echo "  ${pending} check(s) still pending; sleeping 30s…"
+            sleep 30
+          done
+
+      - name: Fast-forward master to develop
+        run: |
+          set -euo pipefail
+          git config user.name  "flexnetos-sync[bot]"
+          git config user.email "sync@flexnetos.local"
+          git fetch origin master
+          SHA="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor origin/master "$SHA"; then
+            git push origin "${SHA}:refs/heads/master"
+            echo "✅ master fast-forwarded to $(git rev-parse --short "$SHA")"
+          else
+            echo "::error::develop is not a fast-forward of master — refusing to sync (would not be a clean promotion). Reconcile master↔develop manually."
+            exit 1
+          fi
