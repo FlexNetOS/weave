@@ -203,7 +203,7 @@ pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
             Mux::Tmux => nonempty_env("TMUX_PANE").map(|id| Target {
                 mux: Mux::Tmux,
                 id,
-                socket: String::new(),
+                socket: tmux_socket_from_env(),
             }),
             Mux::Zellij => nonempty_env("ZELLIJ_SESSION_NAME").map(|id| Target {
                 mux: Mux::Zellij,
@@ -248,7 +248,7 @@ pub fn detect_target_with_preference(preferred: Option<Mux>) -> Target {
         return Target {
             mux: Mux::Tmux,
             id,
-            socket: String::new(),
+            socket: tmux_socket_from_env(),
         };
     }
     if let Some(id) = nonempty_env("ZELLIJ_SESSION_NAME") {
@@ -359,23 +359,28 @@ pub fn commands_for(target: &Target, text: &str) -> Vec<Vec<String>> {
         // tmux: type literal text, close bracketed-paste mode with the hex
         // ESC[201~ sequence (so the TUI doesn't treat the following Enter as a
         // key/cancel), then send Enter.
-        Mux::Tmux => vec![
-            argv(&["tmux", "send-keys", "-t", id, "-l", "--", text]),
-            argv(&[
-                "tmux",
-                "send-keys",
-                "-t",
-                id,
-                "-H",
-                "1b",
-                "5b",
-                "32",
-                "30",
-                "31",
-                "7e",
-            ]),
-            argv(&["tmux", "send-keys", "-t", id, "Enter"]),
-        ],
+        Mux::Tmux => {
+            let s = target.socket.as_str();
+            vec![
+                tmux_argv(s, &["send-keys", "-t", id, "-l", "--", text]),
+                tmux_argv(
+                    s,
+                    &[
+                        "send-keys",
+                        "-t",
+                        id,
+                        "-H",
+                        "1b",
+                        "5b",
+                        "32",
+                        "30",
+                        "31",
+                        "7e",
+                    ],
+                ),
+                tmux_argv(s, &["send-keys", "-t", id, "Enter"]),
+            ]
+        }
         // zellij: write the literal chars, then write byte 13 (carriage return).
         // `--` ends option parsing so a body beginning with `-`/`--` is treated as
         // content, not as a flag to `write-chars`.
@@ -484,6 +489,42 @@ fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
+/// Extract the tmux server **socket path** from `$TMUX` (WL-053). tmux exports
+/// `$TMUX` as `<socket>,<server-pid>,<session-id>`; the socket is the field before
+/// the first comma — a path like `/tmp/tmux-1000/default`, or a non-default one set
+/// via `tmux -L <label>` (`…/<label>`) or `tmux -S <path>`. Returns `""` when not
+/// inside tmux or `$TMUX` is malformed (⇒ fall back to tmux's default server).
+///
+/// Capturing this at registration lets a later `inject`/`spawn`/`kill` reach the
+/// ORIGINATING server via `tmux -S <socket>` instead of silently hitting whatever
+/// `$TMUX` points at in the acting process (the WL-047 `/verify` failure mode).
+fn tmux_socket_from_env() -> String {
+    nonempty_env("TMUX")
+        .map(|v| parse_tmux_socket(&v))
+        .unwrap_or_default()
+}
+
+/// Pure parse of a `$TMUX` value (`<socket>,<pid>,<session>`) to its socket path.
+/// Returns `""` for an empty/malformed value (no socket field).
+fn parse_tmux_socket(tmux: &str) -> String {
+    tmux.split(',').next().unwrap_or("").to_string()
+}
+
+/// Build a tmux argv `tmux [-S <socket>] <rest…>`. When `socket` is non-empty the
+/// `-S <socket>` server selector is inserted so the command targets the captured
+/// server (WL-053); empty `socket` yields the historical `tmux <rest…>` (default
+/// server), so behavior is unchanged for peers registered without a socket.
+fn tmux_argv(socket: &str, rest: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(rest.len() + 3);
+    v.push("tmux".to_string());
+    if !socket.is_empty() {
+        v.push("-S".to_string());
+        v.push(socket.to_string());
+    }
+    v.extend(rest.iter().map(|s| s.to_string()));
+    v
+}
+
 /// Is `s` an acceptable single child-argv element for a spawn (WL-047)?
 ///
 /// Argv is passed to the OS as discrete elements — never concatenated into a shell
@@ -514,6 +555,7 @@ pub fn spawn_arg_ok(s: &str) -> bool {
 /// `--`, so a child arg beginning with `-` is content, never a flag to the mux.
 pub fn spawn_commands(
     mux: Mux,
+    socket: &str,
     cwd: &str,
     name: &str,
     cert: &str,
@@ -528,12 +570,14 @@ pub fn spawn_commands(
     match mux {
         // tmux: `-P -F '#{pane_id}'` makes tmux PRINT the new pane id on stdout so
         // the runner can capture it. `-c <cwd>` sets the working dir. `--` guards the
-        // child argv. window=true ⇒ a new window, else a split pane.
+        // child argv. window=true ⇒ a new window, else a split pane. `-S <socket>`
+        // (WL-053) pins the new pane to the caller's own tmux server, not the default.
         Mux::Tmux => {
             let verb = if window { "new-window" } else { "split-window" };
-            let mut a: Vec<&str> = vec!["tmux", verb, "-P", "-F", "#{pane_id}", "-c", cwd, "--"];
-            a.extend_from_slice(&child);
-            vec![argv(&a)]
+            let head = tmux_argv(socket, &[verb, "-P", "-F", "#{pane_id}", "-c", cwd, "--"]);
+            let mut a: Vec<String> = head;
+            a.extend(child.iter().map(|s| s.to_string()));
+            vec![a]
         }
         // zellij does NOT echo a usable new-pane id, so we cannot pre-register a
         // target — the child self-registers from its env at SessionStart. We simply
@@ -610,7 +654,7 @@ pub fn kill_commands(target: &Target) -> Vec<Vec<String>> {
     let id = &target.id;
     match target.mux {
         // tmux: kill the pane by id (`%<n>`).
-        Mux::Tmux => vec![argv(&["tmux", "kill-pane", "-t", id])],
+        Mux::Tmux => vec![tmux_argv(target.socket.as_str(), &["kill-pane", "-t", id])],
         // wezterm: kill the pane by id.
         Mux::Wezterm => vec![argv(&["wezterm", "cli", "kill-pane", "--pane-id", id])],
         // kitty: close the window matched by id. Thread `--to <socket>` before `@`
@@ -696,7 +740,15 @@ pub fn spawn(
     let prog = &argv_child[0];
     let prog_abs = resolve_trusted_program(prog)
         .ok_or_else(|| anyhow::anyhow!("spawn: program {prog:?} is not in a trusted directory"))?;
-    let cmds = spawn_commands(mux, cwd, name, cert, argv_child, window);
+    // A spawn creates the new pane in the CALLER's OWN tmux server, so capture this
+    // process's `$TMUX` socket and pin the new pane to it (WL-053); other muxes don't
+    // use a socket here (the child captures its own at SessionStart).
+    let spawn_socket = if mux == Mux::Tmux {
+        tmux_socket_from_env()
+    } else {
+        String::new()
+    };
+    let cmds = spawn_commands(mux, &spawn_socket, cwd, name, cert, argv_child, window);
     if cmds.is_empty() {
         // Unspawnable mux (iTerm2/None): not an error, just unsupported.
         return Ok(SpawnOutcome::default());
@@ -950,7 +1002,10 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
     match target.mux {
         // `tmux has-session -t <pane>` resolves the pane's session and exits 0 iff
         // it exists. (A pane id like `%3` resolves through to its session.)
-        Mux::Tmux => Some(argv(&["tmux", "has-session", "-t", id])),
+        Mux::Tmux => Some(tmux_argv(
+            target.socket.as_str(),
+            &["has-session", "-t", id],
+        )),
         // zellij has no per-session "exists" verb; `list-sessions` enumerates them
         // and we scan stdout for the name in `target_alive`.
         Mux::Zellij => Some(argv(&["zellij", "list-sessions", "--no-formatting"])),
@@ -2311,6 +2366,7 @@ mod tests {
         // Pane (default): split-window, captures the new pane id via -P -F.
         let c = spawn_commands(
             Mux::Tmux,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2336,6 +2392,7 @@ mod tests {
         // Window opt-in: new-window instead of split-window.
         let w = spawn_commands(
             Mux::Tmux,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2345,10 +2402,91 @@ mod tests {
         assert_eq!(w[0][1], "new-window");
     }
 
+    // ---- WL-053: tmux server socket (`-S`) is captured + threaded ------------
+
+    /// `$TMUX` (`<socket>,<pid>,<session>`) parses to its socket path; empty/garbage
+    /// yields no socket (⇒ default server).
+    #[test]
+    fn parse_tmux_socket_extracts_path() {
+        assert_eq!(
+            parse_tmux_socket("/tmp/tmux-1000/default,12345,0"),
+            "/tmp/tmux-1000/default"
+        );
+        assert_eq!(
+            parse_tmux_socket("/tmp/tmux-1000/mylabel,9,3"),
+            "/tmp/tmux-1000/mylabel"
+        );
+        assert_eq!(parse_tmux_socket(""), "");
+    }
+
+    /// `tmux_argv` inserts `-S <socket>` only when a socket is present; empty socket
+    /// reproduces the historical default-server argv byte-for-byte.
+    #[test]
+    fn tmux_argv_inserts_socket_selector() {
+        assert_eq!(
+            tmux_argv("", &["kill-pane", "-t", "%3"]),
+            argv(&["tmux", "kill-pane", "-t", "%3"])
+        );
+        assert_eq!(
+            tmux_argv("/tmp/tmux-1000/foo", &["kill-pane", "-t", "%3"]),
+            argv(&["tmux", "-S", "/tmp/tmux-1000/foo", "kill-pane", "-t", "%3"])
+        );
+    }
+
+    /// A peer carrying a captured socket threads `-S <socket>` through inject, kill,
+    /// liveness, and spawn — so the command reaches the ORIGINATING server, not the
+    /// default one (the WL-047 `/verify` failure mode).
+    #[test]
+    fn tmux_socket_threads_through_all_commands() {
+        let sock = "/tmp/tmux-1000/agents";
+        let tgt = Target {
+            mux: Mux::Tmux,
+            id: "%7".into(),
+            socket: sock.into(),
+        };
+        // inject: every send-keys argv is `-S`-pinned.
+        for cmd in commands_for(&tgt, "hi") {
+            assert_eq!(&cmd[0..3], &["tmux".to_string(), "-S".into(), sock.into()]);
+            assert_eq!(cmd[3], "send-keys");
+        }
+        // kill.
+        assert_eq!(
+            kill_commands(&tgt),
+            vec![argv(&["tmux", "-S", sock, "kill-pane", "-t", "%7"])]
+        );
+        // liveness probe (has-session).
+        assert_eq!(
+            liveness_probe(&tgt),
+            Some(argv(&["tmux", "-S", sock, "has-session", "-t", "%7"]))
+        );
+        // spawn: `-S <sock>` precedes the verb.
+        let sp = spawn_commands(
+            Mux::Tmux,
+            sock,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["echo"]),
+            false,
+        );
+        assert_eq!(
+            &sp[0][0..3],
+            &["tmux".to_string(), "-S".into(), sock.into()]
+        );
+        assert_eq!(sp[0][3], "split-window");
+        // A socket-less peer is unchanged (default server).
+        let bare = t(Mux::Tmux, "%7");
+        assert_eq!(
+            kill_commands(&bare),
+            vec![argv(&["tmux", "kill-pane", "-t", "%7"])]
+        );
+    }
+
     #[test]
     fn zellij_spawn_argv() {
         let c = spawn_commands(
             Mux::Zellij,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2358,6 +2496,7 @@ mod tests {
         assert_eq!(c[0], argv(&["zellij", "action", "new-pane", "--", "agent"]));
         let w = spawn_commands(
             Mux::Zellij,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2371,6 +2510,7 @@ mod tests {
     fn kitty_spawn_argv() {
         let c = spawn_commands(
             Mux::Kitty,
+            "",
             "/work",
             "bob",
             "deadbeef",
@@ -2398,6 +2538,7 @@ mod tests {
         // Window opt-in flips the launch type to a new OS window.
         let w = spawn_commands(
             Mux::Kitty,
+            "",
             "/work",
             "bob",
             "deadbeef",
@@ -2407,7 +2548,15 @@ mod tests {
         let ty = w[0].iter().position(|s| s == "--type").unwrap();
         assert_eq!(w[0][ty + 1], "os-window");
         // No cert ⇒ no WEAVE_BIRTH_CERT --env pair emitted.
-        let nc = spawn_commands(Mux::Kitty, "/work", "bob", "", &child(&["agent"]), false);
+        let nc = spawn_commands(
+            Mux::Kitty,
+            "",
+            "/work",
+            "bob",
+            "",
+            &child(&["agent"]),
+            false,
+        );
         assert!(!nc[0].iter().any(|s| s.starts_with("WEAVE_BIRTH_CERT")));
     }
 
@@ -2415,6 +2564,7 @@ mod tests {
     fn wezterm_spawn_argv() {
         let c = spawn_commands(
             Mux::Wezterm,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2427,6 +2577,7 @@ mod tests {
         );
         let w = spawn_commands(
             Mux::Wezterm,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2441,6 +2592,7 @@ mod tests {
         // screen owns its own session named after the child for a cleaner kill.
         let c = spawn_commands(
             Mux::Screen,
+            "",
             "/work",
             "bob",
             "cert",
@@ -2452,10 +2604,10 @@ mod tests {
 
     #[test]
     fn iterm2_and_none_spawn_empty() {
-        assert!(spawn_commands(Mux::ITerm2, "/w", "b", "c", &child(&["a"]), false).is_empty());
-        assert!(spawn_commands(Mux::None, "/w", "b", "c", &child(&["a"]), false).is_empty());
+        assert!(spawn_commands(Mux::ITerm2, "", "/w", "b", "c", &child(&["a"]), false).is_empty());
+        assert!(spawn_commands(Mux::None, "", "/w", "b", "c", &child(&["a"]), false).is_empty());
         // An empty child argv is never spawnable, regardless of mux.
-        assert!(spawn_commands(Mux::Tmux, "/w", "b", "c", &[], false).is_empty());
+        assert!(spawn_commands(Mux::Tmux, "", "/w", "b", "c", &[], false).is_empty());
     }
 
     #[test]
@@ -2463,6 +2615,7 @@ mod tests {
         // A child arg beginning with `-` must land AFTER the `--`, treated as content.
         let c = spawn_commands(
             Mux::Tmux,
+            "",
             "/work",
             "bob",
             "cert",

@@ -32,6 +32,16 @@
   --stop` (no zombies); its stderr and any proxy/token secrets are never logged.
 
 ### Fixed
+- **inject (WL-053):** capture the tmux server **socket** at registration and thread
+  it as `tmux -S <socket>` through every command — inject (`send-keys`), spawn
+  (`split-window`/`new-window`), kill (`kill-pane`), and liveness (`has-session`). A
+  peer registered from a non-default tmux server (`tmux -L <label>` / `-S <path>`, or
+  an MCP/CLI process in another session) was previously reachable only via the acting
+  process's ambient `$TMUX`, so commands silently hit `/tmp/tmux-1000/default` — the
+  wrong/empty server. The socket is parsed from `$TMUX` (`<socket>,<pid>,<session>`)
+  and persisted on the existing `peers.socket` column (no schema change); a socket-less
+  peer keeps the historical default-server argv byte-for-byte. (Surfaced by the WL-047
+  `/verify` live test; complements the honest-kill fix below.)
 - **inject/cli/mcp:** `weave kill` (and `weave_kill_peer`) no longer falsely
   report `killed …` when the mux `kill-pane`/`kill` command actually failed
   (non-zero exit — e.g. the pane/session is already gone or the mux server is

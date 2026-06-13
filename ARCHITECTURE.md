@@ -454,7 +454,7 @@ environment variable used for detection:
 
 | `Mux` | CLI binary | Detect env var | Target meaning |
 |---|---|---|---|
-| `Tmux` | `tmux` | `TMUX_PANE` | pane id (e.g. `%3`) |
+| `Tmux` | `tmux` | `TMUX_PANE` (+ `TMUX` socket) | pane id (e.g. `%3`); `socket` = server path from `$TMUX` |
 | `Zellij` | `zellij` | `ZELLIJ_SESSION_NAME` + `ZELLIJ_PANE_ID` | session name + pane id |
 | `Kitty` | `kitten` | `KITTY_WINDOW_ID` | window id |
 | `Wezterm` | `wezterm` | `WEZTERM_PANE` | pane id |
@@ -518,7 +518,10 @@ the paste-safe submission idiom for its terminal:
   (`send-keys -t <pane> -l -- <text>`), then **close bracketed paste** with the
   hex sequence `ESC [ 2 0 1 ~` (`send-keys -t <pane> -H 1b 5b 32 30 31 7e`), then
   send `Enter`. Closing the paste before Enter is what stops the TUI from
-  treating the newline as a cancel.
+  treating the newline as a cancel. **WL-053:** when the peer was registered from a
+  non-default tmux server, its captured socket is threaded as `tmux -S <socket> …`
+  on every command (inject/spawn/kill/liveness) so they reach the originating
+  server instead of `$TMUX`'s default; a socket-less peer keeps the historical argv.
 - **zellij** — write the literal chars (`action write-chars <text>`), optionally
   scoped to a specific pane via `--pane-id`, then write byte 13 (`action write 13`).
 - **kitty** — match the target window by id and send the text, then send a
