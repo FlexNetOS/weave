@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 2026-06-04 | Removed ECC auto-generated `weave` skill | `.claude/skills/weave/` | Misinformation drift: it falsely claimed camelCase filenames, relative imports, `*.test.*` files, freeform commits — none true of this repo |
 | 2026-06-04 | Confirmed 4-agent team (kept `weave-guardian` separate from `weave-verifier`) | Team composition | Phase 7 feedback: user opted to keep the dedicated guardian for invariant + Rust-native drift review rather than fold it into the verifier |
 | 2026-06-11 | Documented the multi-crate Cargo workspace (`weave-core` ← `weave-inject` ← `weave-mcp` ← `weave`) as the **current** structure; synced the architecture + "Where things live" sections to it | CLAUDE.md, ARCHITECTURE.md | The loop's `WL-001 workspace split` carved the original single crate into four **without updating the docs** (silent structural drift); the split was *not* required to port repowire. **Single-crate remains the goal** — the workspace is kept as an *interim* state and will be collapsed back **after the meta workspace is aligned**; the `backup/*` tags on origin are retained for that collapse. Docs match today's code; meanwhile do **not** add further crates. |
+| 2026-06-13 | Adopted the full `.handoff` continuity kernel (migrated `_workspace/`, `sessions-handoff/`, root handoff docs → `.handoff/`; rewired the loop harness; full Tier-B design) and **corrected the branch model** to the owner's actual workflow: **PR target is `develop`** (not `master`), gates-green auto-merge, then `develop` syncs to the protected `master`/`main` via org automation (pending build-out) | CLAUDE.md, `.handoff/` | The documented model said "PR into `master`; `develop` never ahead" — the reverse of the owner's real pattern; `develop` is the integration/PR target and `master`/`main` the protected default it propagates into. Continuity state now lives only under `.handoff/` (P7 / handoff ADR-0003/0004). |
 
 ## What weave is
 
@@ -26,19 +27,22 @@ Deep design lives in `ARCHITECTURE.md`; contributor rules in `CONTRIBUTING.md`; 
 
 ## Mandatory session-start ritual
 
-**Start every session in a fresh git worktree, branched off the freshly-fetched `develop`** — never work directly on a shared checkout, and never branch off a possibly-stale *local* ref. At session start:
+**Start every session in a fresh git worktree, branched off the freshly-fetched `develop`** — never work directly on a shared checkout, and never branch off a possibly-stale *local* ref. weave is a member of the FlexNetOS **meta** workspace, so follow the **meta git worktree policy**: isolate every session in its own worktree off the latest `origin/develop`, keep it inside the workspace, and remove it once merged.
 
 ```bash
 git fetch origin                                                       # never branch off outdated local refs
 git worktree add ../weave-<task-slug> -b <task-branch> origin/develop  # isolate this session on the latest base
+# cross-repo work spanning multiple meta members: `meta git worktree add <set>` manages an isolated
+# worktree set across the workspace (see the meta:meta-worktree skill / meta-workspace-discipline rule).
 ```
 
 Then operate inside that worktree. This keeps concurrent agent sessions from colliding on the working tree (weave's whole reason to exist is multi-session work) and keeps each session's diff reviewable in isolation. Remove the worktree when the branch is merged (`git worktree remove`).
 
-**Branch model (`develop` mirrors `master`):**
-- **`master`** is the protected trunk and the **PR target**. It requires the six CI checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)`, `sign`, `libsql + sign` — to be green and the branch to be up to date before merge (admins may bypass in emergencies). Do not push to `master` directly.
-- **`develop`** is a long-lived branch kept **fast-forwarded to `master`**. It exists solely as the always-current base sessions branch their worktrees from, so a stale local checkout can never seed a session with outdated code. Always create worktrees from `origin/develop` after a `git fetch` (as above).
-- **Flow:** worktree off `origin/develop` → work → open a PR **into `master`** → merge once the six checks pass → fast-forward `develop` to the new `master` (`git push origin master:develop`). Keep `develop` at or behind `master`, never ahead.
+**Branch model (`develop` is the integration branch; `master`/`main` is the protected default):**
+- **`develop`** is the **PR target** and the always-current base sessions branch their worktrees from. Open **every PR into `develop`** — never into `master` directly.
+- **Gates green → auto-merge.** Arm `gh pr merge <n> --auto --squash`; the PR merges once CI is green. The six checks — `rustfmt`, `clippy`, `test`, `build (libsql backend)`, `sign`, `libsql + sign` — run on the PR and are the gate.
+- **`master`/`main`** is the protected default branch; **`develop` syncs into it** via org-level automation (being built out across all FlexNetOS repos). Do not push `master` directly. Until that sync automation lands, `develop` may legitimately run *ahead* of `master`.
+- **Flow:** worktree off `origin/develop` → work → PR **into `develop`** → auto-merge on green → `develop` syncs to the protected `master`/`main`.
 
 ## CRITICAL: keep weave Rust-native — guard against language drift
 
