@@ -63,7 +63,8 @@ weave deliberately dropped repowire's *Python* daemon and human surfaces; the
 capabilities themselves remain in scope, to land **Rust-native**:
 
 - **Agent spawn/kill** — `weave_spawn_peer` / `weave_kill_peer`, argv-only,
-  per-mux, birth-cert identity — repowire parity weave currently lacks — **WL-047**.
+  per-mux, birth-cert identity, two-layer gated (trusted child program + cwd
+  allowlist) — **shipped in WL-047** (§3 spawn/kill table, §7 spawn allowlist).
 - **Rust-native human surfaces** — dashboard / Telegram / Slack over
   `weave-mcp/http.rs`, **no Next.js/Python**, behind a `--features surfaces`
   flag — **WL-048 / WL-052**.
@@ -453,6 +454,42 @@ the paste-safe submission idiom for its terminal:
 
 Errors are never fatal to messaging: the message is already persisted, so
 callers treat an injection failure as "fall back to next-turn delivery."
+
+### Spawn / kill (WL-047)
+
+The injector also **launches and terminates** agents, not just nudges them.
+`spawn_commands(mux, cwd, name, cert, argv_child, window)` and
+`kill_commands(target)` are **pure exact-argv builders** — the same discipline as
+`commands_for`: argv vectors only, never a shell string, every attacker-influenceable
+positional (cwd + each child argv element) after an end-of-options `--` where the
+mux's CLI accepts one. The runners `spawn(...) -> SpawnOutcome` and
+`kill(target) -> bool` resolve the mux binary by absolute path through the existing
+trusted-path runner, validate the child argv against `spawn_arg_ok` (length cap
+`MAX_SPAWN_ARG_LEN`, count cap `MAX_SPAWN_ARGS`, reject NUL/control), thread
+`WEAVE_SESSION` / `WEAVE_BIRTH_CERT` / `WEAVE_CIRCLE` into the child via
+`Command::envs`, and capture the new pane/window id where the mux echoes one.
+
+| `Mux` | spawn (pane default; `window` → window/tab) | kill | id echoed? |
+|---|---|---|---|
+| `Tmux` | `tmux split-window -P -F '#{pane_id}' -c <cwd> -- <argv…>` (window: `new-window`) | `tmux kill-pane -t <id>` | yes (`%n`) |
+| `Zellij` | `zellij action new-pane -- <argv…>` (window: `new-tab`) | `zellij delete-session --force <name>` (coarse) | no |
+| `Kitty` | `kitten [--to <sock>] @ launch --type tab --cwd <cwd> --env WEAVE_SESSION=<name> [--env WEAVE_BIRTH_CERT=<cert>] -- <argv…>` (window: `--type os-window`) | `kitten [--to <sock>] @ close-window --match id:<id>` | yes (int) |
+| `Wezterm` | `wezterm cli spawn --cwd <cwd> -- <argv…>` (window: `--new-window`) | `wezterm cli kill-pane --pane-id <id>` | yes (int) |
+| `Screen` | `screen -dmS <name> <argv…>` (child program at idx 3) | `screen -S <name> -X quit` (coarse) | no |
+| `ITerm2` / `None` | `vec![]` (unsupported) | `vec![]` (unsupported) | — |
+
+**The fail-open rule** mirrors the liveness probes: a mux that cannot cleanly spawn
+(`ITerm2` / `None`) or cannot echo a usable target id (`Zellij` / `Screen`) is **not
+an error**. For an id-echoing mux the parent pre-registers the peer row with the
+minted cert and the captured target; for a non-echoing mux the parent registers
+nothing and relies on the **child's own self-registration** at its first
+`weave hook session` (env-derived target + the threaded cert). Kill is exact where
+the mux can address a pane (`kill-pane`/`close-window`) and **coarse** — a whole
+detached session teardown — where it cannot (`Zellij`/`Screen`), documented as
+best-effort, never a correctness guarantee. The child program (`argv[0]`) is
+rewritten to its **trusted absolute path** inside the spawn argv (the mux binary
+stays a bare name for the trusted-path runner to resolve), and the cwd is gated by
+the spawn allowlist (§7) — the two-layer trust gate.
 
 ---
 
@@ -999,7 +1036,27 @@ injected and stored text is handled**, not on network attackers.
   stream.
 - **Destructive ops are gated.** `weave_clear` with `scope:"all"` wipes every
   session's messages and requires an explicit `confirm:true`; the default scope
-  only marks the caller's own inbox read.
+  only marks the caller's own inbox read. **Spawn/kill are dangerous tools.**
+  `weave_spawn_peer` and `weave_kill_peer` are in `DANGEROUS_TOOLS`, so the safe
+  HTTP MCP surface disables them unless started with `--dangerous` (they mutate
+  live terminal/process state).
+- **Spawn is two-layer gated (WL-047).** Launching a child agent passes **two**
+  independent trust checks, both no-shell argv-only: (1) the **child program**
+  (`argv[0]`) must resolve inside weave's trusted directories — the same absolute-
+  path trusted-dir set that constrains every mux/`git` binary — so a remote spawn
+  cannot launch an arbitrary binary off `$PATH`; and (2) the **cwd** must fall under
+  the **spawn allowlist** — `Config::spawn_dir_allowed` canonicalizes the cwd and
+  each allow-dir (resolving `..` and symlinks, so a traversal/symlink escape fails)
+  and requires a prefix match. The allowlist is `spawn_allowed_dirs` in
+  `config.toml`, overlaid by `WEAVE_SPAWN_DIRS` (`split_paths`), and is **empty ⇒
+  deny by default**. The MCP/remote surface **hard-denies** a disallowed cwd; the
+  operator-local CLI **warns but proceeds** (the operator already has a local
+  shell). The child argv is additionally bounded (`MAX_SPAWN_ARGS`,
+  `MAX_SPAWN_ARG_LEN`, NUL/control rejected via `spawn_arg_ok`), and the child's
+  unguessable identity comes from a parent-minted **birth certificate** threaded as
+  `WEAVE_BIRTH_CERT` (§6), so a spawned peer's identity cannot be hijacked. This is
+  the Rust-native equivalent of repowire's `daemon.spawn.allowed_paths`
+  (`docs/REPOWIRE-PARITY.md` §7).
 - **Identity is advisory.** Session names are free strings with no
   authentication — appropriate for a single-user local mesh. weave does not
   defend one local session against another impersonating it; that is out of

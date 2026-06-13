@@ -109,6 +109,12 @@ weave delivery --id 42               # show the transport trace (queued -> injec
                                      # (the complement to `weave receipts`, which shows READ receipts)
 
 weave inject --to envctl --text "live nudge"   # test the injector directly
+
+# Spawn / kill a peer (argv-only, no shell) — launch an agent into a mux pane/window, or kill its pane/session
+weave spawn worker --cmd claude --cmd --dangerously-skip-permissions   # spawn `worker` into a new pane (mints + threads a birth cert)
+weave spawn worker --cmd claude --window --cwd /path/to/repo --mux tmux  # new window instead of split; explicit cwd + mux override
+weave kill worker                    # kill the peer's pane (tmux/kitty/wezterm) or session (zellij/screen, coarse)
+
 weave mcp --session desktop          # run the MCP stdio server
 
 # Cross-store delivery (Tier-2): deposit a message for a recipient in another store
@@ -256,6 +262,18 @@ is pulled in.
 · `weave_claim_orchestrator` · `weave_orchestrator_status` (P4 circles)
 · `weave_set_turn_state` · `weave_set_description` (P5 rich presence)
 · `weave_notify` · `weave_delivery` (P6 notify + delivery observability)
+· `weave_spawn_peer` · `weave_kill_peer` (WL-047 agent spawn/kill — DANGEROUS, off in safe HTTP mode)
+
+`weave_spawn_peer` `{ name, cmd:[…argv], cwd?, mux?, window?, circle? }` launches a
+new agent into a fresh mux pane (or `window:true`) **argv-only — no shell, ever**,
+mints a birth certificate in the parent and threads identity (`WEAVE_SESSION`) +
+cert (`WEAVE_BIRTH_CERT`) into the child's env so it self-registers an unguessable
+identity on its first `weave hook session`. The child program (`cmd[0]`) is
+constrained to weave's trusted-dir set, and the cwd is gated by the spawn allowlist
+(`spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS`): the MCP tool **denies by default** when
+no allowlist is configured. `weave_kill_peer` `{ name }` looks up the registered
+peer's `(mux, target)` and issues the per-mux kill argv. Both are in
+`DANGEROUS_TOOLS`, so they are disabled on the safe HTTP surface unless `--dangerous`.
 
 `weave_peers` / `weave_sessions` / `weave_scan` take an optional `circle` arg
 (`"*"` = mesh-wide; omitted = your circle), and `weave_whoami` echoes your circle +
@@ -504,6 +522,30 @@ idempotent migration — a legacy DB upgrades in place reading `unknown`/empty),
 
 `commands_for()` is a pure, unit-tested function; `inject()` checks the mux is on PATH and
 falls back cleanly (caller uses next-turn delivery) if the pane/session is gone.
+
+### Spawn / kill (WL-047)
+
+The same per-mux command tables back `weave spawn` / `weave kill` and
+`weave_spawn_peer` / `weave_kill_peer`: `spawn_commands()` / `kill_commands()` are
+pure, exact-argv functions (no shell, every positional after an end-of-options
+`--` where the CLI supports it). Spawn captures the new pane/window id where the mux
+echoes one; muxes that don't are **fail-open** and lean on the child's own
+self-registration. Kill is exact where the mux can address a pane, **coarse**
+(whole-session teardown) where it can't.
+
+| Mux | Spawn (pane default; `--window` → window) | Kill | Notes |
+|-----|-------------------------------------------|------|-------|
+| tmux | `tmux split-window -P -F '#{pane_id}' -c <cwd> -- <argv…>` (window: `new-window`) | `tmux kill-pane -t <id>` | id echoed (`%n`) → peer pre-registered |
+| zellij | `zellij action new-pane -- <argv…>` (window: `new-tab`) | `zellij delete-session --force <name>` | **fail-open** (no id echoed); kill is **coarse** (whole session) |
+| kitty | `kitten @ launch --type tab --cwd <cwd> --env WEAVE_SESSION=… -- <argv…>` (window: `--type os-window`) | `kitten @ close-window --match id:<id>` | id echoed → peer pre-registered |
+| wezterm | `wezterm cli spawn --cwd <cwd> -- <argv…>` (window: `--new-window`) | `wezterm cli kill-pane --pane-id <id>` | id echoed → peer pre-registered |
+| screen | `screen -dmS <name> <argv…>` | `screen -S <name> -X quit` | **fail-open** (no id echoed); kill is **coarse** (whole session) |
+| iterm2 / none | — (not supported, fail-open) | — | spawn/kill report "unsupported on this mux" |
+
+Spawn is gated by two layers: the child program (`argv[0]`) must resolve inside
+weave's trusted directories, and the cwd must fall under the spawn allowlist
+(`spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS`) — deny-by-default for the MCP/remote
+surface, warn-but-proceed for the operator-local CLI.
 
 ## Storage
 

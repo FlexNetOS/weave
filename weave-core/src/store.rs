@@ -3261,8 +3261,15 @@ impl Store for SqliteStore {
             .optional()?;
         let cert = match existing_cert {
             None => {
-                // New peer: mint a fresh cert and INSERT.
-                let new_cert = mint_birth_cert()?;
+                // New peer: bind the SUPPLIED cert when one was given (WL-047 spawn
+                // pre-binds the parent-minted cert so the child's self-registration
+                // matches), else mint a fresh one. The supplied cert was already
+                // validated above by `check_birth_cert`. All pre-WL-047 callers pass
+                // `None`, so this is backward-compatible (mint as before).
+                let new_cert = match birth_cert {
+                    Some(c) => c.to_string(),
+                    None => mint_birth_cert()?,
+                };
                 tx.execute(
                     "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -6318,6 +6325,50 @@ mod tests {
         // list_peers also carries the socket.
         let peers = s.list_peers().unwrap();
         assert_eq!(peers[0].socket, "/run/b.sock");
+    }
+
+    /// WL-047 (dual-backend parity): `register_peer_full`'s new-peer INSERT must
+    /// honor a SUPPLIED birth cert (the parent-minted spawn cert) and persist it
+    /// VERBATIM, else mint a fresh one when `None`. This is the spawn-identity chain
+    /// (parent mints → threads into child env → pre-registers row → child self-reg
+    /// matches). The libsql backend has a byte-identical test (`register_peer_full_*`).
+    #[test]
+    fn register_peer_full_binds_supplied_cert_else_mints() {
+        let s = mem();
+        // Supplied cert path: a freshly minted valid cert must persist EXACTLY.
+        let cert = mint_birth_cert().unwrap();
+        let returned = s
+            .register_peer_full(
+                "spawned",
+                "tmux",
+                "%9",
+                "",
+                Some("/w"),
+                None,
+                "h",
+                "",
+                "",
+                "",
+                "default",
+                Some(&cert),
+            )
+            .unwrap();
+        assert_eq!(returned, cert, "register returns the supplied cert");
+        assert_eq!(
+            s.get_birth_cert("spawned").unwrap().unwrap(),
+            cert,
+            "the supplied cert is persisted verbatim on the new-peer INSERT"
+        );
+        // None path (backward-compat): a fresh peer mints its own cert (non-empty,
+        // valid shape, and NOT the one we supplied above).
+        let minted = s
+            .register_peer_full(
+                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+            )
+            .unwrap();
+        assert!(check_birth_cert(&minted).is_ok(), "minted cert is valid");
+        assert_ne!(minted, cert, "the None path mints a fresh, distinct cert");
+        assert_eq!(s.get_birth_cert("auto").unwrap().unwrap(), minted);
     }
 
     /// `sanitize_tag` is lossy-but-total: it strips control chars, truncates to

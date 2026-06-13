@@ -3496,3 +3496,258 @@ fn mcp_memory_oversized_body_is_error() {
     mcp.shutdown();
     std::fs::remove_dir_all(&cfg).ok();
 }
+
+// ---------------------------------------------------------------------------
+// WL-047: spawn allowlist + trusted-program + argv-cap + id_valid kill guard
+// ---------------------------------------------------------------------------
+
+/// A fake `tmux` that echoes `%9` on a spawn verb so a *permitted* spawn can be
+/// observed to fire, and logs argv. Reused across the WL-047 security cases.
+fn make_fake_tmux_spawning(log_path: &std::path::Path) -> std::path::PathBuf {
+    let dir = TestDb::new().path_str();
+    let dir = std::path::PathBuf::from(format!("{dir}.muxbin"));
+    std::fs::create_dir_all(&dir).expect("create fake-mux dir");
+    let script = dir.join("tmux");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *split-window*|*new-window*) echo '%9' ;;\nesac\nexit 0\n",
+        log_path.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake tmux");
+    dir
+}
+
+/// A spawn whose cwd ESCAPES `spawn_allowed_dirs` via `..` traversal must be denied
+/// (canonicalization resolves `..`, so the prefix check fails) and launch nothing.
+#[test]
+fn spawn_cwd_dotdot_traversal_is_denied() {
+    let db = TestDb::new();
+    let log = std::path::PathBuf::from(format!("{}.tmuxlog", TestDb::new().path_str()));
+    let _ = std::fs::remove_file(&log);
+    let fake = make_fake_tmux_spawning(&log);
+
+    let base = std::path::PathBuf::from(format!("{}.base", TestDb::new().path_str()));
+    let allow = base.join("allow");
+    let escape = base.join("escape");
+    std::fs::create_dir_all(&allow).unwrap();
+    std::fs::create_dir_all(&escape).unwrap();
+    let traversal = allow.join("..").join("escape");
+
+    let (ok, _out, err) = run_with_fake_mux(
+        &db,
+        &fake,
+        &[
+            ("TMUX_PANE", "%1"),
+            ("WEAVE_SPAWN_DIRS", allow.to_str().unwrap()),
+        ],
+        &[
+            "spawn",
+            "--name",
+            "esc",
+            "--mux",
+            "tmux",
+            "--cwd",
+            traversal.to_str().unwrap(),
+            "--cmd",
+            "echo",
+            "hi",
+        ],
+    );
+    assert!(!ok, "a `..`-traversal cwd must be denied");
+    assert!(
+        err.contains("refusing to spawn") || err.contains("spawn_allowed_dirs"),
+        "denial should reference the allowlist: {err:?}"
+    );
+    let logged = read_mux_log(&log);
+    assert!(
+        !logged.contains("split-window"),
+        "no launch on a denied cwd:\n{logged}"
+    );
+}
+
+/// A spawn whose cwd is a SYMLINK pointing outside `spawn_allowed_dirs` is denied
+/// (canonicalize follows the symlink to its real, disallowed target).
+#[test]
+fn spawn_cwd_symlink_escape_is_denied() {
+    let db = TestDb::new();
+    let log = std::path::PathBuf::from(format!("{}.tmuxlog", TestDb::new().path_str()));
+    let _ = std::fs::remove_file(&log);
+    let fake = make_fake_tmux_spawning(&log);
+
+    let allow = std::path::PathBuf::from(format!("{}.allow", TestDb::new().path_str()));
+    let outside = std::path::PathBuf::from(format!("{}.outside", TestDb::new().path_str()));
+    std::fs::create_dir_all(&allow).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let link = allow.join("sneaky");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let (ok, _out, err) = run_with_fake_mux(
+        &db,
+        &fake,
+        &[
+            ("TMUX_PANE", "%1"),
+            ("WEAVE_SPAWN_DIRS", allow.to_str().unwrap()),
+        ],
+        &[
+            "spawn",
+            "--name",
+            "sym",
+            "--mux",
+            "tmux",
+            "--cwd",
+            link.to_str().unwrap(),
+            "--cmd",
+            "echo",
+            "hi",
+        ],
+    );
+    assert!(!ok, "a symlink-escape cwd must be denied");
+    assert!(
+        err.contains("refusing to spawn") || err.contains("spawn_allowed_dirs"),
+        "denial should reference the allowlist: {err:?}"
+    );
+    let logged = read_mux_log(&log);
+    assert!(
+        !logged.contains("split-window"),
+        "no launch on a symlink-escape cwd:\n{logged}"
+    );
+}
+
+/// A child program (argv[0]) that does NOT live in a trusted directory is rejected —
+/// a spawn must never launch an arbitrary binary off ambient $PATH. Even with the
+/// allowlist permitting the cwd, the program-trust gate fails the spawn.
+#[test]
+fn spawn_untrusted_child_program_is_rejected() {
+    let db = TestDb::new();
+    let log = std::path::PathBuf::from(format!("{}.tmuxlog", TestDb::new().path_str()));
+    let _ = std::fs::remove_file(&log);
+    let fake = make_fake_tmux_spawning(&log);
+
+    let allow = std::path::PathBuf::from(format!("{}.allow", TestDb::new().path_str()));
+    std::fs::create_dir_all(&allow).unwrap();
+    let untrusted = std::path::PathBuf::from(format!("{}.untrusted", TestDb::new().path_str()));
+    std::fs::create_dir_all(&untrusted).unwrap();
+    let evil = untrusted.join("evil");
+    std::fs::write(&evil, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&evil).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&evil, perms).unwrap();
+
+    let (ok, _out, err) = run_with_fake_mux(
+        &db,
+        &fake,
+        &[
+            ("TMUX_PANE", "%1"),
+            ("WEAVE_SPAWN_DIRS", allow.to_str().unwrap()),
+        ],
+        &[
+            "spawn",
+            "--name",
+            "evil",
+            "--mux",
+            "tmux",
+            "--cwd",
+            allow.to_str().unwrap(),
+            "--cmd",
+            evil.to_str().unwrap(),
+        ],
+    );
+    assert!(!ok, "an untrusted child program must be rejected");
+    assert!(
+        err.contains("trusted directory") || err.contains("not in a trusted"),
+        "rejection should reference the trusted-dir gate: {err:?}"
+    );
+    let logged = read_mux_log(&log);
+    assert!(
+        !logged.contains("split-window"),
+        "no launch with an untrusted child program:\n{logged}"
+    );
+}
+
+/// An oversized child argv (more than `MAX_SPAWN_ARGS` elements) is rejected before
+/// any launch. We pass a permitted cwd + trusted program but a flood of args.
+#[test]
+fn spawn_oversized_child_argv_is_rejected() {
+    let db = TestDb::new();
+    let log = std::path::PathBuf::from(format!("{}.tmuxlog", TestDb::new().path_str()));
+    let _ = std::fs::remove_file(&log);
+    let fake = make_fake_tmux_spawning(&log);
+
+    let allow = std::path::PathBuf::from(format!("{}.allow", TestDb::new().path_str()));
+    std::fs::create_dir_all(&allow).unwrap();
+
+    // MAX_SPAWN_ARGS is 64; build well over it (echo + 200 args).
+    let mut args: Vec<String> = vec![
+        "spawn".into(),
+        "--name".into(),
+        "big".into(),
+        "--mux".into(),
+        "tmux".into(),
+        "--cwd".into(),
+        allow.to_string_lossy().into_owned(),
+        "--cmd".into(),
+        "echo".into(),
+    ];
+    for _ in 0..200 {
+        args.push("x".into());
+    }
+    let argref: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let (ok, _out, err) = run_with_fake_mux(
+        &db,
+        &fake,
+        &[
+            ("TMUX_PANE", "%1"),
+            ("WEAVE_SPAWN_DIRS", allow.to_str().unwrap()),
+        ],
+        &argref,
+    );
+    assert!(!ok, "an oversized child argv must be rejected");
+    assert!(
+        err.to_lowercase().contains("args") || err.to_lowercase().contains("max"),
+        "rejection should reference the argv cap: {err:?}"
+    );
+    let logged = read_mux_log(&log);
+    assert!(
+        !logged.contains("split-window"),
+        "no launch with an oversized child argv:\n{logged}"
+    );
+}
+
+/// Kill must never drive a mux with an attacker-influenced (id_valid-failing) target.
+/// We attempt to register a tmux peer whose pane id carries a shell metacharacter.
+/// Either registration rejects the hostile env id up front (already safe), or the
+/// kill-time `id_valid` gate refuses — in NO case does the hostile id reach a kill
+/// argv against the fake mux.
+#[test]
+fn kill_refuses_invalid_target_id() {
+    let db = TestDb::new();
+    let log = std::path::PathBuf::from(format!("{}.tmuxlog", TestDb::new().path_str()));
+    let _ = std::fs::remove_file(&log);
+    let fake = make_fake_tmux_spawning(&log);
+
+    let (ok, _o, _e) = run_with_fake_mux(
+        &db,
+        &fake,
+        &[("TMUX_PANE", "%1; rm -rf /")],
+        &["register", "--name", "bad"],
+    );
+    // If registration rejected the hostile pane id, the bad id never persisted.
+    if ok {
+        // Otherwise the kill-time id_valid guard must refuse to drive the mux.
+        let (_kok, kout, kerr) = run_with_fake_mux(&db, &fake, &[], &["kill", "--name", "bad"]);
+        let combined = format!("{kout}{kerr}");
+        assert!(
+            combined.contains("invalid") || combined.contains("refusing"),
+            "kill must refuse an invalid target: out={kout:?} err={kerr:?}"
+        );
+    }
+    let logged = read_mux_log(&log);
+    assert!(
+        !logged.contains("rm -rf"),
+        "a hostile target id must never reach the kill argv:\n{logged}"
+    );
+}

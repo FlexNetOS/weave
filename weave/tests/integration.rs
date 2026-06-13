@@ -9687,3 +9687,222 @@ fn harness_ide_merge_ide_dry_run_prints_seven_layer_plan() {
         "dry run should expose the Kimi command: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WL-047: agent spawn / kill via a fake mux (CLI surface, black-box)
+// ---------------------------------------------------------------------------
+
+/// A fake `tmux` that PRINTS a pane id on a spawn verb (`split-window`/`new-window`)
+/// so the spawn runner can capture it, and logs every argv. Other verbs (kill-pane,
+/// has-session, …) just log and exit 0. The printed id `%9` passes `id_valid`.
+fn make_fake_tmux_spawning(log_path: &Path) -> std::path::PathBuf {
+    let dir = common::unique_db().with_extension("muxbin");
+    std::fs::create_dir_all(&dir).expect("create fake-mux bin dir");
+    let script = dir.join("tmux");
+    // Log argv; if this invocation is a spawn (split-window/new-window), echo `%9`.
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *split-window*|*new-window*) echo '%9' ;;\nesac\nexit 0\n",
+        log_path.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux script");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat fake tmux")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake tmux");
+    dir
+}
+
+#[test]
+fn spawn_cli_drives_fake_tmux_and_registers() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux_spawning(&log);
+
+    // `weave spawn` into the (real, trusted) child program `echo`. The fake tmux
+    // echoes `%9`, so the parent pre-registers the peer with the minted cert.
+    let out = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")], // make the parent detect tmux
+        &[
+            "spawn", "--name", "kid", "--mux", "tmux", "--cmd", "echo", "hi",
+        ],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn weave spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "spawn failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The minted identity + cert are printed for the operator.
+    assert!(
+        stdout.contains("spawned 'kid' into tmux %9"),
+        "spawn output should report the captured pane: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("save birth-cert:"),
+        "spawn output should disclose the minted cert: {stdout:?}"
+    );
+
+    // The fake tmux saw the exact spawn argv: split-window with the capture flags,
+    // the `--` end-of-options guard, and the (rewritten-to-absolute) child program.
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("split-window") && logged.contains("#{pane_id}"),
+        "fake tmux should record a capturing split-window spawn:\n{logged}"
+    );
+    assert!(
+        logged.contains(" -- ") && logged.contains("hi"),
+        "child argv must land after the end-of-options --:\n{logged}"
+    );
+
+    // The peer was registered as an injectable tmux peer at %9.
+    let peers = weave_with_fake_path(&db, &fake_dir, &[], &["peers"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn peers");
+    let peers_txt = String::from_utf8_lossy(&peers.stdout);
+    assert!(
+        peers_txt.contains("kid") && peers_txt.contains("%9"),
+        "spawned peer should be registered at %9: {peers_txt:?}"
+    );
+}
+
+#[test]
+fn kill_cli_fires_kill_pane_for_registered_peer() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux_spawning(&log);
+
+    // Register a tmux peer 'p' at %1 (the existing fake-mux register path).
+    let reg = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")],
+        &["register", "--name", "p"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(reg.status.success());
+
+    // `weave kill --name p` must fire the per-mux kill argv against the fake tmux.
+    let out = weave_with_fake_path(&db, &fake_dir, &[], &["kill", "--name", "p"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn kill");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "kill failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("killed 'p' on tmux (target %1)"),
+        "kill output should confirm the target: {stdout:?}"
+    );
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("kill-pane") && logged.contains("-t %1"),
+        "fake tmux should record kill-pane -t %1:\n{logged}"
+    );
+}
+
+#[test]
+fn kill_cli_unknown_peer_errors() {
+    let db = TestDb::new();
+    let (ok, _out, err) = run(&db, &["kill", "--name", "nope"]);
+    assert!(!ok, "killing an unknown peer must exit non-zero");
+    assert!(
+        err.contains("no registered peer"),
+        "error should explain the missing peer: {err:?}"
+    );
+}
+
+#[test]
+fn spawn_cli_warns_but_proceeds_when_allowlist_unset() {
+    // Operator-local policy: with NO spawn_allowed_dirs configured, the CLI WARNS on
+    // stderr but still spawns (the operator already has a local shell).
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux_spawning(&log);
+
+    let out = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")],
+        &[
+            "spawn", "--name", "w", "--mux", "tmux", "--cmd", "echo", "hi",
+        ],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn weave spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "spawn should proceed: {stderr:?}");
+    assert!(
+        stderr.contains("no spawn_allowed_dirs configured"),
+        "CLI should warn about the unset allowlist: {stderr:?}"
+    );
+}
+
+#[test]
+fn spawn_cli_hard_denies_disallowed_cwd_when_allowlist_set() {
+    // When an allowlist IS configured, a cwd outside it is a HARD denial.
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux_spawning(&log);
+
+    // Allowlist points at a real dir; we spawn into a DIFFERENT real dir.
+    let allow = common::unique_db().with_extension("allowdir");
+    std::fs::create_dir_all(&allow).unwrap();
+    let other = common::unique_db().with_extension("otherdir");
+    std::fs::create_dir_all(&other).unwrap();
+
+    let out = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[
+            ("TMUX_PANE", "%1"),
+            ("WEAVE_SPAWN_DIRS", allow.to_str().unwrap()),
+        ],
+        &[
+            "spawn",
+            "--name",
+            "d",
+            "--mux",
+            "tmux",
+            "--cwd",
+            other.to_str().unwrap(),
+            "--cmd",
+            "echo",
+            "hi",
+        ],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn weave spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "spawn into a disallowed cwd must fail"
+    );
+    assert!(
+        stderr.contains("refusing to spawn") || stderr.contains("spawn_allowed_dirs"),
+        "error should explain the allowlist denial: {stderr:?}"
+    );
+    // Nothing was launched.
+    let logged = read_log_with_retries(&log);
+    assert!(
+        !logged.contains("split-window"),
+        "no spawn argv should fire on a denied cwd:\n{logged}"
+    );
+}

@@ -297,6 +297,8 @@ const DANGEROUS_TOOLS: &[&str] = &[
     "weave_daemon_stop",
     "weave_set_message_priority",
     "weave_set_peer_policy",
+    "weave_spawn_peer",
+    "weave_kill_peer",
 ];
 
 /// True if `name` is a dangerous tool that should be filtered in safe mode.
@@ -429,6 +431,8 @@ fn call_tool(
         "weave_doctor" => tool_doctor(store, extra_dbs, injector),
         "weave_whoami" => tool_whoami(store, me_default, injector),
         "weave_attach" => tool_attach(store, me_default, args, injector),
+        "weave_spawn_peer" => tool_spawn_peer(store, me_default, args, injector),
+        "weave_kill_peer" => tool_kill_peer(store, args, injector),
         "weave_set_description" => tool_set_description(store, me_default, args),
         "weave_set_turn_state" => tool_set_turn_state(store, me_default, args),
         "weave_set_message_priority" => tool_set_message_priority(store, args),
@@ -2041,6 +2045,208 @@ fn tool_attach(
     ))
 }
 
+/// `weave_spawn_peer` (WL-047): launch a NEW agent/command into a fresh mux pane (or
+/// window when `window:true`) and thread an unguessable identity into its env so it
+/// self-registers on its first `weave hook session`. Argv-only — the child command is
+/// a JSON array of discrete argv strings, never a shell line.
+///
+/// SECURITY (remote surface): this is in `DANGEROUS_TOOLS` (blocked in safe HTTP
+/// mode) AND the resolved `cwd` must be under a configured `spawn_allowed_dirs`
+/// (`WEAVE_SPAWN_DIRS`) — an empty/unset allowlist DENIES every spawn here (a remote
+/// caller must never pick an arbitrary cwd). The child PROGRAM (argv[0]) is
+/// independently constrained to the injector's trusted dirs (see `inject::spawn`), so
+/// two gates apply: program-trust AND cwd-allowlist.
+///
+/// Identity/cert: the parent pre-registers the new peer ONLY when the mux echoes a
+/// usable target id (tmux/kitty/wezterm). In that case the STORE mints the
+/// authoritative birth cert during pre-registration and we thread THAT cert into the
+/// child env, so the child's later self-registration matches (a single authoritative
+/// cert, no Store change). For muxes that do not echo an id (zellij/screen) we do not
+/// pre-register; the child mints its own cert on self-registration.
+///
+/// All diagnostics go to stderr; the returned tool-result TEXT is the only stdout.
+fn tool_spawn_peer(
+    store: &dyn Store,
+    def: &Option<String>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    // The new child's weave identity (the peer row key). Bounded like any identity.
+    let name = ident(args, "name", def)?;
+    // Reject spawning over an already-registered peer (the spawn mints a fresh
+    // identity; reusing a live one is almost always a mistake and would collide with
+    // the existing peer's birth cert).
+    if store.get_peer(&name).map_err(e)?.is_some() {
+        return Err(format!(
+            "a peer named '{name}' is already registered; choose a fresh name for the spawned agent."
+        ));
+    }
+    // Child command: a JSON array of argv strings. Argv-only — never a shell line.
+    let cmd_val = args
+        .get("cmd")
+        .ok_or("'cmd' is required (a JSON array of argv strings, e.g. [\"agent\", \"--flag\"]).")?;
+    let arr = cmd_val
+        .as_array()
+        .ok_or("'cmd' must be an ARRAY of argv strings (argv-only; never a shell string).")?;
+    if arr.is_empty() {
+        return Err("'cmd' must not be empty (the first element is the program to run).".into());
+    }
+    if arr.len() > weave_inject::MAX_SPAWN_ARGS {
+        return Err(format!(
+            "'cmd' has too many arguments ({}; max {}).",
+            arr.len(),
+            weave_inject::MAX_SPAWN_ARGS
+        ));
+    }
+    let mut argv_child: Vec<String> = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("'cmd[{i}]' must be a string (argv element)."))?;
+        if !weave_inject::spawn_arg_ok(s) {
+            return Err(format!(
+                "'cmd[{i}]' is too long or contains control/NUL bytes (argv elements must be plain text)."
+            ));
+        }
+        argv_child.push(s.to_string());
+    }
+    // Resolve the working directory (default: the server's cwd) and enforce the
+    // allowlist HARD on this remote surface.
+    let cwd = match args.get("cwd").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(e)?,
+    };
+    let cfg = weave_core::config::Config::load();
+    if !cfg.spawn_dir_allowed(std::path::Path::new(&cwd)) {
+        return Err(format!(
+            "refusing to spawn into {cwd:?}: not under a configured spawn_allowed_dirs \
+             (set spawn_allowed_dirs / WEAVE_SPAWN_DIRS to permit this directory)."
+        ));
+    }
+    // Resolve the target mux: an explicit override, else what the SERVER runs under.
+    let mux = match args.get("mux").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => weave_inject::Mux::parse(s.trim()),
+        _ => injector.detect_target().mux,
+    };
+    if matches!(mux, weave_inject::Mux::None) {
+        return Err(
+            "no multiplexer detected to spawn into (run inside tmux/zellij/kitty/wezterm/screen, \
+             or pass an explicit \"mux\")."
+                .into(),
+        );
+    }
+    let window = args
+        .get("window")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let circle = args
+        .get("circle")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg.circle());
+
+    // Mint the authoritative birth cert in the PARENT (pure, no row) and thread it
+    // into the child env. We do NOT pre-register a row before spawn — there is no
+    // peer-delete to roll back a failed launch, so a pre-registered row could leak.
+    // Instead we register AFTER a successful spawn that echoed a target id, binding
+    // THIS cert on the fresh INSERT (register_peer_full honors a supplied cert for a
+    // new peer). For muxes that echo no id (zellij/screen) we skip registration; the
+    // child self-registers with the same env cert on its first hook.
+    let cert = weave_core::store::mint_birth_cert().map_err(e)?;
+
+    // Launch the child, threading WEAVE_SESSION / WEAVE_BIRTH_CERT / WEAVE_CIRCLE.
+    let outcome = injector
+        .spawn(mux, &cwd, &name, &cert, &circle, &argv_child, window)
+        .map_err(e)?;
+    // If the mux echoed a usable target id, register the peer now with the minted
+    // cert so it is immediately injectable; the child's later self-registration with
+    // the same env cert then matches (the UPDATE path preserves the stored cert).
+    if !outcome.target.is_empty() && injector.id_valid(mux, &outcome.target) {
+        store
+            .register_peer_full(
+                &name,
+                mux.as_str(),
+                &outcome.target,
+                "",
+                Some(cwd.as_str()),
+                None,
+                "",
+                "",
+                "",
+                "",
+                &circle,
+                Some(cert.as_str()),
+            )
+            .map_err(e)?;
+    }
+    let tgt = if outcome.target.is_empty() {
+        "(self-registers on first hook)".to_string()
+    } else {
+        outcome.target.clone()
+    };
+    Ok(format!(
+        "Spawned '{name}' into {} {tgt} (cwd={cwd}). birth-cert: {cert}",
+        mux.as_str()
+    ))
+}
+
+/// `weave_kill_peer` (WL-047): terminate a registered peer's pane/session via the
+/// per-mux kill argv. Looks up `(mux, target)` from the peer row, validates the
+/// target with `id_valid`, then issues the kill. zellij/screen kills are COARSE
+/// (session-level) by design — documented, never a precise per-pane guarantee.
+/// In `DANGEROUS_TOOLS` (blocked in safe HTTP mode).
+fn tool_kill_peer(
+    store: &dyn Store,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'name' is required (the registered peer to kill).")?;
+    let peer = store
+        .get_peer(name)
+        .map_err(e)?
+        .ok_or_else(|| format!("no registered peer named '{name}'."))?;
+    let target = Target::from_peer(&peer);
+    if matches!(
+        target.mux,
+        weave_inject::Mux::ITerm2 | weave_inject::Mux::None
+    ) {
+        return Ok(format!(
+            "peer '{name}' is on {} — kill is not supported for that backend (no clean argv).",
+            target.mux.as_str()
+        ));
+    }
+    // The target id is attacker-influenceable (captured from the peer's env at
+    // register time); refuse to drive a mux with an id that doesn't match its shape.
+    if !injector.id_valid(target.mux, &target.id) {
+        return Err(format!(
+            "refusing to kill: peer '{name}' has an invalid {} target {:?}.",
+            target.mux.as_str(),
+            target.id
+        ));
+    }
+    match injector.kill(&target) {
+        Ok(true) => Ok(format!(
+            "Killed peer '{name}' on {} (target {}).",
+            target.mux.as_str(),
+            target.id
+        )),
+        Ok(false) => Ok(format!(
+            "peer '{name}' is on {} — kill is not supported for that backend.",
+            target.mux.as_str()
+        )),
+        Err(err) => Err(e(err)),
+    }
+}
+
 /// `weave_set_description`: set the CALLER's OWN free-form task description (P5).
 /// Self-only — the row key is the resolved caller identity (`ident`), never an
 /// arg-supplied target (the `tool_attach` precedent). The store control-strips +
@@ -3056,6 +3262,25 @@ fn tools() -> Value {
             "inputSchema": {"type":"object","properties":{
                 "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."}
             },"required":[]}
+        },
+        {
+            "name": "weave_spawn_peer",
+            "description": "Launch a NEW agent/command into a fresh mux pane (or a new window with window:true) and thread an unguessable identity into its environment so it self-registers on its first weave hook. ARGV-ONLY: cmd is an array of argv strings, never a shell line — no shell is ever invoked. The child program (cmd[0]) must resolve to a trusted directory, and on the MCP/remote surface the cwd must be under a configured spawn_allowed_dirs (WEAVE_SPAWN_DIRS) — an unset allowlist DENIES the spawn. Returns the minted identity and birth-cert. Dangerous (disabled in safe HTTP mode).",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The new spawned agent's session identity (the peer row key). Must not already exist."},
+                "cmd":{"type":"array","items":{"type":"string"},"description":"The child command as an ARRAY of argv strings, e.g. [\"agent\",\"--flag\"]. Argv-only; never a shell string."},
+                "cwd":{"type":"string","description":"Working directory to launch in (default: the server's cwd). Must be under spawn_allowed_dirs on this surface."},
+                "mux":{"type":"string","description":"Override the multiplexer (tmux|zellij|kitty|wezterm|screen). Default: whatever the server runs under."},
+                "window":{"type":"boolean","description":"Open a new window/tab instead of a split pane (default false)."},
+                "circle":{"type":"string","description":"Visibility circle for the child (default: the server's circle)."}
+            },"required":["name","cmd"]}
+        },
+        {
+            "name": "weave_kill_peer",
+            "description": "Terminate a registered peer's pane/session via the per-mux kill argv (tmux kill-pane, wezterm kill-pane, kitty close-window; zellij/screen are COARSE session-level kills). iterm2/none are unsupported. Dangerous (disabled in safe HTTP mode).",
+            "inputSchema": {"type":"object","properties":{
+                "name":{"type":"string","description":"The registered peer to kill."}
+            },"required":["name"]}
         },
         {
             "name": "weave_set_description",
@@ -4186,7 +4411,7 @@ fn tool_summarize_text(_args: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use weave_core::model::WorktreeTags;
-    use weave_inject::Mux;
+    use weave_inject::{Mux, SpawnOutcome};
 
     /// A mock injector must be usable as `&dyn Injector` so `serve` is testable without
     /// a real mux environment. This is the compile-time + coercion proof for the trait
@@ -4224,6 +4449,336 @@ mod tests {
         }
         let mock = MockInjector;
         let _dyn_ref: &dyn Injector = &mock;
+    }
+
+    // ---- WL-047 spawn/kill MCP tool tests -----------------------------------
+
+    use std::sync::Mutex;
+
+    /// One recorded `spawn` call: the exact arguments the MCP tool threaded down.
+    struct SpawnRecord {
+        mux: Mux,
+        cwd: String,
+        name: String,
+        cert: String,
+        argv: Vec<String>,
+        window: bool,
+    }
+
+    /// A recording fake injector: captures the exact `spawn`/`kill` calls (env +
+    /// argv + target) and returns a scripted [`SpawnOutcome`], so the MCP tools are
+    /// driven without a real mux. Overrides ONLY the trait methods the tools touch;
+    /// the rest panic if reached (they must not be on these code paths).
+    #[derive(Default)]
+    struct RecordingInjector {
+        spawn_calls: Mutex<Vec<SpawnRecord>>,
+        kill_calls: Mutex<Vec<Target>>,
+        /// The target id the fake mux "echoes" back from a spawn (empty ⇒ none).
+        echo_target: String,
+        detect_mux: Mux,
+    }
+    impl Injector for RecordingInjector {
+        fn detect_target(&self) -> Target {
+            Target {
+                mux: self.detect_mux,
+                id: "%1".to_string(),
+                socket: String::new(),
+            }
+        }
+        fn target_alive(&self, _t: &Target) -> bool {
+            true
+        }
+        fn inject_mode(&self, _t: &Target, _b: &str, _m: Nudge) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn capability(&self, _t: &Target) -> Capability {
+            Capability::Live
+        }
+        fn have(&self, _n: &str) -> bool {
+            true
+        }
+        fn id_valid(&self, mux: Mux, id: &str) -> bool {
+            weave_inject::id_valid(mux, id)
+        }
+        fn git_tags(&self, _cwd: &std::path::Path) -> anyhow::Result<WorktreeTags> {
+            Ok(WorktreeTags::default())
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn spawn(
+            &self,
+            mux: Mux,
+            cwd: &str,
+            name: &str,
+            cert: &str,
+            _circle: &str,
+            argv_child: &[String],
+            window: bool,
+        ) -> anyhow::Result<SpawnOutcome> {
+            self.spawn_calls.lock().unwrap().push(SpawnRecord {
+                mux,
+                cwd: cwd.to_string(),
+                name: name.to_string(),
+                cert: cert.to_string(),
+                argv: argv_child.to_vec(),
+                window,
+            });
+            Ok(SpawnOutcome {
+                launched: true,
+                target: self.echo_target.clone(),
+            })
+        }
+        fn kill(&self, target: &Target) -> anyhow::Result<bool> {
+            self.kill_calls.lock().unwrap().push(target.clone());
+            Ok(true)
+        }
+    }
+
+    /// A unique temp store on disk, built for WHICHEVER backend the crate is compiled
+    /// with (the MCP layer holds `&dyn Store`, so the tools are backend-agnostic and
+    /// must pass under both the default `sqlite` and the `--features libsql` builds).
+    fn store() -> Box<dyn Store> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weave-mcp-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        #[cfg(feature = "sqlite")]
+        {
+            Box::new(weave_core::store::SqliteStore::open(&path).unwrap())
+        }
+        #[cfg(all(feature = "libsql", not(feature = "sqlite")))]
+        {
+            let cfg = weave_core::config::Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..weave_core::config::Config::default()
+            };
+            Box::new(weave_core::store_libsql::LibsqlStore::open(&cfg).unwrap())
+        }
+    }
+
+    fn pull_consent() -> PullConsent {
+        PullConsent {
+            from: vec![],
+            inject_pulled: true,
+            allow_inject_from: None,
+            policy: store::VerifyPolicy::default(),
+        }
+    }
+
+    fn call(name: &str, args: Value, st: &dyn Store, inj: &dyn Injector) -> Result<String, String> {
+        call_tool(st, &None, None, &[], &pull_consent(), name, &args, inj)
+    }
+
+    /// `WEAVE_SPAWN_DIRS` is process-global; serialize the env-touching spawn tests so
+    /// parallel cases can't clobber each other's allowlist.
+    static SPAWN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Happy path: `weave_spawn_peer` records the spawn with the exact child argv, the
+    /// resolved cwd, the minted cert, and — since the fake echoes a target id — the
+    /// peer is pre-registered with that cert. Asserts env-thread correctness via the
+    /// recorded (name, cert) the runner turns into WEAVE_SESSION / WEAVE_BIRTH_CERT.
+    #[test]
+    fn spawn_peer_happy_path_records_and_registers() {
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let allow = std::env::temp_dir().join(format!("weave-spawn-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&allow).unwrap();
+        let allow_real = std::fs::canonicalize(&allow).unwrap();
+        std::env::set_var("WEAVE_SPAWN_DIRS", &allow_real);
+
+        let st = store();
+        let inj = RecordingInjector {
+            echo_target: "%7".to_string(),
+            detect_mux: Mux::Tmux,
+            ..Default::default()
+        };
+        let out = call(
+            "weave_spawn_peer",
+            json!({"name":"kid","cmd":["echo","hi"],"cwd": allow_real.to_string_lossy()}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("spawn should succeed for an allowed cwd");
+        assert!(out.contains("kid"), "result names the spawned peer: {out}");
+        assert!(
+            out.contains("birth-cert"),
+            "result discloses the cert: {out}"
+        );
+
+        let calls = inj.spawn_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one spawn fired");
+        let rec = &calls[0];
+        assert_eq!(rec.mux, Mux::Tmux);
+        assert_eq!(rec.cwd, allow_real.to_string_lossy());
+        assert_eq!(rec.name, "kid");
+        assert!(!rec.cert.is_empty(), "a birth cert was minted + threaded");
+        assert_eq!(rec.argv, vec!["echo".to_string(), "hi".to_string()]);
+        assert!(!rec.window, "pane by default");
+
+        // The echoed id ⇒ the peer is registered with the minted cert.
+        let peer = st.get_peer("kid").unwrap().expect("peer pre-registered");
+        assert_eq!(peer.target, "%7");
+        assert_eq!(
+            st.get_birth_cert("kid").unwrap().unwrap(),
+            rec.cert,
+            "the registered cert matches the one threaded into the child env"
+        );
+        std::env::remove_var("WEAVE_SPAWN_DIRS");
+    }
+
+    /// Disallowed cwd: with no allowlist (deny-by-default), the spawn is refused as an
+    /// Err (isError at the protocol seam) and NO spawn call fires.
+    #[test]
+    fn spawn_peer_disallowed_cwd_is_error() {
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEAVE_SPAWN_DIRS");
+        let st = store();
+        let inj = RecordingInjector {
+            detect_mux: Mux::Tmux,
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir();
+        let err = call(
+            "weave_spawn_peer",
+            json!({"name":"kid","cmd":["echo"],"cwd": tmp.to_string_lossy()}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("deny-by-default must refuse the spawn");
+        assert!(
+            err.contains("spawn_allowed_dirs") || err.contains("refusing to spawn"),
+            "error explains the allowlist denial: {err}"
+        );
+        assert!(
+            inj.spawn_calls.lock().unwrap().is_empty(),
+            "no spawn fires when the cwd is denied"
+        );
+        assert!(st.get_peer("kid").unwrap().is_none(), "no phantom peer row");
+    }
+
+    /// Spawning over an already-registered name is refused (Err) before any launch.
+    #[test]
+    fn spawn_peer_existing_name_is_error() {
+        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let allow = std::env::temp_dir().join(format!("weave-spawn-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&allow).unwrap();
+        let allow_real = std::fs::canonicalize(&allow).unwrap();
+        std::env::set_var("WEAVE_SPAWN_DIRS", &allow_real);
+        let st = store();
+        st.register_peer_full(
+            "taken", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+        )
+        .unwrap();
+        let inj = RecordingInjector {
+            detect_mux: Mux::Tmux,
+            ..Default::default()
+        };
+        let err = call(
+            "weave_spawn_peer",
+            json!({"name":"taken","cmd":["echo"],"cwd": allow_real.to_string_lossy()}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("cannot spawn over a live peer");
+        assert!(err.contains("already registered"), "{err}");
+        assert!(inj.spawn_calls.lock().unwrap().is_empty());
+        std::env::remove_var("WEAVE_SPAWN_DIRS");
+    }
+
+    /// `weave_kill_peer` for an unknown peer ⇒ Err (isError), no kill call.
+    #[test]
+    fn kill_peer_unknown_is_error() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let err = call(
+            "weave_kill_peer",
+            json!({"name":"ghost"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect_err("unknown peer must error");
+        assert!(err.contains("no registered peer"), "{err}");
+        assert!(inj.kill_calls.lock().unwrap().is_empty());
+    }
+
+    /// `weave_kill_peer` happy path: a registered tmux peer is killed via the trait.
+    #[test]
+    fn kill_peer_records_kill() {
+        let st = store();
+        st.register_peer_full(
+            "victim", "tmux", "%3", "", None, None, "h", "", "", "", "default", None,
+        )
+        .unwrap();
+        let inj = RecordingInjector::default();
+        let out = call(
+            "weave_kill_peer",
+            json!({"name":"victim"}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap();
+        assert!(out.contains("Killed"), "{out}");
+        let calls = inj.kill_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].mux, Mux::Tmux);
+        assert_eq!(calls[0].id, "%3");
+    }
+
+    /// Kill on an unsupported mux (iterm2/none) ⇒ graceful Ok message, no kill call.
+    #[test]
+    fn kill_peer_unsupported_mux_is_graceful() {
+        let st = store();
+        st.register_peer_full(
+            "it", "iterm2", "anything", "", None, None, "h", "", "", "", "default", None,
+        )
+        .unwrap();
+        let inj = RecordingInjector::default();
+        let out = call("weave_kill_peer", json!({"name":"it"}), st.as_ref(), &inj)
+            .expect("unsupported mux is graceful, not an error");
+        assert!(
+            out.contains("not supported"),
+            "graceful unsupported message: {out}"
+        );
+        assert!(
+            inj.kill_calls.lock().unwrap().is_empty(),
+            "no kill argv runs on an unsupported mux"
+        );
+    }
+
+    /// Both spawn/kill are in DANGEROUS_TOOLS, so a safe-mode (`dangerous=false`)
+    /// HTTP `tools/call` is rejected at `dispatch_request` with the disabled message;
+    /// with `--dangerous` (`dangerous=true`) the gate lets the call through.
+    #[test]
+    fn spawn_kill_blocked_in_safe_http_mode() {
+        assert!(is_dangerous_tool("weave_spawn_peer"));
+        assert!(is_dangerous_tool("weave_kill_peer"));
+        let st = store();
+        let inj = RecordingInjector::default();
+        for tool in ["weave_spawn_peer", "weave_kill_peer"] {
+            let req = json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"name":"x"}}
+            });
+            let reply = dispatch_request(
+                st.as_ref(),
+                &None,
+                None,
+                &[],
+                &pull_consent(),
+                &req,
+                &inj,
+                /* dangerous = */ false,
+            )
+            .expect("a reply is produced");
+            assert!(
+                reply.contains("disabled in safe HTTP mode"),
+                "{tool} must be gated in safe mode: {reply}"
+            );
+        }
+        // No spawn/kill ever fired — the gate blocks before call_tool.
+        assert!(inj.spawn_calls.lock().unwrap().is_empty());
+        assert!(inj.kill_calls.lock().unwrap().is_empty());
     }
 
     /// The pure verdict→stage fold is exhaustive and stable: each P1 verdict token
