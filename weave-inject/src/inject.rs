@@ -31,6 +31,15 @@ const CR: &str = "\r";
 /// truncated with an ellipsis (the full body still arrives via the store).
 pub const MAX_INJECT_CHARS: usize = 240;
 
+/// WL-047 spawn input caps. A spawned child's argv is attacker-influenceable on the
+/// MCP/remote surface, so bound both the number of argv elements and each element's
+/// length before any of them is handed to a mux. These are generous (a real agent
+/// launch is a handful of short args) but finite — an unbounded/huge argv must never
+/// reach `Command`.
+pub const MAX_SPAWN_ARGS: usize = 64;
+/// Hard cap on the length (bytes) of a single child-argv element.
+pub const MAX_SPAWN_ARG_LEN: usize = 4096;
+
 /// Wall-clock cap for a single mux subprocess. A wedged tmux/zellij server must
 /// never hang the caller (the MCP server serves other sessions).
 const INJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -473,6 +482,452 @@ pub fn commands_for_mode(target: &Target, body: &str, mode: Nudge) -> Vec<Vec<St
 
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// Is `s` an acceptable single child-argv element for a spawn (WL-047)?
+///
+/// Argv is passed to the OS as discrete elements — never concatenated into a shell
+/// string — so there is no shell-metacharacter parsing to defend against here. What
+/// we *do* enforce, matching the input-cap invariant, is: a length cap
+/// ([`MAX_SPAWN_ARG_LEN`]) and a rejection of embedded NUL / other control bytes
+/// (a NUL would truncate the arg at the libc boundary; stray control bytes have no
+/// place in a program name or option and could confuse a mux that reparses its own
+/// args). An empty string IS allowed (a program may legitimately take an empty
+/// positional); the argv as a whole is bounded by [`MAX_SPAWN_ARGS`] at the caller.
+pub fn spawn_arg_ok(s: &str) -> bool {
+    s.len() <= MAX_SPAWN_ARG_LEN && !s.chars().any(|c| c == '\0' || c.is_control())
+}
+
+/// The exact argv command(s) that ask `mux` to open a new pane (or, when `window`,
+/// a new window/tab) in `cwd` running `argv_child`. Pure function — unit-tested for
+/// every backend without any multiplexer present (the whole reason the injector's
+/// command tables are free functions).
+///
+/// `name` is the spawned child's weave identity; some muxes (kitty) let us inject it
+/// as `--env` belt-and-suspenders with the runner's `Command::envs`. `cert` is the
+/// WL-018 birth certificate threaded the same way for kitty.
+///
+/// Returns an EMPTY vec for muxes that cannot cleanly spawn (iTerm2, None) — those
+/// are not errors, the caller reports "spawn not supported" (the same fail-open
+/// posture as [`liveness_probe`] returning `None`). Every attacker-influenceable
+/// positional — `cwd` and each child-argv element — sits after an end-of-options
+/// `--`, so a child arg beginning with `-` is content, never a flag to the mux.
+pub fn spawn_commands(
+    mux: Mux,
+    cwd: &str,
+    name: &str,
+    cert: &str,
+    argv_child: &[String],
+    window: bool,
+) -> Vec<Vec<String>> {
+    if argv_child.is_empty() {
+        return vec![];
+    }
+    // Borrow the child argv as &str for the argv builders.
+    let child: Vec<&str> = argv_child.iter().map(String::as_str).collect();
+    match mux {
+        // tmux: `-P -F '#{pane_id}'` makes tmux PRINT the new pane id on stdout so
+        // the runner can capture it. `-c <cwd>` sets the working dir. `--` guards the
+        // child argv. window=true ⇒ a new window, else a split pane.
+        Mux::Tmux => {
+            let verb = if window { "new-window" } else { "split-window" };
+            let mut a: Vec<&str> = vec!["tmux", verb, "-P", "-F", "#{pane_id}", "-c", cwd, "--"];
+            a.extend_from_slice(&child);
+            vec![argv(&a)]
+        }
+        // zellij does NOT echo a usable new-pane id, so we cannot pre-register a
+        // target — the child self-registers from its env at SessionStart. We simply
+        // open the pane/tab in the named session running the child after `--`.
+        Mux::Zellij => {
+            let verb = if window { "new-tab" } else { "new-pane" };
+            // `new-pane`/`new-tab` take `-- <cmd...>`. `-c` (cwd) is not portable across
+            // zellij actions; rely on the runner's spawn cwd instead. (Documented.)
+            let mut a: Vec<&str> = vec!["zellij", "action", verb, "--"];
+            a.extend_from_slice(&child);
+            vec![argv(&a)]
+        }
+        // kitty: `kitten @ launch` PRINTS the new window id on stdout. `--cwd <cwd>`
+        // sets the dir; `--env K=V` injects identity directly (belt-and-suspenders).
+        // window=true ⇒ a new OS window, else a tab in the current window. `--` guards
+        // the child argv. (No `--to` socket here: a spawn targets the local kitty the
+        // child will live in; the child captures its own KITTY_LISTEN_ON at register.)
+        Mux::Kitty => {
+            let kind = if window { "os-window" } else { "tab" };
+            let env_session = format!("WEAVE_SESSION={name}");
+            let env_cert = format!("WEAVE_BIRTH_CERT={cert}");
+            let mut a: Vec<&str> = vec![
+                "kitten",
+                "@",
+                "launch",
+                "--type",
+                kind,
+                "--cwd",
+                cwd,
+                "--env",
+                &env_session,
+            ];
+            if !cert.is_empty() {
+                a.push("--env");
+                a.push(&env_cert);
+            }
+            a.push("--");
+            a.extend_from_slice(&child);
+            vec![argv(&a)]
+        }
+        // wezterm: `cli spawn` PRINTS the new pane id on stdout. `--cwd <cwd>` sets the
+        // dir; `--new-window` for a window, else a pane in the current tab. wezterm
+        // `spawn` takes no `--env`, so identity rides the runner's `Command::envs`.
+        Mux::Wezterm => {
+            let mut a: Vec<&str> = vec!["wezterm", "cli", "spawn"];
+            if window {
+                a.push("--new-window");
+            }
+            a.extend_from_slice(&["--cwd", cwd, "--"]);
+            a.extend_from_slice(&child);
+            vec![argv(&a)]
+        }
+        // screen: open a new window in session `<name-of-existing-session>`... but we
+        // do not have the parent's screen session here, and screen does not echo a new
+        // target id. Spawn is best-effort: open a NEW detached session named after the
+        // child so the child OWNS its session (cleaner kill), running the child argv.
+        // screen reparses nothing after the command, but keep each element discrete.
+        Mux::Screen => {
+            // `screen -dmS <name> <cmd...>` starts a detached session running cmd.
+            let mut a: Vec<&str> = vec!["screen", "-dmS", name];
+            a.extend_from_slice(&child);
+            vec![argv(&a)]
+        }
+        // iTerm2 has no argv-clean spawn (AppleScript only) and None is not spawnable.
+        Mux::ITerm2 | Mux::None => vec![],
+    }
+}
+
+/// The per-mux kill argv for an existing [`Target`]. Pure + unit-tested. Returns an
+/// empty vec for muxes with no clean kill (iTerm2, None). For zellij/screen the kill
+/// is COARSE/best-effort (documented): zellij closes the focused pane of the session
+/// and screen quits the named session — neither is a precise per-pane guarantee.
+pub fn kill_commands(target: &Target) -> Vec<Vec<String>> {
+    let id = &target.id;
+    match target.mux {
+        // tmux: kill the pane by id (`%<n>`).
+        Mux::Tmux => vec![argv(&["tmux", "kill-pane", "-t", id])],
+        // wezterm: kill the pane by id.
+        Mux::Wezterm => vec![argv(&["wezterm", "cli", "kill-pane", "--pane-id", id])],
+        // kitty: close the window matched by id. Thread `--to <socket>` before `@`
+        // when the peer carries a KITTY_LISTEN_ON socket, exactly as commands_for.
+        Mux::Kitty => {
+            let m = format!("id:{id}");
+            let mut a: Vec<&str> = vec!["kitten"];
+            if !target.socket.is_empty() {
+                a.push("--to");
+                a.push(&target.socket);
+            }
+            a.extend_from_slice(&["@", "close-window", "--match", &m]);
+            vec![argv(&a)]
+        }
+        // zellij: COARSE. Kill the whole session the agent lives in (`delete-session
+        // --force`) — safer than "close-pane" (which closes only the focused pane).
+        // The target id is the session name.
+        Mux::Zellij => vec![argv(&["zellij", "delete-session", "--force", id])],
+        // screen: COARSE. Quit the named session (`-X quit`) — when the spawned agent
+        // owns its own session (see spawn_commands) this cleanly tears it down.
+        Mux::Screen => vec![argv(&["screen", "-S", id, "-X", "quit"])],
+        // No clean kill for iTerm2 (AppleScript) / None.
+        Mux::ITerm2 | Mux::None => vec![],
+    }
+}
+
+/// Outcome of a [`spawn`] call: whether the mux launched the child, and the new
+/// target id when the mux echoed one (tmux/kitty/wezterm). An empty `target` means
+/// the mux does not report an id (zellij/screen) — the child self-registers its own
+/// target at SessionStart from the env we threaded in, so an empty target here is
+/// expected, not a failure.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOutcome {
+    /// `true` iff the launch command ran (exit 0). `false` is unused today (a failed
+    /// launch surfaces as `Err`), kept for forward-compatible reporting.
+    pub launched: bool,
+    /// The captured new pane/window id (`%3`, `7`, …), or empty when the mux does not
+    /// echo one. When non-empty the caller MAY pre-register the peer row.
+    pub target: String,
+}
+
+/// Launch `argv_child` in a new pane/window of `mux`, in `cwd`, threading the child's
+/// identity (`WEAVE_SESSION=name`), birth cert (`WEAVE_BIRTH_CERT=cert`) and optional
+/// `WEAVE_CIRCLE` into its environment (via the runner's `Command::envs`). Mirrors
+/// [`inject_mode`]'s discipline: resolve the mux binary by TRUSTED absolute path,
+/// run bounded, and — for muxes that echo a new id — capture it from stdout.
+///
+/// Returns `Ok(SpawnOutcome{ launched:true, target })` on success (`target` empty for
+/// muxes that do not report an id), `Ok(SpawnOutcome::default())` (launched:false) for
+/// an unspawnable mux (iTerm2/None), or `Err` when the mux binary is missing, the
+/// child argv is invalid/oversized, or the launch command itself fails.
+///
+/// SECURITY: the child PROGRAM (argv[0]) is constrained to the injector's trusted
+/// dirs — a spawn cannot launch an arbitrary binary off `$PATH`. Each child argv
+/// element is validated by [`spawn_arg_ok`] and the count bounded by
+/// [`MAX_SPAWN_ARGS`]. cwd-allowlisting is the CALLER's job (config layer).
+pub fn spawn(
+    mux: Mux,
+    cwd: &str,
+    name: &str,
+    cert: &str,
+    circle: &str,
+    argv_child: &[String],
+    window: bool,
+) -> Result<SpawnOutcome> {
+    if argv_child.is_empty() {
+        bail!("spawn: empty child command");
+    }
+    if argv_child.len() > MAX_SPAWN_ARGS {
+        bail!(
+            "spawn: child command has {} args (max {MAX_SPAWN_ARGS})",
+            argv_child.len()
+        );
+    }
+    for a in argv_child {
+        if !spawn_arg_ok(a) {
+            bail!("spawn: child argument is too long or contains control/NUL bytes");
+        }
+    }
+    // The child PROGRAM must itself resolve to a trusted absolute path — a remote
+    // spawn must not be able to launch an arbitrary binary off ambient $PATH. An
+    // absolute path is accepted as-is only if it lives under a trusted dir.
+    let prog = &argv_child[0];
+    let prog_abs = resolve_trusted_program(prog)
+        .ok_or_else(|| anyhow::anyhow!("spawn: program {prog:?} is not in a trusted directory"))?;
+    let cmds = spawn_commands(mux, cwd, name, cert, argv_child, window);
+    if cmds.is_empty() {
+        // Unspawnable mux (iTerm2/None): not an error, just unsupported.
+        return Ok(SpawnOutcome::default());
+    }
+    let bin = mux.binary();
+    if !have(bin) {
+        bail!(
+            "{bin} not found in a trusted directory (mux '{}')",
+            mux.as_str()
+        );
+    }
+    // Environment threaded into the child so it self-registers its unguessable
+    // identity on its first `weave hook session`.
+    let mut env: Vec<(String, String)> = vec![
+        ("WEAVE_SESSION".to_string(), name.to_string()),
+        ("WEAVE_BIRTH_CERT".to_string(), cert.to_string()),
+    ];
+    if !circle.is_empty() {
+        env.push(("WEAVE_CIRCLE".to_string(), circle.to_string()));
+    }
+    // Replace argv[0] of the CHILD with its trusted absolute path inside the mux's
+    // spawn argv, so the mux launches the trusted binary, not an ambient one. The
+    // child program is the first element AFTER the end-of-options `--`.
+    let mut cmds = cmds;
+    rewrite_child_prog(&mut cmds, &prog_abs);
+    // tmux/kitty/wezterm echo the new id on stdout → capture it. zellij/screen don't.
+    let captures_id = matches!(mux, Mux::Tmux | Mux::Kitty | Mux::Wezterm);
+    let mut outcome = SpawnOutcome {
+        launched: false,
+        target: String::new(),
+    };
+    for (i, cmd) in cmds.iter().enumerate() {
+        let last = i + 1 == cmds.len();
+        if last && captures_id {
+            match run_capture_env(cmd, &env, INJECT_TIMEOUT) {
+                // Parse the single trimmed stdout line as the new id. Be TOLERANT
+                // (WL-008 ANSI lesson): a parse miss ⇒ fail-open to empty target and
+                // lean on child self-registration, never a hard error.
+                Ok(Some(out)) => {
+                    outcome.launched = true;
+                    outcome.target = parse_spawn_id(mux, &out);
+                }
+                Ok(None) => {
+                    // Ran but non-zero / no stdout: treat as launched best-effort,
+                    // empty target (child self-registers).
+                    outcome.launched = true;
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            match run_bounded_env(cmd, &env, INJECT_TIMEOUT) {
+                Ok(true) => outcome.launched = true,
+                Ok(false) => bail!("`{}` exited non-zero", cmd.join(" ")),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Issue the per-mux kill for `target`. Returns `Ok(true)` when a kill command ran,
+/// `Ok(false)` when the mux has no clean kill (iTerm2/None), or `Err` when the mux
+/// binary is missing or the kill command fails. The target id MUST already have been
+/// validated by [`id_valid`] at the caller (mcp/main) before reaching here.
+pub fn kill(target: &Target) -> Result<bool> {
+    let cmds = kill_commands(target);
+    if cmds.is_empty() {
+        return Ok(false);
+    }
+    let bin = target.mux.binary();
+    if !have(bin) {
+        bail!(
+            "{bin} not found in a trusted directory (mux '{}')",
+            target.mux.as_str()
+        );
+    }
+    for cmd in &cmds {
+        match run_bounded(cmd, INJECT_TIMEOUT) {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Resolve a spawned child's PROGRAM (argv[0]) to a trusted absolute path. Accepts
+/// either a bare name resolved against [`trusted_dirs`] (like the mux binaries) OR an
+/// absolute path that itself lives under a trusted dir. Returns `None` otherwise, so a
+/// remote spawn cannot launch a binary outside the trusted set.
+fn resolve_trusted_program(prog: &str) -> Option<std::path::PathBuf> {
+    if prog.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(prog);
+    if p.is_absolute() {
+        // An absolute program path is accepted only when it is a file whose PARENT
+        // DIRECTORY is one of the trusted dirs. We canonicalize the parent dir (so a
+        // `..` escape cannot smuggle the path out of a trusted dir, and a symlinked
+        // dir compares on its real path) but we DO NOT follow the binary's OWN
+        // symlink target — mirroring `resolve_trusted`, which trusts `dir.join(bin)`
+        // by directory, not by the symlink's destination. (On many distros a trusted
+        // `/usr/bin/foo` is itself a symlink into `/usr/lib/...`; following it would
+        // wrongly reject a legitimately trusted binary.)
+        if !p.is_file() {
+            return None;
+        }
+        let parent = std::fs::canonicalize(p.parent()?).ok()?;
+        for d in trusted_dirs() {
+            if let Ok(rd) = std::fs::canonicalize(&d) {
+                if parent == rd {
+                    return Some(p.to_path_buf());
+                }
+            }
+        }
+        None
+    } else {
+        // A bare name resolves against the trusted dirs, like a mux binary.
+        resolve_trusted(prog)
+    }
+}
+
+/// Rewrite the CHILD program (the first element after the end-of-options `--`) in each
+/// spawn command to its trusted absolute path `prog_abs`. The mux binary itself
+/// (argv[0]) is left as a bare name for `trusted_argv` to rewrite at run time.
+fn rewrite_child_prog(cmds: &mut [Vec<String>], prog_abs: &std::path::Path) {
+    let abs = prog_abs.to_string_lossy().into_owned();
+    for cmd in cmds.iter_mut() {
+        if let Some(pos) = cmd.iter().position(|s| s == "--") {
+            if let Some(child0) = cmd.get_mut(pos + 1) {
+                *child0 = abs.clone();
+            }
+        } else if matches!(cmd.first().map(String::as_str), Some("screen")) {
+            // screen's spawn form has no `--`; the child program is the element after
+            // `-dmS <name>`, i.e. index 3.
+            if let Some(child0) = cmd.get_mut(3) {
+                *child0 = abs.clone();
+            }
+        }
+    }
+}
+
+/// Parse the new target id a mux echoed on stdout after a spawn. TOLERANT by design
+/// (the WL-008 lesson: zellij once emitted ANSI codes that broke naive matching):
+/// take the first non-empty trimmed line, strip a known prefix, and accept only an id
+/// that passes [`id_valid`] for the mux — anything else ⇒ empty (child self-registers).
+fn parse_spawn_id(mux: Mux, stdout: &str) -> String {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty());
+    let Some(line) = line else {
+        return String::new();
+    };
+    let candidate = match mux {
+        // tmux `-F '#{pane_id}'` prints the pane id verbatim, e.g. `%3`.
+        Mux::Tmux => line.to_string(),
+        // kitty `@ launch` prints the new window id (an integer) on its own line.
+        // wezterm `cli spawn` prints the new pane id (an integer).
+        Mux::Kitty | Mux::Wezterm => line
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>(),
+        // No other mux captures an id.
+        _ => String::new(),
+    };
+    if !candidate.is_empty() && id_valid(mux, &candidate) {
+        candidate
+    } else {
+        String::new()
+    }
+}
+
+/// Like [`run_bounded`] but sets extra environment variables on the child process.
+/// Used by [`spawn`] to thread the spawned agent's identity/cert/circle into the
+/// new pane's environment without ever placing them in argv.
+fn run_bounded_env(
+    cmd: &[String],
+    env: &[(String, String)],
+    dur: std::time::Duration,
+) -> Result<bool> {
+    use std::time::Instant;
+    let cmd = trusted_argv(cmd)
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a trusted directory", cmd[0]))?;
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if start.elapsed() >= dur {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`{}` timed out after {:?}", cmd.join(" "), dur);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Like [`run_capture`] but sets extra environment variables on the child (so a
+/// spawn's id-echoing launch command also threads the child's identity env).
+fn run_capture_env(
+    cmd: &[String],
+    env: &[(String, String)],
+    dur: std::time::Duration,
+) -> Result<Option<String>> {
+    use std::process::Stdio;
+    use std::time::Instant;
+    let cmd = trusted_argv(cmd)
+        .ok_or_else(|| anyhow::anyhow!("{} is not in a trusted directory", cmd[0]))?;
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let out = child.wait_with_output()?;
+            if status.success() {
+                return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            return Ok(None);
+        }
+        if start.elapsed() >= dur {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`{}` timed out after {:?}", cmd.join(" "), dur);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// The argv that asks a mux whether `target` still exists (its session/pane is
@@ -992,6 +1447,29 @@ pub trait Injector {
             Ok(p) => self.git_tags(&p).unwrap_or_default(),
             Err(_) => weave_core::model::WorktreeTags::default(),
         }
+    }
+
+    /// Spawn a child agent into a new `mux` pane/window (WL-047). Delegates to the
+    /// free [`spawn`] fn by default; tests provide a recording fake. `circle` is the
+    /// optional visibility circle threaded as `WEAVE_CIRCLE` (empty ⇒ omitted).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &self,
+        mux: Mux,
+        cwd: &str,
+        name: &str,
+        cert: &str,
+        circle: &str,
+        argv_child: &[String],
+        window: bool,
+    ) -> anyhow::Result<SpawnOutcome> {
+        spawn(mux, cwd, name, cert, circle, argv_child, window)
+    }
+
+    /// Kill a registered peer's pane/session (WL-047). Delegates to the free [`kill`]
+    /// fn by default; tests provide a recording fake.
+    fn kill(&self, target: &Target) -> anyhow::Result<bool> {
+        kill(target)
     }
 }
 
@@ -1814,5 +2292,261 @@ mod tests {
         for h in handles {
             h.join().expect("stress worker thread panicked");
         }
+    }
+
+    // ---- WL-047 spawn/kill exact-argv unit tests ----------------------------
+
+    fn child(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tmux_spawn_argv() {
+        // Pane (default): split-window, captures the new pane id via -P -F.
+        let c = spawn_commands(
+            Mux::Tmux,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["echo", "hi"]),
+            false,
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0],
+            argv(&[
+                "tmux",
+                "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-c",
+                "/work",
+                "--",
+                "echo",
+                "hi"
+            ])
+        );
+        // Window opt-in: new-window instead of split-window.
+        let w = spawn_commands(
+            Mux::Tmux,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["echo", "hi"]),
+            true,
+        );
+        assert_eq!(w[0][1], "new-window");
+    }
+
+    #[test]
+    fn zellij_spawn_argv() {
+        let c = spawn_commands(
+            Mux::Zellij,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent"]),
+            false,
+        );
+        assert_eq!(c[0], argv(&["zellij", "action", "new-pane", "--", "agent"]));
+        let w = spawn_commands(
+            Mux::Zellij,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent"]),
+            true,
+        );
+        assert_eq!(w[0][2], "new-tab");
+    }
+
+    #[test]
+    fn kitty_spawn_argv() {
+        let c = spawn_commands(
+            Mux::Kitty,
+            "/work",
+            "bob",
+            "deadbeef",
+            &child(&["agent"]),
+            false,
+        );
+        assert_eq!(
+            c[0],
+            argv(&[
+                "kitten",
+                "@",
+                "launch",
+                "--type",
+                "tab",
+                "--cwd",
+                "/work",
+                "--env",
+                "WEAVE_SESSION=bob",
+                "--env",
+                "WEAVE_BIRTH_CERT=deadbeef",
+                "--",
+                "agent"
+            ])
+        );
+        // Window opt-in flips the launch type to a new OS window.
+        let w = spawn_commands(
+            Mux::Kitty,
+            "/work",
+            "bob",
+            "deadbeef",
+            &child(&["agent"]),
+            true,
+        );
+        let ty = w[0].iter().position(|s| s == "--type").unwrap();
+        assert_eq!(w[0][ty + 1], "os-window");
+        // No cert ⇒ no WEAVE_BIRTH_CERT --env pair emitted.
+        let nc = spawn_commands(Mux::Kitty, "/work", "bob", "", &child(&["agent"]), false);
+        assert!(!nc[0].iter().any(|s| s.starts_with("WEAVE_BIRTH_CERT")));
+    }
+
+    #[test]
+    fn wezterm_spawn_argv() {
+        let c = spawn_commands(
+            Mux::Wezterm,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent"]),
+            false,
+        );
+        assert_eq!(
+            c[0],
+            argv(&["wezterm", "cli", "spawn", "--cwd", "/work", "--", "agent"])
+        );
+        let w = spawn_commands(
+            Mux::Wezterm,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent"]),
+            true,
+        );
+        assert!(w[0].iter().any(|s| s == "--new-window"));
+    }
+
+    #[test]
+    fn screen_spawn_argv() {
+        // screen owns its own session named after the child for a cleaner kill.
+        let c = spawn_commands(
+            Mux::Screen,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent"]),
+            false,
+        );
+        assert_eq!(c[0], argv(&["screen", "-dmS", "bob", "agent"]));
+    }
+
+    #[test]
+    fn iterm2_and_none_spawn_empty() {
+        assert!(spawn_commands(Mux::ITerm2, "/w", "b", "c", &child(&["a"]), false).is_empty());
+        assert!(spawn_commands(Mux::None, "/w", "b", "c", &child(&["a"]), false).is_empty());
+        // An empty child argv is never spawnable, regardless of mux.
+        assert!(spawn_commands(Mux::Tmux, "/w", "b", "c", &[], false).is_empty());
+    }
+
+    #[test]
+    fn spawn_child_leading_dash_is_content() {
+        // A child arg beginning with `-` must land AFTER the `--`, treated as content.
+        let c = spawn_commands(
+            Mux::Tmux,
+            "/work",
+            "bob",
+            "cert",
+            &child(&["agent", "--help"]),
+            false,
+        );
+        let dd = c[0].iter().position(|s| s == "--").unwrap();
+        assert_eq!(c[0][dd + 1], "agent");
+        assert_eq!(c[0][dd + 2], "--help");
+    }
+
+    #[test]
+    fn tmux_kill_argv() {
+        assert_eq!(
+            kill_commands(&t(Mux::Tmux, "%3")),
+            vec![argv(&["tmux", "kill-pane", "-t", "%3"])]
+        );
+    }
+
+    #[test]
+    fn wezterm_kill_argv() {
+        assert_eq!(
+            kill_commands(&t(Mux::Wezterm, "7")),
+            vec![argv(&["wezterm", "cli", "kill-pane", "--pane-id", "7"])]
+        );
+    }
+
+    #[test]
+    fn kitty_kill_argv() {
+        // Without a socket: bare close-window.
+        assert_eq!(
+            kill_commands(&t(Mux::Kitty, "7")),
+            vec![argv(&["kitten", "@", "close-window", "--match", "id:7"])]
+        );
+        // With a socket: --to precedes @.
+        let mut tg = t(Mux::Kitty, "7");
+        tg.socket = "unix:/tmp/k".into();
+        let c = kill_commands(&tg);
+        let at = c[0].iter().position(|s| s == "@").unwrap();
+        let to = c[0].iter().position(|s| s == "--to").unwrap();
+        assert!(to < at, "--to before @: {:?}", c[0]);
+    }
+
+    #[test]
+    fn zellij_kill_argv() {
+        // Coarse: delete the whole session by name.
+        assert_eq!(
+            kill_commands(&t(Mux::Zellij, "envctl")),
+            vec![argv(&["zellij", "delete-session", "--force", "envctl"])]
+        );
+    }
+
+    #[test]
+    fn screen_kill_argv() {
+        // Coarse: quit the named session.
+        assert_eq!(
+            kill_commands(&t(Mux::Screen, "1234.pts-0.host")),
+            vec![argv(&["screen", "-S", "1234.pts-0.host", "-X", "quit"])]
+        );
+    }
+
+    #[test]
+    fn iterm2_and_none_kill_empty() {
+        assert!(kill_commands(&t(Mux::ITerm2, "w0t0p0:ABC")).is_empty());
+        assert!(kill_commands(&Target::none()).is_empty());
+    }
+
+    #[test]
+    fn spawn_arg_ok_rejects_bad_args() {
+        assert!(spawn_arg_ok("agent"));
+        assert!(spawn_arg_ok("--flag"));
+        assert!(spawn_arg_ok("")); // empty positional is allowed
+        assert!(!spawn_arg_ok("a\0b")); // NUL rejected
+        assert!(!spawn_arg_ok("a\nb")); // control byte rejected
+        assert!(!spawn_arg_ok("\x1b[0m")); // ESC rejected
+        let huge = "x".repeat(MAX_SPAWN_ARG_LEN + 1);
+        assert!(!spawn_arg_ok(&huge)); // length cap
+    }
+
+    #[test]
+    fn parse_spawn_id_is_tolerant() {
+        // tmux echoes the pane id verbatim.
+        assert_eq!(parse_spawn_id(Mux::Tmux, "%5\n"), "%5");
+        // kitty/wezterm echo an integer; trailing junk is trimmed at the first
+        // non-digit, mirroring the WL-008 ANSI-tolerance lesson.
+        assert_eq!(parse_spawn_id(Mux::Kitty, "12\n"), "12");
+        assert_eq!(parse_spawn_id(Mux::Wezterm, "7 something"), "7");
+        // A line that yields no valid id ⇒ empty (child self-registers).
+        assert_eq!(parse_spawn_id(Mux::Tmux, "garbage"), "");
+        assert_eq!(parse_spawn_id(Mux::Kitty, "\x1b[0mnope"), "");
+        assert_eq!(parse_spawn_id(Mux::Zellij, "anything"), "");
     }
 }

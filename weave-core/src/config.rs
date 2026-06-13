@@ -11,7 +11,7 @@
 //! ```
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A resolved federation / Tier-2 pull source: either a LOCAL store file path or a
 /// REMOTE libSQL/Turso endpoint URL (with an optional auth token). Backend-agnostic
@@ -640,6 +640,18 @@ pub struct Config {
     /// `WEAVE_LLM_MAX_INPUT_CHARS`.
     #[serde(default)]
     pub llm_max_input_chars: Option<i64>,
+    /// Spawn allowlist (WL-047): directories a spawned child agent may be launched
+    /// in. A `weave_spawn_peer` / `weave spawn` request whose resolved cwd is not
+    /// (canonically) under one of these dirs is REFUSED on the MCP/remote surface —
+    /// `None`/empty ⇒ **deny by default** there (a remote caller must never pick an
+    /// arbitrary cwd). The operator-local CLI `weave spawn` only WARNS when no
+    /// allowlist is set (the operator already has a local shell). This mirrors
+    /// repowire's `daemon.spawn.allowed_paths`. Note this is a *cwd* gate; the child
+    /// PROGRAM (argv[0]) is independently constrained to the injector's trusted dirs.
+    /// Overlaid by `WEAVE_SPAWN_DIRS` (path-list separated). `#[serde(default)]`
+    /// keeps configs that omit the key loading unchanged.
+    #[serde(default)]
+    pub spawn_allowed_dirs: Option<Vec<String>>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -677,6 +689,7 @@ impl std::fmt::Debug for Config {
             .field("llm_model", &self.llm_model)
             .field("llm_timeout_secs", &self.llm_timeout_secs)
             .field("llm_max_input_chars", &self.llm_max_input_chars)
+            .field("spawn_allowed_dirs", &self.spawn_allowed_dirs)
             .finish()
     }
 }
@@ -869,7 +882,58 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_CIRCLE") {
             cfg.circle = Some(v);
         }
+        // Spawn allowlist (WL-047): WEAVE_SPAWN_DIRS is a path-list (`:`/`;`) of
+        // directories a spawned child may be launched in. Split with the platform
+        // path-list splitter (mirrors `inject::trusted_dirs`' WEAVE_MUX_DIR handling)
+        // and UNION onto any config `spawn_allowed_dirs`, matching the env-augments-
+        // config posture elsewhere. Validation (canonicalize + prefix-check) happens
+        // at the `spawn_dir_allowed` resolve seam — never store-side trust.
+        if let Some(v) = std::env::var_os("WEAVE_SPAWN_DIRS") {
+            let env_dirs: Vec<String> = std::env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            if !env_dirs.is_empty() {
+                let mut merged = cfg.spawn_allowed_dirs.take().unwrap_or_default();
+                merged.extend(env_dirs);
+                cfg.spawn_allowed_dirs = Some(merged);
+            }
+        }
         cfg
+    }
+
+    /// Is `cwd` an allowed directory to spawn a child agent into (WL-047)?
+    ///
+    /// `true` iff `cwd` canonicalizes to a path that is, or is nested under, one of
+    /// the configured [`spawn_allowed_dirs`](Self::spawn_allowed_dirs) (each itself
+    /// canonicalized so a symlinked allow-dir and a symlinked cwd compare on their
+    /// real paths — the same care `trusted_dirs` takes). An empty/unset allowlist ⇒
+    /// `false` (**deny by default**): the MCP/remote surface must refuse a spawn it
+    /// was never configured to permit. The operator-local CLI may choose to warn and
+    /// proceed instead, but that policy lives in the caller, not here — this helper
+    /// answers only "is this cwd explicitly allowed?".
+    ///
+    /// Canonicalization resolves `..` and symlinks, so a traversal/symlink escape
+    /// out of an allowed dir fails the prefix check. A cwd that does not exist (or
+    /// cannot be canonicalized) is NOT allowed.
+    pub fn spawn_dir_allowed(&self, cwd: &Path) -> bool {
+        let dirs = match self.spawn_allowed_dirs.as_deref() {
+            Some(d) if !d.is_empty() => d,
+            _ => return false,
+        };
+        let Ok(real_cwd) = std::fs::canonicalize(cwd) else {
+            return false;
+        };
+        dirs.iter().any(|d| {
+            let d = d.trim();
+            if d.is_empty() {
+                return false;
+            }
+            match std::fs::canonicalize(d) {
+                Ok(allowed) => real_cwd.starts_with(&allowed),
+                Err(_) => false,
+            }
+        })
     }
 
     /// Resolve this session's visibility-scoping circle (P4). The config/env value
@@ -1511,8 +1575,8 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Every setting below is OPTIONAL and shown commented-out with its default.
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
-# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>) take
-# precedence over anything set here.
+# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>,
+# WEAVE_SPAWN_DIRS) take precedence over anything set here.
 
 # Default identity for this machine/session. When unset, weave falls back to
 # the basename of the current directory (a *guess* that never marks mail read).
@@ -1656,6 +1720,17 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Default (unset) ⇒ \"default\", so a single-circle deployment behaves as before.
 # Overridable via WEAVE_CIRCLE.
 # circle = \"default\"
+
+# SPAWN ALLOWLIST (WL-047): directories a spawned child agent may be launched in.
+# `weave_spawn_peer` (MCP/remote) REFUSES a spawn whose resolved cwd is not under
+# one of these dirs — empty/unset ⇒ DENY BY DEFAULT on that surface (a remote caller
+# must never pick an arbitrary working directory). The operator-local `weave spawn`
+# only WARNS when this is unset (you already have a local shell). The child PROGRAM
+# (argv[0]) is independently constrained to the injector's trusted dirs, so this is
+# purely the cwd gate. Paths are canonicalized (symlinks/.. resolved) before the
+# prefix check. Mirrors repowire's daemon.spawn.allowed_paths. Overridable via
+# WEAVE_SPAWN_DIRS (path-list separated, `:` on unix / `;` on windows).
+# spawn_allowed_dirs = [\"/home/me/agents\", \"/srv/work\"]
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened

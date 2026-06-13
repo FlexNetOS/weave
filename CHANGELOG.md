@@ -35,6 +35,52 @@
 > MCP refactor + budget invariant + multi-surface parity (WL-050..052 / ADR-0003).
 > Structural: collapse the interim 4-crate workspace to single-crate (WL-043).
 
+## [Unreleased] — agent spawn/kill (WL-047)
+
+> **feat(inject/mcp/cli): agent spawn/kill (`weave_spawn_peer` /
+> `weave_kill_peer`) — argv-only, per-mux, birth-cert identity, spawn allowlist
+> (WL-047).** weave can now **launch** a new agent into a fresh mux pane/window and
+> **kill** a registered peer's pane/session, **argv-only — no shell, ever** — across
+> tmux/zellij/kitty/wezterm/screen. The parent mints a WL-018 birth certificate and
+> threads the spawned peer's identity (`WEAVE_SESSION`) + cert
+> (`WEAVE_BIRTH_CERT`) into the child's environment, so the child self-registers an
+> unguessable identity on its first `weave hook session`. Spawn is **two-layer
+> gated**: the child program (`argv[0]`) must resolve inside weave's trusted
+> directories, and the cwd must fall under a **spawn allowlist** (deny-by-default
+> for the MCP/remote surface, warn-but-proceed for the operator-local CLI). Muxes
+> that cannot echo a target id (zellij/screen) are **fail-open** and lean on child
+> self-registration; iterm2/none report "unsupported". Closes repowire-parity gap
+> #2 (`docs/REPOWIRE-PARITY.md` §2).
+
+### Added
+- **inject (`weave-inject`):** pure exact-argv builders `spawn_commands` /
+  `kill_commands` (per-mux: tmux/zellij/kitty/wezterm/screen, iterm2/none
+  fail-open) and the `spawn` / `kill` runners (trusted-path execution, child-argv
+  validation via `spawn_arg_ok`, `WEAVE_SESSION`/`WEAVE_BIRTH_CERT`/`WEAVE_CIRCLE`
+  threaded via `Command::envs`, captured target id where the mux echoes one);
+  `Injector` trait `spawn`/`kill` default methods; `spawn_arg_ok`, `SpawnOutcome`,
+  `MAX_SPAWN_ARGS`, `MAX_SPAWN_ARG_LEN`.
+- **mcp (`weave-mcp`):** `weave_spawn_peer` `{ name, cmd:[…argv], cwd?, mux?,
+  window?, circle? }` and `weave_kill_peer` `{ name }` tools (+ JSON schemas); both
+  added to `DANGEROUS_TOOLS` (disabled on the safe HTTP surface unless
+  `--dangerous`). Spawn hard-denies a cwd outside the allowlist; kill errors on an
+  unknown peer and reports gracefully on an unsupported mux.
+- **cli (`weave`):** `weave spawn <name> --cmd <argv…> [--cwd] [--mux] [--window]`
+  and `weave kill <name>` subcommands (`--cmd` uses `allow_hyphen_values` so a child
+  argv beginning with `-` is content). CLI spawn warns-but-proceeds when no
+  allowlist is configured; hard-denies when an allowlist is set and the cwd is
+  outside it.
+- **config (`weave-core`):** `spawn_allowed_dirs` config key + `WEAVE_SPAWN_DIRS`
+  env overlay (`split_paths`) + `Config::spawn_dir_allowed` (canonicalizing
+  prefix-check; deny-by-default; resists `..`/symlink escapes); documented in the
+  generated `config.toml` template. Redacted in the `Debug` impl.
+- **store (`weave-core`):** additive, backward-compatible change to
+  `register_peer_full` in **both** backends (sqlite + libSQL) — the new-peer INSERT
+  now honors a supplied `birth_cert` (else mints, exactly as before for `None`), so
+  the parent's minted cert can be pre-bound into a freshly spawned peer row. No new
+  `Store` method, no schema column, no migration; every pre-WL-047 caller passes
+  `None`, so existing behavior is byte-identical.
+
 ## [Unreleased] — Codex 7-layer harness (`weave harness ide-merge-ide`)
 
 > **Autonomous orchestration surface in the binary.** `weave harness

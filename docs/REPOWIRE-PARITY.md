@@ -27,16 +27,16 @@ the code.
 
 | | Count |
 |---|---|
-| repowire features that weave **HAS or SUPERSETS** | **30 of 36** |
-| **Genuine gaps**, all tracked | **4** — spawn/kill (WL-047), human surfaces (WL-048), + 2 minor (agents-scaffold, `SOUL.md` file) |
+| repowire features that weave **HAS or SUPERSETS** | **33 of 36** |
+| **Genuine gaps**, all tracked | **3** — human surfaces (WL-048), + 2 minor (agents-scaffold, `SOUL.md` file) |
 | **Superseded by design** (no-daemon) | **2** — hosted relay, API-key relay isolation → cross-store pull |
 | weave capabilities repowire **does NOT have** | **13** (§4) |
 
 **Conclusion: the superset claim holds.** Every repowire *messaging,
 orchestration, scheduling, memory, presence, security, and transport* primitive
-is present or exceeded. The only true gaps are **agent spawn/kill** (WL-047) and
-the **human surfaces** (WL-048) — both owner-confirmed in scope and Rust-native —
-plus two minor conveniences. weave additionally ships **13** capabilities
+is present or exceeded. With **agent spawn/kill shipped** (WL-047), the only
+remaining true gap is the **human surfaces** (WL-048) — owner-confirmed in scope
+and Rust-native — plus two minor conveniences. weave additionally ships **13** capabilities
 repowire never had (signing, summarization, leases, FTS, federation, dual
 backend, graph analytics, …), and adds governed web reach via obscura (WL-049 /
 ADR-0002) that repowire's relay never offered.
@@ -60,9 +60,9 @@ ADR-0002) that repowire's relay never offered.
 
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
-| `spawn_peer` (spawn agent into pane/window) | — | ⏳ **GAP** | **WL-047** (`weave_spawn_peer`, argv-only, per-mux, birth-cert id) |
-| `kill_peer` (kill pane/session) | — | ⏳ **GAP** | **WL-047** (`weave_kill_peer`) |
-| `peer restart` / `session resume` | — | ⏳ **GAP** | folds into WL-047 (spawn/kill family) |
+| `spawn_peer` (spawn agent into pane/window) | `weave_spawn_peer` / `weave spawn` | ✅ HAVE | **WL-047**; argv-only, per-mux, birth-cert id, spawn allowlist (§7) |
+| `kill_peer` (kill pane/session) | `weave_kill_peer` / `weave kill` | ✅ HAVE | **WL-047**; per-mux kill argv (exact pane, or coarse session for zellij/screen) |
+| `peer restart` / `session resume` | `weave_kill_peer` + `weave_spawn_peer` | ✅ HAVE | **WL-047** spawn/kill family (kill then re-spawn) |
 | Birth certificates (nonce at SessionStart) | `birth_cert` column + getrandom nonce + verify-on-reregister | ✅ HAVE | WL-018; `--cert` / `WEAVE_BIRTH_CERT` |
 | Lazy repair (no polling, request-driven) | request-driven liveness + TTL eviction; optional daemon | 🟢 SUPERSET | §6 presence; works with **no** daemon |
 
@@ -104,7 +104,7 @@ ADR-0002) that repowire's relay never offered.
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
 | Bearer token auth (HTTP/WS/hooks) | bearer-auth HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
-| Spawn allowlists (`daemon.spawn.allowed_paths`) | `trusted_dirs()` for mux binaries; spawn allowlist lands with WL-047 | 🔶 PARTIAL | mux trust present; spawn allowlist tracks with WL-047 |
+| Spawn allowlists (`daemon.spawn.allowed_paths`) | `spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS` + `trusted_dirs()` (two-layer gate) | ✅ HAVE | **WL-047**; cwd allowlist (deny-by-default, MCP hard-deny) + trusted child `argv[0]` |
 | PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` | ✅ HAVE | WL-021 |
 | CORS restricted to localhost | localhost-only HTTP surface | ✅ HAVE | WL-022 |
 | **No E2E encryption on relay (acknowledged gap)** | no relay at all; ed25519 signed identity + owner-only cross-store pull | 🟢 SUPERSET | `sign.rs`; closes repowire's own acknowledged weakness |
@@ -150,13 +150,13 @@ capability repowire's hosted relay never provided.
 
 | Gap | WL | Notes |
 |---|---|---|
-| Agent spawn/kill/restart | **WL-047** | `weave_spawn_peer`/`weave_kill_peer`, argv-only, per-mux, birth-cert identity, + spawn allowlist |
+| ~~Agent spawn/kill/restart~~ | **WL-047** ✅ done | `weave_spawn_peer`/`weave_kill_peer`, argv-only, per-mux, birth-cert identity, + spawn allowlist — shipped (§2, §7) |
 | Rust-native human surfaces (dashboard/Telegram/Slack) | **WL-048 / WL-052** | over `weave-mcp/http.rs`, `--features surfaces`, no Next.js/Python |
 | `agents create` folder scaffolding | *(candidate WL)* | minor convenience; `weave config init` already scaffolds config |
 | `SOUL.md` persona-file precedence | *(candidate WL)* | persona memory **scope** already exists; only the file convention is missing |
 | Governed web reach (beyond repowire) | **WL-049** | ADR-0002 — obscura-as-capability, no V8 in core |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
 
-**Net:** weave already supersets repowire on every dimension except agent
-spawn/kill and the human surfaces, both tracked and in scope. The audit confirms
-the docs' claim (PRD §8, ARCHITECTURE §0): **more than repowire, not less.**
+**Net:** with agent spawn/kill shipped (WL-047), weave supersets repowire on every
+dimension except the human surfaces, which are tracked and in scope. The audit
+confirms the docs' claim (PRD §8, ARCHITECTURE §0): **more than repowire, not less.**

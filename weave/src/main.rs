@@ -512,6 +512,35 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// Spawn a NEW agent/command into a fresh mux pane (or a new window with
+    /// --window) and register it as a peer (WL-047). Argv-only — no shell is ever
+    /// invoked; the child command after --cmd is passed as discrete argv elements.
+    /// An unguessable birth certificate is threaded into the child's env so it
+    /// self-registers a tamper-proof identity on its first `weave hook session`.
+    Spawn {
+        /// The spawned agent's session identity (the peer row key). Must not exist.
+        #[arg(long)]
+        name: String,
+        /// The child command as argv: everything after --cmd is the program + args.
+        #[arg(long = "cmd", allow_hyphen_values = true, num_args = 1.., required = true)]
+        cmd: Vec<String>,
+        /// Working directory to launch in (default: the current directory).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Override the multiplexer (tmux|zellij|kitty|wezterm|screen).
+        #[arg(long)]
+        mux: Option<String>,
+        /// Open a new window/tab instead of a split pane.
+        #[arg(long)]
+        window: bool,
+    },
+    /// Kill a registered peer's pane/session (WL-047). zellij/screen kills are
+    /// coarse (session-level); iterm2/none are unsupported.
+    Kill {
+        /// The registered peer to kill.
+        #[arg(long)]
+        name: String,
+    },
     /// Open a correlation-tracked request to a peer (P1 ask/answer/ack). Returns a
     /// correlation id immediately (non-blocking); the question is delivered like a
     /// normal message and the honest delivery verdict is printed. Point-to-point.
@@ -4182,6 +4211,114 @@ fn main() -> Result<()> {
                     "peer not injectable"
                 }
             );
+        }
+
+        Cmd::Spawn {
+            name,
+            cmd,
+            cwd,
+            mux,
+            window,
+        } => {
+            // The spawned agent mints a fresh identity; refuse to clobber a live one.
+            store::check_ident("name", &name)?;
+            if store.get_peer(&name)?.is_some() {
+                anyhow::bail!(
+                    "a peer named '{name}' is already registered; choose a fresh name for the spawned agent"
+                );
+            }
+            // Resolve the working directory (default: the current dir).
+            let cwd = match cwd {
+                Some(c) if !c.trim().is_empty() => c,
+                _ => std::env::current_dir()?.to_string_lossy().into_owned(),
+            };
+            // Spawn allowlist: operator-local CLI WARNS-but-proceeds when no allowlist
+            // is configured (the operator already has a local shell), and HARD-DENIES
+            // only when an allowlist IS set and this cwd is outside it. (The MCP/remote
+            // surface denies by default — see tool_spawn_peer.)
+            match cfg.spawn_allowed_dirs.as_deref() {
+                Some(dirs) if !dirs.is_empty() => {
+                    if !cfg.spawn_dir_allowed(std::path::Path::new(&cwd)) {
+                        anyhow::bail!(
+                            "refusing to spawn into {cwd:?}: not under a configured spawn_allowed_dirs"
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "[weave] warning: no spawn_allowed_dirs configured; spawning into {cwd:?} (operator-local)"
+                    );
+                }
+            }
+            // Resolve the target mux: explicit override, else auto-detect this pane's.
+            let mux = match mux {
+                Some(s) if !s.trim().is_empty() => inject::Mux::parse(s.trim()),
+                _ => inject::detect_target_with_preference(parse_mux_preference(&cfg)).mux,
+            };
+            if mux == inject::Mux::None {
+                anyhow::bail!(
+                    "no multiplexer detected to spawn into (run inside tmux/zellij/kitty/wezterm/screen, or pass --mux)"
+                );
+            }
+            // Mint the birth cert in the parent (pure, no row) and thread it into the
+            // child env; register the peer only when the mux echoes a target id.
+            let cert = store::mint_birth_cert()?;
+            let circle = cfg.circle();
+            let outcome = inject::spawn_child(mux, &cwd, &name, &cert, &circle, &cmd, window)?;
+            if !outcome.target.is_empty() && inject::id_valid(mux, &outcome.target) {
+                store.register_peer_full(
+                    &name,
+                    mux.as_str(),
+                    &outcome.target,
+                    "",
+                    Some(cwd.as_str()),
+                    None,
+                    "",
+                    "",
+                    "",
+                    "",
+                    &circle,
+                    Some(cert.as_str()),
+                )?;
+            }
+            let tgt = if outcome.target.is_empty() {
+                "(self-registers on first hook)".to_string()
+            } else {
+                outcome.target.clone()
+            };
+            println!(
+                "spawned '{name}' into {} {tgt} (cwd={cwd})\nsave birth-cert: {cert}",
+                mux.as_str()
+            );
+        }
+
+        Cmd::Kill { name } => {
+            let peer = store
+                .get_peer(&name)?
+                .ok_or_else(|| anyhow::anyhow!("no registered peer '{name}'"))?;
+            let t = inject::Target::from_peer(&peer);
+            if matches!(t.mux, inject::Mux::ITerm2 | inject::Mux::None) {
+                println!(
+                    "peer '{name}' is on {} — kill not supported for that backend",
+                    t.mux.as_str()
+                );
+            } else if !inject::id_valid(t.mux, &t.id) {
+                anyhow::bail!(
+                    "refusing to kill: peer '{name}' has an invalid {} target {:?}",
+                    t.mux.as_str(),
+                    t.id
+                );
+            } else {
+                let killed = inject::kill_target(&t)?;
+                if killed {
+                    println!("killed '{name}' on {} (target {})", t.mux.as_str(), t.id);
+                } else {
+                    println!(
+                        "peer '{name}' is on {} — kill not supported for that backend",
+                        t.mux.as_str()
+                    );
+                }
+            }
         }
 
         #[cfg(feature = "sign")]
