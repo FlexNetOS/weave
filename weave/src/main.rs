@@ -4336,9 +4336,14 @@ fn main() -> Result<()> {
                 if killed {
                     println!("killed '{name}' on {} (target {})", t.mux.as_str(), t.id);
                 } else {
+                    // iTerm2/None are handled above, so this is a supported backend
+                    // whose kill command ran but reported failure: the pane/session
+                    // is likely already gone or the mux server is unreachable (e.g. a
+                    // non-default tmux socket). Report honestly, never a false "killed".
                     println!(
-                        "peer '{name}' is on {} — kill not supported for that backend",
-                        t.mux.as_str()
+                        "could not confirm kill of '{name}' on {} (target {}) — the pane/session may already be gone or unreachable",
+                        t.mux.as_str(),
+                        t.id
                     );
                 }
             }

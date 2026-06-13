@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
+
+### Fixed
+- **inject/cli/mcp:** `weave kill` (and `weave_kill_peer`) no longer falsely
+  report `killed …` when the mux `kill-pane`/`kill` command actually failed
+  (non-zero exit — e.g. the pane/session is already gone or the mux server is
+  unreachable, such as a non-default tmux socket). `inject::kill` now honors the
+  runner's exit status (`Ok(false)` on a non-zero mux exit, mirroring `spawn`,
+  which already did); the CLI and MCP report *"could not confirm kill … the
+  pane/session may already be gone or unreachable"* instead of a false success.
+  Found by `/verify` driving a real tmux server; the prior fake-mux test always
+  `exit 0`, so the path was uncovered — a failing-mux regression test was added.
+
 > **What weave is (v0.2.0).** weave is the **Rust-native superset of repowire** —
 > a full agent-to-agent **orchestration mesh** in one dependency-light static
 > binary, Python-free, no daemon (the DB is the broker): **70 `weave_*` MCP
