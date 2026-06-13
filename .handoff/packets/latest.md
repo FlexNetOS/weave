@@ -1,31 +1,53 @@
-# HANDOFF — weave (.handoff adoption + develop→master automation, COMPLETE)
+# HANDOFF — weave (repowire-superset mission session, COMPLETE)
 
-closed_utc: 2026-06-13T07:55Z
-branch: develop @ 51a944f (== master — converged)
-worktree: main checkout /home/drdave/Desktop/meta/weave (all session worktrees cleaned up)
-session_type: infra — full .handoff kernel adoption + branch protection + develop→master sync (NOT a weave-loop WL cycle)
-status: DONE for weave + handoff. develop→master pipeline proven end-to-end.
+closed_utc: 2026-06-13T20:30Z
+branch: develop @ 7413553 (== master — converged)
+worktree: main checkout /home/drdave/Desktop/meta/weave (all session worktrees removed)
+cycle_budget: n/a (interactive, owner-driven one card at a time)
+cycles_total: 5 cards + 1 verify-fix
+cycles_this_session: WL-046, WL-047, WL-048, WL-049, + kill-fix + SSRF-fix
+last_item: WL-049 (obscura governed web access) — merged + hardened
+next_item: WL-050 (token-light progressive-disclosure MCP, ADR-0003) — owner's call
+orchestrator_phase: complete (plan→implement→verify→guard ran for WL-047/048/049)
+gate_status: PASS — master==develop==7413553, all six required checks green on the tip
+pr_url: (none open) — PRs #72–#78 all merged
 
-## Done this session (all merged + verified)
-- **.handoff adoption (weave #64)** — full Tier-B Continuity Ledger Kernel. Migrated `_workspace/`, `_workspace_prev/`, `sessions-handoff/`, root handoff docs → `.handoff/` (history-preserving `git mv`, archived under `loop/_done/`). Rewired the weave-loop harness off `_workspace/`. Authored capsule, `tasks/TASK-0001.task.json` (canonical `handoff.task.v1`, intent_lock verified loadable by `hf`), `hooks/`, `policies/`, `policy.toml`, `decisions/ADR-0001`.
-- **Fleet register (handoff #12/#13)** — weave in `meta/handoff/.handoff/fleet/weave/capsule.json`, in sync with weave's capsule.
-- **Branch model (weave #65)** — CLAUDE.md corrected to the real workflow: PR→develop, gates-green auto-merge, develop syncs to protected master; meta git worktree policy.
-- **Branch protection** — develop now requires checks, mirroring master: weave = 6 (rustfmt, clippy, test, build (libsql backend), sign, libsql + sign); handoff = 4 (Test ubuntu/macos, Clippy, Format). Both repos `allow_auto_merge=true`. Proven: PRs now arm auto-merge and BLOCK until green.
-- **sync-master workflow (weave #66, handoff #14)** — `.github/workflows/sync-master.yml` in BOTH repos. On develop push, waits for that repo's required checks to go green on the develop tip, then fast-forwards master. Commit-scoped checks satisfy master's protection on the ff, so master stays genuinely gated — no PAT/bypass. No-downgrade ancestor guard.
-- **Reconciliation (weave #68, handoff #14)** — both repos' master/develop had diverged (independent org `.handoff`/fleet seeds landed on master while this session built on develop). Merged master→develop in each (upgrade-only, kept develop's superset, zero tree delta), restoring descent so the ff sync works.
-- **PROVEN end-to-end on weave**: after #68, `sync-master` run `27460564072` ff'd master → `master == develop == 51a944f`, all six checks green on the tip. handoff converging via #14 the same way.
+## Landed this session (all merged to develop; master fast-forwarded)
+- #72 docs: restate canonical docs to the repowire-superset north star (WL-046)
+- #73 docs: provable repowire-superset parity matrix `docs/REPOWIRE-PARITY.md` (WL-046)
+- #74 weave: agent spawn/kill — `weave_spawn_peer`/`weave_kill_peer` (WL-047)
+- #75 weave: Rust-native human surfaces — dashboard + Telegram/Slack (WL-048)
+- #76 fix(inject): `weave kill` no longer falsely reports success on mux failure (found by /verify)
+- #77 feat(weave): WL-049/ADR-0002 governed obscura web-access seam  ⚠️ agent-self-delivered pre-review
+- #78 fix(webpolicy): close SSRF encoded-loopback bypass + WL-049 QA layers (closes #77's hole)
 
-## Remaining / next
-- **TASK-0001** (`.handoff/tasks/TASK-0001.task.json`) — refresh ARCHITECTURE.md + CHANGELOG.md to the real feature set/vision (owner-flagged staleness; canonical docs stay at root). `hf status` surfaces it as the next card.
-- **Roll the sync pattern to the rest of the fleet** — weave + handoff + envctl now have `sync-master` (envctl's is a blind ff since its master has no required checks; weave/handoff wait-for-checks since theirs do). Remaining FlexNetOS repos in `../.meta.yaml` still need: develop branch protection (mirror each repo's master checks) + a `sync-master.yml` (wait-for-checks variant where master is gated, blind-ff where it isn't) + a one-time master↔develop reconciliation if diverged. This is the owner's "org workflow for all repos" build-out.
+## State (verified)
+- master == develop == **7413553**, working tree clean, 0 open PRs, only the main worktree.
+- Repowire-superset scorecard: **35/36 have-or-superset + governed web access** (beyond repowire's hosted relay). Remaining repowire gaps: 2 minor conveniences (`agents create` scaffold, `SOUL.md` persona file).
+- New surfaces all behind feature flags, default build dependency-light + token-light: `surfaces` (dashboard/bots), `obscura` (governed web). Default `cargo tree` unchanged.
 
-## Pointers
-- sync workflow: `.github/workflows/sync-master.yml` (weave + handoff)
-- branch model + worktree policy: weave `CLAUDE.md` → "Mandatory session-start ritual" / "Branch model"
-- continuity layer: `.handoff/` (capsule, README, `decisions/ADR-0001`, `loop/backlog.md` WL-001..045, `tasks/TASK-0001`)
-- workflow preference: memory `git-workflow-pattern.md`
+## Decisions (also in ICM: decisions-weave / errors-resolved / context-weave)
+- WL-049 obscura: **spawn-and-speak stdio MCP, not a crate dep** — weave spawns `obscura mcp` (separate binary) argv-only and is a minimal hand-rolled MCP **client** (std::io + serde_json, NO tokio/V8 in weave). ADR-0002 accepted.
+- All web surfaces are CLI subcommands + **one** dispatcher tool (`weave_web`), never 35 eager MCP tools (ADR-0003 token-light).
+- Deny-by-default governance reuses the existing permission/lease/job Store methods + SSRF webpolicy; no new Store method/schema.
 
-## Verify on resume
-- `git fetch origin && [ "$(git rev-parse origin/master)" = "$(git rev-parse origin/develop)" ] && echo converged` (weave)
-- `gh run list --workflow=sync-master.yml -L 2 -R FlexNetOS/weave` and `-R FlexNetOS/handoff` → expect success
-- next work item: `hf status` (TASK-0001), or pick the fleet-rollout above
+## Dead-ends / hazards (do not re-litigate / re-trip)
+- **Agent self-delivery hazard** (ICM + memory `agent-self-delivery-hazard.md`): a weave-orchestrator SUBAGENT pushed+PR'd+auto-merged WL-049 (#77) before the guardian reviewed → a vulnerable SSRF version reached develop. FIX FORWARD: the leader owns delivery; tell subagents "no git push / gh pr"; verify diff-math at delivery to detect sneak-pushes. Consider denying `Bash(git push:*)`/`Bash(gh pr:*)` for weave-* subagents.
+- **CI duplicate-run flake**: `ci.yml` triggers on BOTH `push:["**"]` and `pull_request` with NO `concurrency:` group → two racing runs cancel each other's jobs (hit #74,#76,#78). Recommended fix: `push: [master, develop]` (sync-master needs trunk-push checks) + `concurrency: {group: ci-${{github.ref}}, cancel-in-progress: true}`. Workaround used: re-run the failed job, or amend to a fresh SHA to clear a latched stale failure.
+- **tmux/zellij socket not captured** (backlog WL-053): peer targets carry the pane id, not the mux socket, so inject/spawn/kill rely on ambient $TMUX → wrong server from a non-default socket / different session. The #76 fix makes kill *fail honestly*; the underlying limitation is WL-053 (dual-backend schema add).
+
+## icm_stored
+- context-weave (01KV19N7…), errors-resolved (01KV19NA…), decisions-weave (01KV19ND…)
+
+## Open backlog (next session — owner's pick)
+- WL-050 token-light progressive-disclosure MCP refactor (ADR-0003) — the natural next mission card.
+- WL-051 token-light invariant + budget gate; WL-052 full multi-surface parity.
+- WL-053 capture mux socket in peer target (P2, found by /verify).
+- Two standing process fixes the owner was offered: (a) deny git/gh to subagents; (b) CI concurrency fix.
+
+## verify_on_resume
+- `git fetch origin && [ "$(git rev-parse origin/master)" = "$(git rev-parse origin/develop)" ] && echo converged`  # expect converged @ 7413553 or later
+- `git status --porcelain` empty
+- `cargo test --all-targets` (default sqlite) and `cargo test --no-default-features --features libsql`
+
+resume_command: /session-relay resume   (reads this packet; weave's own session-relay skill)
