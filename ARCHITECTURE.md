@@ -289,9 +289,10 @@ governs the separate `obscura` binary via a **spawn-and-speak MCP-client** model
 
 - **`weave-core/src/webpolicy.rs`** (core, no I/O): the pure deny-by-default
   decision (`WebPolicy::decide` over the 35-op `WEB_OPS` allow-list) and the
-  **SSRF/loopback URL validator** (`web_url_ok` / `host_is_internal` — denies
+  **SSRF/loopback URL validator** (`check_url` / `host_is_internal` — denies
   loopback / `localhost` / link-local incl. `169.254.169.254` / RFC1918 / `*.local`
-  / bare-IP unless `obscura_allow_internal`), plus `MAX_WEB_ARG_LEN` caps. Pure ⇒
+  / bare-IP, plus encoded-loopback forms (decimal/hex/octal/trailing-dot/IPv4-mapped),
+  unless `obscura_allow_internal`), plus `MAX_WEB_ARG_LEN` caps. Pure ⇒
   unit-tested exhaustively like `model.rs`.
 - **`weave-mcp/src/obscura.rs`** (mcp): a minimal hand-rolled **MCP client**. It
   resolves `obscura` to a trusted absolute path (`weave_inject::resolve_trusted` —
@@ -1176,12 +1177,19 @@ injected and stored text is handled**, not on network attackers.
 - **Governed web access is an egress + child-process surface (`obscura` feature,
   WL-049).** Forwarding `browser_*` ops to a spawned obscura makes weave a potential
   confused-deputy / SSRF vector, so the seam is hardened on four axes. **(1) SSRF /
-  loopback:** every URL-bearing op runs through `webpolicy::web_url_ok`, which
-  default-denies loopback / `localhost` / link-local (incl. the cloud-metadata
-  endpoint `169.254.169.254`) / RFC1918 private / `*.local` / bare-IP targets unless
-  `obscura_allow_internal=true`; a residual is DNS-rebinding to an internal IP after
-  the host check (operators reaching sensitive internal services should also
-  network-isolate the obscura host). **(2) Child-process trust:** `obscura` is
+  loopback:** every URL-bearing op runs through `webpolicy::check_url` →
+  `host_is_internal`, which default-denies loopback / `localhost` / link-local (incl.
+  the cloud-metadata endpoint `169.254.169.254`) / RFC1918 private / `*.local` /
+  bare-IP targets unless `obscura_allow_internal=true`. The guard also normalizes the
+  **encoded-loopback forms** a browser canonicalizes to the same internal address —
+  decimal (`2130706433`), hex (`0x7f000001`, `0x7f.0.0.1`), octal (`017700000001`),
+  trailing-dot FQDN (`localhost.`, `127.0.0.1.`), and IPv4-mapped IPv6
+  (`::ffff:127.0.0.1`) — so those are explicitly blocked too (any non-DNS-name
+  numeric/hex/octal authority fails closed into the bare-IP deny branch). The one
+  documented residual is **DNS-rebinding**: a normal-looking public hostname that
+  resolves to an internal IP at fetch time — weave validates the URL *host*, not
+  obscura's resolved IP, so operators reaching sensitive internal services should also
+  network-isolate the obscura host. **(2) Child-process trust:** `obscura` is
   resolved to a **trusted absolute path** (never ambient `$PATH`) and spawned
   **argv-only** (no shell, no built command string), each argv element bounded by
   `spawn_arg_ok`; the child is reaped on `Drop`/`--stop` (no orphans). **(3) Child

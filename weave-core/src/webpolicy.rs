@@ -286,6 +286,13 @@ pub fn host_is_internal(host: &str) -> bool {
     if host.is_empty() {
         return true;
     }
+    // Normalize a single trailing dot (`localhost.`, `127.0.0.1.`, `example.com.`):
+    // a browser treats `foo.` and `foo` as the same FQDN, so the dot must not let an
+    // internal name/IP slip past the checks below.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return true;
+    }
     // mDNS / local-suffix names.
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         return true;
@@ -299,13 +306,30 @@ pub fn host_is_internal(host: &str) -> bool {
             || (v6.segments()[0] & 0xffc0) == 0xfe80
             // unique-local fc00::/7
             || (v6.segments()[0] & 0xfe00) == 0xfc00
-            // IPv4-mapped → check the embedded v4
+            // IPv4-mapped (`::ffff:127.0.0.1`) → check the embedded v4
+            || v6.to_ipv4_mapped().map(ipv4_is_internal).unwrap_or(false)
+            // IPv4-compatible / mapped via to_ipv4 (`::127.0.0.1`)
             || v6.to_ipv4().map(ipv4_is_internal).unwrap_or(false);
     }
     // Bare IPv4 literal — denied (covers loopback/private/link-local + any public IP,
     // since a literal IP bypasses domain allow-listing).
     if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
         let _ = ipv4_is_internal(v4); // classification kept for clarity
+        return true;
+    }
+    // Fail-closed on obfuscated IP literals. A real browser canonicalizes non-dotted
+    // numeric authorities — decimal (`2130706433`), hex (`0x7f000001`, `0x7f.0.0.1`),
+    // octal (`017700000001`), and dotted forms with hex/octal octets — back to an IPv4
+    // address (e.g. 127.0.0.1), but `Ipv4Addr::parse` above accepts ONLY canonical
+    // dotted-decimal, so these slip through as "not an IP". Any authority composed
+    // solely of `[0-9a-fA-FxX.]` that did NOT parse as a standard dotted-decimal IPv4
+    // can only be such an obfuscated IP literal — treat it as a bare-IP literal, which
+    // the policy denies by default (same intent as the dotted-decimal branch above).
+    if !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '.')
+    {
         return true;
     }
     false
@@ -437,6 +461,66 @@ mod tests {
         ] {
             assert!(
                 p.decide("navigate", Some(bad)).is_err(),
+                "{bad} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_blocks_encoded_loopback_forms() {
+        // Alternate encodings of 127.0.0.1 / loopback that a browser canonicalizes to
+        // the same internal address but a naive dotted-decimal parse misses. Each MUST
+        // be classified internal (denied) — guardian round-2 SSRF hardening.
+        for host in [
+            "2130706433",   // decimal 127.0.0.1
+            "0x7f000001",   // hex 127.0.0.1
+            "0x7f.0.0.1",   // hex octet
+            "017700000001", // octal 127.0.0.1
+            "localhost.",   // trailing-dot FQDN
+            "127.0.0.1.",   // trailing-dot dotted-decimal
+        ] {
+            assert!(
+                host_is_internal(host),
+                "{host:?} is an encoded loopback and must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_loopback_forms() {
+        // IPv4-mapped and fully-expanded IPv6 loopback must all be caught.
+        for host in [
+            "::1",              // compressed loopback
+            "0:0:0:0:0:0:0:1",  // expanded loopback
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+            "::ffff:7f00:1",    // IPv4-mapped loopback (hex form)
+        ] {
+            assert!(
+                host_is_internal(host),
+                "{host:?} is an IPv6 loopback form and must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_blocks_encoded_loopback_via_decide() {
+        // End-to-end through the policy gate (url_host + host_is_internal).
+        let p = policy(&["navigate"], &[], false);
+        for bad in [
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://0x7f.0.0.1/",
+            "http://017700000001/",
+            "http://localhost./",
+            "http://127.0.0.1./",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[0:0:0:0:0:0:0:1]/",
+        ] {
+            assert!(
+                matches!(
+                    p.decide("navigate", Some(bad)).unwrap_err(),
+                    Denied::UnsafeUrl(_)
+                ),
                 "{bad} should be denied"
             );
         }

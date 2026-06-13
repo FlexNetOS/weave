@@ -89,6 +89,7 @@ pub fn stop() {
 
 /// An error from a web op, distinguishing an obscura-reported tool error (the child
 /// is healthy, reuse it) from a transport fault (the child is wedged, drop it).
+#[derive(Debug)]
 struct WebErr {
     message: String,
     transport_fault: bool,
@@ -329,37 +330,55 @@ impl ObscuraClient {
 
     /// Read a single line (up to the next `\n`) with a byte cap and a deadline.
     /// Returns `Ok(None)` on EOF. Reads byte-by-byte through the BufReader so the
-    /// cap is enforced even if the child never emits a newline.
+    /// cap is enforced even if the child never emits a newline. On timeout / cap
+    /// breach the child is killed+reaped before the transport error is returned.
     fn read_bounded_line(&mut self, deadline: Instant) -> Result<Option<String>, WebErr> {
-        let mut buf: Vec<u8> = Vec::with_capacity(256);
-        let mut byte = [0u8; 1];
-        loop {
-            if Instant::now() >= deadline {
+        match read_bounded_line_from(&mut self.stdout, deadline, MAX_LINE_BYTES) {
+            Err(e) if e.transport_fault => {
+                // Reap the wedged/oversized/timed-out child before surfacing.
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                return Err(WebErr::transport("obscura timed out"));
+                Err(e)
             }
-            match self.stdout.read(&mut byte) {
-                Ok(0) => {
-                    if buf.is_empty() {
-                        return Ok(None);
-                    }
+            other => other,
+        }
+    }
+}
+
+/// Read one newline-terminated line from `reader`, byte-by-byte, enforcing both a
+/// `deadline` and a `cap` on the line length — *independent of any child process* so
+/// the framing/cap logic is unit-testable against canned bytes (the production
+/// [`ObscuraClient::read_bounded_line`] delegates here and additionally reaps the
+/// child on a transport fault). Returns `Ok(None)` on EOF with no buffered bytes.
+fn read_bounded_line_from<R: Read>(
+    reader: &mut R,
+    deadline: Instant,
+    cap: usize,
+) -> Result<Option<String>, WebErr> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(WebErr::transport("obscura timed out"));
+        }
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
                     return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
                 }
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
-                    }
-                    buf.push(byte[0]);
-                    if buf.len() > MAX_LINE_BYTES {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        return Err(WebErr::transport("obscura reply exceeded the line cap"));
-                    }
+                buf.push(byte[0]);
+                if buf.len() > cap {
+                    return Err(WebErr::transport("obscura reply exceeded the line cap"));
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Err(WebErr::transport("obscura exited (read failed)")),
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(WebErr::transport("obscura exited (read failed)")),
         }
     }
 }
@@ -522,5 +541,75 @@ mod tests {
         let mut h = Harness::new(stream);
         let reply = h.read_reply_for(1).unwrap();
         assert_eq!(Harness::extract(&reply).unwrap(), "ok");
+    }
+
+    // ---- production bounded-read / line-cap (the real code path, not a mirror) ----
+
+    #[test]
+    fn bounded_line_reads_a_normal_line() {
+        // Drives the PRODUCTION `read_bounded_line_from` against canned bytes.
+        let mut cur = std::io::Cursor::new(b"hello world\n".to_vec());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = read_bounded_line_from(&mut cur, deadline, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "hello world");
+    }
+
+    #[test]
+    fn bounded_line_eof_with_no_bytes_is_none() {
+        let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(read_bounded_line_from(&mut cur, deadline, 1024)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bounded_line_eof_with_unterminated_bytes_returns_buffer() {
+        // A final line without a trailing newline is still returned (then the next
+        // read yields None) — matches the production EOF branch.
+        let mut cur = std::io::Cursor::new(b"tail-no-newline".to_vec());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = read_bounded_line_from(&mut cur, deadline, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "tail-no-newline");
+    }
+
+    #[test]
+    fn oversized_line_exceeds_cap_is_transport_error() {
+        // A response larger than the cap (no newline in sight) must be a clean
+        // transport error — never an OOM, panic, or hang. Uses a tiny cap so the
+        // test stays fast; the production cap is MAX_LINE_BYTES.
+        let big = vec![b'a'; 4096]; // no '\n' ⇒ keeps growing past the cap
+        let mut cur = std::io::Cursor::new(big);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = read_bounded_line_from(&mut cur, deadline, 64).unwrap_err();
+        assert!(err.transport_fault, "cap breach must be a transport fault");
+        assert!(
+            err.message.contains("line cap"),
+            "expected line-cap error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn bounded_line_past_deadline_times_out() {
+        // An already-expired deadline yields a clean timeout transport error rather
+        // than blocking forever on a child that never speaks.
+        let mut cur = std::io::Cursor::new(b"slow".to_vec());
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let err = read_bounded_line_from(&mut cur, deadline, 1024).unwrap_err();
+        assert!(err.transport_fault);
+        assert!(err.message.contains("timed out"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn web_err_op_vs_transport_classification() {
+        // An obscura tool error (child healthy) is NOT a transport fault; a wedged
+        // pipe IS — the `call` wrapper relies on this to decide whether to re-spawn.
+        assert!(!WebErr::op("Missing url").transport_fault);
+        assert!(WebErr::transport("obscura exited").transport_fault);
     }
 }
