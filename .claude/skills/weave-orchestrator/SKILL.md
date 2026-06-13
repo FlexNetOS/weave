@@ -25,9 +25,9 @@ Skills the team draws on: `weave-invariants`, `weave-test-discipline`, `weave-dr
 1. **New-worktree ritual (mandatory).** weave's `CLAUDE.md` requires each session to work in a fresh git worktree. Confirm you are in one (`git worktree list`, check the cwd is not the shared master checkout). If not, create/advise one before mutating code.
 2. **Rust-native drift scan (mandatory).** Run the `weave-drift-guard` detection procedure. If drift is found, surface it to the user as a **critical concern** with the remediation plan *before* starting the requested change.
 3. **Context check (initial vs. follow-up vs. partial):**
-   - `_workspace/` absent → **initial run**.
-   - `_workspace/` present + user gives new input → **new run**: move `_workspace/` to `_workspace_prev/`, start fresh.
-   - `_workspace/` present + user asks for a partial change ("redo only the tests", "refine the plan") → **partial re-run**: re-invoke only the relevant agent(s), passing the existing `_workspace/` files as prior context.
+   - `.handoff/loop/` absent → **initial run**.
+   - `.handoff/loop/` present + user gives new input → **new run**: move `.handoff/loop/` to `.handoff/loop/_done/`, start fresh.
+   - `.handoff/loop/` present + user asks for a partial change ("redo only the tests", "refine the plan") → **partial re-run**: re-invoke only the relevant agent(s), passing the existing `.handoff/loop/` files as prior context.
 4. **Triage scale.** Trivial change (a comment, a doc line, a one-token config default with no behavior change)? Skip the team and do it directly, then still run the verifier gate. Otherwise run the full pipeline below.
 
 ## Phase 1 — Plan
@@ -39,25 +39,25 @@ TeamCreate("weave-dev", members=[weave-planner, weave-implementer, weave-verifie
 TaskCreate(plan → implement → verify → guard, with dependencies in that order)
 ```
 
-Invoke **weave-planner** (`model: "opus"`) with the change request. It writes `_workspace/01_planner_plan.md`. Review the plan for architecture sanity (layer DAG, dual-backend flag, test layers, docs) before proceeding.
+Invoke **weave-planner** (`model: "opus"`) with the change request. It writes `.handoff/loop/01_planner_plan.md`. Review the plan for architecture sanity (layer DAG, dual-backend flag, test layers, docs) before proceeding.
 
 ## Phase 2 — Implement
 
-Invoke **weave-implementer** (`model: "opus"`) with the plan file. It edits `src/`, mirrors any `Store` change across both backends, confirms `cargo build` (and the libsql build if the store was touched), and writes `_workspace/02_implementer_changes.md`. Do not proceed on a non-compiling tree.
+Invoke **weave-implementer** (`model: "opus"`) with the plan file. It edits `src/`, mirrors any `Store` change across both backends, confirms `cargo build` (and the libsql build if the store was touched), and writes `.handoff/loop/02_implementer_changes.md`. Do not proceed on a non-compiling tree.
 
 ## Phase 3 — Verify (incremental QA)
 
-Invoke **weave-verifier** (`model: "opus"`) with the change log. It adds the matching test layers and runs the full gate on **both** backends, plus cross-boundary checks, writing `_workspace/03_verifier_report.md`. On RED, it routes the failure back to the implementer and re-verifies — loop until GREEN. Run QA **per module as it completes**, not once at the very end, so defects surface early.
+Invoke **weave-verifier** (`model: "opus"`) with the change log. It adds the matching test layers and runs the full gate on **both** backends, plus cross-boundary checks, writing `.handoff/loop/03_verifier_report.md`. On RED, it routes the failure back to the implementer and re-verifies — loop until GREEN. Run QA **per module as it completes**, not once at the very end, so defects surface early.
 
 ## Phase 4 — Guard (final gate)
 
-Once GREEN, invoke **weave-guardian** (`model: "opus"`). It audits the diff against `weave-invariants`, runs the `weave-drift-guard` procedure on the change, and checks docs sync, writing `_workspace/04_guardian_review.md` with an **APPROVE** or **BLOCK**. On BLOCK, route findings to the implementer and re-run Phases 3–4 for the touched files. Only on APPROVE is the change done.
+Once GREEN, invoke **weave-guardian** (`model: "opus"`). It audits the diff against `weave-invariants`, runs the `weave-drift-guard` procedure on the change, and checks docs sync, writing `.handoff/loop/04_guardian_review.md` with an **APPROVE** or **BLOCK**. On BLOCK, route findings to the implementer and re-run Phases 3–4 for the touched files. Only on APPROVE is the change done.
 
-**Autonomous loop mode:** When running under `weave-loop`, Phase 4 is delegated to **MiniMax** (`minimax-m3:cloud`) as the external guardian. MiniMax performs the same invariant/drift/docs audit and writes `_workspace/04_guardian_review.md`. The loop waits for APPROVE before proceeding to delivery.
+**Autonomous loop mode:** When running under `weave-loop`, Phase 4 is delegated to **MiniMax** (`minimax-m3:cloud`) as the external guardian. MiniMax performs the same invariant/drift/docs audit and writes `.handoff/loop/04_guardian_review.md`. The loop waits for APPROVE before proceeding to delivery.
 
 ## Phase 5 — Synthesize
 
-Summarize for the user (or the loop): what changed, the both-backends gate result, invariants verified, drift verdict, docs synced, and the `_workspace/` artifact paths. Remind them to update `CHANGELOG.md [Unreleased]` if the agents didn't.
+Summarize for the user (or the loop): what changed, the both-backends gate result, invariants verified, drift verdict, docs synced, and the `.handoff/loop/` artifact paths. Remind them to update `CHANGELOG.md [Unreleased]` if the agents didn't.
 
 **When running under `weave-loop`:** Do **not** clean up the team and do **not** commit yet. Return control to the loop. The loop will invoke MiniMax for Phase 4 (if not already done) and handle delivery in Phase 6.
 
@@ -69,23 +69,23 @@ Summarize for the user (or the loop): what changed, the both-backends gate resul
 
 1. **Commit** the diff with Conventional Commits: `weave: <summary>`.
 2. **Push** the branch: `git push origin HEAD`.
-3. **Open a PR** (`gh pr create --fill` or equivalent). The PR body should reference the `_workspace/` artifacts and the backlog item.
+3. **Open a PR** (`gh pr create --fill` or equivalent). The PR body should reference the `.handoff/loop/` artifacts and the backlog item.
 4. **Enable auto-merge** (`gh pr merge --auto`). This closes the loop — the construction crew delivers without human gating.
-5. If `gh` is unavailable or auto-merge fails, write `_workspace/NEEDS-HUMAN` with the specific error and halt.
+5. If `gh` is unavailable or auto-merge fails, write `.handoff/loop/NEEDS-HUMAN` with the specific error and halt.
 
 ## Data transfer protocol
 
-Task-based (coordination) + File-based (`_workspace/`) + Message-based (`SendMessage` for the implementer↔verifier↔guardian fix loops).
+Task-based (coordination) + File-based (`.handoff/loop/`) + Message-based (`SendMessage` for the implementer↔verifier↔guardian fix loops).
 
 ```
-_workspace/
+.handoff/loop/
 ├── 01_planner_plan.md
 ├── 02_implementer_changes.md
 ├── 03_verifier_report.md
 └── 04_guardian_review.md
 ```
 
-Preserve `_workspace/` for audit; only the code diff + doc edits land in the repo. Naming: `{phase}_{agent}_{artifact}.md`.
+Preserve `.handoff/loop/` for audit; only the code diff + doc edits land in the repo. Naming: `{phase}_{agent}_{artifact}.md`.
 
 ## Error handling
 
@@ -107,4 +107,4 @@ preflight (in worktree, no drift) → planner: edit `src/inject.rs` only, invari
 implementer (mistakenly) adds a helper `script.py` invoked from `build.rs` → verifier gate may pass → guardian's `weave-drift-guard` scan flags `build.rs → script.py` as category-1 drift → **BLOCK** → route back: port the helper's logic into a Rust module, remove the `.py` + `build.rs` shell-out, re-sync `Cargo.toml`/tests/docs → re-verify both backends → re-guard → APPROVE.
 
 **Follow-up — "redo only the tests, the routing case is thin":**
-Phase 0 detects `_workspace/` present + partial request → partial re-run → invoke only weave-verifier with the existing plan + change log → it strengthens `tests/prop.rs`/`tests/integration.rs`, re-runs the gate → guardian re-checks → APPROVE.
+Phase 0 detects `.handoff/loop/` present + partial request → partial re-run → invoke only weave-verifier with the existing plan + change log → it strengthens `tests/prop.rs`/`tests/integration.rs`, re-runs the gate → guardian re-checks → APPROVE.

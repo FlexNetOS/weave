@@ -1,0 +1,11 @@
+{
+  "schema": "handoff.context_capsule.v1",
+  "project_name": "weave",
+  "role": "Single dependency-light Rust binary (interim internal workspace weave-core <- weave-inject <- weave-mcp <- weave[bin]) that lets coding-agent sessions message each other over a shared SQLite mailbox and push a message into a recipient's live terminal pane via a native multi-mux injector (tmux, zellij, kitty, wezterm, screen). No Python, no daemon, no repowire. The DB file is the broker.",
+  "plane": "agent-mesh",
+  "tier": "B",
+  "northstar": "One dependency-light Rust binary, no-daemon push: the sender injects directly into the recipient's registered pane; the DB is the broker. The four interim crates collapse back to single-crate once the meta workspace is aligned (backup/* tags held). Heal not harm; never downgrade; never delete (archive).",
+  "next_command": "hf resume; then work the loop backlog in .handoff/loop/backlog.md from a FRESH worktree off origin/develop. Next items: WL-043 single-crate collapse (DEFERRED until meta workspace aligned), WL-044 dependabot, WL-045 README. Also TASK-0001: refresh ARCHITECTURE.md + CHANGELOG.md to the real feature set/vision (owner-flagged staleness).",
+  "loop": ".handoff/loop/backlog.md — WL-001..WL-045; loop_state.md shows reconciliation COMPLETE (master == develop @ 6cd3dd9, dual-backend gate green 531 sqlite / 491 libsql). Roadmap in loop/TASKS.md.",
+  "source": "migrated from deprecated _workspace/ + sessions-handoff/ (handoff ADR-0004 / P7), 2026-06-13"
+}

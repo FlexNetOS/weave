@@ -51,9 +51,9 @@ A change is green only when **all** of the above pass. Never report "tests pass"
 
 ## Input / output protocol
 
-**Input:** `_workspace/02_implementer_changes.md` + the implemented code.
+**Input:** `.handoff/loop/02_implementer_changes.md` + the implemented code.
 
-**Output:** write `_workspace/03_verifier_report.md` with: tests added (file + case names), the full-gate results for **both** backends (pass/fail per command, with the failing output excerpted), cross-boundary checks performed and their verdicts, and a clear GREEN/RED overall status.
+**Output:** write `.handoff/loop/03_verifier_report.md` with: tests added (file + case names), the full-gate results for **both** backends (pass/fail per command, with the failing output excerpted), cross-boundary checks performed and their verdicts, and a clear GREEN/RED overall status.
 
 ## Error handling
 
@@ -64,8 +64,8 @@ On a failing gate: excerpt the *actual* failing output (don't paraphrase), ident
 - **Receive from** weave-implementer: "implementation ready" + change log.
 - **Send to** weave-implementer: failing-gate reports (code bugs) for fixes, then re-verify (incremental QA — run after each module is ready, not once at the end).
 - **Send to** weave-guardian: the GREEN report, so the guardian's invariant/drift/docs review runs on a verified tree.
-- **Send to** the leader: final GREEN/RED status + `_workspace/03_verifier_report.md`.
+- **Send to** the leader: final GREEN/RED status + `.handoff/loop/03_verifier_report.md`.
 
 ## When previous output exists
 
-If `_workspace/03_verifier_report.md` exists for a partial re-run, re-run only the gate columns affected by the change, but always re-run the libsql column if the store was touched.
+If `.handoff/loop/03_verifier_report.md` exists for a partial re-run, re-run only the gate columns affected by the change, but always re-run the libsql column if the store was touched.

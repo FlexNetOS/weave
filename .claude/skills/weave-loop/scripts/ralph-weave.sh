@@ -21,7 +21,7 @@ AGENT_CMD="${WEAVE_AGENT_CMD:-claude}"
 AGENT_MODEL_ARGS="${WEAVE_AGENT_MODEL_ARGS:-}"
 APPLY="${WEAVE_APPLY:-0}"
 
-WS="$WORKTREE/_workspace"
+WS="$WORKTREE/.handoff/loop"
 mkdir -p "$WS"
 
 log(){ printf '[ralph-weave %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -60,15 +60,15 @@ fi
 read -r -d '' PROMPT_PHASE_A <<'EOF' || true
 You are the weave-loop construction crew (phases 1-3). Worktree: WORKTREE_PLACEHOLDER.
 
-1. Read _workspace/HANDOFF.md if present and RESUME; else DISCOVER from TASKS.md M1/M3, seed _workspace/backlog.md, write _workspace/loop_state.md, and stop.
-2. Pick the top uncompleted backlog item (first `- [ ]` in _workspace/backlog.md).
+1. Read .handoff/packets/latest.md if present and RESUME; else DISCOVER from .handoff/loop/TASKS.md M1/M3, seed .handoff/loop/backlog.md, write .handoff/loop/loop_state.md, and stop.
+2. Pick the top uncompleted backlog item (first `- [ ]` in .handoff/loop/backlog.md).
 3. Run the weave-orchestrator phases 1-3 for this item:
-   - Phase 1 (planner): write _workspace/01_planner_plan.md
-   - Phase 2 (implementer): edit src/, mirror Store changes across both backends, confirm both `cargo build` and `cargo build --no-default-features --features libsql` compile. Write _workspace/02_implementer_changes.md.
-   - Phase 3 (verifier): add matching test layers, run the full gate on BOTH backends (fmt, clippy -D warnings, test). Write _workspace/03_verifier_report.md with GREEN or RED.
+   - Phase 1 (planner): write .handoff/loop/01_planner_plan.md
+   - Phase 2 (implementer): edit src/, mirror Store changes across both backends, confirm both `cargo build` and `cargo build --no-default-features --features libsql` compile. Write .handoff/loop/02_implementer_changes.md.
+   - Phase 3 (verifier): add matching test layers, run the full gate on BOTH backends (fmt, clippy -D warnings, test). Write .handoff/loop/03_verifier_report.md with GREEN or RED.
 4. STOP before Phase 4 (Guardian). Do NOT commit. The diff must remain uncommitted.
-5. If verifier is RED, do not proceed. Write the failures to _workspace/03_verifier_report.md and stop this iteration.
-6. If verifier is GREEN, write a one-line summary of the diff to _workspace/03_verifier_report.md and stop.
+5. If verifier is RED, do not proceed. Write the failures to .handoff/loop/03_verifier_report.md and stop this iteration.
+6. If verifier is GREEN, write a one-line summary of the diff to .handoff/loop/03_verifier_report.md and stop.
 EOF
 
 # ---------------------------------------------------------------------------
@@ -81,9 +81,9 @@ Worktree: WORKTREE_PLACEHOLDER.
 
 Inputs:
 - The uncommitted diff in src/ and tests/
-- _workspace/01_planner_plan.md
-- _workspace/02_implementer_changes.md
-- _workspace/03_verifier_report.md (must be GREEN)
+- .handoff/loop/01_planner_plan.md
+- .handoff/loop/02_implementer_changes.md
+- .handoff/loop/03_verifier_report.md (must be GREEN)
 
 Your job:
 1. Read the diff, the plan, the change log, and the verifier report.
@@ -100,7 +100,7 @@ Your job:
 4. Check docs sync (CHANGELOG.md [Unreleased], README.md, ARCHITECTURE.md if surface changed).
 
 Output:
-Write _workspace/04_guardian_review.md with exactly this structure:
+Write .handoff/loop/04_guardian_review.md with exactly this structure:
 
 ```
 # Guardian Review
@@ -140,16 +140,16 @@ EOF
 read -r -d '' PROMPT_PHASE_C <<'EOF' || true
 You are the weave-loop delivery crew (Phase 5-6). Worktree: WORKTREE_PLACEHOLDER.
 
-1. Read _workspace/04_guardian_review.md. If it does not contain APPROVE, STOP.
+1. Read .handoff/loop/04_guardian_review.md. If it does not contain APPROVE, STOP.
 2. If APPROVE:
    a. Stage and commit with Conventional Commits subject: `weave: WL-NNN <one-line summary>`.
-      Include updated _workspace/backlog.md (flip item to `- [x]`) and _workspace/loop_state.md.
+      Include updated .handoff/loop/backlog.md (flip item to `- [x]`) and .handoff/loop/loop_state.md.
    b. Push the branch: `git push origin HEAD`.
    c. Open a PR: `gh pr create --fill` (or equivalent).
    d. Enable auto-merge: `gh pr merge --auto`.
-   e. Update _workspace/loop_state.md: bump cycles_this_session and cycles_total.
-   f. If backlog has more items, write _workspace/HANDOFF.md (spawn continuity-steward pattern) for the next session.
-   g. If backlog is complete, write _workspace/DONE with evidence.
+   e. Update .handoff/loop/loop_state.md: bump cycles_this_session and cycles_total.
+   f. If backlog has more items, write .handoff/packets/latest.md (spawn continuity-steward pattern) for the next session.
+   g. If backlog is complete, write .handoff/loop/DONE with evidence.
 3. Stop. Do not ScheduleWakeup.
 EOF
 

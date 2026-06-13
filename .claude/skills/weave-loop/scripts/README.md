@@ -7,7 +7,7 @@ closed auto-loop that merges the 3 parts into one:
    planner → implementer → verifier (phases 1-3).
 2. **MiniMax** (`minimax-m3:cloud`) is the external guardian (phase 4):
    reviews the diff against invariants, drift-guard, and docs; writes
-   `_workspace/04_guardian_review.md` with **APPROVE** or **BLOCK**.
+   `.handoff/loop/04_guardian_review.md` with **APPROVE** or **BLOCK**.
 3. **Local agent** delivers on APPROVE (phases 5-6):
    commit, push, open PR, enable auto-merge.
 
@@ -38,7 +38,7 @@ WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 ## Exit codes
 
 - `0` — `DONE` sentinel written; evidence inside.
-- `2` — `NEEDS-HUMAN` or `STOP` (human wall / kill switch). Inspect `_workspace/`.
+- `2` — `NEEDS-HUMAN` or `STOP` (human wall / kill switch). Inspect `.handoff/loop/`.
 - `3` — `MAX_ITERS` hit without a terminal sentinel. Investigate; the loop is stuck.
 
 ## Bootstrap hazard
@@ -46,5 +46,5 @@ WEAVE_APPLY=1 bash .claude/skills/weave-loop/scripts/ralph-weave.sh
 The runner's spawned agent **must not** depend on the live `weave` binary for the
 handoff heartbeat in a cycle that mutates weave's own wire or mux code
 (`mcp.rs` / `store.rs` / `inject.rs` / `setup.rs`). The committed
-`_workspace/HANDOFF.md` is the authoritative resume signal; the heartbeat is
+`.handoff/packets/latest.md` is the authoritative resume signal; the heartbeat is
 observability. The agent's prompt (above) carries the rule.

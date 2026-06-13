@@ -1,0 +1,62 @@
+# weave .handoff — policy rules (handoff.policy.rules.v1)
+#
+# Adopted from the Continuity Ledger Kernel (meta/handoff, ADR-0004 §2). Read by
+# `hf policy` (HFTASK-0015) and the drift gate (HFTASK-0005) when the shared `hf`
+# binary operates on this repo. Fail-closed defaults.
+
+[policy]
+schema                  = "handoff.policy.rules.v1"
+default_write_mode      = "deny_without_claim"
+default_network_mode    = "deny_unless_task_allows"
+default_dependency_mode = "deny_without_audit_event"
+
+[leases]
+heartbeat_seconds            = 30
+stale_after_seconds          = 300
+force_release_after_seconds  = 1800
+require_disjoint_write_scopes = true
+
+[handoff]
+require_checkpoint     = true
+require_test_evidence  = true   # weave: dual-backend gate (sqlite + libsql) is the evidence
+allow_test_waiver      = true
+require_drift_audit    = true   # weave: Rust-native drift guard (CLAUDE.md)
+require_next_command   = true
+
+[drift]
+block_out_of_scope_write                = true
+block_objective_change_without_adr      = true
+block_acceptance_change_without_reclaim = true
+block_architecture_change_without_adr   = true
+
+[merge]
+require_review_verdict        = true
+require_permission_granted    = true
+block_protected_file_changes  = true
+
+[merge.protected_files]
+# A confused/compromised agent must not rewrite its own guardrails. Block PRs that
+# touch these. weave additions: CLAUDE.md (the operating contract) and rustfmt.toml.
+patterns = [
+  ".github/**",
+  ".handoff/policy.toml",
+  ".handoff/policies/**",
+  ".handoff/hooks/**",
+  ".handoff/decisions/**",
+  "CLAUDE.md",
+  "rustfmt.toml",
+  "**/Cargo.toml",
+  "**/*.lock",
+]
+
+[commands.blocked]
+patterns = [
+  "rm -rf /",
+  "git reset --hard",
+  "git clean -fdx",
+  "git push --force",        # use --force-with-lease
+  "sudo rm",
+  "chmod -R 777",
+  "curl * | sh",
+  "wget * | sh",
+]

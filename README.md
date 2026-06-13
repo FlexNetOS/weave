@@ -7,7 +7,7 @@ running session's terminal pane** (tmux *or* zellij) so a peer is flagged the mo
 message arrives. One static binary. No Python, no daemon, no external dependency on
 repowire.
 
-See [PRD.md](PRD.md) for the full design and [TASKS.md](TASKS.md) for the roadmap.
+See [.handoff/context/PRD.md](.handoff/context/PRD.md) for the full design and [.handoff/loop/TASKS.md](.handoff/loop/TASKS.md) for the roadmap.
 
 ## Why
 
@@ -824,7 +824,7 @@ Dry-run is the default and prints the seven layers plus the exact `WEAVE_*`
 environment handed to the runner. It wraps
 `.claude/skills/weave-loop/scripts/ralph-weave.sh`: Kimi Code plans/reviews,
 Ollama launches Claude MiniMax for the implementation pass, and durable
-`_workspace` sentinels control resume/handoff. `--json` emits the plan
+`.handoff/loop` sentinels control resume/handoff. `--json` emits the plan
 machine-readably; `--safe` keeps destructive applies disabled inside the loop.
 The script is spawned argv-only (`bash <script>`), never via a shell string.
 

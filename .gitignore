@@ -1,3 +1,7 @@
 target/
 /.weave-test/
-_workspace/
+
+# ADR-0004 §3: per-repo .handoff carries NO ledger.db / no binary state in git.
+# Guard against a local `hf claim/checkpoint` writing the ephemeral member ledger.
+.handoff/ledger.db
+.handoff/**/ledger.db

@@ -1,0 +1,60 @@
+# weave .handoff — hook contract (handoff.hooks.v1)
+#
+# Adopted verbatim from the Continuity Ledger Kernel (meta/handoff, ADR-0004 §2:
+# the loop pieces are revived for the fleet layer). This is the lifecycle-automation
+# contract the agent harness fires on its session/edit events; the shared `hf` binary
+# resolves them against THIS repo's .handoff. fail_mode=block is a hard gate; warn is
+# advisory. Verbs not yet implemented are tracked as kernel tasks (HFTASK-*).
+
+schema = "handoff.hooks.v1"
+
+[[hooks]]
+event = "SessionStart"
+command = "hf resume --compact"          # rehydrate state; also the loop entry point
+timeout_seconds = 10
+fail_mode = "warn"
+
+[[hooks]]
+event = "TaskClaim"
+command = "hf policy check-claim --json" # enforce claim policy (lease, scope) — HFTASK-0015
+timeout_seconds = 15
+fail_mode = "block"
+
+[[hooks]]
+event = "PreEdit"
+command = "hf policy check-edit --json"  # refuse out-of-scope writes — HFTASK-0015
+timeout_seconds = 5
+fail_mode = "block"
+
+[[hooks]]
+event = "PostEdit"
+command = "hf checkpoint --auto --changed-files"
+timeout_seconds = 30
+fail_mode = "warn"
+
+[[hooks]]
+event = "PreHandoff"
+command = "hf drift --json && hf policy check-handoff --json"  # drift gate — HFTASK-0005/0015
+timeout_seconds = 30
+fail_mode = "block"
+
+[[hooks]]
+event = "SessionStop"
+command = "hf checkpoint --auto && hf handoff --auto"
+timeout_seconds = 60
+fail_mode = "warn"
+
+[[hooks]]
+# Sync/drift preflight before a session may create a worktree; block on drift so a
+# stale tree/branch/remote can never seed a session (weave's documented loop lesson).
+event = "PreSessionStart"
+command = "hf session preflight --json"  # HFTASK-0007
+timeout_seconds = 20
+fail_mode = "block"
+
+[[hooks]]
+# After a merge lands, mirror state one-way to .kb + ensure meta registration.
+event = "PostMerge"
+command = "hf sync --auto"               # HFTASK-0011
+timeout_seconds = 45
+fail_mode = "warn"
