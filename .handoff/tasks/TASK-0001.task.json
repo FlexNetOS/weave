@@ -22,5 +22,10 @@
   "allows_network": false,
   "allows_dependency_addition": false,
   "correlation_id": "weave-handoff-adoption",
-  "role": "implementer"
+  "role": "implementer",
+  "intent_lock": {
+    "objective_hash": "blake3:65bdec2a171095a70c61940490ef68ec48a46ac068afb1eef9377ab543fca248",
+    "path_scope_hash": "blake3:03b38bf25ac58004b636ffe17b888835762692e7a44b53a9361003bf0989c1cd",
+    "acceptance_hash": "blake3:62a3a7000bc7bd88b43cf37686065133184e69289bc1363c4ead3f9d422bfce5"
+  }
 }
