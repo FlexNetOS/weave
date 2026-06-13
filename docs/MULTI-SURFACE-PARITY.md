@@ -56,10 +56,11 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 Full human-surface write-parity is a multi-step effort; it is decomposed into concrete cards so a
 gap is never mistaken for "covered":
 
-- **WL-052a — Dashboard write/read completeness.** A bearer-gated `POST` action surface over the
-  existing hand-rolled `weave-mcp/http.rs` server (distinct from the JSON-RPC POST path), plus
-  per-message/job read views. Security-sensitive (auth, CSRF, no-shell, input caps) — must reuse
-  the same `tool_*` handlers the MCP/CLI use (single source of truth), never a parallel path.
+- **WL-052a — Dashboard write (v1 DONE).** `weave dashboard --write` exposes a bearer-gated
+  `POST /api` JSON-RPC action route that dispatches through the **same** `dispatch_request` →
+  `call_tool` handler as MCP/CLI — no parallel path; every invariant inherited. Read-only is the
+  default (POST → 403). Remaining polish: an in-page HTML send form + per-message/job read views
+  (the API is the substrate; the form is a leaf, per the agent-first stance).
 - **WL-052b — Bot command grammar.** Structured commands on Telegram/Slack (`/inbox`, `/ask`,
   `/peers`, …) mapping to the same handlers, with the existing identity-sanitization + secret-free
   logging guarantees. Currently the bots relay free text only.

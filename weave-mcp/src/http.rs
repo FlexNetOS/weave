@@ -70,13 +70,23 @@ pub fn serve_http(
 /// boundary; a per-connection handle is the clean, lock-free answer for read-only
 /// snapshots. Bearer auth (WL-022) gates both routes; an empty `token` ⇒ open.
 #[cfg(feature = "surfaces")]
-pub fn serve_dashboard<F>(port: u16, token: &str, store_factory: F) -> anyhow::Result<()>
+pub fn serve_dashboard<F>(
+    port: u16,
+    token: &str,
+    write: bool,
+    me_default: Option<String>,
+    injector: &(dyn Injector + Sync),
+    store_factory: F,
+) -> anyhow::Result<()>
 where
     F: Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync + 'static,
 {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;
-    log(&format!("dashboard listening on http://{addr}"));
+    log(&format!(
+        "dashboard listening on http://{addr} ({})",
+        if write { "read-write" } else { "read-only" }
+    ));
     let token = token.to_string();
     let factory = std::sync::Arc::new(store_factory);
     std::thread::scope(|scope| {
@@ -85,6 +95,7 @@ where
                 Ok(mut s) => {
                     let token = token.clone();
                     let factory = std::sync::Arc::clone(&factory);
+                    let me_default = me_default.clone();
                     scope.spawn(move || {
                         let store = match factory() {
                             Ok(st) => st,
@@ -93,8 +104,14 @@ where
                                 return;
                             }
                         };
-                        if let Err(e) = handle_dashboard_connection(&mut s, store.as_ref(), &token)
-                        {
+                        if let Err(e) = handle_dashboard_connection(
+                            &mut s,
+                            store.as_ref(),
+                            &token,
+                            write,
+                            &me_default,
+                            injector,
+                        ) {
                             log(&format!("dashboard connection error: {e}"));
                         }
                     });
@@ -106,13 +123,21 @@ where
     Ok(())
 }
 
-/// Handle one dashboard connection: parse the request line, bearer-check, and
-/// dispatch the GET route. GET-only and read-only.
+/// Handle one dashboard connection. GET serves the read-only HTML/SSE routes. When
+/// the server was started with `write` (WL-052a: `weave dashboard --write`), a
+/// bearer-gated `POST /api` accepts a JSON-RPC body and routes it through the **same**
+/// [`dispatch_request`] the MCP/CLI surfaces use — no parallel write path, so every
+/// invariant (caps, parameterized SQL, destructive gating, nudge-inject) is inherited.
+/// Without `write`, any POST is refused 403 (the default read-only posture).
 #[cfg(feature = "surfaces")]
+#[allow(clippy::too_many_arguments)]
 fn handle_dashboard_connection(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
     token: &str,
+    write: bool,
+    me_default: &Option<String>,
+    injector: &dyn Injector,
 ) -> anyhow::Result<()> {
     use crate::dashboard::{route, Route};
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -122,23 +147,91 @@ fn handle_dashboard_connection(
     let method = rl.next().unwrap_or("").to_string();
     let path = rl.next().unwrap_or("").to_string();
 
-    if method != "GET" {
-        write_http(stream, 405, b"Method Not Allowed")?;
-        return Ok(());
-    }
-    let auth_ok = read_headers_auth_only(&mut reader, token)?;
-    if !auth_ok {
-        write_http(stream, 401, b"Unauthorized")?;
-        return Ok(());
-    }
-    match route(&method, &path) {
-        Route::Page => serve_dashboard_page(stream, store),
-        Route::Events => serve_dashboard_events(stream, store),
-        _ => {
-            write_http(stream, 404, b"Not Found")?;
-            Ok(())
+    if method == "GET" {
+        let auth_ok = read_headers_auth_only(&mut reader, token)?;
+        if !auth_ok {
+            write_http(stream, 401, b"Unauthorized")?;
+            return Ok(());
         }
+        return match route(&method, &path) {
+            Route::Page => serve_dashboard_page(stream, store),
+            Route::Events => serve_dashboard_events(stream, store),
+            _ => {
+                write_http(stream, 404, b"Not Found")?;
+                Ok(())
+            }
+        };
     }
+
+    if method == "POST" {
+        if !write {
+            write_http(
+                stream,
+                403,
+                b"Dashboard is read-only. Start `weave dashboard --write` to enable the action API.",
+            )?;
+            return Ok(());
+        }
+        if path != "/api" {
+            write_http(stream, 404, b"Not Found")?;
+            return Ok(());
+        }
+        // Parse headers (content-length + bearer), mirroring the JSON-RPC POST path.
+        let mut content_length = 0usize;
+        let mut auth_ok = token.is_empty();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            let lower = line.to_lowercase();
+            if lower.starts_with("content-length:") {
+                content_length = lower
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+            if lower.starts_with("authorization:") {
+                let provided = line.split(':').nth(1).unwrap_or("").trim();
+                if provided == format!("Bearer {token}") || provided == format!("bearer {token}") {
+                    auth_ok = true;
+                }
+            }
+        }
+        if !auth_ok {
+            write_http(stream, 401, b"Unauthorized")?;
+            return Ok(());
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let req: Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                write_http(stream, 400, format!("Invalid JSON: {e}").as_bytes())?;
+                return Ok(());
+            }
+        };
+        // The SAME handler as MCP/CLI. `dangerous = true` because `--write` is the
+        // operator's explicit opt-in to mutations on this bearer-gated local surface.
+        let resp = dispatch_request(
+            store,
+            me_default,
+            None,
+            &[],
+            &PullConsent::empty(),
+            &req,
+            injector,
+            true,
+        );
+        let resp_body = resp.unwrap_or_else(|| "{}".to_string());
+        write_http(stream, 200, resp_body.as_bytes())?;
+        return Ok(());
+    }
+
+    write_http(stream, 405, b"Method Not Allowed")?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

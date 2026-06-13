@@ -10136,6 +10136,113 @@ mod surfaces_dashboard {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// Spawn `weave dashboard --write` (WL-052a): the read-only server plus the
+    /// bearer-gated `POST /api` action surface.
+    fn spawn_dashboard_write(db: &TestDb, token: &str) -> Dashboard {
+        let port = free_port();
+        let mut cmd = Command::new(weave_bin());
+        cmd.args([
+            "dashboard",
+            "--port",
+            &port.to_string(),
+            "--token",
+            token,
+            "--write",
+        ]);
+        scrub_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn weave dashboard --write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("dashboard did not start listening on port {port}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Dashboard { child, port }
+    }
+
+    /// Send a raw `POST <path>` with a JSON body (optionally bearer) and return the
+    /// full raw HTTP response text.
+    fn http_post(port: u16, path: &str, bearer: Option<&str>, body: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut req = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(t) = bearer {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        req.push_str("Connection: close\r\n\r\n");
+        req.push_str(body);
+        s.write_all(req.as_bytes()).expect("write request");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// WL-052a: `weave dashboard --write` exposes a `POST /api` action surface that
+    /// routes through the SAME `dispatch_request` handler as MCP/CLI — proven by
+    /// sending a message and reading it back, both via the dashboard API, end-to-end
+    /// through the real binary.
+    #[test]
+    fn dashboard_write_api_routes_through_same_handler() {
+        let db = TestDb::new();
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        // Send via the dashboard's POST /api (same JSON-RPC the MCP surface speaks).
+        let send = http_post(
+            dash.port,
+            "/api",
+            Some("secret-tok"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weave_send","arguments":{"from":"desktop","to":"envctl","body":"via-dash"}}}"#,
+        );
+        assert!(
+            send.starts_with("HTTP/1.1 200"),
+            "POST /api should be 200:\n{send}"
+        );
+        assert!(
+            send.contains("\"isError\":false") || send.contains("\"isError\": false"),
+            "send via dashboard should succeed: {send}"
+        );
+        // Read it back via the same API — proves the write hit the real store.
+        let inbox = http_post(
+            dash.port,
+            "/api",
+            Some("secret-tok"),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"weave_inbox","arguments":{"me":"envctl"}}}"#,
+        );
+        assert!(
+            inbox.contains("via-dash"),
+            "the message sent via dashboard API is delivered: {inbox}"
+        );
+    }
+
+    /// A read-only dashboard (no `--write`) refuses the action API with 403 — the
+    /// safe default; writes require the explicit opt-in.
+    #[test]
+    fn dashboard_readonly_rejects_post() {
+        let db = TestDb::new();
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let resp = http_post(
+            dash.port,
+            "/api",
+            Some("secret-tok"),
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weave_send","arguments":{"to":"x","body":"y"}}}"#,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "read-only dashboard must refuse POST /api with 403:\n{resp}"
+        );
+    }
+
     /// Like `http_get` but for `/events`: the SSE route never closes, so we read
     /// just the response head (until the blank line) instead of to EOF.
     fn http_get_head(port: u16, path: &str, bearer: Option<&str>) -> String {

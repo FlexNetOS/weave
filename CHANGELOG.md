@@ -3,6 +3,15 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **Dashboard write surface (WL-052a), behind `weave dashboard --write` (default
+  read-only):** a bearer-gated `POST /api` action route that accepts a JSON-RPC body
+  and dispatches through the **same** `dispatch_request` → `call_tool` handler the MCP
+  and CLI surfaces use — no parallel write path, so every invariant (input caps,
+  parameterized SQL, destructive-op gating, real nudge-inject) is inherited, not
+  re-implemented (the WL-052 "one handler, many surfaces" design law). A send issued
+  via the dashboard behaves byte-for-byte like a CLI send. Read-only stays the safe
+  default (POST → 403 without `--write`). Verified end-to-end through the real binary
+  (send → read-back via the API) on sqlite + libsql.
 - **`token-light` is now a first-class invariant with a CI-enforced budget gate
   (WL-051, ADR-0003).** The standing MCP `tools/list` surface is budget-capped by
   `MAX_STANDING_TOOLS_BYTES` (≈2k tokens) and guarded by the
