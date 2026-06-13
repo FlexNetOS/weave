@@ -3,6 +3,18 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **Token-light MCP via progressive disclosure (WL-050, ADR-0003).** The standing
+  `tools/list` surface is now a single `weave` **meta-tool** instead of 70+ eager
+  flat tools, cutting the standing context cost from tens of thousands of tokens to
+  ≈ a few hundred — **with zero capability loss**. Every operation is reached on
+  demand via the meta-tool's modes: `search {query}` (find ops), `list` (enumerate),
+  `describe {name}` (one op's schema), `call {name, arguments}` (invoke it; op names
+  may omit the `weave_` prefix). `call` routes back through the same dispatcher, so it
+  preserves every guard — the safe-HTTP destructive-op gate is re-applied to the inner
+  op and self-recursion is refused. A backward-compatible **eager-flat** mode
+  (`WEAVE_MCP_EAGER=1`) restores the full flat `tools/list` for harnesses that need it.
+  Pure `weave-mcp` refactor: no `Store`/schema/dependency change; default `cargo tree`
+  byte-identical; both backends green.
 - **obscura governed web access (WL-049, ADR-0002), behind `--features obscura`
   (default OFF):** weave becomes the governance plane for obscura's stealth web
   access. It spawns the separate `obscura mcp` binary (argv-only, trusted-path

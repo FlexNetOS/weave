@@ -286,6 +286,12 @@ impl McpServer {
         cwd: Option<&std::path::Path>,
     ) -> Self {
         let mut cmd = weave_cmd(db, args);
+        // WL-050 / ADR-0003: by default the integration MCP harness drives the
+        // backward-compatible EAGER-FLAT tool table, so the historical "tool X is
+        // advertised in tools/list" assertions still hold end-to-end. A test that
+        // wants the token-light progressive-disclosure surface (the production
+        // default) overrides this by passing ("WEAVE_MCP_EAGER", "0") in extra_env.
+        cmd.env("WEAVE_MCP_EAGER", "1");
         for (k, v) in extra_env {
             cmd.env(k, v);
         }

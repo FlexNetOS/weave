@@ -78,11 +78,12 @@ capabilities themselves remain in scope, to land **Rust-native**:
   `weave web` CLI, **deny-by-default** + SSRF-guarded, gated by the existing
   permission/lease/job primitives. **NO V8/tokio/obscura crate in weave's core**
   (zero new default deps). See "Governance plane: stealth web access" below.
-- **token-light surface** — replace the 70 eager flat MCP tools with
-  progressive-disclosure dispatchers / a meta-tool (≤ ~2k standing tokens, zero
-  capability loss) and add a guarded standing-token budget — **WL-050..052**,
-  decided in **ADR-0003**
-  (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
+- **token-light surface** — **WL-050 (done):** the 70+ eager flat MCP tools are
+  replaced by the `weave` **meta-tool** (search/describe/call/list) as the default
+  standing surface (≈ a few hundred tokens, zero capability loss), with an eager-flat
+  fallback (`WEAVE_MCP_EAGER=1`). Remaining: a guarded standing-token budget
+  (**WL-051**) and full multi-surface write/parity (**WL-052**). Decided in
+  **ADR-0003** (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
 
 The provable have/superset/gap parity matrix against repowire's inventory is
 `docs/REPOWIRE-PARITY.md` (**WL-046**). Structurally, the four-crate workspace below is **interim** —
@@ -244,8 +245,22 @@ probe is the existing fail-open `target_alive` and the verdict is a pure value.
 
 A newline-delimited JSON-RPC 2.0 server over stdio implementing `initialize`,
 `ping`, `tools/list`, `tools/call`, and empty `resources/list` / `prompts/list`.
-It exposes the `weave_*` tools and performs the live nudge-inject on send.
+It exposes the `weave_*` operations and performs the live nudge-inject on send.
 stdout is reserved for protocol frames; **all logging goes to stderr**.
+
+**Token-light progressive disclosure (WL-050 / ADR-0003).** `tool_catalog()` is the
+canonical registry of every `weave_*` operation (name, description, inputSchema) and
+the single source `call_tool` dispatches against. The **standing** surface returned by
+`tools/list`, however, is *not* the full catalog: by default it is **one** tool — the
+`weave` **meta-tool** — so the standing context cost stays bounded (≈ a few hundred
+tokens) no matter how many operations exist (the `token-light` invariant). The full set
+is reached on demand through the meta-tool's modes:
+`search {query}` (find ops), `list` (enumerate), `describe {name}` (one op's schema),
+`call {name, arguments}` (invoke it). `call` routes back through `call_tool`, so it
+preserves **every** guard — the safe-HTTP destructive-op gate is re-applied to the inner
+op, and it refuses to target `weave` itself (no recursion). A backward-compatible
+**eager-flat** mode (`WEAVE_MCP_EAGER=1`) restores the complete flat `tools/list` for
+harnesses that require flat tools — no capability or compatibility lost.
 `weave_attach` (zero-restart self-adoption — re-capture the pane and upsert the
 caller's own peer row) and `weave_connect` (the §4 capability verdict) sit
 alongside the messaging tools; the peers/sessions/doctor tools also surface

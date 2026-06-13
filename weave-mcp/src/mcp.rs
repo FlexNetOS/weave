@@ -381,6 +381,7 @@ pub fn dispatch_request(
                 name,
                 &args,
                 injector,
+                dangerous,
             ) {
                 Ok(text) => Some(reply(
                     &id,
@@ -410,8 +411,20 @@ fn call_tool(
     name: &str,
     args: &Value,
     injector: &dyn Injector,
+    dangerous: bool,
 ) -> Result<String, String> {
     match name {
+        // WL-050 / ADR-0003: token-light meta-tool — the full op set on demand.
+        "weave" => tool_meta(
+            store,
+            me_default,
+            nudge_template,
+            extra_dbs,
+            pull,
+            args,
+            injector,
+            dangerous,
+        ),
         "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
         "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
         "weave_broadcast_notify" => {
@@ -3110,7 +3123,10 @@ fn reply_err(id: &Value, code: i64, message: &str) -> String {
     json!({"jsonrpc":"2.0","id": id.clone(),"error":{"code":code,"message":message}}).to_string()
 }
 
-fn tools() -> Value {
+/// Canonical catalog of every `weave_*` operation (name, description, inputSchema).
+/// The single source of truth for the meta-tool's `describe`/`search`/`list` modes
+/// and for eager-flat mode. Every operation in `call_tool` has exactly one entry here.
+fn tool_catalog() -> Vec<Value> {
     #[allow(unused_mut)]
     let mut list = json!([
         {
@@ -3727,7 +3743,184 @@ fn tools() -> Value {
             },"required":["action"]}
         }));
     }
-    list
+    list.as_array().cloned().unwrap_or_default()
+}
+
+/// Whether the MCP server exposes the full **eager-flat** tool table (every
+/// `weave_*` op as a standing tool) instead of the token-light progressive-disclosure
+/// surface. Off by default (WL-050 / ADR-0003). Set `WEAVE_MCP_EAGER=1` (or `true`)
+/// for harnesses that require flat tools — no capability or compatibility is lost.
+fn eager_mode() -> bool {
+    std::env::var("WEAVE_MCP_EAGER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The token-light `weave` meta-tool (WL-050 / ADR-0003). It exposes the FULL
+/// operation set on demand — `search` to find ops, `describe` to fetch one op's
+/// schema, `call` to invoke it, `list` to enumerate — so per-op schemas are not
+/// paid as standing context. One standing tool replaces 70+ flat tools.
+fn meta_tool_def() -> Value {
+    json!({
+        "name": "weave",
+        "description": "Token-light gateway to every weave operation (messaging, asks, peers, jobs, leases, orchestration, review, schedules, memory, permissions, daemon, web). The full operation set is reachable WITHOUT loading every schema into context: mode='search' {query} finds ops; mode='list' enumerates them; mode='describe' {name} returns one op's argument schema; mode='call' {name, arguments} runs it. Op names may omit the 'weave_' prefix (e.g. 'send' == 'weave_send'). For flat tools instead, start the server with WEAVE_MCP_EAGER=1.",
+        "inputSchema": {"type":"object","properties":{
+            "mode":{"type":"string","enum":["search","describe","call","list"],"description":"search: find ops by keyword; list: all op names; describe: one op's schema; call: invoke an op."},
+            "query":{"type":"string","description":"For mode=search: keyword matched against op name + description (case-insensitive). Empty = all."},
+            "name":{"type":"string","description":"For mode=describe/call: the operation name, e.g. 'weave_send' or 'send'."},
+            "arguments":{"type":"object","description":"For mode=call: the called operation's own arguments object."},
+            "limit":{"type":"integer","description":"For mode=search: max matches to return (default 40, capped)."}
+        },"required":["mode"]}
+    })
+}
+
+/// The STANDING MCP surface returned by `tools/list`.
+///
+/// - **Progressive disclosure (default):** just the `weave` meta-tool (~a few hundred
+///   tokens). The full operation set is reachable via `search`/`describe`/`call`, so
+///   the standing context cost stays bounded regardless of how many ops exist
+///   (the `token-light` invariant, ADR-0003).
+/// - **Eager-flat (`WEAVE_MCP_EAGER=1`):** the complete catalog, byte-identical to the
+///   pre-WL-050 table, for harnesses that require flat tools.
+fn tools() -> Value {
+    if eager_mode() {
+        Value::Array(tool_catalog())
+    } else {
+        json!([meta_tool_def()])
+    }
+}
+
+/// First sentence (through the first ". ") of a tool description — a compact summary
+/// for `mode=search` results so the listing itself stays token-light.
+fn first_sentence(desc: &str) -> String {
+    match desc.split_once(". ") {
+        Some((head, _)) => format!("{head}."),
+        None => desc.to_string(),
+    }
+}
+
+/// Accept an operation name with or without the `weave_` prefix: `send` -> `weave_send`,
+/// `weave_send` -> `weave_send`. The bare `weave` meta-tool name is returned unchanged so
+/// `mode=call` can reject self-targeting.
+fn normalize_op_name(name: &str) -> String {
+    let n = name.trim();
+    if n == "weave" || n.starts_with("weave_") {
+        n.to_string()
+    } else {
+        format!("weave_{n}")
+    }
+}
+
+/// WL-050 / ADR-0003: the `weave` meta-tool. Progressive disclosure over the full
+/// operation catalog so the standing MCP surface stays token-light:
+/// - `search {query, limit?}` — find ops by keyword (name + description), compact summaries.
+/// - `list` — enumerate every operation name.
+/// - `describe {name}` — return one op's full `{name, description, inputSchema}`.
+/// - `call {name, arguments}` — invoke an op via `call_tool`, preserving every guard.
+///
+/// `call` re-applies the safe-HTTP destructive-op gate to the *inner* op (so the meta-tool
+/// is not a bypass) and refuses to target the meta-tool itself (no recursion).
+#[allow(clippy::too_many_arguments)]
+fn tool_meta(
+    store: &dyn Store,
+    me_default: &Option<String>,
+    nudge_template: Option<&str>,
+    extra_dbs: &[StoreSource],
+    pull: &PullConsent,
+    args: &Value,
+    injector: &dyn Injector,
+    dangerous: bool,
+) -> Result<String, String> {
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    match mode {
+        "search" => {
+            let q = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(40)
+                .clamp(1, 200) as usize;
+            let mut matches: Vec<Value> = Vec::new();
+            for t in tool_catalog() {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                if q.is_empty()
+                    || name.to_lowercase().contains(&q)
+                    || desc.to_lowercase().contains(&q)
+                {
+                    matches.push(json!({"name": name, "summary": first_sentence(desc)}));
+                    if matches.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(json!({"count": matches.len(), "matches": matches}).to_string())
+        }
+        "list" => {
+            let names: Vec<String> = tool_catalog()
+                .iter()
+                .filter_map(|t| {
+                    t.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            Ok(json!({"count": names.len(), "operations": names}).to_string())
+        }
+        "describe" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err("mode=describe requires 'name' (the operation to describe)".into());
+            }
+            let want = normalize_op_name(name);
+            match tool_catalog()
+                .into_iter()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(want.as_str()))
+            {
+                Some(def) => Ok(def.to_string()),
+                None => Err(format!(
+                    "unknown operation '{name}' (try mode=search or mode=list)"
+                )),
+            }
+        }
+        "call" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err("mode=call requires 'name' (the operation to invoke)".into());
+            }
+            let want = normalize_op_name(name);
+            if want == "weave" {
+                return Err("mode=call cannot target the 'weave' meta-tool itself".into());
+            }
+            // Preserve the safe-HTTP destructive-op gate on the INNER op — the meta-tool
+            // must never be a way around it (parity with the flat dispatch path).
+            if !dangerous && is_dangerous_tool(&want) {
+                return Err(format!(
+                    "Tool '{want}' is disabled in safe HTTP mode. Start with --dangerous to enable."
+                ));
+            }
+            let inner_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            call_tool(
+                store,
+                me_default,
+                nudge_template,
+                extra_dbs,
+                pull,
+                &want,
+                &inner_args,
+                injector,
+                dangerous,
+            )
+        }
+        "" => Err("missing 'mode' (one of: search, describe, call, list)".into()),
+        other => Err(format!(
+            "unknown mode '{other}' (one of: search, describe, call, list)"
+        )),
+    }
 }
 
 fn tool_daemon_start(me_default: &Option<String>, args: &Value) -> Result<String, String> {
@@ -4811,7 +5004,17 @@ mod tests {
     }
 
     fn call(name: &str, args: Value, st: &dyn Store, inj: &dyn Injector) -> Result<String, String> {
-        call_tool(st, &None, None, &[], &pull_consent(), name, &args, inj)
+        call_tool(
+            st,
+            &None,
+            None,
+            &[],
+            &pull_consent(),
+            name,
+            &args,
+            inj,
+            true,
+        )
     }
 
     /// `WEAVE_SPAWN_DIRS` is process-global; serialize the env-touching spawn tests so
@@ -4823,8 +5026,10 @@ mod tests {
     #[cfg(feature = "obscura")]
     #[test]
     fn weave_web_is_registered_and_dangerous() {
-        // The single token-light dispatcher is present in the standing tool table…
-        let listed = tools();
+        // The single token-light dispatcher is present in the operation catalog…
+        // (WL-050: the standing surface is now the `weave` meta-tool; weave_web is
+        // reachable via it — its one-dispatcher property is a catalog invariant.)
+        let listed = Value::Array(tool_catalog());
         let has = listed
             .as_array()
             .unwrap()
@@ -5257,6 +5462,259 @@ mod tests {
         // No spawn/kill ever fired — the gate blocks before call_tool.
         assert!(inj.spawn_calls.lock().unwrap().is_empty());
         assert!(inj.kill_calls.lock().unwrap().is_empty());
+    }
+
+    // ---- WL-050 / ADR-0003 token-light progressive-disclosure MCP -----------
+
+    /// `WEAVE_MCP_EAGER` is process-global; serialize the two tests that mutate it so
+    /// a parallel run can't observe the standing surface mid-flip.
+    static MCP_EAGER_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Default (progressive disclosure): the standing `tools/list` surface is exactly
+    /// ONE tool — the `weave` meta-tool — not the dozens of flat ops. This is the whole
+    /// token-light point: a bounded standing context cost regardless of op count.
+    #[test]
+    fn progressive_default_surface_is_just_the_meta_tool() {
+        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        std::env::remove_var("WEAVE_MCP_EAGER");
+        let listed = tools();
+        let arr = listed.as_array().expect("tools() is an array");
+        assert_eq!(arr.len(), 1, "standing surface must be a single meta-tool");
+        assert_eq!(
+            arr[0].get("name").and_then(|v| v.as_str()),
+            Some("weave"),
+            "the one standing tool is the `weave` meta-tool"
+        );
+        // And the meta-tool is itself token-light: it does not inline the catalog.
+        assert!(
+            arr[0].get("inputSchema").is_some(),
+            "meta-tool carries its own small schema"
+        );
+        // The catalog (full op set) is strictly larger — it is reached on demand.
+        assert!(
+            tool_catalog().len() > 1,
+            "catalog holds the full operation set"
+        );
+    }
+
+    /// Eager-flat mode (`WEAVE_MCP_EAGER=1`) restores the full standing table, byte-for-byte
+    /// the catalog — the backward-compatible path for harnesses that require flat tools.
+    #[test]
+    fn eager_mode_restores_the_full_flat_table() {
+        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        std::env::set_var("WEAVE_MCP_EAGER", "1");
+        let listed = tools();
+        let n = listed.as_array().map(|a| a.len()).unwrap_or(0);
+        std::env::remove_var("WEAVE_MCP_EAGER");
+        assert_eq!(
+            n,
+            tool_catalog().len(),
+            "eager surface == full catalog (no op dropped)"
+        );
+        assert!(n > 1, "eager table is the full flat set");
+    }
+
+    /// `mode=search` finds ops by keyword over name + description, with compact summaries.
+    #[test]
+    fn meta_search_finds_ops_by_keyword() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let out = call(
+            "weave",
+            json!({"mode":"search","query":"inbox"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("search succeeds");
+        let v: Value = serde_json::from_str(&out).expect("search returns JSON");
+        let names: Vec<&str> = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"weave_inbox"),
+            "search 'inbox' surfaces weave_inbox: {names:?}"
+        );
+        // Empty query enumerates everything (an index), still bounded by `limit`.
+        let all = call(
+            "weave",
+            json!({"mode":"search","query":"","limit":5}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap();
+        let av: Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(av["matches"].as_array().unwrap().len(), 5, "limit honored");
+    }
+
+    /// `mode=list` enumerates the full operation set.
+    #[test]
+    fn meta_list_enumerates_every_op() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let out = call("weave", json!({"mode":"list"}), st.as_ref(), &inj).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["count"].as_u64().unwrap() as usize,
+            tool_catalog().len(),
+            "list returns every catalog op"
+        );
+    }
+
+    /// `mode=describe` returns one op's full schema; the `weave_` prefix is optional;
+    /// an unknown op is an error (not a silent empty).
+    #[test]
+    fn meta_describe_returns_schema_or_errors() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        // Bare name resolves through the `weave_` prefix.
+        let out = call(
+            "weave",
+            json!({"mode":"describe","name":"send"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("describe succeeds");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"].as_str(), Some("weave_send"));
+        let req: Vec<&str> = v["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(req.contains(&"to") && req.contains(&"body"), "{req:?}");
+        // Unknown op → error.
+        let err = call(
+            "weave",
+            json!({"mode":"describe","name":"does_not_exist"}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown operation"), "{err}");
+    }
+
+    /// `mode=call` dispatches to exactly the same handler as a direct flat call — the
+    /// meta-tool is a faithful gateway, not a reimplementation.
+    #[test]
+    fn meta_call_matches_direct_dispatch() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let direct = call("weave_peers", json!({}), st.as_ref(), &inj).unwrap();
+        let viameta = call(
+            "weave",
+            json!({"mode":"call","name":"peers","arguments":{}}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap();
+        assert_eq!(direct, viameta, "meta call == direct call for weave_peers");
+    }
+
+    /// `mode=call` refuses to target the meta-tool itself (no recursion), and rejects
+    /// unknown ops with the canonical catch-all (proving it routes through `call_tool`).
+    #[test]
+    fn meta_call_guards_recursion_and_unknown() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let rec = call(
+            "weave",
+            json!({"mode":"call","name":"weave"}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(rec.contains("cannot target the 'weave' meta-tool"), "{rec}");
+        let unk = call(
+            "weave",
+            json!({"mode":"call","name":"weave_nope","arguments":{}}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(unk.contains("Unknown tool"), "{unk}");
+    }
+
+    /// An unknown/missing `mode` is a clean error, not a panic or a silent no-op.
+    #[test]
+    fn meta_rejects_bad_mode() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        assert!(call("weave", json!({}), st.as_ref(), &inj)
+            .unwrap_err()
+            .contains("missing 'mode'"));
+        assert!(
+            call("weave", json!({"mode":"frobnicate"}), st.as_ref(), &inj)
+                .unwrap_err()
+                .contains("unknown mode")
+        );
+    }
+
+    /// The meta-tool's `call` mode is NOT a way around the safe-HTTP destructive-op gate:
+    /// in safe mode (`dangerous=false`) a dangerous inner op is rejected exactly as the
+    /// flat path rejects it (the gate is on the inner op, not the wrapper).
+    #[test]
+    fn meta_call_preserves_safe_http_gate() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        // `weave` itself is NOT dangerous (so it lists/searches in safe mode)…
+        assert!(!is_dangerous_tool("weave"));
+        // …but a dangerous inner op routed via meta=call must still be blocked.
+        let req = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"weave","arguments":{"mode":"call","name":"weave_clear","arguments":{"scope":"all","confirm":true}}}
+        });
+        let reply = dispatch_request(
+            st.as_ref(),
+            &None,
+            None,
+            &[],
+            &pull_consent(),
+            &req,
+            &inj,
+            /* dangerous = */ false,
+        )
+        .expect("a reply is produced");
+        assert!(
+            reply.contains("disabled in safe HTTP mode"),
+            "dangerous inner op must be gated via meta call too: {reply}"
+        );
+    }
+
+    /// Catalog ↔ dispatch completeness: every op the meta-tool can `list`/`describe`
+    /// is actually dispatchable by `call_tool` — none returns the "Unknown tool"
+    /// catch-all. Guards against a catalog entry whose dispatch arm was never wired
+    /// (or was removed), which would otherwise only surface at runtime for an agent.
+    #[test]
+    fn every_catalog_op_is_dispatchable() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        for t in tool_catalog() {
+            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(!name.is_empty(), "catalog entry without a name");
+            // Empty args → each handler validates required args BEFORE any side effect,
+            // so this never spawns/writes; we only assert it is not the unknown-tool arm.
+            let r = call_tool(
+                st.as_ref(),
+                &None,
+                None,
+                &[],
+                &pull_consent(),
+                name,
+                &json!({}),
+                &inj,
+                true,
+            );
+            if let Err(e) = r {
+                assert!(
+                    !e.starts_with("Unknown tool:"),
+                    "catalog op '{name}' has no dispatch arm: {e}"
+                );
+            }
+        }
     }
 
     /// The pure verdict→stage fold is exhaustive and stable: each P1 verdict token

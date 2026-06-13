@@ -101,6 +101,84 @@ fn mcp_stdio_initialize_list_and_send_inbox_roundtrip() {
     mcp.shutdown();
 }
 
+/// WL-050 / ADR-0003: the PRODUCTION-DEFAULT MCP surface is token-light. End-to-end
+/// through the real binary (no `WEAVE_MCP_EAGER`), `tools/list` advertises exactly one
+/// tool — the `weave` meta-tool — and the full operation set is reachable on demand via
+/// its search/describe/call modes. This is the whole point of the refactor: a bounded
+/// standing context cost with zero capability loss.
+#[test]
+fn mcp_progressive_disclosure_default_surface_and_meta_roundtrip() {
+    let db = TestDb::new();
+    // ("WEAVE_MCP_EAGER", "0") opts OUT of the harness's eager default into the
+    // production progressive-disclosure surface.
+    let mut mcp = McpServer::spawn_env(&db, &[("WEAVE_MCP_EAGER", "0")]);
+
+    // tools/list -> EXACTLY the single `weave` meta-tool.
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools/list returns a `tools` array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["weave".to_string()],
+        "default standing surface is just the meta-tool: {names:?}"
+    );
+
+    // mode=search surfaces real ops without loading their schemas standing.
+    let (is_err, search_text) = mcp.call_tool(
+        "weave",
+        serde_json::json!({"mode":"search","query":"inbox"}),
+    );
+    assert!(!is_err, "meta search should not error: {search_text}");
+    assert!(
+        search_text.contains("weave_inbox"),
+        "search 'inbox' finds weave_inbox: {search_text}"
+    );
+
+    // mode=describe returns one op's schema on demand.
+    let (is_err, desc_text) = mcp.call_tool(
+        "weave",
+        serde_json::json!({"mode":"describe","name":"send"}),
+    );
+    assert!(!is_err, "meta describe should not error: {desc_text}");
+    assert!(
+        desc_text.contains("inputSchema") && desc_text.contains("weave_send"),
+        "describe returns weave_send schema: {desc_text}"
+    );
+
+    // mode=call dispatches the real op — send then read back, proving full reachability.
+    let (is_err, send_text) = mcp.call_tool(
+        "weave",
+        serde_json::json!({
+            "mode":"call","name":"send",
+            "arguments":{"from":"desktop","to":"envctl","body":"hi-meta"}
+        }),
+    );
+    assert!(
+        !is_err,
+        "meta call weave_send should not error: {send_text}"
+    );
+
+    let (is_err, inbox_text) = mcp.call_tool(
+        "weave",
+        serde_json::json!({"mode":"call","name":"inbox","arguments":{"me":"envctl"}}),
+    );
+    assert!(
+        !is_err,
+        "meta call weave_inbox should not error: {inbox_text}"
+    );
+    assert!(
+        inbox_text.contains("hi-meta"),
+        "the message sent via meta-call is delivered: {inbox_text}"
+    );
+
+    mcp.shutdown();
+}
+
 #[test]
 fn cli_setup_git_hooks_installs_pre_commit() {
     let db = TestDb::new();
