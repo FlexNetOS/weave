@@ -80,6 +80,18 @@ pub struct PullConsent {
 }
 
 impl PullConsent {
+    /// An empty consent (no pull sources). For surfaces that only ever *write* via
+    /// `dispatch_request` (e.g. the WL-052a dashboard write route) and never drain a
+    /// cross-store inbox, so the pull-side gating is irrelevant.
+    pub fn empty() -> Self {
+        PullConsent {
+            from: Vec::new(),
+            inject_pulled: false,
+            allow_inject_from: None,
+            policy: store::VerifyPolicy::default(),
+        }
+    }
+
     /// Is `source` (an `allow`-listed pull source) permitted to trigger the consent
     /// nudge? Mirrors `Config::inject_allowed_from_source`: unset gate ⇒ every source
     /// is eligible; set gate ⇒ a Local matches by canonical path, a Remote matches by

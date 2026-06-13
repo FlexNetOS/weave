@@ -811,8 +811,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// WL-048: serve the read-only human web dashboard (sessions, messages, jobs,
-    /// leases, schedules) over HTTP + SSE. Localhost-bound, bearer-gated, GET-only.
+    /// WL-048: serve the human web dashboard (sessions, messages, jobs, leases,
+    /// schedules) over HTTP + SSE. Localhost-bound, bearer-gated. Read-only by default;
+    /// `--write` (WL-052a) enables a `POST /api` action surface that routes through the
+    /// SAME handler as MCP/CLI.
     #[cfg(feature = "surfaces")]
     Dashboard {
         /// Port to listen on (default 8788).
@@ -821,6 +823,10 @@ enum Cmd {
         /// Bearer token. If omitted, a random token is generated and printed to stderr.
         #[arg(long)]
         token: Option<String>,
+        /// WL-052a: enable the bearer-gated `POST /api` write surface (mutating ops).
+        /// Off by default — the dashboard is read-only unless this is set.
+        #[arg(long)]
+        write: bool,
     },
     /// WL-048: run the Telegram bridge (poll-only): relay between a Telegram chat
     /// and the weave mesh. Token from config/`WEAVE_TELEGRAM_TOKEN`.
@@ -4547,7 +4553,7 @@ fn main() -> Result<()> {
         }
 
         #[cfg(feature = "surfaces")]
-        Cmd::Dashboard { port, token } => {
+        Cmd::Dashboard { port, token, write } => {
             // Reuse WL-022 bearer auth: generate a random token if none given and
             // print it to stderr (never stdout — MCP stdout discipline), like Serve.
             let token = match token {
@@ -4558,10 +4564,22 @@ fn main() -> Result<()> {
                     t
                 }
             };
+            if write {
+                eprintln!("[weave] dashboard WRITE surface enabled (POST /api)");
+            }
             // Each accepted connection thread opens its OWN read-only store handle
             // (Store is Send, not Sync) — the factory clones the resolved Config.
+            // WL-052a: the `--write` POST /api route reuses the SAME dispatch_request
+            // handler as MCP/CLI, with the real injector so a dashboard send nudges
+            // exactly like a CLI send.
             let cfg_for_factory = cfg.clone();
-            weave_mcp::serve_dashboard(port, &token, move || open_store(&cfg_for_factory))?;
+            let me_default = cfg.session.clone();
+            let injector = RealInjector {
+                preferred_mux: parse_mux_preference(&cfg),
+            };
+            weave_mcp::serve_dashboard(port, &token, write, me_default, &injector, move || {
+                open_store(&cfg_for_factory)
+            })?;
         }
 
         #[cfg(feature = "surfaces")]
