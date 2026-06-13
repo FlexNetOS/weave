@@ -142,7 +142,7 @@ impl Denied {
                 format!("refusing to navigate: {why} (SSRF guard; set obscura_allow_internal=true to override).")
             }
             Denied::DomainNotAllowed(host) => {
-                format!("host {host:?} is not in obscura_allow_domains.")
+                format!("host {host:?} is not in obscura_allow_domains (or WEAVE_OBSCURA_ALLOW_DOMAINS). Add it, or use \"*\" to allow all public hosts (internal hosts stay SSRF-blocked).")
             }
             Denied::ArgTooLong(k) => {
                 format!("web argument {k:?} is too long (max {MAX_WEB_ARG_LEN} bytes).")
@@ -156,8 +156,9 @@ impl Denied {
 pub struct WebPolicy {
     /// Allowed ops (bare names). `["*"]` ⇒ all ops. Empty ⇒ deny all.
     allow_ops: Vec<String>,
-    /// Allowed domains (exact or `.suffix` match). Empty ⇒ no domain restriction
-    /// (the SSRF guard still applies).
+    /// Allowed domains (exact or `.suffix` match). `["*"]` ⇒ any public host.
+    /// Empty ⇒ no domain restriction. In all cases the SSRF guard still applies,
+    /// so internal/loopback hosts are blocked regardless.
     allow_domains: Vec<String>,
     /// Permit internal / loopback / private hosts (SSRF override). Default false.
     allow_internal: bool,
@@ -222,7 +223,12 @@ impl WebPolicy {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         self.allow_domains.iter().any(|d| {
             let d = d.trim().trim_start_matches('.').to_ascii_lowercase();
-            !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
+            // `*` = wildcard: any (SSRF-passing, i.e. public) host, mirroring
+            // `obscura_allow_ops`'s `*`. Without this, an explicit `["*"]` matched
+            // no host and silently denied everything — the opposite of the deny
+            // message's advertised `*`. (Internal/loopback hosts are still blocked
+            // by the SSRF guard, which runs before this check.)
+            d == "*" || (!d.is_empty() && (host == d || host.ends_with(&format!(".{d}"))))
         })
     }
 }
@@ -553,6 +559,27 @@ mod tests {
             .is_ok());
         let d = p.decide("navigate", Some("https://evil.com/")).unwrap_err();
         assert_eq!(d, Denied::DomainNotAllowed("evil.com".to_string()));
+    }
+
+    #[test]
+    fn domain_wildcard_allows_any_public_host_but_ssrf_still_blocks() {
+        // `*` mirrors `obscura_allow_ops`'s `*`: any public host is allowed…
+        let p = policy(&["navigate"], &["*"], false);
+        assert!(p.decide("navigate", Some("https://example.com/")).is_ok());
+        assert!(p
+            .decide("navigate", Some("https://anything.example.org/"))
+            .is_ok());
+        // …but the SSRF guard (which runs before the domain check) still blocks
+        // internal hosts even under `*`.
+        assert!(matches!(
+            p.decide("navigate", Some("http://127.0.0.1/")).unwrap_err(),
+            Denied::UnsafeUrl(_)
+        ));
+        assert!(matches!(
+            p.decide("navigate", Some("http://2130706433/"))
+                .unwrap_err(),
+            Denied::UnsafeUrl(_)
+        ));
     }
 
     #[test]
