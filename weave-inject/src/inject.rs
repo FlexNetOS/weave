@@ -775,7 +775,13 @@ pub fn kill(target: &Target) -> Result<bool> {
     }
     for cmd in &cmds {
         match run_bounded(cmd, INJECT_TIMEOUT) {
-            Ok(_) => {}
+            // The mux ran but reported failure (non-zero exit) — e.g. the pane /
+            // session is already gone, or the mux server is unreachable. Do NOT
+            // claim the kill succeeded: surface it so the caller can report honestly
+            // instead of a false "killed". (Mirrors `spawn`, which already fails on
+            // a non-zero exit rather than swallowing it.)
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
             Err(e) => return Err(e),
         }
     }

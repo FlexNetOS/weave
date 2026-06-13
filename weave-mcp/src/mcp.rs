@@ -2239,9 +2239,14 @@ fn tool_kill_peer(
             target.mux.as_str(),
             target.id
         )),
+        // iTerm2/None are handled above, so a `false` here is a supported backend
+        // whose kill command ran but reported failure: the pane/session is likely
+        // already gone or the mux server is unreachable (e.g. a non-default tmux
+        // socket). Report honestly instead of a false "killed".
         Ok(false) => Ok(format!(
-            "peer '{name}' is on {} — kill is not supported for that backend.",
-            target.mux.as_str()
+            "could not confirm kill of '{name}' on {} (target {}) — the pane/session may already be gone or unreachable.",
+            target.mux.as_str(),
+            target.id
         )),
         Err(err) => Err(e(err)),
     }

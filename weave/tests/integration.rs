@@ -9816,6 +9816,70 @@ fn kill_cli_fires_kill_pane_for_registered_peer() {
     );
 }
 
+/// A fake tmux that echoes a pane id on spawn but EXITS NON-ZERO on `kill-pane`
+/// — modelling a pane/session that is already gone or a mux server that can't be
+/// reached (e.g. a non-default tmux socket). The shipped `make_fake_tmux_spawning`
+/// always `exit 0`, so it could never exercise the kill-failure path.
+fn make_fake_tmux_failing_kill(log_path: &Path) -> std::path::PathBuf {
+    let dir = common::unique_db().with_extension("muxbin");
+    std::fs::create_dir_all(&dir).expect("create fake-mux bin dir");
+    let script = dir.join("tmux");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *kill-pane*) echo 'error connecting' 1>&2; exit 1 ;;\n  *split-window*|*new-window*) echo '%9' ;;\nesac\nexit 0\n",
+        log_path.display()
+    );
+    std::fs::write(&script, body).expect("write fake tmux script");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat fake tmux")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod +x fake tmux");
+    dir
+}
+
+/// Regression for the `weave kill` false-success bug (found by `/verify`): when the
+/// mux `kill-pane` exits non-zero, `weave kill` MUST NOT print "killed" — it must
+/// report honestly that the kill could not be confirmed. Before the fix, `kill()`
+/// swallowed the non-zero status and always returned `Ok(true)`.
+#[test]
+fn kill_cli_reports_failure_when_mux_kill_exits_nonzero() {
+    let db = TestDb::new();
+    let log = common::unique_db().with_extension("tmuxlog");
+    let _ = std::fs::remove_file(&log);
+    let fake_dir = make_fake_tmux_failing_kill(&log);
+
+    let reg = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1")],
+        &["register", "--name", "p"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("spawn register");
+    assert!(reg.status.success());
+
+    let out = weave_with_fake_path(&db, &fake_dir, &[], &["kill", "--name", "p"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn kill");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("killed 'p'"),
+        "kill MUST NOT falsely claim success when the mux command failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("could not confirm kill"),
+        "kill should report the failure honestly: {stdout:?}"
+    );
+    // The kill argv must still have been issued against the (failing) mux.
+    let logged = read_log_with_retries(&log);
+    assert!(
+        logged.contains("kill-pane") && logged.contains("-t %1"),
+        "fake tmux should still record the attempted kill-pane -t %1:\n{logged}"
+    );
+}
+
 #[test]
 fn kill_cli_unknown_peer_errors() {
     let db = TestDb::new();
