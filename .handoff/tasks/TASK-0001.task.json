@@ -1,31 +1,33 @@
 {
-  "schema": "handoff.task.v1",
+  "acceptance_criteria": [
+    "ARCHITECTURE.md intro + sections state the corrected north star (repowire-superset orchestration mesh; no-daemon; one dependency-light Rust binary; obscura-governed web access) and cover the actually-built surface: jobs, leases, orchestrator, reviews, scheduling, memory, permissions, summarization, sign",
+    "CHANGELOG.md reconciled against actual merged WL items / PRs (ground truth: .handoff/loop/backlog.md WL-001..) — the shipped orchestration surface is reflected, not just v0.1.0",
+    "PRD (.handoff/context/PRD.md) Status/feature list updated from 'v0.1.0 — 38 tests' to current reality (70 MCP tools, dual backend, sign/llm, daemon/lease/job/review/schedule surfaces); Vision section restated to the repowire-superset + obscura mission",
+    "The repowire-superset framing is explicit and honest: which repowire features weave supersets, plus the in-scope gaps (agent spawn/kill, Rust-native human surfaces) cross-referenced to their backlog items",
+    "obscura web-access integration referenced via ADR-0002 (the governed, non-V8-linking decision)",
+    "All three reviewed against the code via git-kb code intelligence, not memory; no content lost vs prior versions (upgrade-only)"
+  ],
+  "allows_dependency_addition": false,
+  "allows_network": false,
+  "blocked_by": [],
+  "correlation_id": "weave-handoff-adoption",
+  "dependencies": [],
   "id": "TASK-0001",
-  "title": "Refresh canonical docs (ARCHITECTURE.md + CHANGELOG.md) to the real feature set/vision",
-  "status": "backlog",
-  "priority": "P1",
-  "objective": "Owner-flagged during the .handoff adoption (2026-06-13): ARCHITECTURE.md and CHANGELOG.md stay at the repo root (canonical living docs, source-of-truth per CLAUDE.md) but have drifted — they are NOT updating with proper feature additions or the current vision. Bring both back in sync with what weave actually does today, against the code (not from memory). Upgrade-only: expand, never truncate; no content lost vs prior versions.",
+  "intent_lock": {
+    "acceptance_hash": "blake3:7909823bcf0241b832ab22f8fc04715f34338a1c286c54d4a528340f73282846",
+    "objective_hash": "blake3:51c7c4e9f4d29827ad458555113740bf1d13f37d5dd87b0d21c8ee021e0e9136",
+    "path_scope_hash": "blake3:0e68c9431e70e1c4ba8c22f4294a8170a67e2977b5c0c285f8cf04489114ec75"
+  },
+  "objective": "ARCHITECTURE.md, CHANGELOG.md, and PRD (.handoff/context/PRD.md) under-sell weave: they describe the v0.1.0 'message each other + inject' seed, not the mission. Owner-corrected north star (2026-06-13): weave is the DEFINITIVE Rust-native SUPERSET of repowire — MORE than repowire, not less — a full agent-to-agent orchestration mesh in one dependency-light binary (70 weave_* tools: messaging+inject, asks/answers/permissions, durable job board, leases, orchestrator turn-state, review queue, scheduling, agent memory, LLM summarization), Python-free; plus the still-to-land repowire-superset gaps (agent spawn/kill, Rust-native human surfaces) and obscura integration as a weave-governed web-access capability (ADR-0002). Restate this accurately across the three canonical docs, against the code, not from memory. Canonical docs stay at the repo root; PRD is the migrated .handoff/context/PRD.md.",
   "path_scope": [
     "ARCHITECTURE.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    ".handoff/context/PRD.md"
   ],
-  "acceptance_criteria": [
-    "ARCHITECTURE.md reconciled against shipped code: interim 4-crate workspace section, MCP tool table, injector mux table, and every feature added since last edit",
-    "CHANGELOG.md [Unreleased] + released sections reconciled against actual merged WL items / PRs (ground truth: .handoff/loop/backlog.md WL-001..WL-045)",
-    "Current vision/northstar captured accurately in ARCHITECTURE.md intro (single-crate-is-the-goal; no-daemon push; one dependency-light binary)",
-    "Both docs reviewed against the code via git-kb code intelligence, not memory",
-    "No content lost vs prior versions (upgrade-only)"
-  ],
-  "test_commands": [],
-  "dependencies": [],
-  "blocked_by": [],
-  "allows_network": false,
-  "allows_dependency_addition": false,
-  "correlation_id": "weave-handoff-adoption",
+  "priority": "P1",
   "role": "implementer",
-  "intent_lock": {
-    "objective_hash": "blake3:65bdec2a171095a70c61940490ef68ec48a46ac068afb1eef9377ab543fca248",
-    "path_scope_hash": "blake3:03b38bf25ac58004b636ffe17b888835762692e7a44b53a9361003bf0989c1cd",
-    "acceptance_hash": "blake3:62a3a7000bc7bd88b43cf37686065133184e69289bc1363c4ead3f9d422bfce5"
-  }
+  "schema": "handoff.task.v1",
+  "status": "backlog",
+  "test_commands": [],
+  "title": "Refresh canonical docs to the corrected north star (repowire-superset + obscura)"
 }
