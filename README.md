@@ -605,7 +605,8 @@ explicitly allows it (`obscura_allow_ops` / `WEAVE_OBSCURA_ALLOW_OPS`, or `"*"`)
 and every URL is **SSRF-guarded** — loopback / `localhost` / link-local
 (`169.254.*` incl. the cloud-metadata endpoint) / RFC1918 private / `*.local` /
 bare-IP targets are blocked unless `obscura_allow_internal=true`. Optional
-`obscura_allow_domains` narrows to a domain allow-list; `--lease-ttl` rate-limits per
+`obscura_allow_domains` narrows to a domain allow-list (or `"*"` for any public host;
+SSRF still blocks internal); `--lease-ttl` rate-limits per
 host; `--audit` records a durable job. Web access reuses weave's existing
 permission/lease/job primitives (the same gate as any other mesh work) and
 `weave_web` is gated as a **dangerous** tool (blocked in safe HTTP mode). The
