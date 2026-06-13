@@ -547,6 +547,35 @@ weave's trusted directories, and the cwd must fall under the spawn allowlist
 (`spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS`) — deny-by-default for the MCP/remote
 surface, warn-but-proceed for the operator-local CLI.
 
+## Human surfaces (`--features surfaces`)
+
+Optional **human** surfaces, all Rust-native (no Next.js, no Python, no async
+runtime) and behind one feature flag. The **default build links none of this** —
+the bots reuse the same optional `reqwest` client `--features llm` already carries,
+so enabling `surfaces` adds **one** shared copy, and the default `cargo build` adds
+zero. These are **CLI subcommands, not MCP tools**, so the MCP surface is unchanged.
+
+```bash
+cargo build --release --features surfaces        # composes: --features "libsql surfaces"
+
+# Read-only web dashboard (sessions/presence, recent messages, jobs, leases,
+# schedules). Localhost-bound, bearer-gated; a random token is printed to stderr
+# when --token is omitted. Open http://127.0.0.1:8788/ with that bearer token.
+weave dashboard                                   # default port 8788
+weave dashboard --port 9000 --token mysecret
+
+# Telegram / Slack bridges (poll-only): relay between a chat and the mesh.
+WEAVE_TELEGRAM_TOKEN=… WEAVE_TELEGRAM_CHAT_ID=… weave telegram
+WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=…        weave slack
+```
+
+The dashboard is **read-only** (`GET /` HTML, `GET /events` SSE — never mutates) and
+HTML-escapes every stored string. Bot tokens are **secrets** — supply them via
+config (`telegram_token` / `slack_token`) or the env vars above (envctl can inject
+them); they are Debug-redacted and never logged. The bridge posts inbound human
+replies into the mesh as the configured `bridge_identity` (`WEAVE_BRIDGE_IDENTITY`,
+default `telegram`/`slack`). See ADR-0004 for the locked stack decision.
+
 ## Storage
 
 SQLite (rusqlite, bundled) at `~/.local/share/weave/messages.db` (override with `WEAVE_DB`),

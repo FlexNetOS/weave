@@ -96,3 +96,39 @@ jobs:
         run: cargo build --no-default-features --features "libsql sign"
       - name: test (libsql + sign)
         run: cargo test --no-default-features --features "libsql sign"
+
+  surfaces:
+    # The optional human surfaces (dashboard + Telegram/Slack, gated behind
+    # `surfaces`, WL-048) are compiled out of the default binary, so they need their
+    # own column or an XSS/render regression ships unnoticed. This is the sqlite
+    # backend WITH `surfaces`.
+    name: surfaces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (surfaces)
+        run: cargo clippy --all-targets --features surfaces -- -D warnings
+      - name: test (surfaces)
+        run: cargo test --features surfaces
+
+  libsql-surfaces:
+    # The libSQL × surfaces cross-product: the human surfaces on the cross-machine
+    # backend. No Store change, but the feature must compile + serve on both backends.
+    name: libsql + surfaces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (libsql + surfaces)
+        run: cargo clippy --no-default-features --features "libsql surfaces" --all-targets -- -D warnings
+      - name: build (libsql + surfaces)
+        run: cargo build --no-default-features --features "libsql surfaces"
+      - name: test (libsql + surfaces)
+        run: cargo test --no-default-features --features "libsql surfaces"

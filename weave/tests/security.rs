@@ -22,6 +22,8 @@
 mod common;
 
 use common::{run, run_env, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
+#[cfg(feature = "surfaces")]
+use common::{scrub_env, weave_bin};
 use std::os::unix::fs::PermissionsExt;
 
 // ---------------------------------------------------------------------------
@@ -3751,3 +3753,123 @@ fn kill_refuses_invalid_target_id() {
         "a hostile target id must never reach the kill argv:\n{logged}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WL-048: human surfaces — XSS end-to-end + bot-token secrecy (surfaces feature).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "surfaces")]
+mod surfaces_security {
+    use super::{run_env, scrub_env, weave_bin, TestDb};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        l.local_addr().unwrap().port()
+    }
+
+    struct Dashboard {
+        child: Child,
+        port: u16,
+    }
+    impl Drop for Dashboard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_dashboard(db: &TestDb, token: &str) -> Dashboard {
+        let port = free_port();
+        let mut cmd = Command::new(weave_bin());
+        cmd.args(["dashboard", "--port", &port.to_string(), "--token", token]);
+        scrub_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn weave dashboard");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("dashboard did not start on port {port}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Dashboard { child, port }
+    }
+
+    fn http_get(port: u16, path: &str, bearer: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).expect("write");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// End-to-end XSS: a stored message body and a registered peer name containing
+    /// `<script>` MUST be HTML-escaped in the served dashboard page — the raw tag
+    /// must NOT appear, the escaped entity MUST.
+    #[test]
+    fn dashboard_escapes_stored_xss_payload_end_to_end() {
+        let db = TestDb::new();
+        let xss_name = "<script>alert(1)</script>";
+        let xss_body = "<script>alert('pwn')</script>";
+        // Register a peer whose NAME is the XSS payload (foreign host so it sticks).
+        run_env(
+            &db,
+            &["register", "--name", xss_name],
+            &[("HOSTNAME", "h2")],
+        );
+        run_env(&db, &["register", "--name", "bob"], &[("HOSTNAME", "h2")]);
+        // Send a message whose BODY is the XSS payload.
+        run_env(
+            &db,
+            &[
+                "send", "--from", "bob", "--to", xss_name, "--body", xss_body,
+            ],
+            &[("HOSTNAME", "h2")],
+        );
+
+        let dash = spawn_dashboard(&db, "tok");
+        let resp = http_get(dash.port, "/", "tok");
+        assert!(resp.starts_with("HTTP/1.1 200"), "page should 200: {resp}");
+
+        // The RAW <script> payloads must NOT survive into the response.
+        assert!(
+            !resp.contains("<script>alert(1)</script>"),
+            "unescaped peer-name XSS leaked into the dashboard:\n{resp}"
+        );
+        assert!(
+            !resp.contains("<script>alert('pwn')</script>"),
+            "unescaped message-body XSS leaked into the dashboard:\n{resp}"
+        );
+        // The ESCAPED forms must be present (proof the payload was rendered, escaped).
+        assert!(
+            resp.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "escaped peer name missing — payload may not have rendered at all:\n{resp}"
+        );
+        assert!(
+            resp.contains("&lt;script&gt;alert(&#x27;pwn&#x27;)&lt;/script&gt;"),
+            "escaped message body missing — payload may not have rendered at all:\n{resp}"
+        );
+    }
+}
+
+// Bot-token secrecy is asserted directly against the bridge code (no live network)
+// in the `weave-core` config Debug-redaction unit test and the `weave` bin's
+// telegram/slack error-path unit tests — see `secret_redacted_in_debug` and
+// `error_log_never_contains_token`.

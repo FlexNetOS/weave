@@ -3250,6 +3250,7 @@ dependencies = [
  "fnx-classes",
  "fnx-runtime",
  "proptest",
+ "reqwest",
  "serde",
  "serde_json",
  "weave-core",

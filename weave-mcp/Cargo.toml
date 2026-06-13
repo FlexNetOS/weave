@@ -12,6 +12,8 @@ sqlite = ["weave-core/sqlite"]
 libsql = ["weave-core/libsql"]
 sign = ["weave-core/sign"]
 llm = ["weave-core/llm"]
+# WL-048 / ADR-0004: the dashboard render/route/SSE module lives in this crate.
+surfaces = ["weave-core/surfaces"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }

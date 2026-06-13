@@ -27,16 +27,17 @@ the code.
 
 | | Count |
 |---|---|
-| repowire features that weave **HAS or SUPERSETS** | **33 of 36** |
-| **Genuine gaps**, all tracked | **3** — human surfaces (WL-048), + 2 minor (agents-scaffold, `SOUL.md` file) |
+| repowire features that weave **HAS or SUPERSETS** | **35 of 36** |
+| **Genuine gaps**, all tracked | **2** — minor only (agents-scaffold, `SOUL.md` file) |
 | **Superseded by design** (no-daemon) | **2** — hosted relay, API-key relay isolation → cross-store pull |
 | weave capabilities repowire **does NOT have** | **13** (§4) |
 
 **Conclusion: the superset claim holds.** Every repowire *messaging,
 orchestration, scheduling, memory, presence, security, and transport* primitive
-is present or exceeded. With **agent spawn/kill shipped** (WL-047), the only
-remaining true gap is the **human surfaces** (WL-048) — owner-confirmed in scope
-and Rust-native — plus two minor conveniences. weave additionally ships **13** capabilities
+is present or exceeded. With **agent spawn/kill shipped** (WL-047) **and the
+human surfaces shipped** (WL-048 — Rust-native web dashboard + Telegram/Slack
+behind `--features surfaces`), the remaining gaps are **two minor conveniences**
+only. weave additionally ships **13** capabilities
 repowire never had (signing, summarization, leases, FTS, federation, dual
 backend, graph analytics, …), and adds governed web reach via obscura (WL-049 /
 ADR-0002) that repowire's relay never offered.
@@ -95,9 +96,9 @@ ADR-0002) that repowire's relay never offered.
 
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
-| Browser dashboard (Next.js) | `weave sessions --watch` (TUI) today; Rust dashboard planned | ⏳ **GAP** | **WL-048** (Rust-native HTTP/SSE over `http.rs`, no Next.js) |
-| Telegram bot | — | ⏳ **GAP** | **WL-048** (Rust-native bridge, `--features surfaces`) |
-| Slack bot | — | ⏳ **GAP** | **WL-048** |
+| Browser dashboard (Next.js) | read-only web dashboard (`weave dashboard`), server-rendered HTML + SSE; `weave sessions --watch` TUI also | ✅ **HAVE** | **WL-048** — `weave-mcp/src/dashboard.rs` + `http.rs::serve_dashboard`, Rust-native HTTP/SSE over `http.rs`, no Next.js, `--features surfaces` |
+| Telegram bot | Telegram bridge (`weave telegram`), poll-only | ✅ **HAVE** | **WL-048** — `weave/src/telegram.rs`, shared `reqwest` blocking client, `--features surfaces` |
+| Slack bot | Slack bridge (`weave slack`), poll-only | ✅ **HAVE** | **WL-048** — `weave/src/slack.rs`, `--features surfaces` |
 
 ## 7. Security
 

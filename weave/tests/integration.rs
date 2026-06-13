@@ -17,6 +17,8 @@ use common::{
     run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_in_cwd_env, run_ok,
     run_ok_env, McpServer, TestDb,
 };
+#[cfg(feature = "surfaces")]
+use common::{scrub_env, weave_bin};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -9905,4 +9907,208 @@ fn spawn_cli_hard_denies_disallowed_cwd_when_allowlist_set() {
         !logged.contains("split-window"),
         "no spawn argv should fire on a denied cwd:\n{logged}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// WL-048: human surfaces — `weave dashboard` HTTP server (surfaces feature).
+//
+// These drive the *compiled* binary's `dashboard` subcommand as a black box:
+// spawn it on an ephemeral port, then speak raw HTTP/1.1 over a TcpStream (no
+// new deps). They assert the WL-022 bearer gate (200 with token / 401 without)
+// and that the rendered page contains the expected sections.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "surfaces")]
+mod surfaces_dashboard {
+    use super::{run_env, scrub_env, weave_bin, TestDb};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Grab a currently-free TCP port by binding :0 and immediately dropping the
+    /// listener. There is an unavoidable race window before the child re-binds,
+    /// but it is tiny and the test is single-purpose.
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        l.local_addr().unwrap().port()
+    }
+
+    /// A spawned `weave dashboard` child that is killed on drop.
+    struct Dashboard {
+        child: Child,
+        port: u16,
+    }
+
+    impl Drop for Dashboard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Spawn `weave dashboard --port P --token T` against `db`, then poll the
+    /// port until it accepts a connection (or time out).
+    fn spawn_dashboard(db: &TestDb, token: &str) -> Dashboard {
+        let port = free_port();
+        let mut cmd = Command::new(weave_bin());
+        cmd.args(["dashboard", "--port", &port.to_string(), "--token", token]);
+        scrub_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn weave dashboard");
+
+        // Wait for the listener to come up.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("dashboard did not start listening on port {port}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Dashboard { child, port }
+    }
+
+    /// Send a raw `GET <path>` (optionally with a bearer token) and return the
+    /// full raw HTTP response text.
+    fn http_get(port: u16, path: &str, bearer: Option<&str>) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(t) = bearer {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        req.push_str("Connection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).expect("write request");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        // Read until EOF (page route closes the connection) or timeout.
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Like `http_get` but for `/events`: the SSE route never closes, so we read
+    /// just the response head (until the blank line) instead of to EOF.
+    fn http_get_head(port: u16, path: &str, bearer: Option<&str>) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(t) = bearer {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).expect("write request");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Read until we have seen the header terminator "\r\n\r\n".
+        loop {
+            match s.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    buf.push(byte[0]);
+                    if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn seed_peers(db: &TestDb) {
+        // Register under a foreign host so peers survive after register exits.
+        run_env(db, &["register", "--name", "alice"], &[("HOSTNAME", "h2")]);
+        run_env(db, &["register", "--name", "bob"], &[("HOSTNAME", "h2")]);
+        run_env(
+            db,
+            &[
+                "send",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--body",
+                "hello-dash",
+            ],
+            &[("HOSTNAME", "h2")],
+        );
+    }
+
+    #[test]
+    fn dashboard_serves_page_with_bearer_token() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let resp = http_get(dash.port, "/", Some("secret-tok"));
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "expected 200 with token, got:\n{resp}"
+        );
+        assert!(resp.contains("text/html"), "page should be html: {resp}");
+        // Expected dashboard sections are present.
+        assert!(
+            resp.contains("Sessions / presence"),
+            "missing peers section"
+        );
+        assert!(resp.contains("Recent messages"), "missing messages section");
+        // Seeded peer + message body show through.
+        assert!(resp.contains("alice"), "seeded peer alice missing");
+        assert!(resp.contains("hello-dash"), "seeded message body missing");
+    }
+
+    #[test]
+    fn dashboard_rejects_without_bearer_token() {
+        let db = TestDb::new();
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let resp = http_get(dash.port, "/", None);
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "expected 401 without token, got:\n{resp}"
+        );
+        // And a wrong token is also rejected.
+        let wrong = http_get(dash.port, "/", Some("nope"));
+        assert!(
+            wrong.starts_with("HTTP/1.1 401"),
+            "expected 401 with wrong token, got:\n{wrong}"
+        );
+    }
+
+    #[test]
+    fn dashboard_events_route_is_event_stream() {
+        let db = TestDb::new();
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let head = http_get_head(dash.port, "/events", Some("secret-tok"));
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "events should be 200, got:\n{head}"
+        );
+        assert!(
+            head.contains("text/event-stream"),
+            "events should be an SSE stream, got:\n{head}"
+        );
+    }
+
+    #[test]
+    fn dashboard_unknown_path_is_404() {
+        let db = TestDb::new();
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let resp = http_get(dash.port, "/nope", Some("secret-tok"));
+        assert!(
+            resp.starts_with("HTTP/1.1 404"),
+            "unknown path should 404, got:\n{resp}"
+        );
+    }
 }
