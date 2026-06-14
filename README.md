@@ -1003,10 +1003,24 @@ The script is spawned argv-only (`bash <script>`), never via a shell string.
 
 ## Status
 
-v0.1.0 — both backends build clean (clippy `-D warnings`), **38 tests green** (22 unit + 16
-integration), MCP + CLI + injector + setup automation working; libSQL backend runtime-verified.
-Live pane injection is validated by construction (pure command-builder unit tests + fake-mux
-integration test); end-to-end mux injection on real tmux/zellij is to be confirmed on the target box.
+v0.2.0 — a small internal Cargo workspace (`weave-core` ← `weave-inject` ← `weave-mcp` ← `weave`)
+that links to **one** dependency-light static binary. Both backends build clean under clippy
+`-D warnings` and `cargo fmt --check`; **706 tests green** on the default `sqlite` backend and
+**657 green** on `--features libsql` (the `sign` and `surfaces` feature combos are CI-gated too).
+MCP + CLI + native multi-mux injector + `weave setup` automation are all working.
+
+The MCP surface is **token-light** (ADR-0003): ~70 `weave_*` operations are exposed through a
+single standing `weave` meta-tool via progressive disclosure, not a flat per-op table, with a
+CI-enforced standing-token budget. Full **CLI parity** is the zero-standing-cost path.
+
+Live pane injection is **validated end-to-end on real tmux and zellij** (including a live
+RTX-5090 box) — `connect` → Live, `notify`/`send` → `injected/ok` delivery trace — on top of the
+pure command-builder unit tests and fake-mux integration tests.
+
+Optional, default-OFF features add **zero** compiled deps to the default build: `libsql`
+(libSQL/Turso backend), `sign` (ed25519 message signing), `llm` (thread summarization),
+`surfaces` (read-only web dashboard + Telegram/Slack bridges), and `obscura` (governed,
+deny-by-default web access).
 
 ## See also
 
