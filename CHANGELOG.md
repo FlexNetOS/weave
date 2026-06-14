@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Changed (libsql dependency surface trimmed — WL-044b)
+- **`libsql` is now pulled with `default-features = false, features =
+  ["core", "remote", "tls"]`** — only what weave uses (`Builder::new_local`
+  local file + `Builder::new_remote` remote Turso over HTTPS). weave uses no
+  embedded-replica sync, so dropping the default `replication`/`sync` features
+  removes their dependency trees — **eliminating the unmaintained `bincode 1.x`
+  advisory (RUSTSEC-2025-0141)** and dropping `tonic`/`tonic-web`/`tower-http`/
+  `libsql_replication`/etc. **Zero capability or test change** (libsql backend:
+  668 passed / 1 ignored, unchanged); the audit surface drops from 6 advisories
+  to 5. The remaining 4 `rustls-webpki` vulns + `rustls-pemfile` live in the
+  `tls` feature weave needs for remote HTTPS and remain upstream-pinned (libsql
+  pins `hyper-rustls 0.25` even on git `main`) — tracked by WL-044b, deny.toml.
+
 ### Security (dependency advisory gate — WL-044)
 - **Added a `cargo-deny` advisory gate to CI** (`audit` job) + a `deny.toml`
   policy — continuous supply-chain enforcement that did not exist before. The

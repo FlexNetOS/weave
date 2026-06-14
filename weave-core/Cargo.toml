@@ -25,7 +25,16 @@ obscura = []
 anyhow = "1.0.102"
 ed25519-dalek = { version = "2", optional = true }
 getrandom = "0.2"
-libsql = { version = "0.9.30", optional = true }
+# WL-044b: trim to the features weave actually uses — `core` (local file via
+# `Builder::new_local`) + `remote`+`tls` (remote Turso over HTTPS via
+# `Builder::new_remote`). weave uses NO embedded-replica sync, so dropping the
+# default `replication`/`sync` features removes their dependency trees — most
+# notably the unmaintained `bincode 1.x` (RUSTSEC-2025-0141, pulled only by
+# `replication`) plus tonic/tower-http/etc. — with zero capability loss. The
+# remaining rustls-webpki/rustls-pemfile advisories live in `tls` (hyper-rustls),
+# which weave needs for remote HTTPS and which libsql still pins to 0.25 (even on
+# git main) — tracked in deny.toml + WL-044b.
+libsql = { version = "0.9.30", default-features = false, features = ["core", "remote", "tls"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
