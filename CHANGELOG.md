@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Added (faithful ask-thread replay on session import — WL-040b)
+- **`weave session import` now replays tracked ask threads + ask-many groups
+  (WL-040b, completes WL-040 / casr parity).** WL-040 already exported the `asks`
+  array but import **skipped** it ("N asks not imported — see WL-040b"); import now
+  **replays** each ask faithfully:
+  - New dual-backend **`Store::import_ask`** — a deliberate out-of-order materializer
+    that inserts an ask row DIRECTLY in its exported `AskState` (open / answered /
+    acked), bypassing the create→answer→ack lifecycle (the question/answer message
+    rows already exist from the message-import pass). Mirrored in `store.rs` (named
+    `params!`) and `store_libsql.rs` (positional `params(vec![...])`, 15-column INSERT
+    order pinned to `row_to_ask`). Parameterized SQL only.
+  - **Message-id remap (correctness-critical).** Each ask's `question_msg_id` /
+    `answer_msg_id` is rewired to the freshly re-minted local message id (resolved
+    from `Store::send`, which returns the existing id on a dedup hit). An ask whose
+    message is **absent** from the export is **dangling** → skipped+counted (never an
+    inserted broken link).
+  - **Ask-many groups round-trip too.** The envelope now carries an additive
+    `ask_groups` block (read via the new `Store::list_ask_groups`), replayed via the
+    new dual-backend `Store::import_ask_group` **before** the child asks so each
+    child's `parent_id` is rewired to the replayed group. `target_count` (totality)
+    preserved.
+  - **`ExportedAsk` gained** `kind` / `options` / `reply_to` / `close_note` /
+    `parent_id` (all `#[serde(default)]`, **no `schema_version` bump** — additive). The
+    `reply_to` chain pointer is intentionally NULLed on import (it references a
+    regenerated source ask id).
+  - **Idempotent re-import** (dedup on the remapped `(asker, askee, question_msg_id)`
+    triple / minted `parent_id`); `--as` identity remap applied to asker/askee; the
+    import summary reports `N ask(s) replayed, M skipped[, K dangling skipped]; G ask
+    group(s) replayed, …` (no longer "skipped"). CLI-only — **no new standing MCP
+    tool**, no new dependency. Untrusted-input bounded before any write (`check_ident`,
+    `MAX_BODY` caps, id-shape, `AskState`/`AskKind` parsed — unknown state rejected),
+    re-validated at the store seam. See `docs/FORMAT-session-export.md`.
+
 ### Changed
 - **README "Status" refreshed to v0.2.0 reality (WL-045).** Replaced the stale
   `v0.1.0 — 38 tests green … injection to be confirmed` block with the current

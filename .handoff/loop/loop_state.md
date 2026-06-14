@@ -1,22 +1,22 @@
 ---
 session_started: 2026-06-14
-session_type: WL loop batch (owner-driven: "resume and drive the next 5 tasks to 100% + healthy")
-cycles_this_session: 5
-cycles_total: 49
-cycle_budget: 5 (owner override for this interactive batch — "drive the next 5 tasks")
-worktree: /home/drdave/Desktop/meta/weave-wl038-042 (batch); main checkout = /home/drdave/Desktop/meta/weave
-branch: develop (PR target); cycle branch wl-038-042-batch
-last_item: WL-042 (last of the WL-038..042 batch) — APPROVED, delivering
+session_type: WL loop (owner-driven follow-on: "WL-045 then WL-040b")
+cycles_this_session: 7
+cycles_total: 51
+cycle_budget: n/a (owner-directed item list)
+worktree: /home/drdave/Desktop/meta/weave-wl040b; main checkout = /home/drdave/Desktop/meta/weave
+branch: develop (PR target); cycle branch wl-040b-ask-replay
+last_item: WL-040b (ask-thread + ask-group replay on import) — APPROVED, delivering
 last_update: 2026-06-14
 status: |
-  Resumed from #92 checkpoint (develop @ 83bf523, trunks converged). Drove the next 5 mechanical
-  backlog items in one batch worktree: WL-038 (ephemeral TTL msgs), WL-039 (idle-notification dedup),
-  WL-040 (canonical session export/import + WL-040b filed for ask-replay), WL-041 (read-back verify of
-  destructive config/hook writes), WL-042 (multi-provider setup --provider claude|codex|gemini|aider).
-  Pipeline: 5 parallel planners -> 5 serial implementers -> combined verifier (GREEN) -> guardian APPROVE.
-  Combined gate GREEN: 706 sqlite / 657 libsql / 697 libsql.sign, clippy -D warnings clean on
-  sqlite+libsql+sign+surfaces, fmt clean; standing-MCP token budget + BROADCAST drift-guard green;
-  +91 tests. Two additive nullable columns (messages.expires_at idx 11, messages.kind idx 12) mirrored
-  + projection-aligned across both backends. ZERO new deps/crates. Delivering as one PR into develop.
-  Next open: WL-044 (5 Dependabot vulns, P1) / WL-045 (README status) / WL-040b (ask-replay).
+  After the WL-038..042 batch (#93 merged), owner queued "WL-045 then WL-040b".
+  WL-045 (README Status refresh to v0.2.0 reality) shipped #95 (MERGED, develop @ 9719a89).
+  WL-040b (faithful ask-thread + ask-many GROUP replay on session import — completes WL-040):
+  3 new dual-backend Store methods (import_ask, import_ask_group, list_ask_groups); export envelope
+  additively gained ExportedAsk fields + ExportedAskGroup + ask_groups (no schema_version bump);
+  import replays groups-then-asks with message-id remap (resolve new local id by idempotency_key,
+  incl. deduped msgs) + parent rewire + dangling-skip + --as remap. ask_groups COMPLETED (no WL-040c
+  needed). Gate GREEN: 717 sqlite / 668 libsql / 708 libsql+sign; clippy -D warnings clean on
+  sqlite+libsql+sign (--all-targets); fmt clean; +12 tests; ZERO Cargo.toml change. Guardian APPROVE.
+  Rebased onto origin/develop (9719a89) before delivery. Next open: WL-044 (5 Dependabot vulns, P1).
 ---

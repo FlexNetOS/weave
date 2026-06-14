@@ -12140,6 +12140,230 @@ fn session_export_import_round_trips_mesh_memory() {
 }
 
 // ---------------------------------------------------------------------------
+// WL-040b: faithful ask-thread replay on session import.
+//
+// A source DB carries (1) an answered+acked ask THREAD and (2) a broadcast-ask
+// GROUP; export → import into a FRESH DB must reproduce both the thread (with the
+// message links remapped to the freshly re-minted local message ids) and the group
+// (with the child's parent linkage). Re-import is idempotent; --dry-run counts the
+// asks/groups without writing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_import_replays_ask_thread_and_group() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+
+    // (1) A standalone tracked ask thread: alice asks bob, bob answers, alice acks.
+    let asked = run_ok(
+        &a,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "deploy?",
+            "--body",
+            "ship it?",
+            "--no-memory",
+        ],
+    );
+    // The correlation id is printed; capture it for answer/ack.
+    let cid = asked
+        .split_whitespace()
+        .find(|t| t.starts_with("ask_"))
+        .expect("ask prints a correlation id")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .to_string();
+    run_ok(
+        &a,
+        &[
+            "answer", "--from", "bob", "--id", &cid, "--body", "yes ship",
+        ],
+    );
+    run_ok(
+        &a,
+        &["ack", "--from", "bob", "--id", &cid, "--message", "done"],
+    );
+
+    // (2) A broadcast-ask group: alice fans one question to bob + carol.
+    run_ok(
+        &a,
+        &[
+            "ask-many",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--to",
+            "carol",
+            "--subject",
+            "poll",
+            "--body",
+            "yes or no?",
+        ],
+    );
+
+    // Export alice's session.
+    let out = run_ok(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(out.contains("ask(s)"), "export reports asks: {out}");
+    assert!(out.contains("ask group(s)"), "export reports groups: {out}");
+
+    // Import into a FRESH DB.
+    let imp = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imp.contains("ask(s) replayed"),
+        "import reports replayed asks: {imp}"
+    );
+    assert!(
+        imp.contains("ask group(s) replayed"),
+        "import reports replayed groups: {imp}"
+    );
+
+    // The acked thread is present in DB-B with the remapped links resolving.
+    let asks_json = run_ok(&b, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&asks_json).expect("asks json");
+    let asks = parsed["asks"].as_array().expect("asks array");
+    // The standalone thread reads back acked; at least one child ask carries a parent.
+    let acked = asks
+        .iter()
+        .find(|a| a["state"] == "acked")
+        .expect("an acked ask is present");
+    assert_eq!(
+        acked["close_note"], "done",
+        "close_note survived replay: {acked}"
+    );
+    let q_id = acked["question_msg_id"].as_i64().expect("question id");
+    let ans_id = acked["answer_msg_id"].as_i64().expect("answer id");
+    assert!(q_id > 0 && ans_id > 0, "remapped ids are real rowids");
+    // The remapped links point at REAL imported messages — search resolves their text.
+    let found_q = run_ok(&b, &["search", "--query", "ship it"]);
+    assert!(
+        found_q.contains("ship it?"),
+        "remapped question message present in DB-B: {found_q}"
+    );
+    let found_a = run_ok(&b, &["search", "--query", "yes ship"]);
+    assert!(
+        found_a.contains("yes ship"),
+        "remapped answer message present in DB-B: {found_a}"
+    );
+    // A group child carries a (remapped) parent_id.
+    let has_parented_child = asks.iter().any(|a| {
+        a["parent_id"].is_string() && a["parent_id"].as_str().unwrap().starts_with("askm_")
+    });
+    assert!(
+        has_parented_child,
+        "a child ask links to the replayed group: {asks_json}"
+    );
+
+    // Re-import is idempotent: 0 newly replayed, all skipped, count stable.
+    let imp2 = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imp2.contains("0 ask(s) replayed"),
+        "re-import replays no new asks: {imp2}"
+    );
+    let asks_json2 = run_ok(&b, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let parsed2: serde_json::Value = serde_json::from_str(&asks_json2).unwrap();
+    assert_eq!(
+        parsed2["asks"].as_array().unwrap().len(),
+        asks.len(),
+        "ask count stable after re-import"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_dry_run_counts_asks_without_writing() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+
+    run_ok(
+        &a,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "q?",
+            "--no-memory",
+        ],
+    );
+    run_ok(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+
+    let dry = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+            "--dry-run",
+        ],
+    );
+    assert!(dry.contains("dry-run"), "dry-run banner: {dry}");
+    assert!(dry.contains("1 ask(s)"), "dry-run counts the ask: {dry}");
+
+    // Nothing was written: B has no asks.
+    let asks_json = run_ok(&b, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&asks_json).unwrap();
+    assert!(
+        parsed["asks"].as_array().unwrap().is_empty(),
+        "dry-run wrote no asks: {asks_json}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
 // WL-042: multi-provider lifecycle hook templates (Codex / Gemini / Aider).
 //
 // HOME ISOLATION (critical, the WL-041 #1 risk): every provider config lives

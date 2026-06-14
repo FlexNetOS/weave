@@ -7,7 +7,10 @@
 //! ([`weave_core::session`]). `weave session import --in X [--as id] [--dry-run]`
 //! reads that document back into a *different* weave instance: messages are
 //! re-inserted via [`Store::send`] (free id-remap + idempotent dedup on
-//! idempotency_key) and memory entries via `memory::memory_write`.
+//! idempotency_key), tracked asks are faithfully replayed via `Store::import_ask`
+//! / `Store::import_ask_group` (WL-040b — message links remapped to the freshly
+//! minted local ids, materialized in their exported `AskState`), and memory
+//! entries via `memory::memory_write`.
 //!
 //! This is the **logical, portable, versioned interchange** surface — distinct
 //! from WL-034 (`weave export`, HTML presentation) and WL-035 (`weave backup`,
@@ -30,11 +33,17 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use weave_core::config::Config;
 use weave_core::memory::{self, MemoryScope};
-use weave_core::model::{idempotency_key_valid, trace_id_valid};
+use weave_core::model::{
+    ask_id_valid, ask_many_id_valid, idempotency_key_valid, new_ask_id, new_ask_many_id,
+    trace_id_valid, AskKind, AskState,
+};
 use weave_core::session::{
-    self, synth_idempotency_key, ExportedAsk, ExportedMemory, ExportedMessage, SessionExport,
+    self, synth_idempotency_key, ExportedAsk, ExportedAskGroup, ExportedMemory, ExportedMessage,
+    SessionExport,
 };
 use weave_core::store::{check_body, check_ident, Store, MAX_BODY};
 
@@ -96,9 +105,39 @@ pub fn run_export(
             askee: a.askee.clone(),
             subject: a.subject.clone(),
             state: a.state.as_str().to_string(),
+            kind: a.kind.as_str().to_string(),
+            options: a.options.clone(),
+            reply_to: a.reply_to.clone(),
+            close_note: a.close_note.clone(),
             opened_ts: a.opened_ts,
             updated_ts: a.updated_ts,
             closed_ts: a.closed_ts,
+            parent_id: a.parent_id.clone(),
+        })
+        .collect();
+
+    // WL-040b: carry the ask-many PARENT anchor rows the exported child asks
+    // reference, so `parent_id` linkage + group totality (`target_count`) survive a
+    // round-trip. Gather the distinct parent ids, then read the group rows.
+    let mut group_ids: Vec<String> = Vec::new();
+    for a in &exported_asks {
+        if let Some(p) = &a.parent_id {
+            if !group_ids.iter().any(|g| g == p) {
+                group_ids.push(p.clone());
+            }
+        }
+    }
+    let exported_groups: Vec<ExportedAskGroup> = store
+        .list_ask_groups(&group_ids)
+        .context("reading ask-many groups for export")?
+        .into_iter()
+        .map(|g| ExportedAskGroup {
+            parent_id: g.parent_id,
+            asker: g.asker,
+            subject: g.subject,
+            body: g.body,
+            opened_ts: g.opened_ts,
+            target_count: g.target_count,
         })
         .collect();
 
@@ -109,6 +148,7 @@ pub fn run_export(
         weave_core::model::now(),
         exported_msgs,
         exported_asks,
+        exported_groups,
         exported_mem,
     );
     let json = session::to_json(&envelope).context("serializing session export")?;
@@ -134,10 +174,12 @@ pub fn run_export(
     }
 
     println!(
-        "session export written: {} ({} message(s), {} ask(s), {} memory entr{} for '{me}')",
+        "session export written: {} ({} message(s), {} ask(s), {} ask group(s), {} memory \
+         entr{} for '{me}')",
         out.display(),
         envelope.messages.len(),
         envelope.asks.len(),
+        envelope.ask_groups.len(),
         envelope.memory.len(),
         if envelope.memory.len() == 1 {
             "y"
@@ -198,9 +240,11 @@ fn scope_from_strings(kind: &str, name: &str) -> Result<MemoryScope> {
 ///
 /// Reads + validates the document, then (unless `--dry-run`) re-inserts messages
 /// via [`Store::send`] under the importing identity (id-remap is automatic; dedup
-/// is by idempotency_key, synthesized for keyless legacy messages) and writes
-/// memory entries via `memory::memory_write`. Idempotent on re-run. Asks are
-/// recorded in the file but NOT replayed in this version (see WL-040b).
+/// is by idempotency_key, synthesized for keyless legacy messages), replays the
+/// tracked asks + ask-many groups (WL-040b: each ask materialized in its exported
+/// `AskState` with its message links remapped; a dangling ask — one whose message
+/// is absent from the export — is skipped, never linked broken), and writes memory
+/// entries via `memory::memory_write`. Idempotent on re-run.
 pub fn run_import(
     cfg: &Config,
     store: &dyn Store,
@@ -225,13 +269,31 @@ pub fn run_import(
 
     // --- validate EVERY field BEFORE any store write (untrusted input) -----
     validate_messages(&envelope.messages)?;
+    validate_ask_groups(&envelope.ask_groups)?;
+    validate_asks(&envelope.asks)?;
     validate_memory(&envelope.memory)?;
 
     let mut msg_inserted = 0usize;
     let mut msg_skipped = 0usize;
     let mut mem_written = 0usize;
+    // WL-040b counters: asks/groups actually replayed (newly inserted), skipped as
+    // already-present (idempotent re-import), and dangling (an ask whose question/
+    // answer message was not in the export — skipped, never a broken link).
+    let mut ask_replayed = 0usize;
+    let mut ask_skipped = 0usize;
+    let mut ask_dangling = 0usize;
+    let mut group_replayed = 0usize;
+    let mut group_skipped = 0usize;
+    // Count of asks that WOULD replay in dry-run (resolvable, non-dangling).
+    let mut ask_would_replay = 0usize;
 
     if !dry_run {
+        // WL-040b: map each SOURCE message id to its REMAPPED local id so asks can
+        // rewire question/answer links to the freshly re-minted rows. `Store::send`
+        // is idempotent on idempotency_key and returns the EXISTING local id on a
+        // dedup hit (verified in both backends), so this map is correct whether the
+        // message was newly inserted or already present.
+        let mut msg_id_map: HashMap<i64, i64> = HashMap::with_capacity(envelope.messages.len());
         for m in &envelope.messages {
             // Identity remap: rewrite occurrences of the SOURCE identity to the
             // importing identity, preserving third-party names. This resumes the
@@ -245,7 +307,7 @@ pub fn run_import(
                 None => synth_idempotency_key(&envelope.identity, m.id),
             };
             let before = store.total_messages().unwrap_or(-1);
-            let _id = store
+            let new_id = store
                 .send(
                     &sender,
                     &recipient,
@@ -261,6 +323,97 @@ pub fn run_import(
             } else {
                 msg_skipped += 1;
             }
+            msg_id_map.insert(m.id, new_id);
+        }
+
+        // WL-040b: replay ask-many PARENT anchors BEFORE the child asks so each
+        // child's parent_id resolves to the replayed group. Source group ids are
+        // instance-scoped, so mint a fresh local id per group and remember the
+        // source→new mapping for the children.
+        let mut group_id_map: HashMap<String, String> =
+            HashMap::with_capacity(envelope.ask_groups.len());
+        for g in &envelope.ask_groups {
+            let asker = remap(&g.asker, &envelope.identity, as_id);
+            let new_parent = new_ask_many_id(g.opened_ts);
+            let inserted = store
+                .import_ask_group(
+                    &new_parent,
+                    &asker,
+                    g.subject.as_deref(),
+                    &g.body,
+                    g.opened_ts,
+                    g.target_count,
+                )
+                .with_context(|| format!("replaying ask group '{}'", g.parent_id))?;
+            group_id_map.insert(g.parent_id.clone(), new_parent);
+            if inserted {
+                group_replayed += 1;
+            } else {
+                group_skipped += 1;
+            }
+        }
+
+        // WL-040b: replay each ask thread. Resolve the remapped question/answer
+        // message ids; an ask referencing a message NOT in the export is dangling and
+        // skipped (never inserts a broken link). The ask id is regenerated from the
+        // remapped question id (the source id is meaningless here); dedup on
+        // (asker, askee, question_msg_id) keeps re-import idempotent.
+        for a in &envelope.asks {
+            let Some(&new_q) = msg_id_map.get(&a.question_msg_id) else {
+                ask_dangling += 1;
+                continue;
+            };
+            let new_a = match a.answer_msg_id {
+                Some(src_a) => match msg_id_map.get(&src_a) {
+                    Some(&mapped) => Some(mapped),
+                    // An ask that claims an answer whose message is missing cannot be
+                    // faithfully linked — treat as dangling rather than insert a row
+                    // pointing at a non-existent answer.
+                    None => {
+                        ask_dangling += 1;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let asker = remap(&a.asker, &envelope.identity, as_id);
+            let askee = remap(&a.askee, &envelope.identity, as_id);
+            let state = AskState::from_str(&a.state)
+                .map_err(|m| anyhow::anyhow!("imported ask carries an invalid state: {m}"))?;
+            let kind = AskKind::parse(&a.kind);
+            // Rewire parent_id to the replayed group; a parent we did not replay (it
+            // was absent from the export) is dropped to NULL so the ask still replays
+            // standalone rather than dangling on a missing group.
+            let new_parent = a.parent_id.as_ref().and_then(|p| group_id_map.get(p));
+            let new_id = new_ask_id(new_q);
+            let inserted = store
+                .import_ask(
+                    &new_id,
+                    new_q,
+                    new_a,
+                    &asker,
+                    &askee,
+                    a.subject.as_deref(),
+                    state,
+                    kind,
+                    a.options.as_deref(),
+                    // reply_to chains reference source ask ids that are regenerated on
+                    // import; rather than dangle the chain link we NULL it (the thread
+                    // itself is faithfully replayed — only the cross-ask chain pointer
+                    // is dropped). Documented in FORMAT-session-export.md.
+                    None,
+                    a.close_note.as_deref(),
+                    a.opened_ts,
+                    a.updated_ts,
+                    a.closed_ts,
+                    new_parent.map(|s| s.as_str()),
+                )
+                .with_context(|| format!("replaying ask '{}'", a.id))?;
+            if inserted {
+                ask_replayed += 1;
+            } else {
+                ask_skipped += 1;
+            }
         }
 
         for e in &envelope.memory {
@@ -271,22 +424,34 @@ pub fn run_import(
                 .with_context(|| format!("importing memory entry '{}'", e.key))?;
             mem_written += 1;
         }
+    } else {
+        // Dry-run: count asks whose question (and answer, if any) are present in the
+        // export so the would-replay total excludes danglers, without writing.
+        let present: std::collections::HashSet<i64> =
+            envelope.messages.iter().map(|m| m.id).collect();
+        for a in &envelope.asks {
+            let q_ok = present.contains(&a.question_msg_id);
+            let ans_ok = a.answer_msg_id.is_none_or(|id| present.contains(&id));
+            if q_ok && ans_ok {
+                ask_would_replay += 1;
+            } else {
+                ask_dangling += 1;
+            }
+        }
     }
 
-    let ask_note = if envelope.asks.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; {} ask(s) in archive not imported — see WL-040b",
-            envelope.asks.len()
-        )
-    };
-
     if dry_run {
+        let dangling_note = if ask_dangling > 0 {
+            format!(" ({ask_dangling} dangling ask(s) would be skipped)")
+        } else {
+            String::new()
+        };
         println!(
-            "session import (dry-run): {} message(s), {} memory entr{} would be imported as \
-             '{as_id}'{ask_note} (no changes written)",
+            "session import (dry-run): {} message(s), {} ask(s), {} ask group(s), {} memory \
+             entr{} would be imported as '{as_id}'{dangling_note} (no changes written)",
             envelope.messages.len(),
+            ask_would_replay,
+            envelope.ask_groups.len(),
             envelope.memory.len(),
             if envelope.memory.len() == 1 {
                 "y"
@@ -295,11 +460,22 @@ pub fn run_import(
             },
         );
     } else {
+        let dangling_note = if ask_dangling > 0 {
+            format!(", {ask_dangling} dangling skipped")
+        } else {
+            String::new()
+        };
         println!(
             "session import complete: {} message(s) inserted, {} skipped (already present); \
-             {} memory entr{} written as '{as_id}'{ask_note}",
+             {} ask(s) replayed, {} ask(s) skipped (already present){dangling_note}; \
+             {} ask group(s) replayed, {} skipped; \
+             {} memory entr{} written as '{as_id}'",
             msg_inserted,
             msg_skipped,
+            ask_replayed,
+            ask_skipped,
+            group_replayed,
+            group_skipped,
             mem_written,
             if mem_written == 1 { "y" } else { "ies" },
         );
@@ -340,6 +516,82 @@ fn validate_messages(msgs: &[ExportedMessage]) -> Result<()> {
         if let Some(t) = &m.trace_id {
             if !trace_id_valid(t) {
                 bail!("imported message carries an invalid trace_id");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// WL-040b: bound every imported ask field BEFORE any store write (the central
+/// import invariant; the store seam re-validates too, defense-in-depth). The ask id
+/// is regenerated on import, so a hostile source `id` never reaches a query — but we
+/// still bound asker/askee (identity shape), subject/options/close_note (length),
+/// state (must parse to the enum — unknown REJECTED), and parent_id (`askm_` shape).
+fn validate_asks(asks: &[ExportedAsk]) -> Result<()> {
+    for a in asks {
+        check_ident("ask asker", &a.asker)?;
+        check_ident("ask askee", &a.askee)?;
+        // The source id is informational (regenerated on import). Still reject an
+        // egregiously malformed one early so a hostile file fails loudly.
+        if !ask_id_valid(&a.id) {
+            bail!("imported ask carries an invalid id");
+        }
+        if AskState::from_str(&a.state).is_err() {
+            bail!("imported ask carries an unknown state '{}'", a.state);
+        }
+        if let Some(s) = &a.subject {
+            if s.len() > MAX_IMPORT_SUBJECT {
+                bail!(
+                    "imported ask subject is too long ({} bytes; max {MAX_IMPORT_SUBJECT})",
+                    s.len()
+                );
+            }
+        }
+        if let Some(o) = &a.options {
+            if o.len() > MAX_BODY {
+                bail!(
+                    "imported ask options is too long ({} bytes; max {MAX_BODY})",
+                    o.len()
+                );
+            }
+        }
+        if let Some(c) = &a.close_note {
+            if c.len() > MAX_BODY {
+                bail!(
+                    "imported ask close_note is too long ({} bytes; max {MAX_BODY})",
+                    c.len()
+                );
+            }
+        }
+        if let Some(rt) = &a.reply_to {
+            if !ask_id_valid(rt) {
+                bail!("imported ask carries an invalid reply_to id");
+            }
+        }
+        if let Some(p) = &a.parent_id {
+            if !ask_many_id_valid(p) {
+                bail!("imported ask carries an invalid parent_id");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// WL-040b: bound every imported ask-many group field BEFORE any store write. The
+/// parent id is regenerated on import; still reject a malformed source id early.
+fn validate_ask_groups(groups: &[ExportedAskGroup]) -> Result<()> {
+    for g in groups {
+        check_ident("ask group asker", &g.asker)?;
+        if !ask_many_id_valid(&g.parent_id) {
+            bail!("imported ask group carries an invalid parent_id");
+        }
+        check_body(&g.body)?;
+        if let Some(s) = &g.subject {
+            if s.len() > MAX_IMPORT_SUBJECT {
+                bail!(
+                    "imported ask group subject is too long ({} bytes; max {MAX_IMPORT_SUBJECT})",
+                    s.len()
+                );
             }
         }
     }

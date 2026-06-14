@@ -3047,6 +3047,206 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn list_ask_groups(&self, parent_ids: &[String]) -> Result<Vec<AskGroup>> {
+        self.rt.block_on(async {
+            let mut out = Vec::new();
+            // Bounded, parameterized per-id lookups (no IN-list interpolation).
+            for pid in parent_ids {
+                if !ask_many_id_valid(pid) {
+                    continue;
+                }
+                let mut it = self
+                    .conn
+                    .query(
+                        "SELECT parent_id, asker, subject, body, opened_ts, target_count \
+                         FROM ask_groups WHERE parent_id = ?1",
+                        params(vec![pid.clone().into()]),
+                    )
+                    .await?;
+                if let Some(r) = it.next().await? {
+                    out.push(AskGroup {
+                        parent_id: r.get::<String>(0)?,
+                        asker: r.get::<String>(1)?,
+                        subject: r.get::<Option<String>>(2)?,
+                        body: r.get::<String>(3)?,
+                        opened_ts: r.get::<i64>(4)?,
+                        target_count: r.get::<i64>(5)?,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_ask(
+        &self,
+        id: &str,
+        question_msg_id: i64,
+        answer_msg_id: Option<i64>,
+        asker: &str,
+        askee: &str,
+        subject: Option<&str>,
+        state: AskState,
+        kind: AskKind,
+        options: Option<&str>,
+        reply_to: Option<&str>,
+        close_note: Option<&str>,
+        opened_ts: i64,
+        updated_ts: i64,
+        closed_ts: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        // Defense-in-depth re-validation at the store seam (mirrors the sqlite impl).
+        check_ident("asker", asker)?;
+        check_ident("askee", askee)?;
+        if !ask_id_valid(id) {
+            anyhow::bail!("invalid imported ask id.");
+        }
+        if let Some(o) = options {
+            check_body(o)?;
+        }
+        if let Some(c) = close_note {
+            check_body(c)?;
+        }
+        if let Some(rt) = reply_to {
+            if !ask_id_valid(rt) {
+                anyhow::bail!("invalid imported reply_to correlation id.");
+            }
+        }
+        if let Some(p) = parent_id {
+            if !ask_many_id_valid(p) {
+                anyhow::bail!("invalid imported parent_id.");
+            }
+        }
+        // Owned copies for the async move.
+        let id = id.to_string();
+        let asker = asker.to_string();
+        let askee = askee.to_string();
+        let subject = subject.map(|s| s.to_string());
+        let options = options.map(|s| s.to_string());
+        let reply_to = reply_to.map(|s| s.to_string());
+        let close_note = close_note.map(|s| s.to_string());
+        let parent_id = parent_id.map(|s| s.to_string());
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            // Idempotency: dedup on the remapped (asker, askee, question) triple — the
+            // source ask id is meaningless across instances (mirrors the sqlite impl).
+            let mut probe = tx
+                .query(
+                    "SELECT COUNT(*) FROM asks WHERE asker = ?1 AND askee = ?2 \
+                     AND question_msg_id = ?3",
+                    params(vec![
+                        asker.clone().into(),
+                        askee.clone().into(),
+                        question_msg_id.into(),
+                    ]),
+                )
+                .await?;
+            let existing: i64 = match probe.next().await? {
+                Some(r) => r.get::<i64>(0)?,
+                None => 0,
+            };
+            if existing > 0 {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            // 15-column POSITIONAL INSERT. The column order MUST match `row_to_ask`'s
+            // positional indices 0..14 (id, question_msg_id, answer_msg_id, asker,
+            // askee, subject, state, kind, options, reply_to, close_note, opened_ts,
+            // updated_ts, closed_ts, parent_id) — libsql has no by-name binding.
+            tx.execute(
+                "INSERT INTO asks \
+                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                     options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params(vec![
+                    id.into(),
+                    question_msg_id.into(),
+                    answer_msg_id.into(),
+                    asker.into(),
+                    askee.into(),
+                    subject.into(),
+                    state.as_str().into(),
+                    kind.as_str().into(),
+                    options.into(),
+                    reply_to.into(),
+                    close_note.into(),
+                    opened_ts.into(),
+                    updated_ts.into(),
+                    closed_ts.into(),
+                    parent_id.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn import_ask_group(
+        &self,
+        parent_id: &str,
+        asker: &str,
+        subject: Option<&str>,
+        body: &str,
+        opened_ts: i64,
+        target_count: i64,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        if !ask_many_id_valid(parent_id) {
+            anyhow::bail!("invalid imported ask-many parent id.");
+        }
+        check_ident("asker", asker)?;
+        check_body(body)?;
+        if let Some(s) = subject {
+            check_body(s)?;
+        }
+        let parent_id = parent_id.to_string();
+        let asker = asker.to_string();
+        let subject = subject.map(|s| s.to_string());
+        let body = body.to_string();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut probe = tx
+                .query(
+                    "SELECT COUNT(*) FROM ask_groups WHERE parent_id = ?1",
+                    params(vec![parent_id.clone().into()]),
+                )
+                .await?;
+            let existing: i64 = match probe.next().await? {
+                Some(r) => r.get::<i64>(0)?,
+                None => 0,
+            };
+            if existing > 0 {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO ask_groups (parent_id, asker, subject, body, opened_ts, target_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params(vec![
+                    parent_id.into(),
+                    asker.into(),
+                    subject.into(),
+                    body.into(),
+                    opened_ts.into(),
+                    target_count.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
     fn has_open_asks(&self, me: &str) -> Result<bool> {
         check_ident("me", me)?;
         self.rt.block_on(async {
@@ -4813,6 +5013,182 @@ mod tests {
         assert_eq!(s.list_asks("a", AskRole::Asker, 50).unwrap()[0].id, c1);
         assert_eq!(s.list_asks("a", AskRole::Askee, 50).unwrap()[0].id, c2);
         assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 2);
+    }
+
+    /// WL-040b libsql parity: `import_ask` materializes an ANSWERED ask out-of-order
+    /// with the positional 15-column INSERT mapping cleanly back through `row_to_ask`,
+    /// and dedups on (asker, askee, question) so re-import is a no-op.
+    #[test]
+    fn import_ask_materializes_answered_and_is_idempotent_libsql() {
+        let s = mem();
+        let q = s
+            .send("a", "b", Some("subj"), "question?", None, None)
+            .unwrap();
+        let ans = s
+            .send("b", "a", Some("Re: subj"), "answer!", None, None)
+            .unwrap();
+        let id = crate::model::new_ask_id(q);
+        assert!(s
+            .import_ask(
+                &id,
+                q,
+                Some(ans),
+                "a",
+                "b",
+                Some("subj"),
+                AskState::Answered,
+                AskKind::Choice,
+                Some("yes\nno"),
+                None,
+                None,
+                100,
+                200,
+                None,
+                None,
+            )
+            .unwrap());
+        let got = s.get_ask(&id).unwrap().unwrap();
+        assert_eq!(got.state, AskState::Answered);
+        assert_eq!(got.kind, AskKind::Choice);
+        assert_eq!(got.options.as_deref(), Some("yes\nno"));
+        assert_eq!(got.answer_msg_id, Some(ans));
+        assert_eq!(got.closed_ts, None);
+        // Idempotent skip.
+        assert!(!s
+            .import_ask(
+                &crate::model::new_ask_id(q),
+                q,
+                Some(ans),
+                "a",
+                "b",
+                Some("subj"),
+                AskState::Answered,
+                AskKind::Choice,
+                Some("yes\nno"),
+                None,
+                None,
+                100,
+                200,
+                None,
+                None,
+            )
+            .unwrap());
+        assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
+    }
+
+    /// WL-040b libsql parity: `import_ask` materializes an ACKED ask + `import_ask_group`
+    /// replays a parent anchor with the child's `parent_id` linked; `ask_many_result`
+    /// reads the group back; `list_ask_groups` returns it by id.
+    #[test]
+    fn import_ask_acked_and_group_libsql() {
+        let s = mem();
+        let pid = crate::model::new_ask_many_id(500);
+        assert!(s
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .unwrap());
+        assert!(!s
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .unwrap());
+        let q = s.send("a", "b", None, "yes or no?", None, None).unwrap();
+        let id = crate::model::new_ask_id(q);
+        assert!(s
+            .import_ask(
+                &id,
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Acked,
+                AskKind::FreeText,
+                None,
+                None,
+                Some("closing note"),
+                10,
+                30,
+                Some(30),
+                Some(&pid),
+            )
+            .unwrap());
+        let got = s.get_ask(&id).unwrap().unwrap();
+        assert_eq!(got.state, AskState::Acked);
+        assert_eq!(got.closed_ts, Some(30));
+        assert_eq!(got.close_note.as_deref(), Some("closing note"));
+        assert_eq!(got.parent_id.as_deref(), Some(pid.as_str()));
+        let res = s.ask_many_result(&pid, None).unwrap().unwrap();
+        assert_eq!(res.target_count, 2);
+        assert_eq!(res.acked, 1);
+        let groups = s
+            .list_ask_groups(&[pid.clone(), "askm_999_1".to_string()])
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].parent_id, pid);
+    }
+
+    /// WL-040b libsql parity: store-seam re-validation rejects a hostile askee, a
+    /// malformed ask id, and an oversized options payload before the INSERT.
+    #[test]
+    fn import_ask_rejects_malformed_inputs_libsql() {
+        let s = mem();
+        let q = s.send("a", "b", None, "q", None, None).unwrap();
+        assert!(s
+            .import_ask(
+                "ask_1_1",
+                q,
+                None,
+                "a",
+                "b\u{7}c",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(s
+            .import_ask(
+                "bad id",
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
+        let big = "x".repeat(crate::store::MAX_BODY + 1);
+        assert!(s
+            .import_ask(
+                "ask_1_1",
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                Some(&big),
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
     }
 
     /// libsql parity: `has_open_asks` matches the sqlite semantics.
