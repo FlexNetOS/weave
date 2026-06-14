@@ -3,6 +3,16 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **Static mailbox export (WL-034), `weave export --out <path> [--for <id>] [--limit N]`:**
+  renders a **self-contained, offline, XSS-safe portable HTML** bundle of the caller's
+  mailbox with **client-side search** (mcp_agent_mail parity). The file double-click-opens
+  with no network — no external script/style/CDN — and is safe with JavaScript disabled (a
+  static `<noscript>` table escapes every field). Message data is embedded once in a
+  `<script type="application/json">` block whose `</`/`<!--` byte sequences are neutralized
+  so a hostile body can't break out, and the client renders via `textContent`/`createElement`
+  (never `innerHTML`). `--for <id>` scopes the export to another identity; `--limit N` caps
+  the rows. The pure renderer (`render_mailbox_html`) lives in `weave-core/src/export.rs`,
+  which also now owns the single `html_escape` source of truth the dashboard reuses.
 - **Bot command grammar (WL-052b), `--features surfaces`:** the Telegram bridge now
   answers structured `/`-commands — `/inbox`, `/peers`, `/sessions`, `/help` — by
   dispatching through the **same** `dispatch_request` → `call_tool` handler as MCP/CLI

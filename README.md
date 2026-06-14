@@ -60,6 +60,7 @@ weave sessions --watch --interval 5 --repo weave  # re-render every 5s, narrowed
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
+weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id> to scope; --limit N to cap)
 
 # Tracked ask/answer/ack (correlation-tracked request/response — distinct from send/reply)
 weave ask --from desktop --to envctl --body "can you confirm the schema?" --subject "schema"

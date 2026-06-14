@@ -10052,6 +10052,197 @@ fn spawn_cli_hard_denies_disallowed_cwd_when_allowlist_set() {
 }
 
 // ---------------------------------------------------------------------------
+// WL-034: `weave export` — self-contained, offline-openable HTML mailbox bundle.
+//
+// These drive the *compiled* binary end-to-end: send a couple of messages, then
+// `weave export --out <tmp>/mb.html`, and assert the file exists, exits 0, is a
+// valid self-contained document (no external src/href), contains the (escaped)
+// message text, and that `--for <id>` scoping and `--limit N` behave.
+// ---------------------------------------------------------------------------
+
+/// Read a freshly exported HTML file, failing the test loudly if absent.
+fn read_export(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("export file {} should exist: {e}", path.display()))
+}
+
+#[test]
+fn export_writes_self_contained_html_with_message_text() {
+    let db = TestDb::new();
+    // Two messages addressed to `bob` so they land in bob's history scope.
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body=hello from alice",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "carol",
+            "--to",
+            "bob",
+            "--body=second message body",
+        ],
+    );
+
+    let out_path = std::env::temp_dir().join(format!(
+        "weave-it-export-{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let out_str = out_path.to_string_lossy().into_owned();
+
+    let stdout = run_ok(&db, &["export", "--for", "bob", "--out", &out_str]);
+    assert!(
+        stdout.contains("exported 2 message(s) for 'bob'"),
+        "export should report 2 messages for bob: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(&out_str),
+        "export should print the output path: {stdout:?}"
+    );
+
+    let html = read_export(&out_path);
+    // Valid self-contained document.
+    assert!(
+        html.to_lowercase().contains("<!doctype html>"),
+        "must be a complete HTML document"
+    );
+    assert!(html.contains("<style>"), "must inline a <style> block");
+    // No external assets: no CDN, no <script src>, no <link href>.
+    assert!(
+        !html.contains("<script src"),
+        "must not reference an external script: self-contained"
+    );
+    assert!(
+        !html.contains("<link "),
+        "must not reference an external stylesheet"
+    );
+    assert!(
+        !html.contains("http://") && !html.contains("https://"),
+        "must contain no external asset URLs"
+    );
+    // The message bodies are present (in the <noscript> static region they are
+    // html_escape'd; these bodies have no special chars so they appear verbatim).
+    assert!(
+        html.contains("hello from alice"),
+        "first body must be in the export: {out_str}"
+    );
+    assert!(
+        html.contains("second message body"),
+        "second body must be in the export"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn export_for_scopes_to_one_identity() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "x", "--body=to-x-only"],
+    );
+    run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "y", "--body=to-y-only"],
+    );
+
+    let dir = std::env::temp_dir();
+    let out_x = dir.join(format!("weave-it-exp-x-{}.html", std::process::id()));
+    let out_y = dir.join(format!("weave-it-exp-y-{}.html", std::process::id()));
+
+    run_ok(
+        &db,
+        &["export", "--for", "x", "--out", &out_x.to_string_lossy()],
+    );
+    run_ok(
+        &db,
+        &["export", "--for", "y", "--out", &out_y.to_string_lossy()],
+    );
+
+    let hx = read_export(&out_x);
+    let hy = read_export(&out_y);
+    // x's export has only x's message; y's body is NOT in x's noscript region.
+    assert!(hx.contains("to-x-only"), "x export should hold x's message");
+    assert!(
+        !hx.contains("to-y-only"),
+        "x export must NOT leak y's message (per-identity scope)"
+    );
+    assert!(hy.contains("to-y-only"), "y export should hold y's message");
+    assert!(
+        !hy.contains("to-x-only"),
+        "y export must NOT leak x's message (per-identity scope)"
+    );
+
+    let _ = std::fs::remove_file(&out_x);
+    let _ = std::fs::remove_file(&out_y);
+}
+
+#[test]
+fn export_limit_caps_message_count() {
+    let db = TestDb::new();
+    for i in 0..5 {
+        run_ok(
+            &db,
+            &[
+                "send",
+                "--from",
+                "a",
+                "--to",
+                "bob",
+                &format!("--body=msg-number-{i}"),
+            ],
+        );
+    }
+
+    let out_path =
+        std::env::temp_dir().join(format!("weave-it-exp-limit-{}.html", std::process::id()));
+
+    let stdout = run_ok(
+        &db,
+        &[
+            "export",
+            "--for",
+            "bob",
+            "--limit",
+            "2",
+            "--out",
+            &out_path.to_string_lossy(),
+        ],
+    );
+    // history(me, None, 2) keeps the newest 2 rows -> the export reports 2.
+    assert!(
+        stdout.contains("exported 2 message(s) for 'bob'"),
+        "--limit 2 should cap the export at 2 messages: {stdout:?}"
+    );
+    let html = read_export(&out_path);
+    // The two newest bodies (msg-number-3, msg-number-4) are present; an older
+    // one (msg-number-0) is dropped by the cap.
+    assert!(
+        html.contains("msg-number-4") && html.contains("msg-number-3"),
+        "the two newest messages must be present"
+    );
+    assert!(
+        !html.contains("msg-number-0"),
+        "the oldest message must be dropped by --limit 2"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+// ---------------------------------------------------------------------------
 // WL-048: human surfaces — `weave dashboard` HTTP server (surfaces feature).
 //
 // These drive the *compiled* binary's `dashboard` subcommand as a black box:
