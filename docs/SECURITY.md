@@ -336,14 +336,22 @@ database — a gate that did not exist before WL-044. The **default shippable
 binary is advisory-clean**: `cargo tree -i rustls-webpki` on default features
 matches nothing.
 
-The only open advisories are confined to the **optional `libsql` feature's
-remote-Turso TLS stack** and are **upstream-pinned**, not weave-fixable today:
+**Surface reduced (WL-044b):** `libsql` is pulled with
+`default-features = false, features = ["core", "remote", "tls"]` — only what
+weave uses (`Builder::new_local` for a local file; `Builder::new_remote` for
+remote Turso over HTTPS). Dropping the default `replication`/`sync` features
+(weave uses no embedded-replica sync) removed their dependency trees — including
+the unmaintained **`bincode 1.x` (RUSTSEC-2025-0141), now eliminated** — plus
+`tonic`/`tower-http`/etc., with zero capability or test change.
+
+The remaining open advisories are confined to the **`tls` feature's remote-Turso
+TLS stack** (which weave genuinely needs for remote HTTPS) and are
+**upstream-pinned**, not weave-fixable today:
 
 | Advisory | Crate | Why it can't be fixed yet |
 |---|---|---|
-| RUSTSEC-2026-0098 / -0099 / -0049 / -0104 | `rustls-webpki 0.102.8` | Fixed in `>=0.103`, which needs `rustls 0.23` / `hyper-rustls 0.27`. `libsql` (incl. `0.10.0-pre`) hard-pins `hyper-rustls ^0.25` → `rustls 0.22` → `rustls-webpki 0.102`; the resolver rejects forcing the patched line. |
-| RUSTSEC-2025-0141 | `bincode 1.x` (unmaintained) | Pulled transitively by `libsql`; no weave code uses it directly. |
-| RUSTSEC-2025-0134 | `rustls-pemfile` (unmaintained) | Pulled by `libsql`'s `rustls-native-certs`. |
+| RUSTSEC-2026-0098 / -0099 / -0049 / -0104 | `rustls-webpki 0.102.8` | Fixed in `>=0.103`, which needs `rustls 0.23` / `hyper-rustls 0.27`. `libsql` (incl. `0.10.0-pre` **and git `main`**, both checked) hard-pins `hyper-rustls ^0.25` → `rustls 0.22` → `rustls-webpki 0.102`; the resolver rejects forcing the patched line. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` (unmaintained) | Pulled by `libsql`'s `rustls-native-certs` (part of the `tls` feature weave needs). |
 
 These are reachable **only** when `--features libsql` is compiled **and** the
 operator configures a remote `libsql_url` (a Turso endpoint they own, over a

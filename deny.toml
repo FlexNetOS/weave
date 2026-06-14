@@ -35,9 +35,12 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name-constraints — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
     { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL Distribution Point matching — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL-parse reachable panic — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
-    # --- unmaintained (informational) — both inside the libsql tree ---
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — pulled by libsql; no weave code uses it directly. Track: WL-044b." },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — pulled by libsql's rustls-native-certs. Track: WL-044b." },
+    # --- unmaintained (informational) — inside the libsql remote-TLS tree ---
+    # NOTE (WL-044b): the bincode advisory (RUSTSEC-2025-0141) was ELIMINATED by
+    # trimming libsql to default-features=false features=["core","remote","tls"]
+    # (bincode was pulled only by the unused `replication` feature). Do NOT re-add
+    # it — if it reappears, a `replication`/`sync` feature crept back in.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — pulled by libsql's rustls-native-certs (the `tls` feature weave needs for remote HTTPS). Track: WL-044b." },
 ]
 
 [bans]
