@@ -136,9 +136,82 @@ pub fn redact_reqwest_error(e: &reqwest::Error) -> String {
     }
 }
 
+/// WL-052b: a structured bot command parsed from an inbound `/…` message. Read-only
+/// in v1 (mutating commands are intentionally not exposed to chat by default).
+#[derive(Debug, PartialEq, Eq)]
+pub enum BotCommand {
+    Help,
+    Inbox,
+    Peers,
+    Sessions,
+}
+
+/// Parse an inbound message into a [`BotCommand`]. Returns `None` for ordinary text
+/// (no leading `/`), which falls through to the relay path. An unknown `/x` maps to
+/// `Help`. The Telegram group suffix form (`/inbox@mybot`) is tolerated.
+pub fn parse_bot_command(text: &str) -> Option<BotCommand> {
+    let first = text.split_whitespace().next().unwrap_or("");
+    let rest = first.strip_prefix('/')?;
+    let cmd = rest.split('@').next().unwrap_or(rest);
+    Some(match cmd {
+        "inbox" => BotCommand::Inbox,
+        "peers" => BotCommand::Peers,
+        "sessions" => BotCommand::Sessions,
+        _ => BotCommand::Help,
+    })
+}
+
+/// Map a command to the JSON-RPC `tools/call` it dispatches through — the SAME
+/// `dispatch_request` → `call_tool` handler the MCP and CLI surfaces use (the WL-052
+/// one-handler-many-surfaces law). `Help` has no RPC (handled locally). All mapped
+/// ops are read-only, so they pass the safe (`dangerous=false`) gate.
+pub fn bot_command_rpc(cmd: &BotCommand, me: &str) -> Option<Value> {
+    let (name, args) = match cmd {
+        BotCommand::Help => return None,
+        BotCommand::Inbox => ("weave_inbox", json!({"me": me, "include_read": false})),
+        BotCommand::Peers => ("weave_peers", json!({"circle": "*"})),
+        BotCommand::Sessions => ("weave_sessions", json!({"circle": "*"})),
+    };
+    Some(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": args}
+    }))
+}
+
+/// The `/help` listing.
+pub fn bot_help_text() -> String {
+    "weave bot commands:\n\
+     /inbox — unread messages for this bridge\n\
+     /peers — registered peers + presence\n\
+     /sessions — known sessions + unread counts\n\
+     /help — this list"
+        .to_string()
+}
+
+/// Extract the human-readable reply from a JSON-RPC `tools/call` response
+/// (`result.content[0].text`), or an error message, falling back to the raw string.
+pub fn format_bot_reply(resp: Option<&str>) -> String {
+    let raw = match resp {
+        Some(r) => r,
+        None => return "(no response)".to_string(),
+    };
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return raw.to_string(),
+    };
+    if let Some(t) = v.pointer("/result/content/0/text").and_then(|x| x.as_str()) {
+        return t.to_string();
+    }
+    if let Some(e) = v.pointer("/error/message").and_then(|x| x.as_str()) {
+        return format!("error: {e}");
+    }
+    raw.to_string()
+}
+
 /// Run the Telegram bridge blocking loop on the calling thread (like `Cmd::Serve`).
 /// Returns an error only on fatal misconfiguration; transient HTTP errors are
-/// logged to stderr and retried.
+/// logged to stderr and retried. WL-052b: inbound `/commands` are answered via the
+/// shared `dispatch_request` handler; ordinary text relays into the mesh.
 pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
     let token = resolve_token(config).context(
         "Telegram bot token not configured (set telegram_token in config or WEAVE_TELEGRAM_TOKEN)",
@@ -160,6 +233,13 @@ pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
 
     let mut offset: i64 = 0;
 
+    // WL-052b: command replies dispatch through the SAME handler as MCP/CLI, so the
+    // bot needs the real injector (read-only commands don't use it, but the shared
+    // entry point requires it — and a future write command would nudge correctly).
+    let injector = crate::RealInjector {
+        preferred_mux: crate::parse_mux_preference(config),
+    };
+
     loop {
         // --- inbound: long-poll getUpdates ---
         let updates_body = telegram_get_updates_payload(offset, POLL_TIMEOUT_SECS);
@@ -176,7 +256,41 @@ pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
                                 offset = offset.max(uid + 1);
                             }
                             if let Some((from, text)) = parse_telegram_update(update) {
-                                relay_inbound(store, &from, &recipient, &text, &identity);
+                                // WL-052b: a `/command` is answered structurally via the
+                                // shared handler; ordinary text falls through to the relay.
+                                if let Some(cmd) = parse_bot_command(&text) {
+                                    let reply = match bot_command_rpc(&cmd, &identity) {
+                                        None => bot_help_text(),
+                                        Some(rpc) => {
+                                            let resp = weave_mcp::mcp::dispatch_request(
+                                                store,
+                                                &Some(identity.clone()),
+                                                None,
+                                                &[],
+                                                &weave_mcp::PullConsent::empty(),
+                                                &rpc,
+                                                &injector,
+                                                false,
+                                            );
+                                            format_bot_reply(resp.as_deref())
+                                        }
+                                    };
+                                    if let Some(chat) = &chat_id {
+                                        let payload = telegram_send_payload(chat, &reply);
+                                        if let Err(e) = client
+                                            .post(format!("{base}/sendMessage"))
+                                            .json(&payload)
+                                            .send()
+                                        {
+                                            eprintln!(
+                                                "[weave-telegram] reply error: {}",
+                                                redact_reqwest_error(&e)
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    relay_inbound(store, &from, &recipient, &text, &identity);
+                                }
                             }
                         }
                     }
@@ -253,6 +367,48 @@ mod tests {
         let p = telegram_send_payload("123", "hello");
         assert_eq!(p["chat_id"], "123");
         assert_eq!(p["text"], "hello");
+    }
+
+    // ---- WL-052b bot command grammar ----------------------------------------
+
+    #[test]
+    fn parse_bot_command_recognizes_and_falls_through() {
+        assert_eq!(parse_bot_command("/inbox"), Some(BotCommand::Inbox));
+        assert_eq!(parse_bot_command("/peers"), Some(BotCommand::Peers));
+        assert_eq!(parse_bot_command("/sessions"), Some(BotCommand::Sessions));
+        // group-suffix form + unknown -> Help.
+        assert_eq!(
+            parse_bot_command("/inbox@weavebot"),
+            Some(BotCommand::Inbox)
+        );
+        assert_eq!(parse_bot_command("/wat"), Some(BotCommand::Help));
+        assert_eq!(parse_bot_command("/help"), Some(BotCommand::Help));
+        // ordinary text falls through to the relay (None).
+        assert_eq!(parse_bot_command("hello there"), None);
+        assert_eq!(parse_bot_command(""), None);
+    }
+
+    #[test]
+    fn bot_command_rpc_maps_to_read_ops() {
+        let rpc = bot_command_rpc(&BotCommand::Inbox, "bridge").unwrap();
+        assert_eq!(rpc["method"], "tools/call");
+        assert_eq!(rpc["params"]["name"], "weave_inbox");
+        assert_eq!(rpc["params"]["arguments"]["me"], "bridge");
+        assert_eq!(
+            bot_command_rpc(&BotCommand::Peers, "x").unwrap()["params"]["name"],
+            "weave_peers"
+        );
+        // Help has no RPC (answered locally).
+        assert!(bot_command_rpc(&BotCommand::Help, "x").is_none());
+    }
+
+    #[test]
+    fn format_bot_reply_extracts_text_or_error() {
+        let ok = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"no unread"}],"isError":false}}"#;
+        assert_eq!(format_bot_reply(Some(ok)), "no unread");
+        let err = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}"#;
+        assert_eq!(format_bot_reply(Some(err)), "error: boom");
+        assert_eq!(format_bot_reply(None), "(no response)");
     }
 
     #[test]
