@@ -1,78 +1,75 @@
-# Guardian review — WL-035 + WL-037 + WL-036 combined batch
+# 04 — Guardian review — WL-038..WL-042 combined batch
 
-- **Worktree:** `/home/drdave/Desktop/meta/weave-batch`
-- **Branch:** `wl-035-037-batch` (3 commits on `develop`: 08608d6 WL-035, eff25ea WL-037, f4142c5 WL-036)
-- **Input:** `03_verifier_report.md` = **GREEN** (626 sqlite / 581 libsql; all clippy variants clean `-D warnings`; fmt clean; +27 tests; no production bug).
-- **Verdict: APPROVE** (docs-only re-review, 2026-06-13). The prior BLOCK was *solely* the code↔docs fork; the implementer has now added the enumerated entries across 7 docs and every claim was re-verified against the shipped (byte-unchanged) code. Sections 1–2 (security/correctness invariants + Rust-native drift) were APPROVED on the first pass and the code is byte-unchanged (uncommitted diffs are pure additions, 0 deletions, identical to the approved batch), so they stand. See the **Docs re-review** addendum under Section 3.
+**Worktree:** `/home/drdave/Desktop/meta/weave-wl038-042` (branch `wl-038-042-batch`, base `origin/develop`)
+**Input:** `03_verifier_report.md` = **GREEN** (706 sqlite / 657 libsql / 697 libsql·sign; fmt+clippy clean on all six gated combos + surfaces; standing-MCP budget + BROADCAST drift-guard green; HOME-isolation confirmed).
+**Scope reviewed:** full uncommitted diff vs `origin/develop` + new files `weave-core/src/session.rs`, `weave/src/session.rs`, `docs/FORMAT-session-export.md`.
 
-## Section 1 — Invariants
+## VERDICT: **APPROVE**
 
-### WL-036 post-send hooks (highest risk: no-shell spawn)
-- **OK — No shell, argv-only.** `weave-inject/src/inject.rs:run_post_send_hook` is `Command::new(&prog_abs).args(&argv[1..]).envs(...)` — no `sh -c`, no `-c`, no string-built command. Whole-diff grep for shell-assembly patterns returns nothing. (inject.rs ~862-918; ARCHITECTURE §7)
-- **OK — argv[0] constrained to a trusted dir.** `resolve_trusted_program(&argv[0])` (inject.rs:1005) accepts only a bare name resolved against `trusted_dirs()` or an absolute path whose **canonicalized parent** is a trusted dir; `None` ⇒ `bail`. A hook cannot launch an arbitrary `$PATH` binary. (verified: `..` escape canonicalized away; binary's own symlink intentionally not followed, mirroring `resolve_trusted`.)
-- **OK — message text reaches the child ONLY as env, never argv, body never exported.** `hook_env` (inject.rs:956) builds `WEAVE_HOOK_{EVENT,SENDER,RECIPIENT,SUBJECT,MESSAGE_ID,PAYLOAD}`; values pass via `Command::envs`. **BODY is not in the vector** — no leak into child `environ`/`ps e`. `WEAVE_HOOK_PAYLOAD` JSON is hand-escaped (`json_escape`, inject.rs:985) — `"`/`\`/C0 controls escaped, so a hostile subject cannot break the quotes; and it is an env *value* regardless. A hostile subject `"; rm -rf /"`/`"$(reboot)"` is an inert env value — **airtight: there is no shell on this path, and no code substitutes message text into an argv element.** (security test `post_send_hook_hostile_subject_is_inert` confirms.)
-- **OK — input caps.** `spawn_arg_ok` per element (`MAX_SPAWN_ARG_LEN=4096`, NUL/control reject), `MAX_SPAWN_ARGS=64` on the argv, `MAX_POST_SEND_HOOKS=16` + `MAX_HOOK_ARGV=64` + `MAX_HOOK_ARG_LEN=4096` in `config::PostSendHook::is_valid`/`hooks_for`. Empty argv ⇒ bail.
-- **OK — fault isolation / stdout discipline.** Bounded try_wait/kill at `timeout`; every `Err` caught in `fire_post_send_hooks` and `eprintln!`-logged (stderr) — never propagated, never the JSON-RPC stdout frame. MCP fires hooks AFTER the result is built.
-- **OK — BROADCAST single-source.** `hook_recipient_matches` (config.rs:142) reuses `crate::model::is_broadcast` for the alias case — no new alias list; `BROADCAST_SQL` drift guard untouched and still passes.
+---
 
-### WL-037 supersede (SQL + authz + libsql positional trap)
-- **OK — all SQL parameterized.** `supersede` sender lookup, existence probe, and `UPDATE messages SET superseded_by = ?2 WHERE id = ?1` all bound `params!` (sqlite store.rs:4962) / `params(vec![...])` (libsql store_libsql.rs:197). Read-path filters add only the constant literal `AND superseded_by IS NULL` — no runtime value interpolated. No new inlined SQL literal beyond the `BROADCAST`-derived aliases.
-- **OK — sender-only authorization actually blocks X superseding Y.** Both backends look up `old_id`'s sender and `bail` when `old_sender != caller`, BEFORE the UPDATE. Identity X cannot supersede identity Y's message (censorship/DoS guard). Both ids' existence checked (no phantom-row stranding). (security tests `supersede_cannot_censor_another_agents_message`, `supersede_cross_identity_is_rejected` confirm.)
-- **OK — libsql positional projection cannot mis-map.** `row_to_message` reads `superseded_by` at **index 10** (store_libsql.rs:340); EVERY explicit projection (`inbox` both branches, `history` both, `search`, `inbox_since`, `peek_oldest_unread_on`, `thread` CTE) now lists `superseded_by` as the trailing 11th column. Grep confirms **zero** remaining 10-column projections feeding the mapper. (4 libsql supersede unit tests + full libsql run prove alignment.)
-- **OK — input caps.** `--supersedes`/`supersedes` rejected when `<= 0` at CLI (main.rs:131), MCP (mcp.rs ~595), before any bind. `--to-store` + `--supersedes` is rejected (no `superseded_by` on `outbox`) rather than silently ignored.
-- **OK — additive, backward-compatible migration.** Guarded `column_exists`/`pragma_table_info` ADD COLUMN, NULL == not superseded; `#[serde(default)]` on `Message.superseded_by`. No-op on a legacy store.
+## Part 1 — Security/correctness invariants
 
-### WL-035 backup/restore (traversal guard + snapshot)
-- **OK — traversal guard airtight.** `archive::safe_entry_name` (archive.rs) rejects empty, >100 bytes, NUL, absolute (`/`,`\`), any path separator, `:`, `.`/`..`, AND requires membership in the closed `KNOWN_ENTRY_NAMES` allow-list. `run_restore` runs it on EVERY parsed entry before use. `../escape` fails on both separator AND allow-list — a tar cannot write outside the target. (security test `restore_refuses_path_traversal_entry` confirms nothing written outside target.)
-- **OK — parameterized VACUUM INTO, no raw live-DB copy.** `snapshot_to` (both backends) issues `VACUUM INTO ?1` (path BOUND), never `fs::copy` of a live WAL DB; remote libsql `bail`s (no local file). Read-back verify at both ends (open read-only + count before declaring success).
-- **OK — destructive ops gated.** Backup `--out` refuses overwrite without `--force`; restore refuses to clobber DB/config without `--force` and gates `settings.json` overwrite behind `--force` with a `.bak` first.
-- **OK — GAP-2.** `Cmd::Export` write now `.with_context(...)` wrapped (main.rs:198).
+### 1. No shell — OK
+- No `sh -c`, no `bash -c`, no format!-built command string anywhere in the diff.
+- WL-042 provider writers compose config TEXT (TOML/JSON/YAML), they do **not** spawn — confirmed (no `Command` in `setup.rs` additions).
+- Only added external spawn is `Command::new("git").args(["init"])` in `weave/tests/integration.rs:4081` (WL-041 git-hook test fixture) — argv-only, test code. OK.
 
-### Cross-cutting
-- **OK — Layer DAG intact.** `weave-core` imports nothing upward (grep: no `use weave_inject`/`weave_mcp`); `weave-inject` imports no `weave_mcp`. `archive.rs` is pure (sits with `model`); matcher+config pure in `weave-core`; spawn in `weave-inject`; orchestration in `weave-inject` reachable from both send paths with no upward dep.
-- **OK — token-light MCP (ADR-0003).** ZERO new standing tools. `supersedes` is a property on `tool_catalog()`'s `weave_send` schema (mcp.rs:3232), not `tools/list`; hooks are invisible to MCP; backup/restore are CLI-only. `standing_mcp_surface_is_within_token_budget` + `progressive_default_surface_is_just_the_meta_tool` pass.
-- **OK — destructive-op gating** (covered per-feature above).
+### 2. Parameterized SQL — OK
+- Every new query binds values with `params!`/`params(vec![…])`: `expires_at`/`kind` filters use `?N` (`store.rs` unread/peek/inbox/history/search/inbox_since/thread; `store_libsql.rs` mirrors at the same indices), `set_message_expiry`, `sweep_expired_messages`, `supersede_prior_idle`, `enqueue_intent` ttl carry, `commit_pulled` re-stamp.
+- No **added** `format!`-built SQL. The pre-existing `format!(… {bc} …)` lines interpolate only `BROADCAST_SQL` (compile-time const); the migration probe interpolates `{table}`/`{col}` from a hardcoded static list (pre-existing pattern, no user data). BROADCAST drift-guard test green (verifier §3). OK.
+- `KIND_IDLE` is bound as a param (`crate::model::KIND_IDLE`), not inlined. OK.
 
-## Section 2 — Rust-native drift
+### 3. Layer DAG — OK
+- `weave-core/src/session.rs` is **pure** (no DB / fs / socket; doc-asserted and code-confirmed) — correctly in `weave-core`.
+- `weave/src/session.rs` holds all file+store+memory I/O — correctly in the bin layer; imports only downward (`weave_core::*`). No upward dep introduced. `pub mod session;` added to `weave-core/lib.rs` + `mod session;` to `weave/main.rs`. OK.
 
-- **OK — zero dependency drift.** **No `Cargo.toml` or `Cargo.lock` changed at all.** No `tar`/`zip`/`flate2`/`glob`/`serde_json`-in-inject/`tokio` added. The USTAR tar is hand-rolled pure Rust in `weave-core/src/archive.rs`; the hook JSON payload is hand-escaped (`json_escape`) so `weave-inject` gains no `serde_json` dep. Default `cargo tree` unchanged. (Matches CLAUDE.md "no new heavyweight dependency in the default build".)
-- **OK — every new source file is `.rs`.** Added files: `weave-core/src/archive.rs`, `weave/src/backup.rs` (+ three `.handoff/loop/*.md` plan sidecars, inert metadata that nothing builds against — not drift).
-- **OK — no non-Rust build/runtime intrusion.** Nothing introduces a non-Rust build step or a source-of-truth Rust must mirror by hand. The interim 4-crate workspace is respected (no new crate added).
+### 4. Paste-safe injection — N/A
+- No mux/injector arm touched in this batch.
 
-## Section 3 — Docs sync  →  **OK** (resolved 2026-06-13)
+### 5. Input caps — OK
+- WL-038: `MAX_MSG_TTL_SECS = 86_400`, `ttl_valid(1..=cap)` enforced at **both** seams (CLI `main.rs:210`, MCP `mcp.rs` weave_send/notify/reply) before any write; `expiry_from_ttl` uses `saturating_add` (overflow-safe). `ttl: 0` rejected (test `weave_send_ttl_zero_is_rejected`).
+- WL-040 import bounds EVERY field before any store write (`validate_messages`/`validate_memory`): `check_ident` sender+recipient, `check_body`/`MAX_BODY`, `MAX_IMPORT_SUBJECT=4096`, `idempotency_key_valid`, `trace_id_valid`, scope-kind whitelist, `MAX_IMPORT_FILE_BYTES=256MiB`. `synth_idempotency_key` sanitizes a hostile source identity to `[A-Za-z0-9_]` (SQL/metachar smuggle test passes). Format carries no path fields → no in-payload traversal; `--in`/`--out` UTF-8+existence+overwrite guarded.
 
-**No documentation file was touched in this batch** (`git diff` name-only shows zero of README/ARCHITECTURE/CHANGELOG/SECURITY/OPERATIONS/PARITY/CONTRIBUTING). All three features ship user-facing surface (CLI flags, a config block, an env contract, a schema column) with stale docs — a code↔docs fork, which is a BLOCK for user-facing changes. The implementers explicitly deferred docs ("flagged for the verifier/docs pass"); they were not added. Required entries (docs-only, no code change), enumerated per feature so the leader can add them in one pass:
+### 6. Destructive ops gated — OK
+- WL-038 sweep/gc delete **only** genuinely-expired rows (`WHERE expires_at IS NOT NULL AND expires_at <= now()`), reads-then-messages in one IMMEDIATE tx; `expires_at IS NULL` (permanent) is never touched (test `non_ephemeral_message_is_never_swept`). Bounded by the existing gc — no new unbounded sweeper.
+- WL-039 `supersede_prior_idle` is sender-scoped (`sender = ?` authz, the WL-037 spine), `kind='idle'`-scoped (never touches a real message — tested), unread-scoped, `id <> new_id` (idempotency replay = no-op). Reuses the `superseded_by` hide-spine; never deletes, never touches `reads`.
+- WL-040 import is idempotent (idempotency-key dedup; re-run = no-op).
+- WL-041/042 never clobber foreign config: read-existing → merge-own-entry-only → atomic temp+rename + one-time `.weave.bak` (0o600) → **read-back verify** that weave's entry landed AND every foreign entry survived (a non-NotFound read error aborts without writing). Confirmed in `merge_hooks_at`/`prune_hooks_at`/`merge_codex_notify`/`merge_aider_stanza` + `verify_*` predicates + `backup.rs::verify_restored_bytes`.
 
-### WL-035 backup/restore
-- **`CHANGELOG.md` `[Unreleased]` → `### Added`:** "Mailbox backup/restore (WL-035), `weave backup --out <path> [--force]` / `weave restore --in <path> [--force]`: a portable **dependency-free uncompressed USTAR** archive of a consistent SQLite snapshot (`VACUUM INTO`, never a raw live-DB copy) + `config.toml` + the installed Claude `settings.json` hooks + a `MANIFEST`. Read-back-verified at both ends; **traversal-guarded** extraction (closed allow-list `safe_entry_name`); restore gates DB/config and `settings.json` (with `.bak`) overwrite behind `--force`; remote libSQL is unsupported (no local file to snapshot). Re-run `weave setup` after restore to re-register the MCP server. Also: `weave export` write now reports its path on failure (GAP-2)."
-- **`README.md` `## CLI` (after the `weave export` line at README.md:63):** add `weave backup --out mailbox.tar` and `weave restore --in mailbox.tar` lines — one-line each: "portable no-dep snapshot of the DB + config + Claude settings; `--force` to overwrite; restore is traversal-guarded; remote libSQL unsupported."
-- **`ARCHITECTURE.md`:** (a) note `weave-core/src/archive.rs` in the `weave-core` layer tree (pure USTAR writer/reader + `safe_entry_name` traversal guard); (b) note `Store::snapshot_to` (parameterized `VACUUM INTO`, dual-backend mirror, remote-libSQL `bail`, read-back verify) in the store layer; cross-reference §7 (no-shell / parameterized-SQL) for the traversal-guard + bound-path rationale.
+### 7. MCP stdout discipline — OK
+- No new stdout writes in `mcp.rs`; new `ttl`/`dedupIdle` are handler params returning protocol frames. Logging discipline untouched.
 
-### WL-037 supersede
-- **`CHANGELOG.md` `[Unreleased]` → `### Added`:** "Message supersede / successor chains (WL-037), `weave send --supersedes <id>` (CLI) and a `supersedes` property on `weave_send` (MCP, zero standing-token cost): a sender replaces a prior message; the predecessor is stamped `superseded_by` and **hidden from the recipient's unread inbox** (kept and flagged in history/thread/search for audit). Chains supported (only the tail is unread). **Sender-only authorization** — you may only supersede your own messages (censorship/DoS guard). Additive nullable `messages.superseded_by` column, mirrored across both backends; distinct from `in_reply_to` threading."
-- **`README.md` `## CLI` (near the `weave send` examples ~README.md:61):** add a `weave send --to <id> --body ... --supersedes <old_id>` example with one line on supersede-vs-reply (replacement vs threading) and the hidden-from-unread / flagged-in-history read semantics.
-- **`ARCHITECTURE.md`:** (a) messages-schema note — new nullable `superseded_by` column (additive ADD COLUMN, NULL == not superseded), placed alongside the existing `in_reply_to`/`priority` notes (~ARCHITECTURE.md:743); (b) the read-semantics rule (`AND superseded_by IS NULL` on every unread/inbox/nudge path; retained-but-flagged in history/thread/search); (c) one line that supersede is **replacement** and orthogonal to `in_reply_to` **threading**; (d) the sender-only authz invariant.
+### token-light MCP surface — OK
+- WL-038 `ttl` and WL-039 `dedupIdle` are **catalog-only** (added to existing `weave_send`/`weave_notify`/reply op input schemas in `tool_catalog()`), **no new standing tool**. `standing_mcp_surface_is_within_token_budget` green (verifier §2). WL-040/041/042 are CLI-only (zero MCP surface). OK.
 
-### WL-036 post-send hooks
-- **`CHANGELOG.md` `[Unreleased]` → `### Added`:** "Post-send hooks (WL-036), config `[[post_send_hook]]`: run an operator-authored external program after a matching send/ack. **argv-only, no-shell** spawn (`argv[0]` constrained to a trusted dir); message fields reach the child ONLY as `WEAVE_HOOK_*` env vars (the message **body is never exported**); recipient matching supports `*` (universal) + exact + `BROADCAST` aliases. Fault-isolated and bounded (a slow/failing/missing hook never breaks send; failures log to stderr); fired from CLI `weave send`/`notify`/`ack` and MCP `weave_send`/`weave_notify`/`weave_ack` via one shared helper. **No new standing MCP tool.**"
-- **`README.md` (and `docs/OPERATIONS.md`):** a `[[post_send_hook]]` config example (`recipient`/`argv`/`event`/`timeout_ms`) + the `WEAVE_HOOK_{EVENT,SENDER,RECIPIENT,SUBJECT,MESSAGE_ID,PAYLOAD}` env-var contract; note body is NOT passed, the file-only (no env overlay) posture, and the hook-recursion footgun (a hook must not call back into `weave send` for the same event).
-- **`ARCHITECTURE.md`:** note the post-send-hook seam on the send path and the **no-shell / env-only injection-safety** statement (it is a security-invariant surface): operator-authored fixed argv, `resolve_trusted_program(argv[0])`, message text only via `Command::envs`.
-- **`docs/SECURITY.md`:** document the argv-only / env-only hook execution model + trusted-program constraint + bounded-wait fault isolation (the plan cites this; the hook spawn is a new attack surface and belongs in SECURITY).
-- **`docs/REPOWIRE-PARITY.md` and/or `docs/MULTI-SURFACE-PARITY.md`:** tick the atm-core post-send-hook (and supersede, and backup) parity rows the WL-035/036/037 plans cite.
+---
 
-### Docs re-review (2026-06-13) — RESOLVED, all OK
+## Part 2 — Rust-native drift guard
 
-The implementer added the docs (working-tree, uncommitted): `CHANGELOG.md` (+25), `README.md` (+43), `ARCHITECTURE.md` (+43/-1), `docs/SECURITY.md` (+33), `docs/OPERATIONS.md` (+50), `docs/REPOWIRE-PARITY.md` (+3), `docs/MULTI-SURFACE-PARITY.md` (+3). Each claim was checked against the actual shipped code — no over-claim, no code↔docs fork:
+- **No Cargo.toml / Cargo.lock change** in the entire diff → **zero new dependencies, zero new crates**. Default-feature `cargo tree` unchanged by construction. OK.
+- WL-042 provider writers are **Rust-native by hand**: codex TOML via line-based merge (**no `toml` dep**), gemini JSON reuses the existing serde_json hook merge, aider YAML via manual single-quoted-scalar compose (**no `serde_yaml` dep**). Confirmed in `setup.rs`.
+- The `.codex`/`.gemini`/`.aider` files weave writes are **OUTPUT sidecar artifacts for the user**, NOT build/runtime inputs to weave — the allowed sidecar case. Nothing in `src/`/`Cargo.toml`/`build.rs`/CI builds against them; weave is not expected to mirror them by hand. The README/parity docs explicitly note the codex writer is Rust-native and "NOT via the ecc `.codex` sidecar." No drift.
+- New module `session` lives inside the existing `weave-core` crate (no new crate — honors the "do not add crates" interim rule).
+- **No misinformation drift:** the gemini/aider scaffolds are documented as **scaffold-with-caveat** (UNCONFIRMED/LIMITED) in README, MULTI-SURFACE-PARITY, REPOWIRE-PARITY, the CLI output, AND the in-code comments — consistent, not a false claim of confirmed support.
 
-- **OK — CHANGELOG `[Unreleased] → ### Added`** has truthful entries for all three: WL-035 backup/restore + GAP-2 export-error-context, WL-037 supersede (additive `superseded_by`, hide-from-unread/flag-in-history, sender-only authz), WL-036 post-send hooks (argv-only/no-shell, body-never-exported, no new standing tool). Wording matches behavior.
-- **OK — README** documents `weave backup`/`weave restore` (CLI block + traversal-guard/remote-libSQL-unsupported notes), `weave send --supersedes` (replacement-vs-threading + hidden-from-unread), and a full `[[post_send_hook]]` section: the `recipient`/`argv`/`event`/`timeout_ms` config, the `WEAVE_HOOK_{EVENT,SENDER,RECIPIENT,SUBJECT,MESSAGE_ID,PAYLOAD}` env table, the **body-NOT-exported** statement, the file-only (no env overlay) posture, and the hook-recursion footgun. Matches `hook_env` (inject.rs:956), the config caps (config.rs:236-247), and the no-env-overlay design (config.rs:881).
-- **OK — ARCHITECTURE** notes `archive.rs` in the `weave-core` layer tree, `Store::snapshot_to` (parameterized `VACUUM INTO ?1`, dual-backend mirror, remote-libSQL bail, read-back-verify), the additive `superseded_by` column with the hide-from-unread/flag-in-history read-semantics and sender-only authz, and the post-send-hook no-shell/env-only seam. Verified against store.rs:3150/4965, store_libsql.rs:1693, inject.rs:862.
-- **OK — docs/SECURITY.md** documents the hook execution model: argv-only `Command::new(&prog_abs).args(&argv[1..]).envs(...)`, `resolve_trusted_program(argv[0])` trusted-dir constraint, message fields env-only with body never exported, input caps, and bounded/fault-isolated/stderr-only-stdout-discipline. Exactly matches the code.
-- **OK — actual shipped behavior, no over-claim.** Every load-bearing assertion spot-checked against code: bound `VACUUM INTO ?1` (store.rs:3159, store_libsql.rs:1711), sender-only authz before UPDATE (store.rs:4987-4992), `AND superseded_by IS NULL` on unread paths + retained-flagged in history (store.rs:1779/3091/3617), `safe_entry_name` closed allow-list applied per-entry (archive.rs:46, backup.rs:174), six `WEAVE_HOOK_*` env vars with body omitted (inject.rs:971-978), `supersedes` as a `weave_send` *property* not a new standing tool (mcp.rs:3236), remote-libSQL snapshot bail (store_libsql.rs:1697). Parity rows (REPOWIRE/MULTI-SURFACE) reflect the real CLI/MCP reachability.
-- **OK — `cargo fmt --all --check` clean** (exit 0); no code edited in this docs pass (the code diffs are the same pure-additive, 0-deletion batch previously approved).
+---
 
-## Overall
+## Part 3 — Docs sync
 
-All security/correctness invariants and the Rust-native drift guard **pass** (Sections 1–2, byte-unchanged code), and the sole prior blocker — the docs sync (Section 3) — is now **resolved**: all enumerated entries were added across 7 docs and each was re-verified to describe the actual shipped behavior with no over-claim and no code↔docs fork. `cargo fmt --all --check` is clean. The verifier's GREEN is upheld. Nothing remains to block.
+All user-facing surfaces updated **with** the code (no code↔docs fork):
+- **CHANGELOG.md** `[Unreleased]` — all five cards (WL-038 ephemeral/ttl, WL-039 idle dedup, WL-040 session export/import, WL-041 read-back, WL-042 multi-provider). OK.
+- **README.md** — provider table (claude/codex/gemini/aider) with confirmed/partially/unconfirmed/limited caveats; `--ttl`, idle dedup, `session export/import`, read-back. OK.
+- **ARCHITECTURE.md** — provider, ttl/ephemeral, idle, WL-040 interchange, read-back. OK.
+- **docs/REPOWIRE-PARITY.md** / **docs/MULTI-SURFACE-PARITY.md** — casr parity rows for providers + session resume + read-back. OK.
+- **docs/SECURITY.md** — WL-041 read-back verification section. OK.
+- **docs/TESTING.md** — WL-038/039/040 test-layer entries. OK.
+- **docs/FORMAT-session-export.md** (new, 167 lines) — byte-consistent with `weave-core/src/session.rs` + `weave/src/session.rs`: `FORMAT_TAG=1`, `SCHEMA_VERSION=1`, `MAX_BODY=65536`, `MAX_IMPORT_*` caps, idempotent-reimport, untrusted-input field-bounding all match the code. OK.
 
-**APPROVE**
+---
+
+## Routing
+
+Nothing to route back. No BLOCK, no WARN. The tree is invariant-clean, drift-free, and docs-synced.
+
+**Leader: cleared to deliver the PR into `develop`** (arm `gh pr merge <n> --auto --squash`; the six required checks are the gate).

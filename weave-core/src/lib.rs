@@ -4,6 +4,7 @@ pub mod config;
 pub mod export;
 pub mod memory;
 pub mod model;
+pub mod session;
 pub mod store;
 pub mod testenv;
 

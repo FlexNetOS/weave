@@ -38,8 +38,9 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 | **Governed web** (`weave web` / `weave_web`, obscura) | ✅ | ✅ | — | — | `--features obscura`; deny-by-default. Agent-surface by design. |
 | **Daemon** (start / stop / status) | ✅ | ✅ | — | — | Process-lifecycle; agent/operator surface. |
 | **Summarize** (text / thread, LLM) | ✅ | ✅ | ❌ | ❌ | `--features llm`. |
-| **Admin** (setup / uninstall / clear / gc / config) | ✅ | ◐ | — | — | Some admin ops are CLI-only by design (host wiring, retention). |
+| **Admin** (setup / uninstall / clear / gc / config) | ✅ | ◐ | — | — | Some admin ops are CLI-only by design (host wiring, retention). **Multi-provider host wiring (WL-042, casr parity):** `weave setup --provider <claude\|codex\|gemini\|aider>` wires weave into each host's own config file with the same never-clobber-foreign, idempotent, read-back-verified merge. Provider mechanism status: claude ✅ confirmed · codex ◐ partially confirmed (`notify`→drain) · gemini ◐ scaffold-with-caveat (hook key unconfirmed) · aider ◐ scaffold-with-caveat (limited hook surface). CLI-only by design (no new standing MCP tool/token). |
 | **Backup / restore** (atm-core, WL-035) | ✅ | — | — | — | CLI-only by design (host-local file I/O on a consistent snapshot); MCP does not expose it. |
+| **Session export/import** (casr, WL-040) | ✅ | ❌ | — | — | CLI-only by design (host-local file I/O); logical JSON interchange (messages + memory), distinct from the WL-035 binary backup. MCP exposure is a catalog-only follow-up if ever needed (no new standing tool). See `FORMAT-session-export.md`. |
 | **Supersede** (atm-core, WL-037) | ✅ | ✅ | ❌ | ❌ | `weave send --supersedes` / `weave_send {supersedes}` (zero standing-token cost — a `weave_send` property, not a new tool). |
 | **Post-send hooks** (atm-core, WL-036) | ✅ | ✅ | — | — | Operator config (`[[post_send_hook]]`); fires on send/notify/ack from both agent surfaces. No new standing MCP tool. |
 
@@ -71,6 +72,18 @@ gap is never mistaken for "covered":
 - **Design law for both:** a human surface must call the **same** capability handler as CLI/MCP —
   parity is achieved by *routing to one implementation*, not by re-implementing per surface. That
   is what keeps this matrix honest and the behavior identical everywhere.
+- **WL-042 — multi-provider host wiring (tracked caveats, not silent).** `weave setup --provider`
+  now scaffolds Codex/Gemini/Aider lifecycle wiring alongside the confirmed Claude path. Two of
+  these mechanisms are **scaffolded with an explicit caveat** and are tracked here rather than
+  presented as fully confirmed:
+  - **gemini** — Gemini CLI uses a Claude-shaped `~/.gemini/settings.json`, but its **exact
+    lifecycle-hook key is unconfirmed**. weave writes the documented best-known (Claude-compatible)
+    `hooks.{event}` shape and prints the caveat each run. **Follow-up:** confirm Gemini's hook key
+    (or whether it only supports MCP-server registration) and update the writer accordingly.
+  - **aider** — Aider's `~/.aider.conf.yml` has **no rich lifecycle-hook surface**. weave appends a
+    minimal hand-templated `weave-hook:` stanza (no YAML dependency) that Aider may ignore until it
+    grows a hook surface. **Follow-up:** revisit when Aider ships lifecycle hooks; until then the
+    stanza is documentation of intent, not a working hook.
 
 ## Why this is the right v1 boundary
 

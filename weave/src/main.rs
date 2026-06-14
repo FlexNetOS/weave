@@ -2,8 +2,9 @@
 //!
 //! Subcommands:
 //!   weave mcp            run the MCP stdio server (register with `claude mcp add`)
-//!   weave setup          wire weave into Claude Code (MCP + hooks)
-//!   weave uninstall      remove weave's Claude Code wiring
+//!   weave setup          wire weave into a coding-agent host (MCP + hooks);
+//!                        --provider <claude|codex|gemini|aider> (default claude)
+//!   weave uninstall      remove weave's host wiring (--provider <…>, default claude)
 //!   weave send           send a message (CLI; --to-store deposits a cross-store intent)
 //!   weave outbox         list pending cross-store intents (Tier-2)
 //!   weave pull           pull cross-store intents from pull_from sources into your inbox
@@ -42,6 +43,7 @@ compile_error!("no storage backend selected: enable `sqlite` (default) or `libsq
 mod backup;
 mod git;
 mod harness;
+mod session;
 mod setup;
 #[cfg(feature = "surfaces")]
 mod slack;
@@ -180,16 +182,25 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Wire weave into Claude Code (register MCP server + lifecycle hooks).
-    /// Optionally also install a git pre-commit hook that guards against
-    /// committing files reserved by other peers.
+    /// Wire weave into a coding-agent host (register MCP server + lifecycle
+    /// hooks). `--provider` selects the host (default `claude`); each provider
+    /// writes into its own config file with the same never-clobber-foreign,
+    /// idempotent, read-back-verified merge. Optionally also install a git
+    /// pre-commit hook that guards against committing files reserved by peers.
     Setup {
+        /// Which coding-agent host to wire (default: claude).
+        #[arg(long, value_enum, default_value_t = SetupProvider::Claude)]
+        provider: SetupProvider,
         /// Also install the git pre-commit hook in the current repo.
         #[arg(long)]
         git_hooks: bool,
     },
-    /// Remove weave's Claude Code wiring.
-    Uninstall,
+    /// Remove weave's host wiring (`--provider` selects the host; default claude).
+    Uninstall {
+        /// Which coding-agent host to unwire (default: claude).
+        #[arg(long, value_enum, default_value_t = SetupProvider::Claude)]
+        provider: SetupProvider,
+    },
     /// Autonomous orchestration harnesses (Codex seven-layer ide-merge-ide).
     Harness {
         #[command(subcommand)]
@@ -231,6 +242,11 @@ enum Cmd {
         /// messages.
         #[arg(long)]
         supersedes: Option<i64>,
+        /// WL-038: ephemeral TTL in seconds (1..=86400). The message is
+        /// auto-deleted after this many seconds (delete-on-sweep) and excluded
+        /// from every read surface; omit for a permanent message.
+        #[arg(long)]
+        ttl: Option<i64>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -252,6 +268,12 @@ enum Cmd {
         /// Message priority: low, normal, high, urgent (default normal).
         #[arg(long)]
         priority: Option<String>,
+        /// WL-039: idle-notification dedup. Mark this ping as an idle "still
+        /// waiting" notification and auto-supersede this sender's prior *unread*
+        /// idle pings to the same recipient, so they collapse to just the latest.
+        /// Never touches a real `weave send` message or another sender's pings.
+        #[arg(long)]
+        dedup_idle: bool,
     },
     /// Broadcast a notification to all online peers in your circle. Fan-out:
     /// one message per online peer, plus a live nudge for each injectable peer.
@@ -880,6 +902,14 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// WL-040: portable, canonical, schema-versioned JSON interchange for resuming a
+    /// session (its messages + mesh memory) across distinct weave instances — casr
+    /// parity. Logical (not byte-exact like `backup`) and presentation-free (not HTML
+    /// like `export`). Idempotent re-import.
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// WL-049 / ADR-0002: governed stealth web access via obscura (deny-by-default).
     /// `weave web <op> [--url …] [--arg k=v …]` runs a single browser op through the
     /// same policy/lease/job gate as the `weave_web` MCP tool. `weave web --list`
@@ -929,6 +959,41 @@ enum DaemonCmd {
     Run {
         #[arg(long)]
         me: Option<String>,
+    },
+}
+
+/// `weave session` subcommands — WL-040 canonical JSON interchange.
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Export an identity's messages + mesh memory to a canonical JSON file.
+    Export {
+        /// Output path for the `.json` interchange document.
+        #[arg(long)]
+        out: PathBuf,
+        /// Identity whose session to export. Falls back to `resolve_me()`
+        /// (`$WEAVE_SESSION` > basename(cwd)) when omitted.
+        #[arg(long = "for")]
+        for_id: Option<String>,
+        /// Max messages/asks to include (clamped to the store's MAX_LIMIT).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Overwrite `--out` if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import a canonical JSON file into THIS instance (idempotent re-import).
+    Import {
+        /// Path to a document produced by `weave session export`.
+        #[arg(long = "in")]
+        in_path: PathBuf,
+        /// Identity to resume the session under. Occurrences of the source
+        /// identity are remapped to this; third-party names are preserved.
+        /// Falls back to `resolve_me()` when omitted.
+        #[arg(long = "as")]
+        as_id: Option<String>,
+        /// Report counts without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1316,6 +1381,28 @@ enum CompletionShell {
     Bash,
     Zsh,
     Fish,
+}
+
+/// The coding-agent host `weave setup`/`weave uninstall` targets (WL-042). A
+/// closed `ValueEnum` (no free text → no injection); default `claude` preserves
+/// today's behavior. Maps onto [`setup::Provider`].
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SetupProvider {
+    Claude,
+    Codex,
+    Gemini,
+    Aider,
+}
+
+impl From<SetupProvider> for setup::Provider {
+    fn from(p: SetupProvider) -> Self {
+        match p {
+            SetupProvider::Claude => setup::Provider::Claude,
+            SetupProvider::Codex => setup::Provider::Codex,
+            SetupProvider::Gemini => setup::Provider::Gemini,
+            SetupProvider::Aider => setup::Provider::Aider,
+        }
+    }
 }
 
 /// Open the configured storage backend. Unknown backend names fail loudly rather
@@ -2773,15 +2860,18 @@ fn main() -> Result<()> {
 
     // Commands that don't need the store.
     match &cli.cmd {
-        Cmd::Setup { git_hooks } => {
+        Cmd::Setup {
+            provider,
+            git_hooks,
+        } => {
             let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-            setup::run(&exe)?;
+            setup::run_provider(&exe, (*provider).into())?;
             if *git_hooks {
                 setup::install_git_precommit_hook(&exe)?;
             }
             return Ok(());
         }
-        Cmd::Uninstall => return setup::uninstall(),
+        Cmd::Uninstall { provider } => return setup::uninstall_provider((*provider).into()),
         Cmd::Config {
             cmd: ConfigCmd::Init,
         } => {
@@ -2818,7 +2908,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Setup { .. }
-        | Cmd::Uninstall
+        | Cmd::Uninstall { .. }
         | Cmd::Config { .. }
         | Cmd::Completions { .. }
         | Cmd::Man
@@ -2885,11 +2975,22 @@ fn main() -> Result<()> {
             idempotency_key,
             priority,
             supersedes,
+            ttl,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
             let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             let trace_id = model::mint_trace_id();
+            // WL-038: validate the ephemeral TTL once at the CLI seam (the
+            // --priority/lease-ttl precedent) before any store write.
+            if let Some(t) = ttl {
+                if !model::ttl_valid(t) {
+                    anyhow::bail!(
+                        "--ttl must be between 1 and {} seconds.",
+                        model::MAX_MSG_TTL_SECS
+                    );
+                }
+            }
             match to_store {
                 // Cross-store (Tier-2): the recipient lives in a FOREIGN store, so
                 // we deposit an intent into OUR OWN outbox rather than attempt any
@@ -2929,6 +3030,7 @@ fn main() -> Result<()> {
                         idempotency_key.as_deref(),
                         Some(&trace_id),
                         priority.as_deref(),
+                        ttl.unwrap_or(0),
                     )?;
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
@@ -2943,6 +3045,12 @@ fn main() -> Result<()> {
                     )?;
                     if let Some(p) = priority {
                         let _ = store.set_message_priority(mid, &p);
+                    }
+                    // WL-038: post-stamp the ephemeral expiry (the priority post-stamp
+                    // precedent). `ttl` is already cap-validated above.
+                    if let Some(t) = ttl {
+                        let _ =
+                            store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
                     }
                     // WL-037: post-stamp the supersede link (the priority post-stamp
                     // precedent). Authorization + id existence are enforced in
@@ -2986,6 +3094,7 @@ fn main() -> Result<()> {
             body,
             idempotency_key,
             priority,
+            dedup_idle,
         } => {
             // Fire-and-forget point-to-point notification. Persist via the normal send
             // path (no fork), fire the SAME caller-side nudge + trace, and print the
@@ -3009,6 +3118,14 @@ fn main() -> Result<()> {
             )?;
             if let Some(p) = priority {
                 let _ = store.set_message_priority(mid, &p);
+            }
+            // WL-039: opt-in idle-notification dedup. Stamp this ping idle and
+            // auto-supersede this sender's prior UNREAD idle pings to `to` so a
+            // pile of "still waiting" pings collapses to just the latest. Post-send
+            // (mirrors the WL-037 `--supersedes` post-stamp); best-effort — a dedup
+            // failure must not sink the notify the recipient already received.
+            if dedup_idle {
+                let _ = store.supersede_prior_idle(&from, &to, mid);
             }
             // Trace + nudge (best-effort trace, no store→inject edge). The honest
             // verdict is derived from the SAME inject result that drove the trace, so
@@ -3807,6 +3924,28 @@ fn main() -> Result<()> {
                 out.display()
             );
         }
+
+        Cmd::Session { cmd } => match cmd {
+            SessionCmd::Export {
+                out,
+                for_id,
+                limit,
+                force,
+            } => {
+                let (me, explicit) = resolve_me_explicit(for_id, None, &cfg);
+                refresh_presence(store, &me, explicit);
+                let limit = limit.unwrap_or(10_000) as i64;
+                session::run_export(&cfg, store, &out, &me, limit, force)?;
+            }
+            SessionCmd::Import {
+                in_path,
+                as_id,
+                dry_run,
+            } => {
+                let (me, _explicit) = resolve_me_explicit(as_id, None, &cfg);
+                session::run_import(&cfg, store, &in_path, &me, dry_run)?;
+            }
+        },
 
         Cmd::Peers {
             json,

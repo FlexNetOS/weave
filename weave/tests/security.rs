@@ -4130,6 +4130,403 @@ fn post_send_hook_untrusted_program_refused_send_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
+// WL-038: ephemeral TTL — cap enforcement + non-recoverability after expiry.
+// ---------------------------------------------------------------------------
+
+/// The TTL is capped: an over-cap `--ttl` is rejected with no row and no panic
+/// (the resource-bound invariant — prevents an `expires_at = ts + ttl` overflow).
+#[test]
+fn ttl_is_capped() {
+    let db = TestDb::new();
+    let (ok, _o, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "attacker",
+            "--to",
+            "victim",
+            "--body",
+            "x",
+            "--ttl",
+            "9223372036854775807",
+        ],
+    );
+    assert!(!ok, "an over-cap (i64::MAX) --ttl must be rejected");
+    assert!(err.contains("ttl"), "cap error should mention ttl: {err:?}");
+    let inbox = run_ok(&db, &["inbox", "--me", "victim", "--json", "--peek"]);
+    let parsed: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    assert_eq!(
+        parsed["messages"].as_array().unwrap().len(),
+        0,
+        "no row may be persisted for a rejected ttl"
+    );
+}
+
+/// Delete-on-sweep means "ephemeral means gone": after the deadline + a sweep
+/// (forced via `gc`), the body is absent from inbox, history, search AND export
+/// — it is NOT merely filtered, the row is deleted and unrecoverable.
+#[test]
+fn expired_ephemeral_is_not_recoverable() {
+    let db = TestDb::new();
+    let secret = "top-secret-ephemeral-marker";
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--subject",
+            "ephemeral",
+            "--body",
+            secret,
+            "--ttl",
+            "1",
+        ],
+    );
+    // Let the 1s deadline pass (deterministic via a short real sleep, matching the
+    // lease-expiry security/integration precedent), then force the sweep via gc.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    run_ok(&db, &["gc", "--older-than-secs", "999999999"]);
+
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--peek"]);
+    assert!(
+        !inbox.contains(secret),
+        "expired body must be gone from inbox"
+    );
+    // `inbox --all` surfaces read history too; delete-on-sweep removed the row.
+    let history = run_ok(&db, &["inbox", "--me", "b", "--all", "--peek"]);
+    assert!(
+        !history.contains(secret),
+        "expired body must be gone from history (delete-on-sweep)"
+    );
+    let search = run_ok(&db, &["search", "--query", "ephemeral"]);
+    assert!(
+        !search.contains(secret),
+        "expired body must be gone from search"
+    );
+    // Export: the body must not survive in an exported mailbox bundle either.
+    let out_path = std::env::temp_dir().join(format!(
+        "weave-sec-ttl-export-{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let out_str = out_path.to_string_lossy().into_owned();
+    run_ok(&db, &["export", "--for", "b", "--out", &out_str]);
+    let html = std::fs::read_to_string(&out_path).unwrap_or_default();
+    assert!(
+        !html.contains(secret),
+        "expired ephemeral body must not be recoverable via export"
+    );
+    let _ = std::fs::remove_file(&out_path);
+}
+
+// ---------------------------------------------------------------------------
+// WL-040: canonical session import is an UNTRUSTED parser + DB write path.
+//
+// Every field is bounded BEFORE any bind: a hostile body/identity/key is
+// rejected cleanly (non-zero exit, no panic, no partial-write corruption); SQL/
+// shell metachars in a body store as LITERAL text (no injection, no shell);
+// path-traversal / non-file --in/--out are guarded. JSON is built via
+// serde_json so any control byte is explicit and the source stays pure ASCII.
+// ---------------------------------------------------------------------------
+
+/// A unique temp JSON path for one session-security test.
+fn unique_session_file_sec() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("weave-sessec-{pid}-{n}-{nanos}.json"))
+}
+
+/// Write an import file and return its path.
+fn write_import_file(envelope_json: &str) -> std::path::PathBuf {
+    let p = unique_session_file_sec();
+    std::fs::write(&p, envelope_json).expect("write import file");
+    p
+}
+
+#[test]
+fn session_import_rejects_oversized_body() {
+    let db = TestDb::new();
+    // MAX_BODY is 65536; exceed it.
+    let big = "x".repeat(70_000);
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": big}],
+        "asks": [], "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "oversized body must be rejected");
+    assert!(err.contains("too long"), "expected length error: {err}");
+    // No corruption: bob's inbox opens cleanly and has zero messages.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox json");
+    assert_eq!(
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len()),
+        Some(0),
+        "nothing partial-written: {inbox}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_control_char_identity() {
+    let db = TestDb::new();
+    // A control char (U+0001) in the sender identity must be rejected by
+    // check_ident BEFORE any store bind.
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "al\u{1}ice", "recipient": "bob", "body": "hi"}],
+        "asks": [], "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "control-char identity must be rejected");
+    assert!(
+        err.contains("control characters") || err.contains("sender"),
+        "expected ident error: {err}"
+    );
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox json");
+    assert_eq!(
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len()),
+        Some(0),
+        "nothing partial-written: {inbox}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_malformed_idempotency_key() {
+    let db = TestDb::new();
+    // A control char (U+0001) in the idempotency key must be rejected by
+    // idempotency_key_valid before any bind.
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{
+            "id": 1, "ts": 0, "sender": "alice", "recipient": "bob",
+            "body": "hi", "idempotency_key": "bad\u{1}key"
+        }],
+        "asks": [], "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "malformed idempotency_key must be rejected");
+    assert!(err.contains("idempotency_key"), "expected key error: {err}");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_stores_sql_and_shell_metachars_as_literals() {
+    let db = TestDb::new();
+    // A body full of SQL-injection + shell metachars must import as LITERAL text.
+    let hostile = "'; DROP TABLE messages; -- $(rm -rf /) `whoami`";
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": hostile}],
+        "asks": [], "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let imp = run_ok(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(imp.contains("1 message(s) inserted"), "import: {imp}");
+
+    // The DB still exists (DROP TABLE did not execute) and the body round-trips
+    // byte-identical (no shell ran).
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox json");
+    let body = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("body"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("");
+    assert_eq!(body, hostile, "metachar body must store literally: {inbox}");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_export_refuses_to_overwrite_without_force() {
+    let db = TestDb::new();
+    let file = unique_session_file_sec();
+    std::fs::write(&file, b"preexisting").unwrap();
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(!ok, "must refuse to clobber without --force");
+    assert!(
+        err.contains("refusing to overwrite"),
+        "expected guard: {err}"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"preexisting");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_export_rejects_nonexistent_parent_dir() {
+    let db = TestDb::new();
+    let bogus = std::env::temp_dir()
+        .join(format!("weave-sessec-no-such-dir-{}", std::process::id()))
+        .join("nested")
+        .join("out.json");
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            bogus.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(!ok, "must reject a missing parent dir");
+    assert!(
+        err.contains("parent directory does not exist"),
+        "expected parent guard: {err}"
+    );
+}
+
+#[test]
+fn session_import_rejects_missing_and_directory_in_path() {
+    let db = TestDb::new();
+    let missing = unique_session_file_sec();
+    let (ok, _o, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            missing.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "missing --in must error");
+    assert!(
+        err.contains("does not exist"),
+        "expected missing-file error: {err}"
+    );
+
+    let dir = std::env::temp_dir().join(format!("weave-sessec-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ok2, _o2, err2) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            dir.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok2, "directory --in must error");
+    assert!(
+        err2.contains("directory") || err2.contains("expected a file"),
+        "expected dir guard: {err2}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_import_rejects_non_weave_json() {
+    let db = TestDb::new();
+    let json = serde_json::json!({
+        "weave_session_export": 42, "schema_version": 1,
+        "identity": "x", "exported_at": 0
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "wrong magic must be rejected");
+    assert!(err.contains("magic"), "expected magic error: {err}");
+    let _ = std::fs::remove_file(&file);
+}
+
+// ---------------------------------------------------------------------------
 // WL-048: human surfaces — XSS end-to-end + bot-token secrecy (surfaces feature).
 // ---------------------------------------------------------------------------
 
@@ -4457,4 +4854,71 @@ done
         );
         mcp.shutdown();
     }
+}
+
+// ---------------------------------------------------------------------------
+// WL-041: a settings.json write that cannot land must surface a descriptive Err
+// and MUST NOT destroy the pre-existing foreign hooks. The atomic tmp+rename in
+// `write_settings` stages in the SAME directory, so a read-only `.claude/` dir
+// makes the write fail BEFORE the live file is touched — proving the destructive
+// path fails loudly and leaves foreign content intact (the read-back contract's
+// safety guarantee at the FS level).
+//
+// HOME isolation: pins a unique temp HOME so it never touches the real
+// ~/.claude/settings.json (the harness scrubs XDG_CONFIG_HOME, not HOME).
+// ---------------------------------------------------------------------------
+#[test]
+fn setup_failed_settings_write_is_loud_and_preserves_foreign_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let db = TestDb::new();
+    let home = std::env::temp_dir().join(format!(
+        "weave-it-sec-failwrite-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+
+    // Pre-seed a foreign hook we must never lose.
+    let settings = claude.join("settings.json");
+    let foreign = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {
+            "SessionStart": [ { "matcher": "",
+                "hooks": [ { "type": "command", "command": "rtk hook session" } ] } ]
+        }
+    }))
+    .unwrap();
+    std::fs::write(&settings, &foreign).unwrap();
+
+    // Make the .claude dir read-only so the atomic tmp create / rename fails.
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let home_str = home.to_string_lossy().into_owned();
+    let (ok, _out, err) = run_env(&db, &["setup"], &[("HOME", &home_str)]);
+
+    // Restore writability so we can read back + clean up regardless of outcome.
+    let _ = std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700));
+
+    assert!(
+        !ok,
+        "setup must FAIL when settings.json cannot be written, not silently succeed"
+    );
+    assert!(
+        err.contains("settings.json") || err.contains("merging weave hooks"),
+        "failure should name the settings write path: {err}"
+    );
+
+    // The pre-existing foreign hook is intact (the failed write never touched it).
+    let after = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        after.contains("rtk hook session"),
+        "a failed settings write must not destroy the foreign hook: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }

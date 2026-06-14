@@ -73,7 +73,9 @@ const SCHEMA: &[&str] = &[
         idempotency_key TEXT UNIQUE,
         trace_id        TEXT,
         priority        TEXT NOT NULL DEFAULT 'normal',
-        superseded_by   INTEGER
+        superseded_by   INTEGER,
+        expires_at      INTEGER,
+        kind            TEXT
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -116,7 +118,8 @@ const SCHEMA: &[&str] = &[
         sig             TEXT NOT NULL DEFAULT '',
         idempotency_key TEXT,
         trace_id        TEXT,
-        priority        TEXT NOT NULL DEFAULT 'normal'
+        priority        TEXT NOT NULL DEFAULT 'normal',
+        ttl             INTEGER NOT NULL DEFAULT 0
     )",
     "CREATE TABLE IF NOT EXISTS pull_cursor (
         source  TEXT PRIMARY KEY,
@@ -341,6 +344,12 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         // WL-037: positional index 10 — EVERY explicit projection feeding this
         // mapper MUST list `superseded_by` as the trailing (11th) column.
         superseded_by: r.get::<Option<i64>>(10).ok().flatten(),
+        // WL-038: positional index 11 — EVERY explicit projection feeding this
+        // mapper MUST list `expires_at` as the 12th column.
+        expires_at: r.get::<Option<i64>>(11).ok().flatten(),
+        // WL-039: positional index 12 — EVERY explicit projection feeding this
+        // mapper MUST list `kind` as the trailing (13th) column.
+        kind: r.get::<Option<String>>(12).ok().flatten(),
     })
 }
 
@@ -360,6 +369,8 @@ fn row_to_intent(r: &libsql::Row) -> Result<Intent> {
         idempotency_key: r.get::<Option<String>>(8).ok().flatten(),
         trace_id: r.get::<Option<String>>(9).ok().flatten(),
         priority: r.get::<String>(10).unwrap_or("normal".to_string()),
+        // WL-038: positional index 11 — `list_outbox`/`outbox_all` project `ttl` last.
+        ttl: r.get::<i64>(11).unwrap_or(0),
     })
 }
 
@@ -1049,6 +1060,13 @@ impl LibsqlStore {
                 ("outbox", "priority", "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
                 // WL-037: nullable (NULL == not superseded), no DEFAULT.
                 ("messages", "superseded_by", "ALTER TABLE messages ADD COLUMN superseded_by INTEGER"),
+                // WL-038: ephemeral absolute deadline. Nullable (NULL == permanent),
+                // no DEFAULT; outbox carries the *relative* ttl (re-stamped on commit).
+                ("messages", "expires_at", "ALTER TABLE messages ADD COLUMN expires_at INTEGER"),
+                ("outbox", "ttl", "ALTER TABLE outbox ADD COLUMN ttl INTEGER NOT NULL DEFAULT 0"),
+                // WL-039: idle-notification marker. Nullable (NULL == ordinary
+                // message), no DEFAULT; set to 'idle' only on the notify dedup path.
+                ("messages", "kind", "ALTER TABLE messages ADD COLUMN kind TEXT"),
             ] {
                 let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
                 let mut it = conn.query(&probe, ()).await?;
@@ -1498,21 +1516,30 @@ impl Store for LibsqlStore {
         if mark_read {
             self.guard_writable()?;
         }
+        // WL-038: opportunistically delete expired ephemeral rows before the read.
+        if mark_read {
+            let _ = self.sweep_expired_messages();
+        }
         let limit = clamp_limit(limit);
+        let now_cut = now();
         self.rt.block_on(async {
+            // WL-038: positional index 11 is `expires_at`; guard excludes
+            // expired-but-not-yet-swept rows (the SqliteStore mirror).
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                        AND superseded_by IS NULL
+                       AND (expires_at IS NULL OR expires_at > ?3)
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority, m.superseded_by FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority, m.superseded_by, m.expires_at, m.kind FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                        AND m.superseded_by IS NULL
+                       AND (m.expires_at IS NULL OR m.expires_at > ?3)
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1527,7 +1554,9 @@ impl Store for LibsqlStore {
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
 
-            let mut rows_iter = tx.query(&sql, params(vec![me.into(), limit.into()])).await?;
+            let mut rows_iter = tx
+                .query(&sql, params(vec![me.into(), limit.into(), now_cut.into()]))
+                .await?;
             let mut rows: Vec<Message> = Vec::new();
             while let Some(r) = rows_iter.next().await? {
                 rows.push(row_to_message(&r)?);
@@ -1553,34 +1582,42 @@ impl Store for LibsqlStore {
     }
 
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so history never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
+        let now_cut = now();
         self.rt.block_on(async {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
-                     WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
-                        OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                     WHERE ((sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
+                        OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc})))
+                       AND (expires_at IS NULL OR expires_at > ?4)
                      ORDER BY id DESC LIMIT ?3",
                     bc = BROADCAST_SQL
                 );
                 let mut it = self
                     .conn
-                    .query(&sql, params(vec![me.into(), p.into(), limit.into()]))
+                    .query(
+                        &sql,
+                        params(vec![me.into(), p.into(), limit.into(), now_cut.into()]),
+                    )
                     .await?;
                 while let Some(r) = it.next().await? {
                     rows.push(row_to_message(&r)?);
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
-                     WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                     WHERE (sender = ?1 OR recipient = ?1 OR recipient IN {bc})
+                       AND (expires_at IS NULL OR expires_at > ?3)
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 );
                 let mut it = self
                     .conn
-                    .query(&sql, params(vec![me.into(), limit.into()]))
+                    .query(&sql, params(vec![me.into(), limit.into(), now_cut.into()]))
                     .await?;
                 while let Some(r) = it.next().await? {
                     rows.push(row_to_message(&r)?);
@@ -1592,16 +1629,20 @@ impl Store for LibsqlStore {
     }
 
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so search never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
+        let now_cut = now();
         self.rt.block_on(async {
-            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
                  WHERE id IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
                  )
+                 AND (expires_at IS NULL OR expires_at > ?3)
                  ORDER BY id DESC LIMIT ?2";
             let mut it = self
                 .conn
-                .query(sql, params(vec![query.into(), limit.into()]))
+                .query(sql, params(vec![query.into(), limit.into(), now_cut.into()]))
                 .await?;
             let mut rows: Vec<Message> = Vec::new();
             while let Some(r) = it.next().await? {
@@ -1612,18 +1653,30 @@ impl Store for LibsqlStore {
     }
 
     fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so the drain never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
+        let now_cut = now();
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
                    AND superseded_by IS NULL
+                   AND (expires_at IS NULL OR expires_at > ?4)
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
             );
             let mut it = self
                 .conn
-                .query(&sql, params(vec![me.into(), since_id.into(), limit.into()]))
+                .query(
+                    &sql,
+                    params(vec![
+                        me.into(),
+                        since_id.into(),
+                        limit.into(),
+                        now_cut.into(),
+                    ]),
+                )
                 .await?;
             let mut rows: Vec<Message> = Vec::new();
             while let Some(r) = it.next().await? {
@@ -1770,6 +1823,8 @@ impl Store for LibsqlStore {
     }
 
     fn peek_oldest_unread(&self, me: &str) -> Result<Option<Message>> {
+        // WL-038: opportunistic sweep so the wake hook never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         self.block_on_bounded(async { peek_oldest_unread_on(&self.conn, me).await })
     }
 
@@ -1822,6 +1877,21 @@ impl Store for LibsqlStore {
             tx.execute(
                 "DELETE FROM messages WHERE ts < ?1",
                 params(vec![cutoff.into()]),
+            )
+            .await?;
+            // WL-038: fold the ephemeral expiry into the SAME gc pass — delete expired
+            // messages (and their reads) even if `ts >= cutoff` (delete-on-sweep),
+            // mirroring SqliteStore::gc.
+            let expiry_cut = now();
+            tx.execute(
+                "DELETE FROM reads WHERE message_id IN
+                    (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+                params(vec![expiry_cut.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                params(vec![expiry_cut.into()]),
             )
             .await?;
             // P6: prune the delivery trace by the SAME cutoff so it is bounded by the
@@ -1947,7 +2017,7 @@ impl Store for LibsqlStore {
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
                 SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                       m.idempotency_key, m.trace_id, m.priority, m.superseded_by
+                       m.idempotency_key, m.trace_id, m.priority, m.superseded_by, m.expires_at, m.kind
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -2363,6 +2433,7 @@ impl Store for LibsqlStore {
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
         priority: Option<&str>,
+        ttl: i64,
     ) -> Result<i64> {
         self.guard_writable()?;
         check_ident("recipient", to)?;
@@ -2370,11 +2441,13 @@ impl Store for LibsqlStore {
         check_host(to_host)?;
         check_body(body)?;
         let p = priority.unwrap_or("normal").to_string();
+        // WL-038: carry the *relative* ttl; `<= 0` normalizes to 0 (no TTL).
+        let ttl = ttl.max(0);
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params(vec![
                         now().into(),
                         to.into(),
@@ -2386,6 +2459,7 @@ impl Store for LibsqlStore {
                         idempotency_key.map(|s| s.to_string()).into(),
                         trace_id.map(|s| s.to_string()).into(),
                         p.into(),
+                        ttl.into(),
                     ]),
                 )
                 .await?;
@@ -2401,7 +2475,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl FROM outbox \
                      WHERE to_peer = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
                     params(vec![for_recipient.into(), since_id.into(), limit.into()]),
                 )
@@ -2420,7 +2494,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox \
+                    "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl FROM outbox \
                      ORDER BY id ASC LIMIT ?1",
                     params(vec![limit.into()]),
                 )
@@ -4167,6 +4241,46 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn set_message_expiry(&self, id: i64, expires_at: i64) -> Result<()> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            self.conn
+                .execute(
+                    "UPDATE messages SET expires_at = ?1 WHERE id = ?2",
+                    params(vec![expires_at.into(), id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn sweep_expired_messages(&self) -> Result<usize> {
+        self.guard_writable()?;
+        let now = now();
+        self.rt.block_on(async {
+            // Delete-on-sweep: reads first, then messages, in one IMMEDIATE tx
+            // (the SqliteStore mirror).
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            tx.execute(
+                "DELETE FROM reads WHERE message_id IN
+                    (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+                params(vec![now.into()]),
+            )
+            .await?;
+            let n = tx
+                .execute(
+                    "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                    params(vec![now.into()]),
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(n as usize)
+        })
+    }
+
     fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
         self.guard_writable()?;
         self.rt.block_on(async {
@@ -4209,6 +4323,47 @@ impl Store for LibsqlStore {
                 )
                 .await?;
             Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    fn supersede_prior_idle(&self, sender: &str, recipient: &str, new_id: i64) -> Result<usize> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            // Stamp the new ping as idle (scoped to `sender` = self-only authz),
+            // then auto-supersede the sender's prior UNREAD idle pings to this
+            // recipient. The predicate is the SqliteStore mirror — kind='idle'
+            // excludes every real message, sender/recipient scope it, id<>new_id
+            // makes an idempotency replay a no-op, superseded_by IS NULL skips
+            // chained rows, and the NOT EXISTS clause is the SAME unread
+            // definition used by the unread count.
+            self.conn
+                .execute(
+                    "UPDATE messages SET kind = ?3 WHERE id = ?1 AND sender = ?2",
+                    params(vec![
+                        new_id.into(),
+                        sender.into(),
+                        crate::model::KIND_IDLE.into(),
+                    ]),
+                )
+                .await?;
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE messages SET superseded_by = ?1
+                     WHERE sender = ?2 AND recipient = ?3
+                       AND kind = ?4
+                       AND superseded_by IS NULL
+                       AND id <> ?1
+                       AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = messages.id AND r.reader = ?3)",
+                    params(vec![
+                        new_id.into(),
+                        sender.into(),
+                        recipient.into(),
+                        crate::model::KIND_IDLE.into(),
+                    ]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(n as usize)
         })
     }
 
@@ -4379,10 +4534,13 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND m.superseded_by IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > ?2)
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
-    let mut it = conn.query(&sql, params(vec![me.into()])).await?;
+    let mut it = conn
+        .query(&sql, params(vec![me.into(), now().into()]))
+        .await?;
     match it.next().await? {
         Some(r) => Ok(r.get::<i64>(0)?),
         None => Ok(0),
@@ -4391,14 +4549,17 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND m.superseded_by IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > ?2)
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
     );
-    let mut it = conn.query(&sql, params(vec![me.into()])).await?;
+    let mut it = conn
+        .query(&sql, params(vec![me.into(), now().into()]))
+        .await?;
     match it.next().await? {
         Some(r) => Ok(Some(row_to_message(&r)?)),
         None => Ok(None),
@@ -6209,7 +6370,7 @@ mod tests {
         );
         assert_trapped(
             "enqueue_intent",
-            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None, None)
+            ro.enqueue_intent("to", "boxB", "from", None, "body", "", None, None, None, 0)
                 .map(|_| ()),
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
@@ -6310,6 +6471,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         s.enqueue_intent(
@@ -6322,10 +6484,11 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None)
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None, 0)
             .unwrap();
 
         let all = s.outbox_all(50).unwrap();
@@ -6509,6 +6672,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         }
@@ -7700,6 +7864,84 @@ mod tests {
         assert_eq!(unread_ids(&s, "r2"), vec![b]);
     }
 
+    // ---- WL-039: idle-notification dedup (libsql, positional-projection trap)
+
+    #[test]
+    fn idle_dedup_replaces_prior_unread_idle_libsql() {
+        let s = mem();
+        let p1 = s
+            .send("a", "b", None, "still waiting?", None, None)
+            .unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", p1).unwrap(), 0);
+        let p2 = s
+            .send("a", "b", None, "still waiting??", None, None)
+            .unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", p2).unwrap(), 1);
+        // Only the latest is unread; the predecessor is stamped + hidden (the
+        // positional `kind` projection at index 12 must align).
+        assert_eq!(unread_ids(&s, "b"), vec![p2]);
+        assert_eq!(superseded_by_of(&s, "b", p1), Some(p2));
+        assert_eq!(s.peek_oldest_unread("b").unwrap().unwrap().id, p2);
+    }
+
+    #[test]
+    fn idle_dedup_never_touches_real_messages_libsql() {
+        let s = mem();
+        let p1 = s.send("a", "b", None, "ping 1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", p1).unwrap();
+        let real = s.send("a", "b", Some("work"), "real", None, None).unwrap();
+        let p2 = s.send("a", "b", None, "ping 2", None, None).unwrap();
+        let n = s.supersede_prior_idle("a", "b", p2).unwrap();
+        assert_eq!(n, 1, "only the prior idle ping is superseded");
+        assert_eq!(superseded_by_of(&s, "b", p1), Some(p2));
+        assert_eq!(superseded_by_of(&s, "b", real), None);
+        let unread = unread_ids(&s, "b");
+        assert!(unread.contains(&real), "real message stays unread");
+        assert!(unread.contains(&p2));
+        assert!(!unread.contains(&p1));
+    }
+
+    #[test]
+    fn idle_dedup_only_supersedes_unread_libsql() {
+        let s = mem();
+        let p1 = s.send("a", "b", None, "ping 1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", p1).unwrap();
+        // b reads the first ping.
+        let _ = s.inbox("b", false, true, 50).unwrap();
+        let p2 = s.send("a", "b", None, "ping 2", None, None).unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", p2).unwrap(), 0);
+        assert_eq!(superseded_by_of(&s, "b", p1), None);
+    }
+
+    #[test]
+    fn idle_dedup_scoped_and_authz_self_only_libsql() {
+        let s = mem();
+        // a->b and c->b idle pings, plus a->z.
+        let a_b1 = s.send("a", "b", None, "a1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", a_b1).unwrap();
+        let c_b = s.send("c", "b", None, "c1", None, None).unwrap();
+        s.supersede_prior_idle("c", "b", c_b).unwrap();
+        let a_z = s.send("a", "z", None, "az1", None, None).unwrap();
+        s.supersede_prior_idle("a", "z", a_z).unwrap();
+        // a's new ping supersedes ONLY a's prior a->b ping.
+        let a_b2 = s.send("a", "b", None, "a2", None, None).unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", a_b2).unwrap(), 1);
+        assert_eq!(superseded_by_of(&s, "b", a_b1), Some(a_b2));
+        assert_eq!(superseded_by_of(&s, "b", c_b), None);
+        assert_eq!(superseded_by_of(&s, "z", a_z), None);
+        // Authz: c cannot supersede a's prior ping (sender-scoped). A fresh c->b
+        // ping deduping as 'c' leaves any a->b ping untouched.
+        let a_b3 = s.send("a", "b", None, "a3", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", a_b3).unwrap();
+        let c_b2 = s.send("c", "b", None, "c2", None, None).unwrap();
+        s.supersede_prior_idle("c", "b", c_b2).unwrap();
+        assert_eq!(
+            superseded_by_of(&s, "b", a_b3),
+            None,
+            "c never touches a's ping"
+        );
+    }
+
     // ---- WL-035: snapshot_to on the local libsql backend -------------------
 
     #[test]
@@ -7717,5 +7959,100 @@ mod tests {
         // The local VACUUM INTO snapshot opens read-only with the same count.
         let snap = LibsqlStore::open_readonly(&dest).unwrap();
         assert_eq!(snap.total_messages().unwrap(), src_count);
+    }
+
+    // ---- WL-038: ephemeral messages with TTL + auto-sweep (libsql mirror) ----
+
+    #[test]
+    fn expiry_stamps_and_excludes_from_unread_libsql() {
+        let s = mem();
+        let live = s
+            .send("a", "b", Some("keep"), "permanent", None, None)
+            .unwrap();
+        let eph = s
+            .send("a", "b", Some("v"), "ephemeral", None, None)
+            .unwrap();
+        s.set_message_expiry(eph, now() - 1).unwrap();
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(inbox.iter().any(|m| m.id == live));
+        assert!(!inbox.iter().any(|m| m.id == eph));
+        // Delete-on-sweep (history opportunistically sweeps).
+        assert!(s
+            .history("b", None, 100)
+            .unwrap()
+            .iter()
+            .all(|m| m.id != eph));
+        assert_eq!(s.total_messages().unwrap(), 1);
+        let oldest = s.peek_oldest_unread("b").unwrap().unwrap();
+        assert_eq!(oldest.id, live);
+    }
+
+    #[test]
+    fn sweep_expired_messages_deletes_expired_keeps_live_libsql() {
+        let s = mem();
+        let expired = s.send("a", "b", None, "gone", None, None).unwrap();
+        let future = s.send("a", "b", None, "soon", None, None).unwrap();
+        let permanent = s.send("a", "b", None, "forever", None, None).unwrap();
+        s.set_message_expiry(expired, now() - 5).unwrap();
+        s.set_message_expiry(future, now() + 10_000).unwrap();
+        let n = s.sweep_expired_messages().unwrap();
+        assert_eq!(n, 1);
+        let hist = s.history("b", None, 100).unwrap();
+        assert!(hist.iter().any(|m| m.id == future));
+        assert!(hist.iter().any(|m| m.id == permanent));
+        assert!(hist.iter().all(|m| m.id != expired));
+    }
+
+    #[test]
+    fn gc_also_reaps_expired_ephemeral_libsql() {
+        let s = mem();
+        let eph = s
+            .send("a", "b", None, "fresh-but-expired", None, None)
+            .unwrap();
+        s.set_message_expiry(eph, now() - 1).unwrap();
+        s.gc(86_400 * 365).unwrap();
+        assert_eq!(s.total_messages().unwrap(), 0);
+    }
+
+    #[test]
+    fn non_ephemeral_message_is_never_swept_libsql() {
+        let s = mem();
+        let mid = s.send("a", "b", None, "forever", None, None).unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 0);
+        s.gc(86_400 * 365).unwrap();
+        let hist = s.history("b", None, 100).unwrap();
+        assert!(hist.iter().any(|m| m.id == mid));
+    }
+
+    #[test]
+    fn cross_store_intent_carries_ttl_to_expiry_libsql() {
+        let dir =
+            std::env::temp_dir().join(format!("weave-libsql-ttl-xstore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+        let _ = std::fs::remove_file(&a_path);
+        let _ = std::fs::remove_file(&b_path);
+        let cfg_a = Config {
+            db: Some(a_path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let cfg_b = Config {
+            db: Some(b_path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let a = LibsqlStore::open(&cfg_a).unwrap();
+        a.enqueue_intent("bob", "", "alice", None, "hi", "", None, None, None, 600)
+            .unwrap();
+        let b = LibsqlStore::open(&cfg_b).unwrap();
+        let allow = vec![StoreSource::Local(a_path.clone())];
+        let pulled = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
+        assert_eq!(pulled.committed, 1);
+        let hist = b.history("bob", None, 100).unwrap();
+        let m = hist.iter().find(|m| m.body == "hi").expect("committed");
+        let exp = m.expires_at.expect("ttl re-stamped as expiry");
+        assert!(exp > now() + 500 && exp <= now() + 600);
     }
 }

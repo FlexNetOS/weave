@@ -6,6 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Recipient aliases that mean "deliver to every session". Single source of truth.
 pub const BROADCAST: &[&str] = &["all", "*", "everyone", "broadcast"];
 
+/// WL-039: the [`Message::kind`] marker for an idle/notification "still waiting"
+/// ping. Set **only** on the notify dedup path; the `supersede_prior_idle` query
+/// scopes the auto-supersede to `kind = KIND_IDLE` so dedup can never touch a real
+/// message. An internal enum literal, never user-supplied text.
+pub const KIND_IDLE: &str = "idle";
+
 /// SQL fragment for the broadcast set, e.g. `('all','*','everyone','broadcast')`,
 /// interpolated into the `recipient IN {bc}` delivery/unread/history filters.
 ///
@@ -122,6 +128,28 @@ pub struct Message {
     /// keeps older JSON payloads (which omit the field) deserializable.
     #[serde(default)]
     pub superseded_by: Option<i64>,
+    /// WL-038: absolute epoch-seconds deadline after which this message is
+    /// **ephemeral** and is deleted on the next sweep (delete-on-sweep). `None`
+    /// (the default) means the message is permanent. Stored as the absolute
+    /// deadline (`ts + ttl`), not the relative ttl, so every sweep is a single
+    /// `WHERE expires_at <= now()` (the `leases.expires`/`sweep_expired_leases`
+    /// precedent). Additive + backward-compatible: pre-existing rows (and DBs
+    /// created before the `expires_at` column migration) read back as `None`.
+    /// `#[serde(default)]` keeps older JSON payloads (which omit the field)
+    /// deserializable.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// WL-039: message kind marker. `None`/`"normal"` (the default) is an ordinary
+    /// message; [`KIND_IDLE`] marks an idle/notification "still waiting" ping set
+    /// **only** on the notify dedup path. The marker exists so idle-notification
+    /// dedup (`Store::supersede_prior_idle`) can ever fire ONLY on idle pings and
+    /// never on real content — it scopes the supersede `UPDATE` to `kind='idle'`.
+    /// `kind` is an internal enum literal, never free user text. Additive +
+    /// backward-compatible: pre-existing rows (and DBs created before the `kind`
+    /// column migration) read back as `None`. `#[serde(default)]` keeps older JSON
+    /// payloads (which omit the field) deserializable.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
@@ -170,6 +198,14 @@ pub struct Intent {
     /// Message priority carried on cross-store intents.
     #[serde(default = "default_priority")]
     pub priority: String,
+    /// WL-038: ephemeral TTL (relative seconds) carried on cross-store intents.
+    /// `0` (the default) means no TTL (permanent). The receiver re-stamps `ts` on
+    /// commit, so the relative ttl — not an absolute deadline — is carried; the
+    /// receiver computes `expires_at = now() + ttl` at commit (the priority/WL-031
+    /// carry precedent). `#[serde(default)]` keeps older JSON payloads
+    /// deserializable.
+    #[serde(default)]
+    pub ttl: i64,
 }
 
 /// Hard upper bound (in chars) on a tracked-ask correlation id. The id is always
@@ -1061,6 +1097,11 @@ pub const MAX_LEASE_NOTE_LEN: usize = 1024;
 /// WL-024: max TTL for a lease in seconds (≈ 24 hours).
 pub const MAX_LEASE_TTL_SECS: i64 = 86_400;
 
+/// WL-038: max TTL for an ephemeral message in seconds (≈ 24 hours). Mirrors the
+/// lease ceiling; bounding the TTL also prevents an `expires_at = ts + ttl`
+/// overflow/abuse (the cap + `expiry_from_ttl`'s `saturating_add` together).
+pub const MAX_MSG_TTL_SECS: i64 = 86_400;
+
 /// The lifecycle state of a PR in the review queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1226,6 +1267,20 @@ pub fn lease_resource_valid(r: &str) -> bool {
 /// WL-024: validate a lease TTL in seconds.
 pub fn lease_ttl_valid(ttl: i64) -> bool {
     ttl > 0 && ttl <= MAX_LEASE_TTL_SECS
+}
+
+/// WL-038: validate an ephemeral-message TTL in seconds. Accepts `1..=MAX_MSG_TTL_SECS`;
+/// rejects `0`, negatives, and over-cap values at the CLI/MCP seam (the
+/// `lease_ttl_valid` precedent).
+pub fn ttl_valid(ttl: i64) -> bool {
+    (1..=MAX_MSG_TTL_SECS).contains(&ttl)
+}
+
+/// WL-038: compute an absolute ephemeral deadline from a base timestamp and a
+/// relative ttl. Uses `saturating_add` so an `i64::MAX` base never wraps/panics
+/// (callers must still validate via [`ttl_valid`] first).
+pub fn expiry_from_ttl(ts: i64, ttl: i64) -> i64 {
+    ts.saturating_add(ttl)
 }
 
 /// WL-029: normalize a lease resource path for conflict detection.
@@ -2974,6 +3029,24 @@ mod tests {
         assert!(!lease_ttl_valid(0));
         assert!(!lease_ttl_valid(-1));
         assert!(!lease_ttl_valid(MAX_LEASE_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn ttl_valid_bounds() {
+        assert!(ttl_valid(1));
+        assert!(ttl_valid(3600));
+        assert!(ttl_valid(MAX_MSG_TTL_SECS));
+        assert!(!ttl_valid(0));
+        assert!(!ttl_valid(-1));
+        assert!(!ttl_valid(MAX_MSG_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn expiry_from_ttl_adds_and_saturates() {
+        assert_eq!(expiry_from_ttl(1000, 60), 1060);
+        assert_eq!(expiry_from_ttl(0, MAX_MSG_TTL_SECS), MAX_MSG_TTL_SECS);
+        // i64::MAX base must saturate, not wrap/panic.
+        assert_eq!(expiry_from_ttl(i64::MAX, 1), i64::MAX);
     }
 
     #[test]

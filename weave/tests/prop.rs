@@ -381,3 +381,40 @@ proptest! {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// WL-038: ephemeral TTL — expiry monotonicity (pure helper property).
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// For any non-negative base `ts` and a valid `ttl` in `1..=MAX_MSG_TTL_SECS`,
+    /// the absolute deadline is STRICTLY in the future (no wrap) and bounded by
+    /// `ts + MAX_MSG_TTL_SECS`. This is the resource-bound / no-overflow property
+    /// behind the `expires_at = ts + ttl` design.
+    #[test]
+    fn expiry_monotonicity(
+        ts in 0i64..(i64::MAX - weave_core::model::MAX_MSG_TTL_SECS),
+        ttl in 1i64..=weave_core::model::MAX_MSG_TTL_SECS,
+    ) {
+        let exp = weave_core::model::expiry_from_ttl(ts, ttl);
+        prop_assert!(exp > ts, "expiry {exp} must be strictly after base {ts}");
+        prop_assert!(
+            exp <= ts + weave_core::model::MAX_MSG_TTL_SECS,
+            "expiry {exp} must be bounded by ts + MAX_MSG_TTL_SECS"
+        );
+        // A valid ttl is always accepted by the cap guard.
+        prop_assert!(weave_core::model::ttl_valid(ttl));
+    }
+
+    /// `expiry_from_ttl` never panics and always saturates at `i64::MAX` for an
+    /// extreme base, even outside the validated range.
+    #[test]
+    fn expiry_saturates_without_panic(ts in any::<i64>(), ttl in any::<i64>()) {
+        let exp = weave_core::model::expiry_from_ttl(ts, ttl);
+        // Saturating semantics: result is within [i64::MIN, i64::MAX] (trivially
+        // true) and equals a saturating add — assert it matches the reference.
+        prop_assert_eq!(exp, ts.saturating_add(ttl));
+    }
+}

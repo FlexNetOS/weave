@@ -29,6 +29,42 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// WL-041: read-back-verify a just-restored config/settings file. Re-opens `path`,
+/// asserts its bytes equal the archived `expected` payload, and (for settings.json,
+/// `is_json`) that the re-read content parses as a JSON object — so a restore never
+/// reports success on a write that landed truncated or corrupt. The WL-035
+/// `backup_existing` `.bak` is the recovery path on failure.
+fn verify_restored_bytes(path: &Path, expected: &[u8], is_json: bool) -> Result<()> {
+    let got = std::fs::read(path).with_context(|| {
+        format!(
+            "restore read-back failed for {}: cannot re-read after write",
+            path.display()
+        )
+    })?;
+    if got != expected {
+        bail!(
+            "restore read-back failed for {}: the re-read bytes do not match the archived \
+             payload (recover from the .bak)",
+            path.display()
+        );
+    }
+    if is_json {
+        let v: serde_json::Value = serde_json::from_slice(&got).with_context(|| {
+            format!(
+                "restore read-back failed for {}: not valid JSON",
+                path.display()
+            )
+        })?;
+        if !v.is_object() {
+            bail!(
+                "restore read-back failed for {}: restored content is not a JSON object",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Open the configured backend **read-only** at an arbitrary `path` (a snapshot
 /// file), returning a counter we can use to sanity-check it. Backend-aware so the
 /// libsql build verifies through libsql.
@@ -246,6 +282,7 @@ pub fn run_restore(cfg: &Config, in_path: &Path, force: bool) -> Result<()> {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         write_file(&config_path, &c.data)?;
+        verify_restored_bytes(&config_path, &c.data, false)?;
         restored.push(config_path.display().to_string());
     }
 
@@ -262,6 +299,7 @@ pub fn run_restore(cfg: &Config, in_path: &Path, force: bool) -> Result<()> {
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
             write_file(&settings_path, &s.data)?;
+            verify_restored_bytes(&settings_path, &s.data, true)?;
             restored.push(settings_path.display().to_string());
         } else {
             skipped_settings = true;

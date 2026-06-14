@@ -170,6 +170,68 @@ fn mcp_weave_send_supersedes_post_stamps_and_failure_path() {
     mcp.shutdown();
 }
 
+/// WL-039: `weave_notify {dedupIdle:true}` twice collapses a sender's idle pings to
+/// the latest unread one; a clean no-op (returns 0 superseded) on the first ping;
+/// and `weave_send` with the same body twice is NEVER deduped (real-message safety).
+#[test]
+fn mcp_weave_notify_dedup_idle_collapses_and_spares_real_send() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let _ = mcp.request(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "weave-it", "version": "0"}
+        }),
+    );
+
+    // First idle ping: a clean no-op (no prior idle ping to supersede).
+    let (is_err, n1) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "desktop", "to": "envctl", "body": "still waiting 1", "dedupIdle": true}),
+    );
+    assert!(!is_err, "first idle notify should succeed: {n1}");
+
+    // Second idle ping: supersedes the first.
+    let (is_err, n2) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({"from": "desktop", "to": "envctl", "body": "still waiting 2", "dedupIdle": true}),
+    );
+    assert!(!is_err, "second idle notify should succeed: {n2}");
+
+    // The recipient's unread inbox shows ONLY the latest idle ping.
+    let (is_err, inbox) = mcp.call_tool("weave_inbox", serde_json::json!({"me": "envctl"}));
+    assert!(!is_err, "inbox should not error: {inbox}");
+    assert!(
+        inbox.contains("still waiting 2"),
+        "latest idle ping must be unread: {inbox}"
+    );
+    assert!(
+        !inbox.contains("still waiting 1"),
+        "superseded first idle ping must be hidden from unread: {inbox}"
+    );
+
+    // REAL-MESSAGE SAFETY: `weave_send` (no dedupIdle) of the same body twice — both
+    // stay unread; idle dedup never touches a real message.
+    for _ in 0..2 {
+        let (is_err, t) = mcp.call_tool(
+            "weave_send",
+            serde_json::json!({"from": "desktop", "to": "carol", "body": "real twice"}),
+        );
+        assert!(!is_err, "real send should succeed: {t}");
+    }
+    let (is_err, cinbox) = mcp.call_tool("weave_inbox", serde_json::json!({"me": "carol"}));
+    assert!(!is_err, "inbox should not error: {cinbox}");
+    assert_eq!(
+        cinbox.matches("real twice").count(),
+        2,
+        "two identical real sends are NEVER deduped: {cinbox}"
+    );
+
+    mcp.shutdown();
+}
+
 /// WL-050 / ADR-0003: the PRODUCTION-DEFAULT MCP surface is token-light. End-to-end
 /// through the real binary (no `WEAVE_MCP_EAGER`), `tools/list` advertises exactly one
 /// tool — the `weave` meta-tool — and the full operation set is reachable on demand via
@@ -904,6 +966,126 @@ fn cli_send_then_inbox_shows_body() {
     assert!(
         other.contains("empty"),
         "inbox for unrelated 'c' should be empty: {other:?}"
+    );
+}
+
+/// WL-039: `weave notify --dedup-idle` twice collapses a sender's idle pings to
+/// the latest unread one; both survive (flagged) in history/search; and a real
+/// `weave send` between the two pings is NEVER superseded. Without the flag, both
+/// pings survive unread.
+#[test]
+fn cli_notify_dedup_idle_collapses_to_latest_and_spares_real_message() {
+    let db = TestDb::new();
+
+    // First idle ping (idle-marked, no prior to supersede).
+    run_ok(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "zappfirst still waiting",
+            "--dedup-idle",
+        ],
+    );
+    // A REAL send between the pings — must NOT be superseded.
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "zappreal content",
+        ],
+    );
+    // Second idle ping — supersedes ONLY the first idle ping.
+    run_ok(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "zappsecond still waiting",
+            "--dedup-idle",
+        ],
+    );
+
+    // bob's unread inbox: the latest idle ping + the real message, NOT the 1st ping.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let iv: serde_json::Value = serde_json::from_str(&inbox).expect("inbox --json parses");
+    let bodies: Vec<&str> = iv["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains("zappsecond")),
+        "latest idle ping must be unread: {inbox}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("zappreal")),
+        "real message must NOT be superseded: {inbox}"
+    );
+    assert!(
+        !bodies.iter().any(|b| b.contains("zappfirst")),
+        "the superseded first idle ping must be hidden from unread: {inbox}"
+    );
+
+    // History (search surfaces superseded rows, flagged): BOTH idle pings survive.
+    let search = run_ok(&db, &["search", "--query", "zappfirst", "--json"]);
+    let sv: serde_json::Value = serde_json::from_str(&search).expect("search --json parses");
+    assert_eq!(
+        sv["messages"].as_array().map(|x| x.len()),
+        Some(1),
+        "the superseded first ping is retained in history/search: {search}"
+    );
+}
+
+/// WL-039 negative: without `--dedup-idle`, two notify pings BOTH stay unread (no
+/// auto-supersede; the marker/dedup is strictly opt-in).
+#[test]
+fn cli_notify_without_dedup_idle_keeps_both_unread() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "ndia ping one",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "ndia ping two",
+        ],
+    );
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let iv: serde_json::Value = serde_json::from_str(&inbox).expect("inbox --json parses");
+    assert_eq!(
+        iv["messages"].as_array().map(|x| x.len()),
+        Some(2),
+        "without --dedup-idle both pings remain unread: {inbox}"
     );
 }
 
@@ -9542,6 +9724,115 @@ fn mcp_lease_sweep_roundtrip() {
 }
 
 // ============================================================================
+// WL-038: ephemeral messages with TTL
+// ============================================================================
+
+/// `weave send --ttl N` stamps a future `expires_at` that the recipient's inbox
+/// surfaces (round-trip). Precise expiry/sweep behavior is covered by the store
+/// unit tests; this asserts the CLI seam carries the ttl through to a deadline.
+#[test]
+fn send_ttl_message_round_trips_with_expiry() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "ephemeral-body",
+            "--ttl",
+            "3600",
+        ],
+    );
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--json", "--peek"]);
+    let parsed: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    let msgs = parsed["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    let exp = msgs[0]["expires_at"]
+        .as_i64()
+        .expect("ttl stamped an expiry");
+    assert!(exp > 0, "expiry must be a positive epoch deadline");
+}
+
+/// `--ttl 0` and an over-cap `--ttl` are rejected with the cap message; no row.
+#[test]
+fn send_ttl_rejects_out_of_range() {
+    let db = TestDb::new();
+    let (ok, _o, err) = run(
+        &db,
+        &[
+            "send", "--from", "a", "--to", "b", "--body", "x", "--ttl", "0",
+        ],
+    );
+    assert!(!ok, "--ttl 0 must be rejected");
+    assert!(err.contains("ttl"), "cap error should mention ttl: {err:?}");
+
+    let (ok2, _o2, err2) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--body",
+            "y",
+            "--ttl",
+            "999999999",
+        ],
+    );
+    assert!(!ok2, "over-cap --ttl must be rejected");
+    assert!(
+        err2.contains("ttl"),
+        "cap error should mention ttl: {err2:?}"
+    );
+    // Neither attempt persisted a row.
+    let inbox = run_ok(&db, &["inbox", "--me", "b", "--json", "--peek"]);
+    let parsed: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 0);
+}
+
+/// A cross-store `send --to-store --ttl N` carries the ttl through the outbox →
+/// pull-commit path; the committed message in the receiver carries an expiry.
+#[test]
+fn send_ttl_cross_store_carries_through() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "cross-ephemeral",
+            "--ttl",
+            "3600",
+            "--to-store",
+            &b.path_str(),
+        ],
+    );
+    let pull = run_ok_env(
+        &b,
+        &["pull", "--me", "bob"],
+        &[("WEAVE_PULL_FROM", &a.path_str())],
+    );
+    assert!(pull.contains("pulled 1 message"), "{pull}");
+    let b_inbox = run_ok(&b, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let biv: serde_json::Value = serde_json::from_str(&b_inbox).unwrap();
+    assert_eq!(biv["messages"].as_array().unwrap().len(), 1);
+    let exp = biv["messages"][0]["expires_at"]
+        .as_i64()
+        .expect("cross-store ttl re-stamped as expiry on commit");
+    assert!(exp > 0);
+}
+
+// ============================================================================
 // WL-031: Message priority
 // ============================================================================
 
@@ -10410,6 +10701,259 @@ fn backup_refuses_to_overwrite_without_force() {
     );
 
     let _ = std::fs::remove_file(&archive);
+}
+
+// ---------------------------------------------------------------------------
+// WL-041: read-back verification for destructive config/hook writes.
+//
+// HOME ISOLATION (critical): `common::scrub_env` scrubs XDG_CONFIG_HOME but NOT
+// HOME, and settings.json lives at $HOME/.claude/settings.json. EVERY test below
+// pins a unique temp HOME via extra_env so it never touches the developer's real
+// ~/.claude/settings.json.
+// ---------------------------------------------------------------------------
+
+/// A unique temp directory rooted at the OS temp dir, tagged for debuggability.
+fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "weave-it-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+#[test]
+fn setup_settings_merge_is_read_back_verified() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-merge-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Pre-seed a FOREIGN hook (rtk) under SessionStart so we can prove preservation.
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings = claude_dir.join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "matcher": "",
+                    "hooks": [ { "type": "command", "command": "rtk hook session" } ] } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `claude` is absent in CI → MCP register no-ops; we assert on the HOOKS outcome.
+    let (ok, out, err) = run_env(&db, &["setup"], &[("HOME", &home_str)]);
+    assert!(
+        ok,
+        "setup should succeed (read-back passes on a good write):\n{out}\n{err}"
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let all: String = v.to_string();
+    // weave's four hooks present.
+    assert!(all.contains("hook session"), "session hook present: {all}");
+    assert!(all.contains("hook prompt"), "prompt hook present: {all}");
+    assert!(all.contains("hook wake"), "wake hook present: {all}");
+    // Foreign rtk hook preserved.
+    assert!(
+        all.contains("rtk hook session"),
+        "foreign rtk hook preserved: {all}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_settings_merge_idempotent_second_run() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-idem-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    let (ok1, _o1, e1) = run_env(&db, &["setup"], &[("HOME", &home_str)]);
+    assert!(ok1, "first setup: {e1}");
+    let (ok2, out2, e2) = run_env(&db, &["setup"], &[("HOME", &home_str)]);
+    assert!(ok2, "second setup: {e2}");
+    assert!(
+        out2.contains("already present"),
+        "second run reports idempotency: {out2}"
+    );
+
+    // Exactly one weave session hook (no duplicates).
+    let settings = home.join(".claude").join("settings.json");
+    let body = std::fs::read_to_string(&settings).unwrap();
+    let n = body.matches("hook session").count();
+    assert_eq!(n, 1, "no duplicate weave session hook: {body}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn uninstall_prune_is_read_back_verified() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("uninstall-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Seed a foreign hook, then run setup so weave hooks are added alongside it.
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "matcher": "",
+                    "hooks": [ { "type": "command", "command": "rtk hook session" } ] } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (ok, _o, e) = run_env(&db, &["setup"], &[("HOME", &home_str)]);
+    assert!(ok, "setup before uninstall: {e}");
+
+    // Now uninstall — read-back must confirm no weave hook remains and rtk survives.
+    let (uok, uout, uerr) = run_env(&db, &["uninstall"], &[("HOME", &home_str)]);
+    assert!(uok, "uninstall should succeed:\n{uout}\n{uerr}");
+
+    let body = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(
+        !body.contains("hook wake") && !body.contains("hook prompt"),
+        "no weave hook remains after uninstall: {body}"
+    );
+    assert!(
+        body.contains("rtk hook session"),
+        "foreign rtk hook survived uninstall: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn git_hook_install_is_read_back_verified_and_preserves_foreign() {
+    let db = TestDb::new();
+    let repo = unique_tmp_dir("git-hook-readback-repo");
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(git_init.status.success(), "git init failed");
+
+    // Pre-seed the pre-commit hook with a FOREIGN line.
+    let hooks_dir = repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n# foreign rtk pre-commit\nrtk pre-commit-check\n",
+    )
+    .unwrap();
+
+    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    assert!(ok, "setup --git-hooks should succeed:\n{out}\n{err}");
+
+    // Read-back: BOTH the guard line and the pre-existing foreign line are present.
+    let body = std::fs::read_to_string(&hook).unwrap();
+    assert!(
+        body.contains("weave lease guard"),
+        "weave guard line present: {body}"
+    );
+    assert!(
+        body.contains("rtk pre-commit-check"),
+        "foreign pre-commit line preserved: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn restore_config_settings_read_back_round_trip() {
+    // Source HOME/XDG seeded with a config.toml + settings.json, backed up, then
+    // restored into a SEPARATE fresh HOME/XDG; the restored bytes must match.
+    let src = TestDb::new();
+    run_ok(
+        &src,
+        &["send", "--from", "alice", "--to", "bob", "--body", "hello"],
+    );
+
+    let src_home = unique_tmp_dir("restore-src-home");
+    let src_xdg = unique_tmp_dir("restore-src-xdg");
+    let src_home_s = src_home.to_string_lossy().into_owned();
+    let src_xdg_s = src_xdg.to_string_lossy().into_owned();
+
+    // Seed config.toml under $XDG_CONFIG_HOME/weave/ and settings.json under $HOME/.claude/.
+    let weave_cfg_dir = src_xdg.join("weave");
+    std::fs::create_dir_all(&weave_cfg_dir).unwrap();
+    let cfg_body = "# weave config\nme = \"alice\"\n";
+    std::fs::write(weave_cfg_dir.join("config.toml"), cfg_body).unwrap();
+    let claude_dir = src_home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings_body = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": { "SessionStart": [] }
+    }))
+    .unwrap();
+    std::fs::write(claude_dir.join("settings.json"), &settings_body).unwrap();
+
+    let archive = std::env::temp_dir().join(format!(
+        "weave-it-restore-rb-{}-{}.tar",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let archive_str = archive.to_string_lossy().into_owned();
+
+    let bout = run_ok_env(
+        &src,
+        &["backup", "--out", &archive_str],
+        &[("HOME", &src_home_s), ("XDG_CONFIG_HOME", &src_xdg_s)],
+    );
+    assert!(bout.contains("backup written"), "backup: {bout}");
+
+    // Restore into FRESH destination dirs (with --force so config/settings land).
+    let dst = TestDb::new();
+    let dst_home = unique_tmp_dir("restore-dst-home");
+    let dst_xdg = unique_tmp_dir("restore-dst-xdg");
+    let dst_home_s = dst_home.to_string_lossy().into_owned();
+    let dst_xdg_s = dst_xdg.to_string_lossy().into_owned();
+
+    let rout = run_ok_env(
+        &dst,
+        &["restore", "--in", &archive_str, "--force"],
+        &[("HOME", &dst_home_s), ("XDG_CONFIG_HOME", &dst_xdg_s)],
+    );
+    assert!(rout.contains("restored:"), "restore: {rout}");
+
+    // Read-back from the test's side: restored bytes must match what was backed up.
+    let restored_cfg = std::fs::read_to_string(dst_xdg.join("weave").join("config.toml")).unwrap();
+    assert_eq!(
+        restored_cfg, cfg_body,
+        "restored config.toml matches source"
+    );
+    let restored_settings =
+        std::fs::read_to_string(dst_home.join(".claude").join("settings.json")).unwrap();
+    assert_eq!(
+        restored_settings, settings_body,
+        "restored settings.json matches source"
+    );
+    // And it parses as a JSON object (the read-back's own invariant).
+    let v: serde_json::Value = serde_json::from_str(&restored_settings).unwrap();
+    assert!(v.is_object(), "restored settings.json is a JSON object");
+
+    let _ = std::fs::remove_file(&archive);
+    let _ = std::fs::remove_dir_all(&src_home);
+    let _ = std::fs::remove_dir_all(&src_xdg);
+    let _ = std::fs::remove_dir_all(&dst_home);
+    let _ = std::fs::remove_dir_all(&dst_xdg);
 }
 
 // ---------------------------------------------------------------------------
@@ -11282,4 +11826,600 @@ done
             "expected stop confirmation, got: {stdout}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// WL-040: canonical session export/import (cross-instance portability).
+//
+// The headline proof: a message sent into DB-A, exported to a JSON file, and
+// imported into a FRESH DB-B appears for the identity in DB-B (id remapping +
+// portability across distinct stores). Plus: idempotent re-import, --dry-run
+// writes nothing, and mesh-memory round-trips.
+// ---------------------------------------------------------------------------
+
+/// A unique temp JSON path for one session export/import test.
+fn unique_session_file() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("weave-session-{pid}-{n}-{nanos}.json"))
+}
+
+/// A unique, isolated XDG_CONFIG_HOME dir (for mesh-memory isolation).
+fn unique_xdg_home(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!("weave-session-cfg-{tag}-{pid}-{n}-{nanos}"));
+    std::fs::create_dir_all(&d).expect("create temp config home");
+    d
+}
+
+#[test]
+fn session_export_import_round_trips_across_distinct_dbs() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+
+    // Seed DB-A: alice sends bob two messages.
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "first portable msg",
+        ],
+    );
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "second portable msg",
+        ],
+    );
+
+    // Export alice's session from DB-A.
+    let out = run_ok(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(out.contains("2 message(s)"), "export summary: {out}");
+    assert!(file.exists(), "export file must exist");
+
+    // Import into a fresh DB-B under the same identity.
+    let imp = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imp.contains("2 message(s) inserted"),
+        "import summary: {imp}"
+    );
+
+    // bob's inbox in DB-B shows both imported messages.
+    let inbox = run_ok(&b, &["inbox", "--me", "bob"]);
+    assert!(
+        inbox.contains("first portable msg") && inbox.contains("second portable msg"),
+        "imported messages must appear in DB-B for bob: {inbox}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_is_idempotent_on_reimport() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+
+    run_ok(
+        &a,
+        &[
+            "send", "--from", "alice", "--to", "bob", "--body", "dedup me",
+        ],
+    );
+    run_ok(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+
+    // First import inserts.
+    let imp1 = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imp1.contains("1 message(s) inserted"),
+        "first import: {imp1}"
+    );
+
+    // Second import of the SAME file is a no-op (skip-existing by synth key).
+    let imp2 = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imp2.contains("0 message(s) inserted") && imp2.contains("1 skipped"),
+        "re-import must dedup: {imp2}"
+    );
+
+    // bob's inbox still has exactly one copy.
+    let inbox = run_ok(&b, &["inbox", "--me", "bob"]);
+    let count = inbox.matches("dedup me").count();
+    assert_eq!(count, 1, "exactly one copy after re-import: {inbox}");
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_dry_run_writes_nothing() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+
+    run_ok(
+        &a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "ghost msg",
+        ],
+    );
+    run_ok(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+
+    let dry = run_ok(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        dry.contains("dry-run") && dry.contains("1 message(s)"),
+        "dry-run summary: {dry}"
+    );
+    assert!(dry.contains("no changes written"), "dry-run note: {dry}");
+
+    // Nothing was written: bob's inbox in DB-B is empty.
+    let inbox = run_ok(&b, &["inbox", "--me", "bob"]);
+    assert!(
+        !inbox.contains("ghost msg"),
+        "dry-run must not write: {inbox}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_export_import_round_trips_mesh_memory() {
+    let a = TestDb::new();
+    let b = TestDb::new();
+    let file = unique_session_file();
+    let a_cfg = unique_xdg_home("a");
+    let b_cfg = unique_xdg_home("b");
+    let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+    let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+    // Write a global memory entry into instance A's memory store.
+    run_ok_env(
+        &a,
+        &[
+            "memory",
+            "write",
+            "--scope",
+            "global",
+            "--key",
+            "patterns",
+            "--title",
+            "Patterns",
+            "--body",
+            "Always use types.",
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+
+    // Export from A (memory is read from A's XDG home).
+    run_ok_env(
+        &a,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+        &[("XDG_CONFIG_HOME", &a_cfg_s)],
+    );
+
+    // Import into B with a DIFFERENT XDG home — memory must land there.
+    let imp = run_ok_env(
+        &b,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert!(
+        imp.contains("memory entr"),
+        "import should report memory write: {imp}"
+    );
+
+    // B can now read the imported memory entry.
+    let got = run_ok_env(
+        &b,
+        &["memory", "read", "--scope", "global", "--key", "patterns"],
+        &[("XDG_CONFIG_HOME", &b_cfg_s)],
+    );
+    assert!(
+        got.contains("Always use types."),
+        "imported memory body must be readable in B: {got}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir_all(&a_cfg);
+    let _ = std::fs::remove_dir_all(&b_cfg);
+}
+
+// ---------------------------------------------------------------------------
+// WL-042: multi-provider lifecycle hook templates (Codex / Gemini / Aider).
+//
+// HOME ISOLATION (critical, the WL-041 #1 risk): every provider config lives
+// under $HOME (`.codex/config.toml`, `.gemini/settings.json`, `.aider.conf.yml`),
+// and `common::scrub_env` scrubs XDG_CONFIG_HOME but NOT HOME. EVERY test below
+// pins a UNIQUE temp HOME via extra_env so it never touches the developer's real
+// ~/.codex, ~/.gemini, or ~/.aider.conf.yml. `claude` is absent in CI, so the
+// Claude MCP-register step no-ops and we assert on the file outcome.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_codex_writes_notify_idempotent_and_preserves_foreign() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-codex-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Pre-seed a FOREIGN Codex config (a top-level key + a table) to prove preservation.
+    let codex_dir = home.join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let cfg = codex_dir.join("config.toml");
+    std::fs::write(&cfg, "model = \"o1\"\n\n[tui]\ntheme = \"dark\"\n").unwrap();
+
+    let (ok, out, err) = run_env(
+        &db,
+        &["setup", "--provider", "codex"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok, "codex setup should succeed:\n{out}\n{err}");
+
+    // File created/updated with weave's notify line; read-back-parseable text.
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    assert!(body.contains("notify = ["), "notify written: {body}");
+    assert!(body.contains("\"hook\""), "argv has hook: {body}");
+    assert!(body.contains("\"wake\""), "argv has wake: {body}");
+    // Foreign content preserved.
+    assert!(body.contains("model = \"o1\""), "foreign key kept: {body}");
+    assert!(
+        body.contains("theme = \"dark\""),
+        "foreign table kept: {body}"
+    );
+
+    // Idempotent re-run: no duplicate notify line, reports no change.
+    let (ok2, out2, err2) = run_env(
+        &db,
+        &["setup", "--provider", "codex"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok2, "second codex setup: {err2}");
+    assert!(
+        out2.contains("already present"),
+        "idempotent report: {out2}"
+    );
+    let body2 = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(body2.matches("notify = ").count(), 1, "one notify: {body2}");
+
+    // Uninstall removes ONLY weave's notify; foreign survives.
+    let (uok, uout, uerr) = run_env(
+        &db,
+        &["uninstall", "--provider", "codex"],
+        &[("HOME", &home_str)],
+    );
+    assert!(uok, "codex uninstall:\n{uout}\n{uerr}");
+    let body3 = std::fs::read_to_string(&cfg).unwrap();
+    assert!(!body3.contains("notify = "), "notify gone: {body3}");
+    assert!(
+        body3.contains("model = \"o1\""),
+        "foreign survived uninstall: {body3}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_gemini_writes_hooks_idempotent_and_preserves_foreign() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-gemini-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Pre-seed a FOREIGN hook under SessionStart in the Gemini settings.
+    let gemini_dir = home.join(".gemini");
+    std::fs::create_dir_all(&gemini_dir).unwrap();
+    let settings = gemini_dir.join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "theme": "default",
+            "hooks": {
+                "SessionStart": [ { "matcher": "",
+                    "hooks": [ { "type": "command", "command": "rtk hook session" } ] } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (ok, out, err) = run_env(
+        &db,
+        &["setup", "--provider", "gemini"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok, "gemini setup should succeed:\n{out}\n{err}");
+
+    // Read-back-parseable JSON with weave's four hooks + foreign preserved.
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let all = v.to_string();
+    assert!(all.contains("hook session"), "session hook: {all}");
+    assert!(all.contains("hook prompt"), "prompt hook: {all}");
+    assert!(all.contains("hook wake"), "wake hook: {all}");
+    assert!(all.contains("rtk hook session"), "foreign kept: {all}");
+    assert_eq!(v["theme"], "default", "foreign top-level key kept");
+
+    // Idempotent re-run.
+    let (ok2, out2, err2) = run_env(
+        &db,
+        &["setup", "--provider", "gemini"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok2, "second gemini setup: {err2}");
+    assert!(
+        out2.contains("already present"),
+        "idempotent report: {out2}"
+    );
+    let body2 = std::fs::read_to_string(&settings).unwrap();
+    // Count only weave's own session hook (single-quoted exe ending in `weave'`)
+    // so the foreign `rtk hook session` substring is not miscounted.
+    assert_eq!(
+        body2.matches("weave' hook session").count(),
+        1,
+        "one weave session hook: {body2}"
+    );
+
+    // Uninstall removes weave's hooks; foreign rtk survives.
+    let (uok, uout, uerr) = run_env(
+        &db,
+        &["uninstall", "--provider", "gemini"],
+        &[("HOME", &home_str)],
+    );
+    assert!(uok, "gemini uninstall:\n{uout}\n{uerr}");
+    let body3 = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        !body3.contains("hook wake") && !body3.contains("hook prompt"),
+        "weave hooks gone: {body3}"
+    );
+    assert!(
+        body3.contains("rtk hook session"),
+        "foreign survived: {body3}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_aider_writes_stanza_idempotent_and_preserves_foreign() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-aider-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Pre-seed a FOREIGN Aider config.
+    let cfg = home.join(".aider.conf.yml");
+    std::fs::write(&cfg, "model: gpt-4o\nauto-commits: false\n").unwrap();
+
+    let (ok, out, err) = run_env(
+        &db,
+        &["setup", "--provider", "aider"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok, "aider setup should succeed:\n{out}\n{err}");
+
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    assert!(body.contains("weave-hook:"), "weave stanza written: {body}");
+    assert!(
+        body.contains("hook session"),
+        "hook command present: {body}"
+    );
+    // Foreign keys preserved verbatim.
+    assert!(body.contains("model: gpt-4o"), "foreign key kept: {body}");
+    assert!(
+        body.contains("auto-commits: false"),
+        "foreign key kept: {body}"
+    );
+
+    // Idempotent re-run: one stanza only.
+    let (ok2, out2, err2) = run_env(
+        &db,
+        &["setup", "--provider", "aider"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok2, "second aider setup: {err2}");
+    assert!(
+        out2.contains("already present"),
+        "idempotent report: {out2}"
+    );
+    let body2 = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(
+        body2.matches("weave-hook:").count(),
+        1,
+        "one stanza: {body2}"
+    );
+
+    // Uninstall removes ONLY weave's stanza.
+    let (uok, uout, uerr) = run_env(
+        &db,
+        &["uninstall", "--provider", "aider"],
+        &[("HOME", &home_str)],
+    );
+    assert!(uok, "aider uninstall:\n{uout}\n{uerr}");
+    let body3 = std::fs::read_to_string(&cfg).unwrap();
+    assert!(!body3.contains("weave-hook:"), "stanza gone: {body3}");
+    assert!(body3.contains("model: gpt-4o"), "foreign survived: {body3}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_provider_claude_is_unchanged_default_path() {
+    // Regression: `--provider claude` (and the default `setup`) must still write
+    // the SAME ~/.claude/settings.json shape — the four lifecycle hooks.
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-claude-regression-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    // Explicit `--provider claude`.
+    let (ok, out, err) = run_env(
+        &db,
+        &["setup", "--provider", "claude"],
+        &[("HOME", &home_str)],
+    );
+    assert!(ok, "claude setup should succeed:\n{out}\n{err}");
+    let settings = home.join(".claude").join("settings.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let hooks = v["hooks"].as_object().expect("hooks object");
+    for ev in ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"] {
+        assert!(hooks.contains_key(ev), "claude hook {ev} present: {v}");
+    }
+
+    // The BARE default `setup` (no --provider) produces the identical file.
+    let home2 = unique_tmp_dir("setup-claude-bare-home");
+    let home2_str = home2.to_string_lossy().into_owned();
+    let (ok2, _o2, e2) = run_env(&db, &["setup"], &[("HOME", &home2_str)]);
+    assert!(ok2, "bare setup: {e2}");
+    let settings2 = home2.join(".claude").join("settings.json");
+    let body1 = std::fs::read_to_string(&settings).unwrap();
+    let body2 = std::fs::read_to_string(&settings2).unwrap();
+    assert_eq!(
+        body1, body2,
+        "`--provider claude` and bare `setup` must produce byte-identical settings.json"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&home2);
+}
+
+#[test]
+fn setup_rejects_invalid_provider() {
+    // An out-of-enum --provider value is rejected by clap (non-zero exit) before
+    // any file is touched.
+    let db = TestDb::new();
+    let home = unique_tmp_dir("setup-bad-provider-home");
+    let home_str = home.to_string_lossy().into_owned();
+
+    let (ok, _out, err) = run_env(
+        &db,
+        &["setup", "--provider", "bogus"],
+        &[("HOME", &home_str)],
+    );
+    assert!(!ok, "invalid --provider must be rejected");
+    assert!(
+        err.contains("invalid value") || err.contains("possible values") || err.contains("bogus"),
+        "clap usage error mentions the bad value: {err}"
+    );
+    // No config files were written anywhere under the temp HOME.
+    assert!(
+        !home.join(".claude").exists()
+            && !home.join(".codex").exists()
+            && !home.join(".gemini").exists()
+            && !home.join(".aider.conf.yml").exists(),
+        "no provider file written on a rejected invalid --provider"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }

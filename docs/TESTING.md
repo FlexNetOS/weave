@@ -469,6 +469,61 @@ suite is hermetic in CI.
   invariant. Exercised purely (no store, no subprocess), so it pins the state
   machine independently of the SQL that enforces it.
 
+- **Property 6 — ephemeral expiry monotonicity (WL-038).** For any non-negative
+  base `ts` and a valid `ttl in 1..=MAX_MSG_TTL_SECS`,
+  `model::expiry_from_ttl(ts, ttl)` is **strictly** after `ts` (no wrap) and bounded
+  by `ts + MAX_MSG_TTL_SECS`; a companion case asserts the helper **saturates**
+  (`== ts.saturating_add(ttl)`) for arbitrary `i64` inputs and never panics. This
+  pins the no-overflow guarantee behind the `expires_at = ts + ttl` deadline that the
+  CLI/MCP TTL cap (`ttl_valid`) and the store sweep rely on. The precise
+  delete-on-sweep / read-exclusion behavior is covered by the dual-backend store unit
+  tests (`expiry_stamps_and_excludes_from_unread`, `sweep_expired_messages_*`,
+  `gc_also_reaps_expired_ephemeral`) and the `expired_ephemeral_is_not_recoverable`
+  security test (gone from inbox/history/search/export after expiry + sweep).
+
+- **Idle notification dedup (WL-039).** Covered by **dual-backend store unit tests**
+  (run under default sqlite **and** `--no-default-features --features libsql`):
+  `supersede_prior_idle_replaces_prior_unread_idle` (two idle pings → only the latest
+  unread, predecessor stamped `superseded_by` + hidden from inbox/peek/unread),
+  `idle_dedup_never_touches_real_messages` (a real `send` between two pings is NOT
+  superseded — the `kind='idle'` predicate is the hard real-message boundary),
+  `idle_dedup_only_supersedes_unread` (a read predecessor is spared),
+  `idle_dedup_scoped_to_same_sender_recipient`, `idle_dedup_authz_self_only` (the
+  sender-scoped guard — peer B cannot dedup peer A's pings), and
+  `idle_dedup_idempotency_replay_is_noop` (the `id <> new_id` guard makes an
+  idempotency-key replay a clean no-op, never self-supersede), plus the libSQL twins
+  which also exercise the **positional `kind` projection at index 12**. The CLI seam is
+  driven through the compiled binary in `tests/integration.rs`
+  (`cli_notify_dedup_idle_collapses_to_latest_and_spares_real_message` and the
+  `..._without_dedup_idle_keeps_both_unread` negative), the MCP seam by an `McpServer`
+  test (`mcp_weave_notify_dedup_idle_collapses_and_spares_real_send`), and the
+  zero-standing-token contract by `catalog_weave_notify_lists_dedup_idle` +
+  `standing_mcp_surface_is_within_token_budget`.
+
+- **Canonical session export/import (WL-040).** Three layers, no stubs.
+  **Pure unit** (`weave-core/src/session.rs`): `serialize_session → to_json →
+  from_json` round-trips messages, asks, and memory byte-for-byte; `from_json`
+  **rejects** a wrong format magic and a `schema_version` newer than the build, and
+  **tolerates** unknown extra fields (additive `#[serde(default)]`); `synth_idempotency_key`
+  is deterministic, bounded, sanitizes a hostile identity, and varies per source id;
+  empty-session round-trips. **Integration** (`tests/integration.rs`, runs under
+  *both* backends since it drives the compiled binary):
+  `session_export_import_round_trips_across_distinct_dbs` is the headline cross-DB
+  portability proof (a message sent into DB-A appears for the identity in a *fresh*
+  DB-B after export→import — proving id remap), `session_import_is_idempotent_on_reimport`
+  (the same file imported twice inserts each message once),
+  `session_import_dry_run_writes_nothing`, and `session_export_import_round_trips_mesh_memory`
+  (a global memory entry written in instance A, with its own `XDG_CONFIG_HOME`, is
+  readable in instance B with a *different* config home). **Security**
+  (`tests/security.rs`): the import file is an untrusted parser + DB write path —
+  an over-`MAX_BODY` body, a control-char identity, and a malformed idempotency key are
+  each **rejected cleanly** (non-zero exit, no partial-write — the inbox re-opens with
+  zero messages); a body of `'; DROP TABLE messages; --` + `$(…)`/backtick metachars
+  imports as **literal text** (byte-identical round-trip, DB intact, no shell);
+  `--out` overwrite/missing-parent and `--in` missing/directory/non-weave-JSON are
+  guarded. **No new `Store` method, no schema change, no new standing MCP tool** —
+  so the libSQL CI job and the standing-budget test are known-unaffected.
+
 ### Tracked ask/answer/ack (P1)
 
 The ask/answer/ack lifecycle is tested **hermetically across both backends** and
