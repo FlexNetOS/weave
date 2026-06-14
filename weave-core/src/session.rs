@@ -57,11 +57,19 @@ pub struct SessionExport {
     /// The portable message set (the core payload; imported via `Store::send`).
     #[serde(default)]
     pub messages: Vec<ExportedMessage>,
-    /// The tracked-ask threads (recorded for fidelity; NOT replayed on import in
-    /// this version — see the WL-040b follow-up). `#[serde(default)]` keeps an
+    /// The tracked-ask threads, replayed faithfully on import via
+    /// [`crate::store::Store::import_ask`] (WL-040b): each ask is re-materialized in
+    /// its exported `AskState` (open / answered / acked) with its message links
+    /// remapped to the freshly re-minted local ids. `#[serde(default)]` keeps an
     /// older document that omits the block deserializable.
     #[serde(default)]
     pub asks: Vec<ExportedAsk>,
+    /// The ask-many PARENT anchor rows (P2 broadcast-ask groups), replayed before
+    /// the child asks that reference them so `parent_id` linkage survives the import
+    /// (WL-040b). `#[serde(default)]` keeps an older document that omits the block
+    /// deserializable.
+    #[serde(default)]
+    pub ask_groups: Vec<ExportedAskGroup>,
     /// The mesh memory entries (filesystem-backed scoped memory; full round-trip).
     /// `#[serde(default)]` keeps an older document that omits the block
     /// deserializable.
@@ -92,10 +100,14 @@ pub struct ExportedMessage {
     pub priority: Option<String>,
 }
 
-/// One tracked ask, recorded for fidelity. NOT imported in this version (faithful
-/// ask-state replay needs a new dual-backend `Store::import_ask` accepting an
-/// out-of-order [`crate::model::AskState`] — a distinct cohesive change tracked as
-/// WL-040b). Every field is `#[serde(default)]`-tolerant on the additive ones.
+/// One tracked ask, replayed faithfully on import (WL-040b) via the dual-backend
+/// `Store::import_ask`, which materializes the row directly in its exported
+/// [`crate::model::AskState`] (out-of-order, bypassing the create→answer→ack
+/// lifecycle) with `question_msg_id`/`answer_msg_id` remapped to the freshly
+/// re-minted local message ids. Every field that was added after the first cut is
+/// `#[serde(default)]`, so an older export (which omitted `kind`/`options`/
+/// `reply_to`/`close_note`/`parent_id`) stays deserializable and replays with the
+/// safe defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExportedAsk {
     pub id: String,
@@ -108,10 +120,49 @@ pub struct ExportedAsk {
     pub subject: Option<String>,
     /// Lifecycle state label (`open`/`answered`/`acked`).
     pub state: String,
+    /// Structured kind label (`free_text`/`choice`/`tool_permission`); defaults to
+    /// `free_text` for an older export that omitted it.
+    #[serde(default = "default_ask_kind")]
+    pub kind: String,
+    /// Kind-specific payload (newline-separated choices, or `tool_name\ntool_args`).
+    #[serde(default)]
+    pub options: Option<String>,
+    /// Prior ask id this one chains/closes (`None` for a root ask). Carried for
+    /// fidelity; remapped to the new local ask id on import when resolvable.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Optional closing note from `ack`.
+    #[serde(default)]
+    pub close_note: Option<String>,
     pub opened_ts: i64,
     pub updated_ts: i64,
     #[serde(default)]
     pub closed_ts: Option<i64>,
+    /// Parent ask-many group id (`askm_<...>`) this ask is a child of, or `None` for
+    /// a standalone ask. Remapped to the replayed group id on import.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+/// Default `ExportedAsk::kind` for an older export that predates the WL-040b field:
+/// the legacy `free_text` kind (matches `AskKind::default()`).
+fn default_ask_kind() -> String {
+    "free_text".to_string()
+}
+
+/// One ask-many PARENT anchor row (the `ask_groups` table), recorded so a
+/// broadcast-ask group's `parent_id` linkage and totality (`target_count`) survive
+/// the import (WL-040b). Replayed before the child asks that reference it via the
+/// dual-backend `Store::import_ask_group`. Every added field is `#[serde(default)]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportedAskGroup {
+    pub parent_id: String,
+    pub asker: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub body: String,
+    pub opened_ts: i64,
+    pub target_count: i64,
 }
 
 /// One mesh-memory entry (filesystem-backed scoped memory; full round-trip).
@@ -134,11 +185,13 @@ pub struct ExportedMemory {
 }
 
 /// Build a canonical envelope from already-fetched, pure data. No I/O.
+#[allow(clippy::too_many_arguments)]
 pub fn serialize_session(
     identity: &str,
     exported_at: i64,
     messages: Vec<ExportedMessage>,
     asks: Vec<ExportedAsk>,
+    ask_groups: Vec<ExportedAskGroup>,
     memory: Vec<ExportedMemory>,
 ) -> SessionExport {
     SessionExport {
@@ -148,6 +201,7 @@ pub fn serialize_session(
         exported_at,
         messages,
         asks,
+        ask_groups,
         memory,
     }
 }
@@ -228,7 +282,7 @@ mod tests {
     #[test]
     fn round_trip_preserves_messages() {
         let msgs = vec![sample_msg(1, Some("k1")), sample_msg(2, None)];
-        let env = serialize_session("alice", 12345, msgs.clone(), vec![], vec![]);
+        let env = serialize_session("alice", 12345, msgs.clone(), vec![], vec![], vec![]);
         let json = to_json(&env).unwrap();
         let back = from_json(&json).unwrap();
         assert_eq!(back.identity, "alice");
@@ -247,9 +301,22 @@ mod tests {
             askee: "bob".into(),
             subject: None,
             state: "answered".into(),
+            kind: "choice".into(),
+            options: Some("yes\nno".into()),
+            reply_to: None,
+            close_note: None,
             opened_ts: 100,
             updated_ts: 200,
             closed_ts: None,
+            parent_id: Some("askm_1_2".into()),
+        }];
+        let groups = vec![ExportedAskGroup {
+            parent_id: "askm_1_2".into(),
+            asker: "alice".into(),
+            subject: Some("poll".into()),
+            body: "yes or no?".into(),
+            opened_ts: 100,
+            target_count: 2,
         }];
         let mem = vec![ExportedMemory {
             scope_kind: "global".into(),
@@ -259,19 +326,43 @@ mod tests {
             tags: vec!["rust".into()],
             body: "Always use types.".into(),
         }];
-        let env = serialize_session("alice", 1, vec![], asks.clone(), mem.clone());
+        let env = serialize_session(
+            "alice",
+            1,
+            vec![],
+            asks.clone(),
+            groups.clone(),
+            mem.clone(),
+        );
         let back = from_json(&to_json(&env).unwrap()).unwrap();
         assert_eq!(back.asks, asks);
+        assert_eq!(back.ask_groups, groups);
         assert_eq!(back.memory, mem);
     }
 
     #[test]
+    fn older_export_without_new_ask_fields_defaults() {
+        // An export predating the WL-040b ExportedAsk fields must still parse, with
+        // kind defaulting to `free_text` and the new optionals to None.
+        let json = format!(
+            r#"{{"weave_session_export":{FORMAT_TAG},"schema_version":{SCHEMA_VERSION},"identity":"a","exported_at":0,"messages":[],"asks":[{{"id":"ask_1_2","question_msg_id":1,"asker":"a","askee":"b","state":"open","opened_ts":1,"updated_ts":1}}],"memory":[]}}"#
+        );
+        let env = from_json(&json).unwrap();
+        assert_eq!(env.asks.len(), 1);
+        assert_eq!(env.asks[0].kind, "free_text");
+        assert_eq!(env.asks[0].options, None);
+        assert_eq!(env.asks[0].parent_id, None);
+        assert!(env.ask_groups.is_empty());
+    }
+
+    #[test]
     fn empty_session_round_trips() {
-        let env = serialize_session("solo", 7, vec![], vec![], vec![]);
+        let env = serialize_session("solo", 7, vec![], vec![], vec![], vec![]);
         let back = from_json(&to_json(&env).unwrap()).unwrap();
         assert_eq!(back, env);
         assert!(back.messages.is_empty());
         assert!(back.asks.is_empty());
+        assert!(back.ask_groups.is_empty());
         assert!(back.memory.is_empty());
     }
 

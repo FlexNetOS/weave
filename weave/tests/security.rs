@@ -4368,6 +4368,199 @@ fn session_import_rejects_malformed_idempotency_key() {
     let _ = std::fs::remove_file(&file);
 }
 
+// ---------------------------------------------------------------------------
+// WL-040b: ask-thread replay is an untrusted DB-write path too. A dangling ask
+// (its question message absent from the export) is SKIPPED with a counted warning,
+// never inserting a broken link; a malformed state/kind/id/options/parent_id is
+// rejected by validate_asks BEFORE any store write.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_import_skips_dangling_ask_reference() {
+    let db = TestDb::new();
+    // The ask references question_msg_id 999, which is NOT in messages[]. The import
+    // must SUCCEED (the messages import is clean) but skip the dangling ask, never
+    // inserting a row pointing at a non-existent message.
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": "real"}],
+        "asks": [{
+            "id": "ask_999_1", "question_msg_id": 999, "asker": "alice", "askee": "bob",
+            "state": "open", "kind": "free_text", "opened_ts": 1, "updated_ts": 1
+        }],
+        "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, out, _err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        ok,
+        "import succeeds; the dangling ask is skipped, not fatal"
+    );
+    assert!(
+        out.contains("1 dangling skipped") && out.contains("0 ask(s) replayed"),
+        "dangling ask is counted + skipped: {out}"
+    );
+    // No corrupt ask row was inserted.
+    let asks = run_ok(&db, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&asks).expect("asks json");
+    assert!(
+        v["asks"].as_array().unwrap().is_empty(),
+        "no broken ask row inserted: {asks}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_malformed_ask_state() {
+    let db = TestDb::new();
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": "q"}],
+        "asks": [{
+            "id": "ask_1_1", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+            "state": "exploded", "kind": "free_text", "opened_ts": 1, "updated_ts": 1
+        }],
+        "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "unknown ask state must be rejected");
+    assert!(err.contains("unknown state"), "expected state error: {err}");
+    // Rejected BEFORE any write: no message landed either.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox json");
+    assert_eq!(
+        v["messages"].as_array().map(|a| a.len()),
+        Some(0),
+        "nothing partial-written: {inbox}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_oversized_ask_options() {
+    let db = TestDb::new();
+    let big = "x".repeat(70_000); // > MAX_BODY (65536)
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": "q"}],
+        "asks": [{
+            "id": "ask_1_1", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+            "state": "open", "kind": "choice", "options": big, "opened_ts": 1, "updated_ts": 1
+        }],
+        "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "oversized ask options must be rejected");
+    assert!(err.contains("too long"), "expected length error: {err}");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_malformed_ask_parent_id() {
+    let db = TestDb::new();
+    // parent_id is not a valid askm_ id (fails ask_many_id_valid).
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": "q"}],
+        "asks": [{
+            "id": "ask_1_1", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+            "state": "open", "kind": "free_text", "parent_id": "ask_1_1",
+            "opened_ts": 1, "updated_ts": 1
+        }],
+        "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "malformed parent_id must be rejected");
+    assert!(err.contains("parent_id"), "expected parent_id error: {err}");
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_hostile_ask_asker() {
+    let db = TestDb::new();
+    // A control char in the ask asker identity must be rejected by check_ident.
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{"id": 1, "ts": 0, "sender": "alice", "recipient": "bob", "body": "q"}],
+        "asks": [{
+            "id": "ask_1_1", "question_msg_id": 1, "asker": "al\u{1}ice", "askee": "bob",
+            "state": "open", "kind": "free_text", "opened_ts": 1, "updated_ts": 1
+        }],
+        "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "hostile ask asker must be rejected");
+    assert!(
+        err.contains("control characters") || err.contains("asker"),
+        "expected ident error: {err}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
 #[test]
 fn session_import_stores_sql_and_shell_metachars_as_literals() {
     let db = TestDb::new();

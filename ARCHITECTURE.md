@@ -502,10 +502,22 @@ row ids will not match. **Import reuses `Store::send`** — no new backend metho
 schema change — so id-remap is free (fresh local ids) and re-import is idempotent
 (dedup on `idempotency_key`, with a deterministic synthetic key
 `wl040:<identity>:<id>` for keyless legacy messages). Identity is remapped via `--as`.
-Asks are recorded in the envelope but **not replayed** in v1 (faithful ask-state
-replay needs a new dual-backend `Store::import_ask` — tracked as WL-040b); **peers
-are excluded by design** (host/mux/birth-cert-local liveness, a takeover hazard
-elsewhere). The import file is **untrusted external input**: every field is bounded
+Tracked **asks are replayed faithfully** (WL-040b) via the dual-backend
+`Store::import_ask` — a deliberate out-of-order materializer that inserts an ask
+row DIRECTLY in its exported `AskState` (open / answered / acked), bypassing the
+create→answer→ack lifecycle (the question/answer message rows already exist from the
+message-import pass), with `question_msg_id`/`answer_msg_id` **remapped** to the
+freshly minted local message ids (resolved from `Store::send`, which returns the
+existing id on a dedup hit). Broadcast-ask **groups** round-trip too: the envelope
+carries the `ask_groups` parent anchors (read via `Store::list_ask_groups`),
+replayed via `Store::import_ask_group` **before** the child asks so `parent_id`
+linkage survives. Both new methods are mirrored in `store.rs` (named `params!`) and
+`store_libsql.rs` (positional `params(vec![...])`, 15-column INSERT order pinned to
+`row_to_ask`'s indices) and dedup (skip-existing) on the remapped triple /
+`parent_id`, so re-import is idempotent. A **dangling** ask (its message absent from
+the export) is skipped+counted, never linked broken; the `reply_to` chain pointer is
+NULLed (it references a regenerated source ask id). **Peers are excluded by design**
+(host/mux/birth-cert-local liveness, a takeover hazard elsewhere). The import file is **untrusted external input**: every field is bounded
 (`check_ident`, `MAX_BODY`, subject cap, id-shape) before any write, all writes go
 through parameterized `Store::send`, no shell is spawned, the format embeds no path
 fields, and `--in`/`--out` are traversal-guarded (the `backup.rs` discipline). The

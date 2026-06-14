@@ -7,9 +7,10 @@
 
 use crate::config::StoreSource;
 use crate::model::{
-    now, Ask, AskKind, AskManyResult, AskRole, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter,
-    JobPatch, JobResultView, JobSpec, JobState, Message, OrchestratorStatus, Peer,
-    PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind,
+    now, Ask, AskGroup, AskKind, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace,
+    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
+    OrchestratorStatus, Peer, PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter,
+    Schedule, ScheduleKind,
 };
 use anyhow::Result;
 
@@ -26,8 +27,8 @@ pub use crate::store_libsql::{
 use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id,
-    permission_status, pr_url_valid, AskGroup, AskManyChildView, AskState, Lease, BROADCAST_SQL,
-    MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
+    permission_status, pr_url_valid, AskManyChildView, Lease, BROADCAST_SQL, MAX_CRON_EXPR_LEN,
+    MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -453,6 +454,63 @@ pub trait Store: Send {
     /// capped at `clamp_limit(limit)`.
     #[allow(dead_code)]
     fn list_asks(&self, me: &str, role: AskRole, limit: i64) -> Result<Vec<Ask>>;
+
+    /// WL-040b: list the ask-many PARENT anchor rows (`ask_groups`) for `parent_ids`
+    /// (the distinct `parent_id`s of the exported asks), so `session export` can carry
+    /// the group rows the child asks reference. Read-only; unknown ids are simply
+    /// absent from the result. Returns in no guaranteed order.
+    #[allow(dead_code)]
+    fn list_ask_groups(&self, parent_ids: &[String]) -> Result<Vec<AskGroup>>;
+
+    /// WL-040b: materialize ONE exported ask directly in an arbitrary terminal/
+    /// non-terminal [`AskState`] (open / answered / acked), bypassing the normal
+    /// create→answer→ack lifecycle (and [`AskState::can_transition`]) — the question/
+    /// answer `messages` rows already exist from the message-import pass, so this is a
+    /// deliberate out-of-order materializer. It inserts NO `messages` row. `id` is the
+    /// caller's freshly-minted local ask id (the source id is meaningless in the
+    /// target); `question_msg_id`/`answer_msg_id` are the REMAPPED local message ids;
+    /// `asker`/`askee` are already `--as`-remapped. Re-validates its own inputs at the
+    /// store seam (`check_ident` asker/askee, `ask_id_valid(id)`, options/close_note
+    /// length-capped) and dedups on `(asker, askee, question_msg_id)` so re-import is
+    /// idempotent. Parameterized SQL only. Returns `Ok(true)` if a row was inserted,
+    /// `Ok(false)` if an equivalent ask already existed (skipped).
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn import_ask(
+        &self,
+        id: &str,
+        question_msg_id: i64,
+        answer_msg_id: Option<i64>,
+        asker: &str,
+        askee: &str,
+        subject: Option<&str>,
+        state: AskState,
+        kind: AskKind,
+        options: Option<&str>,
+        reply_to: Option<&str>,
+        close_note: Option<&str>,
+        opened_ts: i64,
+        updated_ts: i64,
+        closed_ts: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Result<bool>;
+
+    /// WL-040b: materialize ONE exported ask-many PARENT anchor (`ask_groups`) row,
+    /// replayed BEFORE the child asks that reference it so `parent_id` linkage
+    /// survives. `parent_id` is the caller's freshly-minted local group id. Re-validates
+    /// (`ask_many_id_valid(parent_id)`, `check_ident(asker)`, body/subject capped) and
+    /// dedups on `parent_id` so re-import is idempotent. Parameterized SQL only.
+    /// Returns `Ok(true)` if inserted, `Ok(false)` if it already existed (skipped).
+    #[allow(dead_code)]
+    fn import_ask_group(
+        &self,
+        parent_id: &str,
+        asker: &str,
+        subject: Option<&str>,
+        body: &str,
+        opened_ts: i64,
+        target_count: i64,
+    ) -> Result<bool>;
 
     /// P1: true iff `me` has at least one ask in [`AskState::Open`] where they are
     /// the askee. Used by the prompt-hook reminder nudge (WL-014).
@@ -4203,6 +4261,163 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn list_ask_groups(&self, parent_ids: &[String]) -> Result<Vec<AskGroup>> {
+        let mut out = Vec::new();
+        // Bounded, parameterized per-id lookups (no IN-list interpolation): the input
+        // is the small distinct set of parent_ids from the exported asks.
+        for pid in parent_ids {
+            if !ask_many_id_valid(pid) {
+                continue;
+            }
+            let g: Option<AskGroup> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id, asker, subject, body, opened_ts, target_count
+                     FROM ask_groups WHERE parent_id = ?1",
+                    params![pid],
+                    |r| {
+                        Ok(AskGroup {
+                            parent_id: r.get(0)?,
+                            asker: r.get(1)?,
+                            subject: r.get(2)?,
+                            body: r.get(3)?,
+                            opened_ts: r.get(4)?,
+                            target_count: r.get(5)?,
+                        })
+                    },
+                )
+                .ok();
+            if let Some(g) = g {
+                out.push(g);
+            }
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_ask(
+        &self,
+        id: &str,
+        question_msg_id: i64,
+        answer_msg_id: Option<i64>,
+        asker: &str,
+        askee: &str,
+        subject: Option<&str>,
+        state: AskState,
+        kind: AskKind,
+        options: Option<&str>,
+        reply_to: Option<&str>,
+        close_note: Option<&str>,
+        opened_ts: i64,
+        updated_ts: i64,
+        closed_ts: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Result<bool> {
+        // Defense-in-depth: re-validate at the store seam even though the caller
+        // bounds every field. asker/askee are identity-shaped; the minted id is the
+        // ask-id shape; options/close_note are length-capped (subject is bounded by
+        // the caller's MAX_IMPORT_SUBJECT; the body lives in messages, not here).
+        check_ident("asker", asker)?;
+        check_ident("askee", askee)?;
+        if !ask_id_valid(id) {
+            anyhow::bail!("invalid imported ask id.");
+        }
+        if let Some(o) = options {
+            check_body(o)?;
+        }
+        if let Some(c) = close_note {
+            check_body(c)?;
+        }
+        if let Some(rt) = reply_to {
+            if !ask_id_valid(rt) {
+                anyhow::bail!("invalid imported reply_to correlation id.");
+            }
+        }
+        if let Some(p) = parent_id {
+            if !ask_many_id_valid(p) {
+                anyhow::bail!("invalid imported parent_id.");
+            }
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Idempotency: an ask already pointing at this (asker, askee, question) is the
+        // SAME thread — the source ask id is meaningless across instances, so we dedup
+        // on the remapped triple rather than the id (the message remap is itself
+        // idempotent, so a re-import lands on the same question_msg_id).
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM asks WHERE asker = ?1 AND askee = ?2 AND question_msg_id = ?3",
+            params![asker, askee, question_msg_id],
+            |r| r.get(0),
+        )?;
+        if existing > 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        // Out-of-order materialize: insert the row DIRECTLY in `state` with answer/
+        // close fields, bypassing the lifecycle machine. 15-column INSERT order matches
+        // the canonical asks projection.
+        tx.execute(
+            "INSERT INTO asks
+                (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind,
+                 options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                id,
+                question_msg_id,
+                answer_msg_id,
+                asker,
+                askee,
+                subject,
+                state.as_str(),
+                kind.as_str(),
+                options,
+                reply_to,
+                close_note,
+                opened_ts,
+                updated_ts,
+                closed_ts,
+                parent_id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn import_ask_group(
+        &self,
+        parent_id: &str,
+        asker: &str,
+        subject: Option<&str>,
+        body: &str,
+        opened_ts: i64,
+        target_count: i64,
+    ) -> Result<bool> {
+        if !ask_many_id_valid(parent_id) {
+            anyhow::bail!("invalid imported ask-many parent id.");
+        }
+        check_ident("asker", asker)?;
+        check_body(body)?;
+        if let Some(s) = subject {
+            check_body(s)?;
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ask_groups WHERE parent_id = ?1",
+            params![parent_id],
+            |r| r.get(0),
+        )?;
+        if existing > 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO ask_groups (parent_id, asker, subject, body, opened_ts, target_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![parent_id, asker, subject, body, opened_ts, target_count],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn has_open_asks(&self, me: &str) -> Result<bool> {
         check_ident("me", me)?;
         let count: i64 = self.conn.query_row(
@@ -5788,6 +6003,197 @@ mod tests {
         assert_eq!(as_askee[0].id, c2);
         let any = s.list_asks("a", AskRole::Any, 50).unwrap();
         assert_eq!(any.len(), 2);
+    }
+
+    /// WL-040b: `import_ask` materializes an ANSWERED ask out-of-order (bypassing the
+    /// create→answer→ack lifecycle) with the correct state/kind/options and a NULL
+    /// `closed_ts`; the dedup pre-check makes a second identical import a no-op.
+    #[test]
+    fn import_ask_materializes_answered_and_is_idempotent() {
+        let s = mem();
+        let q = s
+            .send("a", "b", Some("subj"), "question?", None, None)
+            .unwrap();
+        let ans = s
+            .send("b", "a", Some("Re: subj"), "answer!", None, None)
+            .unwrap();
+        let id = crate::model::new_ask_id(q);
+        let inserted = s
+            .import_ask(
+                &id,
+                q,
+                Some(ans),
+                "a",
+                "b",
+                Some("subj"),
+                AskState::Answered,
+                AskKind::Choice,
+                Some("yes\nno"),
+                None,
+                None,
+                100,
+                200,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(inserted, "first import inserts");
+        let got = s.get_ask(&id).unwrap().unwrap();
+        assert_eq!(got.state, AskState::Answered);
+        assert_eq!(got.kind, AskKind::Choice);
+        assert_eq!(got.options.as_deref(), Some("yes\nno"));
+        assert_eq!(got.question_msg_id, q);
+        assert_eq!(got.answer_msg_id, Some(ans));
+        assert_eq!(got.closed_ts, None);
+        assert_eq!(got.opened_ts, 100);
+        assert_eq!(got.updated_ts, 200);
+        // Idempotent: a second import on the same (asker, askee, question) is skipped.
+        let again = s
+            .import_ask(
+                &crate::model::new_ask_id(q),
+                q,
+                Some(ans),
+                "a",
+                "b",
+                Some("subj"),
+                AskState::Answered,
+                AskKind::Choice,
+                Some("yes\nno"),
+                None,
+                None,
+                100,
+                200,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!again, "duplicate import is skipped");
+        assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
+    }
+
+    /// WL-040b: `import_ask` materializes an ACKED/closed ask, round-tripping
+    /// `closed_ts` + `close_note`; `import_ask_group` replays a parent anchor and
+    /// links a child ask's `parent_id`, and the group reads back via `ask_many_result`.
+    #[test]
+    fn import_ask_materializes_acked_and_group() {
+        let s = mem();
+        let pid = crate::model::new_ask_many_id(500);
+        assert!(s
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .unwrap());
+        // Re-import the group: idempotent skip.
+        assert!(!s
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .unwrap());
+
+        let q = s.send("a", "b", None, "yes or no?", None, None).unwrap();
+        let id = crate::model::new_ask_id(q);
+        assert!(s
+            .import_ask(
+                &id,
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Acked,
+                AskKind::FreeText,
+                None,
+                None,
+                Some("closing note"),
+                10,
+                30,
+                Some(30),
+                Some(&pid),
+            )
+            .unwrap());
+        let got = s.get_ask(&id).unwrap().unwrap();
+        assert_eq!(got.state, AskState::Acked);
+        assert_eq!(got.closed_ts, Some(30));
+        assert_eq!(got.close_note.as_deref(), Some("closing note"));
+        assert_eq!(got.parent_id.as_deref(), Some(pid.as_str()));
+        // The group reads back with the replayed child.
+        let res = s.ask_many_result(&pid, None).unwrap().unwrap();
+        assert_eq!(res.target_count, 2);
+        assert_eq!(res.acked, 1);
+
+        // Group listing returns the anchor by id; unknown ids are absent.
+        let groups = s
+            .list_ask_groups(&[pid.clone(), "askm_999_1".to_string()])
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].parent_id, pid);
+        assert_eq!(groups[0].target_count, 2);
+    }
+
+    /// WL-040b: `import_ask` re-validates at the store seam — a hostile asker, a
+    /// malformed ask id, and an oversized options payload are all rejected before the
+    /// INSERT (defense-in-depth, even though the bin layer bounds these first).
+    #[test]
+    fn import_ask_rejects_malformed_inputs() {
+        let s = mem();
+        let q = s.send("a", "b", None, "q", None, None).unwrap();
+        // hostile askee identity (control char — rejected by check_ident)
+        assert!(s
+            .import_ask(
+                "ask_1_1",
+                q,
+                None,
+                "a",
+                "b\u{7}c",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
+        // malformed ask id
+        assert!(s
+            .import_ask(
+                "bad id",
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
+        // oversized options
+        let big = "x".repeat(MAX_BODY + 1);
+        assert!(s
+            .import_ask(
+                "ask_1_1",
+                q,
+                None,
+                "a",
+                "b",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                Some(&big),
+                None,
+                None,
+                1,
+                1,
+                None,
+                None,
+            )
+            .is_err());
     }
 
     /// `has_open_asks` is true only when the peer is the askee of an ask in
