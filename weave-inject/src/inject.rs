@@ -840,6 +840,164 @@ pub fn kill(target: &Target) -> Result<bool> {
     Ok(true)
 }
 
+/// WL-036 — run ONE post-send hook program, argv-only and bounded-synchronously.
+///
+/// SECURITY (the single most dangerous edit in WL-036, ARCHITECTURE §7): this is a
+/// **no-shell** spawn. `argv` is a FIXED operator-authored template from `config.toml`;
+/// weave NEVER substitutes message text INTO an argv element here. The program
+/// (`argv[0]`) is resolved to a TRUSTED absolute path via [`resolve_trusted_program`]
+/// (the same constraint a spawned child program gets), so a hook cannot launch an
+/// arbitrary `$PATH` binary. The remaining elements are passed WHOLE via
+/// `Command::args` — never concatenated, never parsed by a shell (there is no shell on
+/// this path). Message-derived strings reach the child ONLY as `Command::envs` values,
+/// delivered as the child's `environ` array with no shell evaluation; a hostile subject
+/// `"; rm -rf /"` / `"$(reboot)"` is therefore an inert env value.
+///
+/// The wait is BOUNDED ([`run_bounded_env`]'s try_wait/kill pattern): a slow hook is
+/// killed at `timeout` and reported, so a wedged hook can never hang `send`. Returns
+/// `Ok(())` on a clean exit-zero; `Err` for a missing trusted program, an invalid argv,
+/// a non-zero exit, a timeout, or a spawn failure — the orchestrator
+/// ([`fire_post_send_hooks`]) catches every `Err` and logs it to stderr WITHOUT
+/// sinking the (already-persisted) send.
+pub fn run_post_send_hook(
+    argv: &[String],
+    env: &[(String, String)],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::time::Instant;
+    if argv.is_empty() {
+        bail!("post-send hook: empty argv");
+    }
+    if argv.len() > MAX_SPAWN_ARGS {
+        bail!(
+            "post-send hook: {} argv elements (max {MAX_SPAWN_ARGS})",
+            argv.len()
+        );
+    }
+    for a in argv {
+        if !spawn_arg_ok(a) {
+            bail!("post-send hook: argv element is too long or contains control/NUL bytes");
+        }
+    }
+    // argv[0] MUST resolve to a trusted absolute path — a hook cannot run an ambient
+    // $PATH binary, exactly as a spawned child program cannot.
+    let prog_abs = resolve_trusted_program(&argv[0]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "post-send hook: program {:?} is not in a trusted directory",
+            argv[0]
+        )
+    })?;
+    let mut child = Command::new(&prog_abs)
+        .args(&argv[1..])
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            bail!("post-send hook {:?} exited non-zero", argv[0]);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("post-send hook {:?} timed out after {:?}", argv[0], timeout);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// WL-036 — fire every post-send hook matching `event`/`recipient`, best-effort.
+///
+/// The ONE orchestration seam invoked by BOTH send paths (CLI `weave send`/`notify` +
+/// MCP `weave_send`/`weave_notify`) and the ack path, so the hook logic has a single
+/// source of truth (no fork between `main.rs` and `mcp.rs`). It:
+///   1. selects matching, valid hooks via the PURE [`Config::hooks_for`];
+///   2. builds the `WEAVE_HOOK_*` env (event/sender/recipient/subject/message-id, plus
+///      a small `WEAVE_HOOK_PAYLOAD` JSON object) — the message BODY is NOT exported
+///      (it must not leak into the child's env / `ps e`);
+///   3. spawns each via the bounded [`run_post_send_hook`];
+///   4. catches EVERY failure (missing trusted binary, non-zero exit, timeout, spawn
+///      error) and logs it to STDERR via `eprintln!` — NEVER propagated. The send has
+///      already succeeded (the message is persisted) before any hook runs.
+///
+/// STDOUT DISCIPLINE: this writes to stderr only (`eprintln!`). The MCP caller invokes
+/// it AFTER its JSON-RPC result is built, and these diagnostics never touch stdout.
+pub fn fire_post_send_hooks(
+    cfg: &weave_core::config::Config,
+    event: weave_core::config::HookEvent,
+    sender: &str,
+    recipient: &str,
+    subject: &str,
+    message_id: i64,
+) {
+    let hooks = cfg.hooks_for(event, recipient);
+    if hooks.is_empty() {
+        return;
+    }
+    let env = hook_env(event, sender, recipient, subject, message_id);
+    for h in hooks {
+        if let Err(err) = run_post_send_hook(&h.argv, &env, h.timeout()) {
+            // Fault isolation: a failing/slow/missing hook never breaks send. stderr
+            // only (the send already persisted; never touch the JSON-RPC stdout frame).
+            eprintln!("[weave] post-send hook failed (non-fatal): {err}");
+        }
+    }
+}
+
+/// Build the `WEAVE_HOOK_*` env vector handed to a post-send hook child. Message
+/// fields travel ONLY as env values (never argv). The BODY is deliberately omitted
+/// (avoid leaking message bodies into the child's environ / `ps e`). The optional
+/// `WEAVE_HOOK_PAYLOAD` mirrors the same fields as a compact JSON object (atm-core
+/// `ATM_POST_SEND` parity); fields are JSON-escaped via [`json_escape`] so any
+/// metacharacters are inert quoted content, never interpreted. We hand-build the JSON
+/// (a 3-field object) to keep `weave-inject` dependency-light — no `serde_json`.
+fn hook_env(
+    event: weave_core::config::HookEvent,
+    sender: &str,
+    recipient: &str,
+    subject: &str,
+    message_id: i64,
+) -> Vec<(String, String)> {
+    let payload = format!(
+        "{{\"event\":\"{}\",\"sender\":\"{}\",\"recipient\":\"{}\",\"subject\":\"{}\",\"message_id\":{}}}",
+        json_escape(event.as_str()),
+        json_escape(sender),
+        json_escape(recipient),
+        json_escape(subject),
+        message_id,
+    );
+    vec![
+        ("WEAVE_HOOK_EVENT".to_string(), event.as_str().to_string()),
+        ("WEAVE_HOOK_SENDER".to_string(), sender.to_string()),
+        ("WEAVE_HOOK_RECIPIENT".to_string(), recipient.to_string()),
+        ("WEAVE_HOOK_SUBJECT".to_string(), subject.to_string()),
+        ("WEAVE_HOOK_MESSAGE_ID".to_string(), message_id.to_string()),
+        ("WEAVE_HOOK_PAYLOAD".to_string(), payload),
+    ]
+}
+
+/// Minimal JSON string-content escaper for [`hook_env`]'s `WEAVE_HOOK_PAYLOAD`.
+/// Escapes the characters that MUST be escaped inside a JSON string (`"`, `\`, and
+/// the C0 control chars) per RFC 8259, so a field value can never break out of its
+/// quotes. Kept tiny on purpose — `weave-inject` has no `serde_json` dep.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Resolve a spawned child's PROGRAM (argv[0]) to a trusted absolute path. Accepts
 /// either a bare name resolved against [`trusted_dirs`] (like the mux binaries) OR an
 /// absolute path that itself lives under a trusted dir. Returns `None` otherwise, so a

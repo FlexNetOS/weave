@@ -641,6 +641,17 @@ fn tool_send(
                 priority,
             )
             .map_err(e)?;
+        // WL-036: a queued cross-store intent IS a send ⇒ fire `Send` hooks. The
+        // message was NOT delivered locally (no inbox row / inject), but the send
+        // event happened. Best-effort; never sinks the queued result.
+        weave_inject::fire_post_send_hooks(
+            &weave_core::config::Config::load(),
+            weave_core::config::HookEvent::Send,
+            &from,
+            to,
+            subject.unwrap_or(""),
+            id,
+        );
         return Ok(format!(
             "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
         ));
@@ -741,6 +752,18 @@ fn tool_send(
             );
         }
     }
+    // WL-036: best-effort post-send hooks, fired AFTER persist + inject. Failures log
+    // to STDERR (never the JSON-RPC stdout frame) and never sink the send. Config is
+    // loaded here (the `Config::load()` precedent already used by other MCP tools) so
+    // the full `Config` need not be plumbed through `serve`.
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Send,
+        &from,
+        to,
+        subject.unwrap_or(""),
+        mid,
+    );
     Ok(out)
 }
 
@@ -869,6 +892,16 @@ fn tool_notify(
         &to,
         stage,
         outcome,
+    );
+
+    // WL-036: notify is a point-to-point send ⇒ fire `Send` hooks (best-effort).
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Send,
+        &from,
+        &to,
+        subject.as_deref().unwrap_or(""),
+        mid,
     );
 
     Ok(format!(
@@ -2649,6 +2682,23 @@ fn tool_ack(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<Str
     if message.is_some() {
         out.push_str(" Note recorded.");
     }
+    // WL-036: fire `Ack` hooks post-state-change. The acker is the sender; the asker
+    // (who learns of the ack) is the recipient. Best-effort lookup — a miss yields an
+    // empty recipient (a `*` hook still fires). Failures log to stderr, never sink.
+    let asker = store
+        .get_ask(cid_raw)
+        .ok()
+        .flatten()
+        .map(|a| a.asker)
+        .unwrap_or_default();
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Ack,
+        &from,
+        &asker,
+        cid_raw,
+        0,
+    );
     Ok(out)
 }
 

@@ -57,7 +57,7 @@ use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
-use weave_core::config::Config;
+use weave_core::config::{Config, HookEvent};
 use weave_core::memory::{self, MemoryScope};
 use weave_core::store::{is_alive, Store};
 use weave_core::{config, model, store};
@@ -2965,6 +2965,16 @@ fn main() -> Result<()> {
                         &to,
                         &body,
                     )?;
+                    // WL-036: best-effort post-send hooks. Fires AFTER the message is
+                    // persisted + injected; a failing/slow hook never sinks the send.
+                    inject::fire_post_send_hooks(
+                        &cfg,
+                        HookEvent::Send,
+                        &from,
+                        &to,
+                        subject.as_deref().unwrap_or(""),
+                        mid,
+                    );
                 }
             }
         }
@@ -3013,6 +3023,15 @@ fn main() -> Result<()> {
                 &body,
             )?;
             println!("notified '{to}' (#{mid}, no reply expected) [{verdict}]");
+            // WL-036: notify is a point-to-point send ⇒ fire `Send` hooks.
+            inject::fire_post_send_hooks(
+                &cfg,
+                HookEvent::Send,
+                &from,
+                &to,
+                subject.as_deref().unwrap_or(""),
+                mid,
+            );
         }
 
         Cmd::BroadcastNotify {
@@ -3322,6 +3341,16 @@ fn main() -> Result<()> {
             refresh_presence(store, &from, explicit);
             store.ack(&from, &id, message.as_deref())?;
             println!("closed ask {id} (acked)");
+            // WL-036: fire `Ack` hooks post-state-change. The acker is the sender; the
+            // original asker (who learns of the ack) is the recipient. Best-effort
+            // lookup — a miss just yields an empty recipient (a `*` hook still fires).
+            let asker = store
+                .get_ask(&id)
+                .ok()
+                .flatten()
+                .map(|a| a.asker)
+                .unwrap_or_default();
+            inject::fire_post_send_hooks(&cfg, HookEvent::Ack, &from, &asker, &id, 0);
         }
 
         Cmd::Asks {

@@ -246,3 +246,84 @@ combined verifier's job per instructions — NOT added here.
 
 Docs (CHANGELOG/README/ARCHITECTURE) not yet synced — flagged for the verifier/docs pass
 per the plan's "Docs to sync".
+
+
+---
+
+# WL-036 — Post-send hooks — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl036_plan.md` + leader decisions. Built ON TOP of the already-committed
+WL-035/WL-037 send path (the `--supersedes` post-stamp). No commit / push / PR — leader
+owns delivery. No `Store`/schema change; `store_libsql.rs` untouched. No new standing MCP
+tool. Docs (CHANGELOG/ARCHITECTURE/README/OPERATIONS/SECURITY/PARITY) NOT yet synced —
+flagged for the verifier/docs pass per the plan's "Docs to sync". Full test layer NOT yet
+written (combined verifier pass later, per leader).
+
+## Files touched
+
+| File | Change | Rationale |
+|---|---|---|
+| `weave-core/src/config.rs` | `HookEvent` enum (Send/Ack, total parse, default Send); `PostSendHook` struct (`recipient`/`argv`/`event`/`timeout_ms`, all `#[serde(default)]`) + helpers (`hook_event`, `recipient_pattern` defaulting empty→`*`, `timeout` clamped, `is_valid`); pure `hook_recipient_matches(pattern, recipient)` reusing `model::is_broadcast`; caps `MAX_POST_SEND_HOOKS=16`/`MAX_HOOK_ARGV=64`/`MAX_HOOK_ARG_LEN=4096`/`HOOK_TIMEOUT_MS_DEFAULT=5000`; `post_send_hook: Option<Vec<PostSendHook>>` field (+ Debug line); `Config::hooks_for(event, recipient)` (pure selection, validity drop, `MAX_POST_SEND_HOOKS` bound). | Config schema + pure matcher in the lowest layer (no I/O), reusable by both send paths; broadcast alias single-source via `model::is_broadcast`. |
+| `weave-inject/src/inject.rs` | `run_post_send_hook(argv, env, timeout)` — the argv-only/no-shell bounded spawn primitive (resolves `argv[0]` via the existing `resolve_trusted_program`, `.args(&argv[1..])`, message fields via `.envs` only, `try_wait`/kill bounded-wait mirroring `run_bounded_env`); `fire_post_send_hooks(&Config, HookEvent, sender, recipient, subject, message_id)` orchestration (selects via `hooks_for`, builds env, spawns each best-effort, stderr-logs failures); `hook_env` builds the `WEAVE_HOOK_*` vector (+ `WEAVE_HOOK_PAYLOAD` JSON; BODY deliberately NOT exported); `json_escape` tiny helper (no `serde_json` dep added to weave-inject). | The spawn primitive + orchestration sit in `weave-inject` — reachable from BOTH `weave` and `weave-mcp` with no upward dep (single source of truth, plan Option A). |
+| `weave-inject/src/lib.rs` | Re-export `fire_post_send_hooks` + `run_post_send_hook`. | Reachable from bin + mcp. |
+| `weave/src/main.rs` | Import `HookEvent`; fire `Send` hooks in `Cmd::Send` local (`None`) branch after `inject_and_trace`, in `Cmd::Notify` after the verdict print; fire `Ack` hooks in `Cmd::Ack` after `store.ack` (best-effort `get_ask` for the asker as recipient). | CLI send/notify/ack must fire hooks. |
+| `weave-mcp/src/mcp.rs` | Fire `Send` hooks in `tool_send` (BOTH the cross-store-intent early-return per Q3 AND the local-send end before `Ok(out)`) and `tool_notify`; fire `Ack` hooks in `tool_ack` (best-effort `get_ask` asker). Config via `weave_core::config::Config::load()` (the existing in-tool `Config::load()` precedent — avoids plumbing `Config` through `serve`). | MCP send/notify/ack must fire hooks; no new standing tool, no `serve` signature churn. |
+
+## Injection-safe spawn design (the load-bearing invariant)
+
+`run_post_send_hook` is a **no-shell** spawn. `argv` is the FIXED operator-authored Vec from
+`config.toml`; weave NEVER substitutes message text into an argv element. `argv[0]` is
+resolved to a TRUSTED absolute path via `resolve_trusted_program` (same constraint as a
+spawned child program — a hook cannot launch an arbitrary `$PATH` binary; a `None` resolve ⇒
+logged to stderr, send unaffected). Remaining elements pass WHOLE via `Command::args`.
+Message-derived strings reach the child ONLY as `Command::envs` values
+(`WEAVE_HOOK_EVENT`/`SENDER`/`RECIPIENT`/`SUBJECT`/`MESSAGE_ID` + `WEAVE_HOOK_PAYLOAD` JSON);
+the BODY is NOT exported (no leak into child env / `ps e`). A hostile subject `"; rm -rf /"`
+/ `"$(reboot)"` is an inert env value — no shell exists on this path. Each argv element is
+re-validated (`spawn_arg_ok`: len + NUL/control reject) and the count bounded by
+`MAX_SPAWN_ARGS` at the spawn primitive; the config layer pre-bounds via `is_valid`. The
+wait is bounded (try_wait/kill at `timeout`) so a slow hook never hangs send; every failure
+(missing trusted binary / non-zero exit / timeout / spawn error) is caught and logged to
+STDERR only (`eprintln!` in inject; never the JSON-RPC stdout frame), NEVER propagated.
+
+## Fire call-sites instrumented (single shared helper `inject::fire_post_send_hooks`)
+
+1. CLI `Cmd::Send` local `None` branch — `Send`, after `inject_and_trace`.
+2. CLI `Cmd::Send` cross-store `Some(store_path)` branch — N/A in CLI (the supersede/intent
+   guard rejects early; the MCP cross-store intent DOES fire per Q3, see 6).
+3. CLI `Cmd::Notify` — `Send`, after the verdict print.
+4. CLI `Cmd::Ack` — `Ack`, after `store.ack` (recipient = `get_ask().asker`, best-effort).
+5. MCP `tool_send` local end — `Send`, before `Ok(out)`.
+6. MCP `tool_send` cross-store intent early-return — `Send` (Q3: a queued intent IS a send).
+7. MCP `tool_notify` — `Send`, before the return.
+8. MCP `tool_ack` — `Ack` (recipient = `get_ask().asker`, best-effort).
+
+Decisions applied (no re-litigation): Q1 empty/missing `recipient` ⇒ `*` (match all).
+Q2 whole-string `*` only (no glob crate, no substring matcher). Q3 cross-store intent fires
+`Send`. Q4 BODY not exported. Q5 bounded-synchronous spawn. Q7 broadcast fires once per send
+(fire point is the send call-site). Ack hooks use subject-slot = correlation id, message_id = 0.
+
+## Config schema
+
+```toml
+[[post_send_hook]]
+recipient  = "agent-a"        # "*" = any; a BROADCAST alias matches a broadcast; else exact. omit/empty ⇒ "*"
+argv       = ["/usr/bin/tee", "/tmp/sentinel"]   # argv[0] resolved to a TRUSTED abs path; no shell
+event      = "send"           # "send" (default) | "ack"
+timeout_ms = 5000             # clamped [MIN_TIMEOUT_MS=50, MAX_TIMEOUT_MS=600000]; omit ⇒ 5000
+```
+File-only (DELIBERATELY no env overlay — a hook is a program to spawn; env injection of one
+would be unsafe). Set capped at `MAX_POST_SEND_HOOKS=16`; invalid/oversized rules dropped at
+selection with a one-line stderr note.
+
+## Build results (from worktree root)
+
+- `cargo build --release` (default sqlite) — GREEN.
+- `cargo build --no-default-features --features libsql` — GREEN.
+- `cargo build --features surfaces` — GREEN.
+- `cargo clippy --all-targets` — no issues.
+- `cargo fmt --all` applied; `cargo fmt --all --check` — clean.
+
+(The `unused import: JobState` warning in `weave-core/src/store.rs` is PRE-EXISTING and
+unrelated to WL-036.)
