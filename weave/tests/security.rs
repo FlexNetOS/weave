@@ -1151,6 +1151,107 @@ fn pulled_inject_never_carries_the_message_body() {
 }
 
 // ---------------------------------------------------------------------------
+// WL-034 — `weave export` HTML bundle: hostile message bodies must be neutralized.
+//
+// A body that *looks* like a `</script>` breakout or an event-handler payload is
+// delivered verbatim into the store (other tests pin that), and then must be
+// rendered SAFELY into the offline HTML bundle: the raw breakout sequence
+// `</script><script>` must NOT survive un-neutralized anywhere in the file, and a
+// raw `<img ... onerror=` tag must NOT survive in the static (noscript) region.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_neutralizes_script_breakout_and_event_handler() {
+    let db = TestDb::new();
+    // The classic data-block breakout, plus an attribute-handler payload.
+    let breakout = "</script><script>document.title='xss'</script>";
+    let img = "<img src=x onerror=alert(1)>";
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "attacker",
+            "--to",
+            "victim",
+            &format!("--body={breakout}"),
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "attacker",
+            "--to",
+            "victim",
+            &format!("--body={img}"),
+        ],
+    );
+
+    let out_path = std::env::temp_dir().join(format!(
+        "weave-sec-export-{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let out_str = out_path.to_string_lossy().into_owned();
+
+    run_ok(&db, &["export", "--for", "victim", "--out", &out_str]);
+
+    let html = std::fs::read_to_string(&out_path)
+        .unwrap_or_else(|e| panic!("export file should exist: {e}"));
+
+    // 1. The attacker's breakout body must NOT survive verbatim. (Note the
+    //    document legitimately ends the data block with `</script>` immediately
+    //    followed by the client `<script>` — so we assert on the attacker's
+    //    *distinctive* breakout string, which carries the injected payload, rather
+    //    than the bare `</script><script>` adjacency.)
+    assert!(
+        !html.contains(breakout),
+        "the raw breakout body must not survive verbatim in the export bundle"
+    );
+    assert!(
+        !html.contains("<script>document.title='xss'</script>"),
+        "the injected inner <script> must never appear as live markup"
+    );
+    // The body DID land, in a neutralized form: in the JSON data block `</` is
+    // rewritten to `<\/`, and in the noscript region `<`/`>` are html_escape'd.
+    assert!(
+        html.contains("<\\/script>") || html.contains("&lt;/script&gt;"),
+        "the breakout body must appear in a neutralized/escaped form"
+    );
+
+    // 2. The raw event-handler tag must NOT survive in the static (noscript) HTML
+    //    region — there every field is html_escape'd. (It is legitimately present
+    //    RAW inside the `<script type="application/json">` data block, which is NOT
+    //    HTML-parsed and is read via textContent; only `</script` could terminate
+    //    that block, and `</` is already neutralized above. So we assert on the
+    //    noscript region specifically.)
+    let noscript = {
+        let s = html.find("<noscript>").expect("noscript region present");
+        let e = html[s..]
+            .find("</noscript>")
+            .expect("noscript region closed")
+            + s;
+        &html[s..e]
+    };
+    assert!(
+        !noscript.contains("<img src=x onerror=alert(1)>"),
+        "raw <img ... onerror=...> must be html_escape'd in the static region"
+    );
+    assert!(
+        noscript.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "the img payload must appear html_escape'd in the static region"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+// ---------------------------------------------------------------------------
 // Tier-2 phase 2d — signed sender identity (only built with `--features sign`).
 //
 // Black-box hostile-input tests against the real `--features sign` binary,

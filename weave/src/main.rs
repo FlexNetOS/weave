@@ -836,6 +836,21 @@ enum Cmd {
     /// the weave mesh. Token from config/`WEAVE_SLACK_TOKEN`.
     #[cfg(feature = "surfaces")]
     Slack,
+    /// WL-034: export a mailbox to a single self-contained, offline-openable HTML
+    /// file with client-side search (no external assets, no CDN). Exports the
+    /// caller's mailbox (sender / recipient / broadcast scope) via `history`.
+    Export {
+        /// Output path for the `.html` bundle.
+        #[arg(long)]
+        out: PathBuf,
+        /// Identity whose mailbox to export. Falls back to `resolve_me()`
+        /// (`$WEAVE_SESSION` > basename(cwd)) when omitted.
+        #[arg(long = "for")]
+        for_id: Option<String>,
+        /// Max messages to include (clamped to the store's MAX_LIMIT).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// WL-049 / ADR-0002: governed stealth web access via obscura (deny-by-default).
     /// `weave web <op> [--url …] [--arg k=v …]` runs a single browser op through the
     /// same policy/lease/job gate as the `weave_web` MCP tool. `weave web --list`
@@ -3685,6 +3700,23 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+
+        Cmd::Export { out, for_id, limit } => {
+            let (me, explicit) = resolve_me_explicit(for_id, None, &cfg);
+            // Honor the identity cap / control-char rejection on the resolved id
+            // before it reaches the store query.
+            weave_core::store::check_ident("identity", &me)?;
+            refresh_presence(store, &me, explicit);
+            let limit = limit.unwrap_or(10_000) as i64;
+            let rows = store.history(&me, None, limit)?;
+            let html = weave_core::export::render_mailbox_html(&rows);
+            std::fs::write(&out, html)?;
+            println!(
+                "exported {} message(s) for '{me}' -> {}",
+                rows.len(),
+                out.display()
+            );
         }
 
         Cmd::Peers {

@@ -1,42 +1,76 @@
-# WL-050 guardian review — MCP progressive disclosure (ADR-0003)
+# WL-034 — Static mailbox export — guardian review
 
-Branch `wl-050-mcp-progressive` (uncommitted worktree changes) vs origin/develop @ 1a9bc1f.
-Read-only audit. Files: `weave-mcp/src/mcp.rs`, `weave/tests/common/mod.rs`, `weave/tests/integration.rs`, `ARCHITECTURE.md`, `CHANGELOG.md`.
+Reviewer: weave-guardian. Worktree `/home/drdave/Desktop/meta/weave-wl034`
+(branch `wl-034-mailbox-export`, base origin/develop). Change is UNCOMMITTED.
+Verifier report: GREEN (sqlite 590 passed; libsql 550 passed/1 pre-existing ignore;
+surfaces + sign clippy clean). Review only — no commit/push/PR.
 
-## 1. Security / correctness invariants
-- **No shell** — OK. Diff adds no `Command`/`sh -c`/`format!`-built command. Pure dispatch+JSON. (mcp.rs)
-- **Parameterized SQL** — OK (N/A). weave-mcp holds no SQL; SQL lives in weave-core/store, untouched. No string-interp SQL introduced.
-- **Layer DAG intact** — OK. Change confined to `weave-mcp` + `weave` tests; `weave-core`/`weave-inject` untouched; no new `use` imports → no upward dep. (compiler-enforced; verified)
-- **Paste-safe injection** — OK (N/A). No mux/injector arm changed; `injector` is threaded through unchanged.
-- **Input caps** — OK. `mode=search` clamps `limit` to `1..=200` (mcp.rs:3842-3846). `call` routes to `call_tool`, which applies the same per-op caps as the flat path (no bypass).
-- **Destructive-op gating** — OK. The key risk surface is clean:
-  - Outer gate: `weave` meta-tool is NOT in `DANGEROUS_TOOLS` (correct — it is a gateway, and search/describe/list must work in safe mode). (mcp.rs:271-309)
-  - Inner gate: `mode=call` re-applies `!dangerous && is_dangerous_tool(&want)` to the INNER op before dispatch, returning the byte-identical "disabled in safe HTTP mode" rejection. (mcp.rs:3901-3905)
-  - Self-recursion guard: `mode=call name=="weave"` → rejected (mcp.rs:3896-3898).
-  - Canonical routing: `call` dispatches via `call_tool(...)` (mcp.rs:3907-3917) — no reimplementation, so all per-tool guards/`confirm` checks (e.g. `weave_clear`) are preserved.
-  - `dangerous` flag plumbed correctly: `dispatch_request` → `call_tool` → `tool_meta` → inner `call_tool` (mcp.rs:324, 384, 3832, 3916). HTTP safe mode passes `false`; the test helper passes `true`.
-  - Verified by `meta_call_preserves_safe_http_gate` driving the full `dispatch_request` path with `dangerous=false` on `weave_clear` → blocked (mcp.rs:5660-5685, PASS).
-- **MCP stdout discipline** — OK. `tool_meta` returns `Result<String,String>` text content via the existing `tools/call` content frame; no new stdout writes, no logging change.
+## Verdict: APPROVE
 
-## 2. Rust-native drift guard
-- No manifest change: `Cargo.toml` (all crates) and `Cargo.lock` show zero diff → no new dependency. Default `cargo tree` unchanged.
-- No non-Rust build/runtime intrusion: only `.rs` + `.md` files touched; no generated sidecar feeds the build.
-- No new heavyweight dep; no shell; no SQL. Confirmed a pure dispatch/JSON refactor.
+Prior BLOCK was a single docs-sync gap. The implementer has now added all three
+required doc entries (truthful, accurate, default-build placement) and additionally
+corrected a stale `ARCHITECTURE.md` reference. Code/security/invariant/drift/test
+axes were already clean and the code is byte-unchanged since the prior review.
+All gates green; `cargo fmt --all --check` clean (exit 0).
 
-## 3. Docs sync
-- **ARCHITECTURE.md** — OK. Roadmap bullet flips WL-050 to "done" with the meta-tool + `WEAVE_MCP_EAGER=1` fallback; new mcp.rs subsection describes `tool_catalog()` as canonical registry, the four modes, inner-op gate re-application, recursion refusal, and eager-flat compat. Matches code.
-- **CHANGELOG.md [Unreleased]** — OK. Describes single meta-tool default surface, four modes, prefix-optional names, inner-op gate + recursion refusal, `WEAVE_MCP_EAGER=1`, and "no dependency change / cargo tree byte-identical / both backends green." Matches code.
+---
 
-## 4. Completeness / zero-loss
-- Every catalog op reachable two ways:
-  - **tools/call flat name** — unchanged dispatch (mcp.rs:363-395); only the standing `tools/list` advertisement changed.
-  - **meta `call`** — routes through the same `call_tool`.
-- `every_catalog_op_is_dispatchable` (mcp.rs:5692-5718) iterates `tool_catalog()` and asserts no entry hits the `Unknown tool:` catch-all (mcp.rs:504) — a real catalog↔dispatch drift guard. PASS.
-- `eager_mode_restores_the_full_flat_table` asserts eager `tools/list` len == `tool_catalog().len()` (no op dropped). PASS.
-- Independent re-run on default (sqlite) backend: progressive (1), meta_* (8), every_catalog_op_is_dispatchable (1), eager (1), integration `mcp_progressive_disclosure_default_surface_and_meta_roundtrip` (1) — all PASS. Verifier reports both backends green (sqlite 577, libsql 537; clippy clean on default/libsql/sign/obscura).
+## Part 1 — Security/correctness invariants  (unchanged — OK)
 
-## Verdict
+All eight invariants pass exactly as in the prior review (code unchanged):
+no shell (`std::fs::write`, pure `render_mailbox_html`), no new SQL (reuses bound
+`Store::history`), layer DAG intact (`export.rs` in `weave-core`, imports only
+`crate::model`; dashboard takes a *downward* dep `use weave_core::export::html_escape`),
+single centralized `html_escape` (no behavior fork), input caps + id validation
+enforced (`check_ident` + clamped `--limit`), read-only (no destructive path),
+zero MCP delta (CLI-only, token-light budget untouched). XSS escaping confirmed
+sufficient (JSON `script_safe_json` neutralizes `</`/`<!--`; `<noscript>` table
+`html_escape`d; client renders via `textContent`/`createElement`). No regressions.
 
-**APPROVE**
+## Part 2 — Rust-native drift scan — OK
 
-No BLOCK or WARN findings. The meta-tool `call` mode is not a destructive-op bypass (inner `is_dangerous_tool` re-check + self-recursion guard + canonical `call_tool` routing, proven end-to-end). Zero-loss is test-guarded in both directions. No Rust-native drift, no new dependency, docs match code. The leader may proceed to commit/handoff.
+Re-run on the full diff: every changed/new file is `.rs` or `.md`. **No Cargo.toml
+change anywhere** (no new dependency; `serde_json` pre-existing). No `build.rs`/CI/
+`.codex`/`.agents`/`.omc` intrusion. No `Store`/schema change → `store_libsql.rs`
+untouched, libsql build/test green. No misinformation drift — docs now match code
+(verified below). Rust-native and dependency-clean.
+
+## Part 3 — Docs sync — **OK (was BLOCK, now resolved)**
+
+`git -C … diff -- CHANGELOG.md README.md ARCHITECTURE.md` verified against code:
+
+- **OK — `CHANGELOG.md`**: `[Unreleased] → ### Added` now carries a truthful WL-034
+  `weave export --out <path> [--for <id>] [--limit N]` entry — describes the
+  self-contained, offline, XSS-safe portable HTML with client-side search, the
+  `script type="application/json"` `</`/`<!--` neutralization, `textContent`/
+  `createElement` rendering, and locates `render_mailbox_html` in
+  `weave-core/src/export.rs` as the centralized `html_escape` owner. Matches code.
+- **OK — `README.md`**: `weave export --out mailbox.html …` added to the CLI list in
+  the **default-build** section (line ~61, alongside `sessions`), **not** under
+  `--features surfaces`. Confirmed correct: the `Cmd::Export` variant in
+  `weave/src/main.rs:842` carries **no** `#[cfg(feature = "surfaces")]` (unlike the
+  adjacent `Slack` variant at :837) — it is genuinely a default-build command.
+- **OK — `ARCHITECTURE.md`**: now lists
+  `weave-core/src/export.rs  pure render_mailbox_html + the centralized html_escape`
+  in the crate layout, and the XSS section reference was corrected
+  `dashboard::html_escape` → `weave_core::export::html_escape` ("reused by the
+  dashboard"). Repo-wide grep for `dashboard::html_escape` (`.rs`+`.md`): **NONE
+  remaining**. `weave-core/src/lib.rs:3` exports `pub mod export;` and
+  `weave-mcp/src/dashboard.rs:17` does `use weave_core::export::html_escape;` — docs
+  describe the real code, no fork.
+
+CONTRIBUTING.md: OK (no new invariant/rule).
+
+## Part 4 — Test-layer adequacy — OK (unchanged)
+
+Pure unit (`export.rs`), integration (3 `export_*` tests), security
+(`export_neutralizes_script_breakout_and_event_handler`) all present and green on
+both backends. Adequate.
+
+---
+
+## Overall: APPROVE
+
+All three axes (Invariants, Drift, Docs) clear. Docs now accurately describe the
+shipped code with no fork; the prior stale `dashboard::html_escape` reference is
+eliminated. Verifier GREEN, fmt clean. The leader may proceed to commit/handoff.

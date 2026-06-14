@@ -14,26 +14,8 @@
 //! every interpolation of untrusted text goes through it — never `format!("…{body}…")`
 //! of raw Store text. The XSS regression test below locks this in.
 
+use weave_core::export::html_escape;
 use weave_core::model::{fmt_ts, Job, Lease, Message, Peer, Schedule};
-
-/// Escape the five HTML-significant characters so Store-derived text can never
-/// break out of an element body or attribute. This is the central XSS defense:
-/// `&` first (so we don't double-escape the entities we emit), then `<`, `>`,
-/// `"`, `'`.
-pub fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
 
 /// Build a single Server-Sent Events frame. Per the SSE spec each line of `data`
 /// is emitted as its own `data:` field and the event is terminated by a blank

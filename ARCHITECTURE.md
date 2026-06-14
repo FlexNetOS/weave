@@ -115,6 +115,7 @@ weave-core/          library: model + config + Store trait + both backends + sig
   src/store.rs         Store trait + bundled SQLite backend (cfg(feature="sqlite"))
   src/store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
   src/memory.rs        agent memory store (write/read/search/list/delete)
+  src/export.rs        pure `render_mailbox_html` + the centralized `html_escape` (no I/O)
   src/llm.rs           OPTIONAL chat-completion client for thread summarization (cfg(feature="llm"))
   src/testenv.rs       test-only env lock / guard helpers
 weave-inject/        library: native multi-mux injector + `Injector` trait
@@ -1191,7 +1192,8 @@ injected and stored text is handled**, not on network attackers.
   WL-048).** The web dashboard is the one surface that renders **stored** text back
   out, so it is an **XSS** target: every Store-derived string (peer names, message
   bodies/subjects, job titles, lease holders, schedule bodies, repo/branch tags)
-  passes through the single `dashboard::html_escape` (`& < > " '`) before it reaches
+  passes through the single `weave_core::export::html_escape` (`& < > " '`, reused by
+  the dashboard) before it reaches
   the HTML — there is no `format!("…{body}…")` of raw Store text, and a regression
   test asserts an injected `<script>` does not survive unescaped. The dashboard is
   additionally **read-only** (GET only, never mutates), **localhost-bound**, and
