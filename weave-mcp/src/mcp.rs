@@ -592,6 +592,14 @@ fn tool_send(
         .get("priority")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    // WL-037: optional id of a prior message this one replaces. Validated as a
+    // positive message id before any DB bind (the `in_reply_to` precedent).
+    let supersedes = match args.get("supersedes").and_then(|v| v.as_i64()) {
+        Some(id) if id <= 0 => {
+            return Err("'supersedes' must be a positive message id.".into());
+        }
+        other => other,
+    };
     let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
@@ -651,12 +659,22 @@ fn tool_send(
     if let Some(p) = priority {
         let _ = store.set_message_priority(mid, p);
     }
+    // WL-037: post-stamp the supersede link after the send (the `set_message_priority`
+    // post-stamp precedent). Authorization (caller == original sender) + id existence
+    // are enforced in `Store::supersede`; a bad id surfaces as an error string.
+    if let Some(old) = supersedes {
+        store.supersede(&from, old, mid).map_err(e)?;
+    }
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
         to
     };
-    let mut out = format!("Sent message #{mid} from '{from}' to '{dest}'.");
+    let mut out = if let Some(old) = supersedes {
+        format!("Sent message #{mid} from '{from}' to '{dest}' (supersedes #{old}).")
+    } else {
+        format!("Sent message #{mid} from '{from}' to '{dest}'.")
+    };
 
     // P6 delivery trace (point-to-point only — broadcast is not injected and is not
     // traced in P6, keeping the trace bounded). Best-effort: never sinks the send.
@@ -3164,7 +3182,8 @@ fn tool_catalog() -> Vec<Value> {
                 "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
                 "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
-                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
+                "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."}
             },"required":["to","body"]}
         },
         {

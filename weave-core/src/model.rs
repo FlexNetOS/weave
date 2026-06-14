@@ -112,6 +112,16 @@ pub struct Message {
     /// Additive + backward-compatible: pre-existing rows read back as "normal".
     #[serde(default = "default_priority")]
     pub priority: String,
+    /// WL-037: id of the message that SUPERSEDES this one, if any. `None` (the
+    /// default) means this message has not been replaced. A non-`None` value marks
+    /// this row as a predecessor in a supersede/successor chain — replacement,
+    /// distinct from `in_reply_to` threading: readers hide it from the unread inbox
+    /// but keep it (flagged) in history/thread/search. Additive +
+    /// backward-compatible: pre-existing rows (and DBs created before the
+    /// `superseded_by` column migration) read back as `None`. `#[serde(default)]`
+    /// keeps older JSON payloads (which omit the field) deserializable.
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row

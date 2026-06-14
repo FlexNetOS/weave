@@ -713,6 +713,20 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn set_message_priority(&self, id: i64, priority: &str) -> Result<()>;
 
+    /// WL-037: mark `old_id` as superseded by `new_id` (replacement, distinct from
+    /// `in_reply_to` threading). Stamps `messages.superseded_by = new_id` on the
+    /// predecessor so it drops out of every reader's unread inbox while remaining
+    /// (flagged) in history/thread/search. Authorization: only the ORIGINAL SENDER
+    /// of `old_id` may supersede it (best-effort same-identity guard — `from` is
+    /// advisory until the `sign` feature makes it unforgeable — preventing a
+    /// hostile session from censoring another agent's message). Both ids must
+    /// exist, else a clean error (never a silent no-op). Superseding an
+    /// already-superseded message re-points the link forward, forming a chain
+    /// (A→B→C); only the tail (`superseded_by IS NULL`) is unread. Never injects,
+    /// never touches the `reads` table.
+    #[allow(dead_code)]
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()>;
+
     /// WL-032: set a peer's contact policy.
     #[allow(dead_code)]
     fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()>;
@@ -1366,7 +1380,8 @@ CREATE TABLE IF NOT EXISTS messages (
     in_reply_to     INTEGER,
     idempotency_key TEXT UNIQUE,
     trace_id        TEXT,
-    priority        TEXT NOT NULL DEFAULT 'normal'
+    priority        TEXT NOT NULL DEFAULT 'normal',
+    superseded_by   INTEGER
 );
 CREATE TABLE IF NOT EXISTS reads (
     message_id INTEGER NOT NULL,
@@ -1584,6 +1599,10 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
         idempotency_key: r.get("idempotency_key").unwrap_or(None),
         trace_id: r.get("trace_id").unwrap_or(None),
         priority: r.get("priority").unwrap_or("normal".to_string()),
+        // WL-037: read by name so `SELECT *` and projections that list the column
+        // populate it; projections that omit it (legacy) read back `None`. The
+        // migration guarantees the column exists.
+        superseded_by: r.get("superseded_by").unwrap_or(None),
     })
 }
 
@@ -1757,6 +1776,7 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
@@ -1768,8 +1788,9 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
 #[cfg(feature = "sqlite")]
 fn peek_oldest_unread_conn(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority, superseded_by FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
@@ -2221,6 +2242,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';",
         )?;
+    }
+    // WL-037: message supersede/successor chains. Nullable (NULL == not
+    // superseded), no DEFAULT — present on fresh DBs via SCHEMA, added here for
+    // DBs created before supersede existed. `ADD COLUMN` is O(1) and every
+    // existing row reads back NULL (== not superseded).
+    if !column_exists(conn, "messages", "superseded_by")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN superseded_by INTEGER;")?;
     }
     // WL-032: per-peer contact policies.
     if !column_exists(conn, "peers", "contact_policy")? {
@@ -2964,6 +2992,7 @@ impl Store for SqliteStore {
             format!(
                 "SELECT * FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
+                   AND superseded_by IS NULL
                  ORDER BY id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
             )
@@ -2971,6 +3000,7 @@ impl Store for SqliteStore {
             format!(
                 "SELECT m.* FROM messages m
                  WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+                   AND m.superseded_by IS NULL
                    AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                  ORDER BY m.id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
@@ -3058,6 +3088,7 @@ impl Store for SqliteStore {
         let sql = format!(
             "SELECT * FROM messages
              WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+               AND superseded_by IS NULL
              ORDER BY id ASC LIMIT ?3",
             bc = BROADCAST_SQL
         );
@@ -3565,7 +3596,7 @@ impl Store for SqliteStore {
                 SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
             )
             SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                   m.idempotency_key, m.trace_id, m.priority
+                   m.idempotency_key, m.trace_id, m.priority, m.superseded_by
             FROM messages m JOIN t ON m.id = t.id
             ORDER BY m.id ASC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
@@ -3582,6 +3613,8 @@ impl Store for SqliteStore {
                     idempotency_key: r.get(7).unwrap_or(None),
                     trace_id: r.get(8).unwrap_or(None),
                     priority: r.get(9).unwrap_or("normal".to_string()),
+                    // WL-037: keep superseded rows in a thread, flagged.
+                    superseded_by: r.get(10).unwrap_or(None),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -4925,6 +4958,42 @@ impl Store for SqliteStore {
         self.conn.execute(
             "UPDATE messages SET priority = ?1 WHERE id = ?2",
             params![p.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
+        // Both ids must exist; the new id is looked up so a typo'd/forged
+        // successor can't strand the predecessor pointing at a phantom row.
+        let old_sender: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sender FROM messages WHERE id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(old_sender) = old_sender else {
+            anyhow::bail!("cannot supersede: message #{old_id} does not exist");
+        };
+        let new_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+            params![new_id],
+            |r| r.get(0),
+        )?;
+        if !new_exists {
+            anyhow::bail!("cannot supersede: successor message #{new_id} does not exist");
+        }
+        // Authorization: only the ORIGINAL SENDER of old_id may supersede it.
+        // Best-effort same-identity guard (`from` is advisory until the `sign`
+        // feature makes it unforgeable) that blocks a hostile session from
+        // hiding another agent's message from inboxes (censorship/DoS vector).
+        if old_sender != caller {
+            anyhow::bail!("cannot supersede: #{old_id} was sent by '{old_sender}', not '{caller}'");
+        }
+        self.conn.execute(
+            "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+            params![old_id, new_id],
         )?;
         Ok(())
     }

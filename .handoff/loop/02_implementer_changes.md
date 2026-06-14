@@ -151,3 +151,98 @@ column changes, so no migration needed.
 Tests beyond the archive unit suite were intentionally NOT added (combined verifier
 pass owns the integration/security/prop layers). Docs (README/ARCHITECTURE/CHANGELOG)
 not yet synced — flagged for the verifier/docs pass per the plan's "Docs to sync".
+
+---
+
+# WL-037 — Message supersede / successor chains — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl037_plan.md` + leader decisions. No commit / push / gh (leader owns
+delivery). **Scope held to WL-037 only** — did not touch archive.rs/backup.rs (WL-035)
+or config hook structs (WL-036).
+
+## Schema / migration (additive, both backends)
+
+New nullable `messages.superseded_by INTEGER` (NULL == not superseded). Added to:
+- **sqlite** `weave-core/src/store.rs`: SCHEMA `messages` (trailing column after
+  `priority`) + guarded `if !column_exists(... "superseded_by") { ALTER TABLE messages
+  ADD COLUMN superseded_by INTEGER }` in `migrate()` (the WL-031 priority precedent).
+- **libsql** `weave-core/src/store_libsql.rs`: SCHEMA `messages` + a new
+  `("messages","superseded_by","ALTER TABLE messages ADD COLUMN superseded_by INTEGER")`
+  entry in the `pragma_table_info`-probe migration loop.
+- `model.rs`: `Message.superseded_by: Option<i64>` with `#[serde(default)]` (old JSON
+  still deserializes). Both `row_to_message` mappers populate it: sqlite **by name**
+  (`r.get("superseded_by").unwrap_or(None)`), libsql **by position** at the new index
+  **10**.
+
+## Store API — `supersede`
+
+New trait method `fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()>`
+declared after `set_message_priority`, mirrored in BOTH backends. Behavior:
+- Parameterized `SELECT sender FROM messages WHERE id=?1` for `old_id`; bail if it does
+  not exist. Parameterized existence probe for `new_id`; bail if missing.
+- **Authorization:** bail unless `old_sender == caller` (best-effort same-identity guard;
+  censorship/DoS protection — documented as advisory until `sign`).
+- `UPDATE messages SET superseded_by=?2 WHERE id=?1` (parameterized). `send` unchanged.
+
+## Projections updated (the libsql positional trap)
+
+EVERY explicit `SELECT id,ts,…,priority` projection feeding a message mapper got
+`superseded_by` appended as the trailing (11th) column, in BOTH backends:
+- sqlite: `peek_oldest_unread_conn`, the `thread` recursive-CTE projection (read index 10).
+  inbox/history/search use `SELECT *` so they pick the column up by name — no projection
+  edit needed there.
+- libsql (positional, the risk item): `inbox` (both branches), `history` (both branches),
+  `search`, `inbox_since`, `peek_oldest_unread_on`, and the `thread` CTE — all extended
+  + the mapper reads index 10. Proven aligned by running the libsql inbox/history/thread/
+  peek/search/reply/priority tests (see below).
+
+## Read semantics — hide-from-unread, flag-in-history
+
+`AND superseded_by IS NULL` added to the unread/nudge paths in BOTH backends:
+- sqlite: `unread_count_conn`, `peek_oldest_unread_conn`, `inbox` (include_read AND
+  unread branches), `inbox_since`.
+- libsql: `unread_count_on` (covers `unread_count` + `unread_count_tx`),
+  `peek_oldest_unread_on`, `inbox` (both branches), `inbox_since`.
+- `history`/`thread`/`search` KEEP superseded rows and populate the flag (audit). No-op
+  on a legacy store (column NULL everywhere).
+
+## CLI + MCP
+
+- **CLI** `weave/src/main.rs`: `Cmd::Send` gains `--supersedes: Option<i64>`. Local-send
+  branch post-stamps `store.supersede(&from, old, mid)` after the priority stamp (rejects
+  `old <= 0`); prints `(supersedes #N)`. Cross-store (`--to-store`) branch rejects
+  `--supersedes` (no `superseded_by` on `outbox`; refuse rather than silently ignore).
+- **MCP** `weave-mcp/src/mcp.rs`: `tool_send` reads optional `supersedes` (rejects `<= 0`),
+  post-stamps `store.supersede(&from, old, mid)` after the priority stamp, surfaces a bad
+  id as the error string. `tool_catalog()` `weave_send` inputSchema gains a `supersedes`
+  integer property. **No new standing tool** — `standing` budget test still passes.
+
+## Test helpers fixed
+
+Two `#[cfg(test)]` `Message { … }` literals needed the new field: `weave-core/src/export.rs`
+and `weave-mcp/src/dashboard.rs` (added `superseded_by: None`). The full new WL-037 test
+layer (supersede stamps/chain/auth/broadcast, integration, MCP, security, proptest) is the
+combined verifier's job per instructions — NOT added here.
+
+## Boundary crossed
+
+**Yes — `Store` trait + schema boundary crossed.** New `supersede` method + new
+`messages.superseded_by` column + changed read SQL, all mirrored in BOTH backends; both
+`sqlite` (default) and `--features libsql` compile.
+
+## Build / lint / test results (from worktree root)
+
+- `cargo build --release` (default sqlite) — **green**.
+- `cargo build --no-default-features --features libsql` — **green**.
+- `cargo clippy --lib --bins` (default) — **no issues**.
+- `cargo clippy --no-default-features --features libsql -- -D warnings` — **no issues**.
+- `cargo fmt --all` applied; `cargo fmt --all --check` — **clean**.
+- **libsql positional-mapper proof** (the highest-risk item): `cargo test
+  --no-default-features --features libsql` for `inbox` (6), `history` (1), and
+  `thread/peek/unread/search/reply/priority` (20) — **all pass**, confirming every
+  extended projection lines up with the index-10 read.
+- `cargo test -p weave-mcp standing` — **passes** (no standing-token regression).
+
+Docs (CHANGELOG/README/ARCHITECTURE) not yet synced — flagged for the verifier/docs pass
+per the plan's "Docs to sync".

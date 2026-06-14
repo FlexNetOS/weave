@@ -225,6 +225,12 @@ enum Cmd {
         /// Message priority: low, normal, high, urgent (default normal).
         #[arg(long)]
         priority: Option<String>,
+        /// WL-037: id of a prior message of YOURS this one replaces. The
+        /// predecessor is marked superseded and hidden from the recipient's unread
+        /// inbox (kept, flagged, in history). You may only supersede your own
+        /// messages.
+        #[arg(long)]
+        supersedes: Option<i64>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -2878,6 +2884,7 @@ fn main() -> Result<()> {
             no_memory,
             idempotency_key,
             priority,
+            supersedes,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2894,6 +2901,15 @@ fn main() -> Result<()> {
                         anyhow::bail!(
                             "cross-store broadcast is not supported; send to a named recipient \
                              (Tier-2 is directed-only)."
+                        );
+                    }
+                    // WL-037: supersede is a local-inbox concept (the predecessor
+                    // lives in THIS store); it has no meaning for a cross-store
+                    // intent, so reject rather than silently ignore.
+                    if supersedes.is_some() {
+                        anyhow::bail!(
+                            "--supersedes is not supported with --to-store \
+                             (supersede targets a message in this store, not a cross-store intent)."
                         );
                     }
                     let host = to_host.as_deref().unwrap_or("");
@@ -2928,7 +2944,18 @@ fn main() -> Result<()> {
                     if let Some(p) = priority {
                         let _ = store.set_message_priority(mid, &p);
                     }
-                    println!("sent #{mid}: {from} -> {to}");
+                    // WL-037: post-stamp the supersede link (the priority post-stamp
+                    // precedent). Authorization + id existence are enforced in
+                    // `Store::supersede`; a bad id bails with a clear message.
+                    if let Some(old) = supersedes {
+                        if old <= 0 {
+                            anyhow::bail!("--supersedes must be a positive message id.");
+                        }
+                        store.supersede(&from, old, mid)?;
+                        println!("sent #{mid}: {from} -> {to} (supersedes #{old})");
+                    } else {
+                        println!("sent #{mid}: {from} -> {to}");
+                    }
                     let _ = inject_and_trace(
                         store,
                         &cfg,

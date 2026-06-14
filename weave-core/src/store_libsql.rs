@@ -72,7 +72,8 @@ const SCHEMA: &[&str] = &[
         in_reply_to     INTEGER,
         idempotency_key TEXT UNIQUE,
         trace_id        TEXT,
-        priority        TEXT NOT NULL DEFAULT 'normal'
+        priority        TEXT NOT NULL DEFAULT 'normal',
+        superseded_by   INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -337,6 +338,9 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         idempotency_key: r.get::<Option<String>>(7).ok().flatten(),
         trace_id: r.get::<Option<String>>(8).ok().flatten(),
         priority: r.get::<String>(9).unwrap_or_else(|_| "normal".to_string()),
+        // WL-037: positional index 10 — EVERY explicit projection feeding this
+        // mapper MUST list `superseded_by` as the trailing (11th) column.
+        superseded_by: r.get::<Option<i64>>(10).ok().flatten(),
     })
 }
 
@@ -1043,6 +1047,8 @@ impl LibsqlStore {
             for (table, col, ddl) in [
                 ("messages", "priority", "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
                 ("outbox", "priority", "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+                // WL-037: nullable (NULL == not superseded), no DEFAULT.
+                ("messages", "superseded_by", "ALTER TABLE messages ADD COLUMN superseded_by INTEGER"),
             ] {
                 let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
                 let mut it = conn.query(&probe, ()).await?;
@@ -1496,15 +1502,17 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
+                       AND superseded_by IS NULL
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority, m.superseded_by FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+                       AND m.superseded_by IS NULL
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1550,7 +1558,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -1565,7 +1573,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1586,7 +1594,7 @@ impl Store for LibsqlStore {
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
-            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                  WHERE id IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
                  )
@@ -1607,8 +1615,9 @@ impl Store for LibsqlStore {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+                   AND superseded_by IS NULL
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
             );
@@ -1938,7 +1947,7 @@ impl Store for LibsqlStore {
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
                 SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                       m.idempotency_key, m.trace_id, m.priority
+                       m.idempotency_key, m.trace_id, m.priority, m.superseded_by
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -4158,6 +4167,51 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            // Both ids must exist; look up the predecessor's sender for the
+            // authorization check.
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT sender FROM messages WHERE id = ?1",
+                    params(vec![old_id.into()]),
+                )
+                .await?;
+            let old_sender = match it.next().await? {
+                Some(r) => r.get::<String>(0)?,
+                None => anyhow::bail!("cannot supersede: message #{old_id} does not exist"),
+            };
+            drop(it);
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT 1 FROM messages WHERE id = ?1",
+                    params(vec![new_id.into()]),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                anyhow::bail!("cannot supersede: successor message #{new_id} does not exist");
+            }
+            drop(it);
+            // Authorization: only the ORIGINAL SENDER of old_id may supersede it
+            // (best-effort same-identity guard; censorship/DoS protection).
+            if old_sender != caller {
+                anyhow::bail!(
+                    "cannot supersede: #{old_id} was sent by '{old_sender}', not '{caller}'"
+                );
+            }
+            self.conn
+                .execute(
+                    "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+                    params(vec![old_id.into(), new_id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
     fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
         let p = crate::model::ContactPolicy::parse(policy);
         self.guard_writable()?;
@@ -4324,6 +4378,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
@@ -4336,8 +4391,9 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
