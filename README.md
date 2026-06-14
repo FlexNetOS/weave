@@ -22,30 +22,48 @@ multiplexer is present.
 cargo build --release      # -> target/release/weave
 ```
 
-## Use with Claude Code
+## Use with your coding agent
 
-Register the MCP server (per user, all projects):
+`weave setup --provider <claude|codex|gemini|aider>` wires weave into your host's
+own config file (default `claude`). Every provider write is **idempotent**
+(re-running is a no-op), **never clobbers foreign content** (only weave's own
+entry is touched), **atomic** (temp + rename, with a one-time `.weave.bak`
+snapshot at `0o600`), and **read-back verified** (re-read + re-parse + assert
+weave's entry landed and every foreign entry survived before reporting success —
+a non-NotFound read error aborts without writing). Reverse with
+`weave uninstall --provider <…>`.
 
-```bash
-claude mcp add weave --scope user -- /path/to/weave mcp
-```
+| Provider | Target file | What weave writes | Mechanism |
+|---|---|---|---|
+| `claude` (default) | `~/.claude/settings.json` | Registers the `weave` MCP server (via `claude mcp add`) + merges four `hooks.{event}` entries (`SessionStart`→`session`, `UserPromptSubmit`→`prompt`, `Stop`/`SubagentStop`→`wake`). | **Confirmed.** |
+| `codex` | `~/.codex/config.toml` | Sets the top-level `notify` argv key: `notify = ["<weave>", "hook", "wake"]`. | **Partially confirmed** — Codex's documented automation hook is `notify`; it has no per-event granularity, so weave maps it to its drain (`hook wake`). Written Rust-natively (not via the ecc `.codex` sidecar). |
+| `gemini` | `~/.gemini/settings.json` | Merges the same Claude-shaped `hooks.{event}` block. | ⚠ **UNCONFIRMED** — Gemini CLI uses a Claude-style JSON settings file, but its exact lifecycle-hook key is not confirmed. weave scaffolds the documented best-known (Claude-compatible) shape; update if Gemini confirms a different key. |
+| `aider` | `~/.aider.conf.yml` | Appends a minimal `weave-hook:` stanza (hand-templated YAML, no YAML dependency). | ⚠ **LIMITED** — Aider has no rich lifecycle-hook surface; this is a best-effort scaffold and may be ignored until Aider grows hook support. |
 
-Wire lifecycle hooks in `~/.claude/settings.json` so sessions auto-register and
-auto-receive (use `weave setup` to do all of this automatically):
+The Claude flow registers the MCP server (per user, all projects) and wires the
+lifecycle hooks so sessions auto-register and auto-receive. The resulting
+`~/.claude/settings.json` looks like:
 
 ```jsonc
 {
   "hooks": {
     "SessionStart":      [{ "hooks": [{ "type": "command", "command": "weave hook session" }] }],
     "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "weave hook prompt" }] }],
-    "Stop":              [{ "hooks": [{ "type": "command", "command": "weave hook stop" }] }],
-    "Notification":      [{ "hooks": [{ "type": "command", "command": "weave hook notification" }] }]
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "weave hook wake" }] }],
+    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "weave hook wake" }] }]
   }
 }
 ```
 
+(You can also register the MCP server by hand: `claude mcp add weave --scope user -- /path/to/weave mcp`.)
+
 Now any session can use the `weave_*` MCP tools, and `weave hook prompt` surfaces unread
 messages into the agent's context on its next turn (auto-delivery without a multiplexer).
+
+> The `codex`/`gemini`/`aider` mechanisms marked above are scaffolded with the
+> caveat noted; weave writes the closest documented config entry Rust-natively
+> and prints the caveat on each run. Track the gaps in
+> [`docs/MULTI-SURFACE-PARITY.md`](docs/MULTI-SURFACE-PARITY.md).
 
 ## CLI
 
@@ -60,10 +78,13 @@ weave sessions --watch --interval 5 --repo weave  # re-render every 5s, narrowed
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
 weave send --to envctl --body "use the v2 schema instead" --supersedes 41   # REPLACE msg #41 (hidden from unread, flagged in history); supersede=replacement, reply=threading
+weave send --to envctl --body "transient status" --ttl 3600   # ephemeral: auto-deleted after N seconds (delete-on-sweep), excluded from every read surface; capped at 24h
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
 weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id> to scope; --limit N to cap)
 weave backup --out mailbox.tar       # no-dep snapshot of DB + config + Claude settings (--force to overwrite)
 weave restore --in mailbox.tar       # restore that snapshot (traversal-guarded; --force to clobber DB/config/settings; remote libSQL unsupported)
+weave session export --out s.json    # portable JSON of a session (messages + mesh memory) for cross-instance resume (--for <id>; --force)
+weave session import --in s.json     # import that session into THIS instance (idempotent; --as <id> to remap; --dry-run for counts)
 
 # Tracked ask/answer/ack (correlation-tracked request/response — distinct from send/reply)
 weave ask --from desktop --to envctl --body "can you confirm the schema?" --subject "schema"
@@ -109,6 +130,7 @@ weave daemon status                  # show whether the daemon is running and it
 
 # Notify + delivery observability (P6): fire-and-forget + transport-side trace
 weave notify --from desktop --to envctl --body "heads up"   # no reply expected; prints the honest delivery verdict
+weave notify --to envctl --body "still waiting?" --dedup-idle   # idle ping: supersedes YOUR prior unread idle pings to envctl (collapse to latest); never touches a real message or another sender's pings
 weave delivery --id 42               # show the transport trace (queued -> injected/not_injectable -> drained); --json
                                      # (the complement to `weave receipts`, which shows READ receipts)
 

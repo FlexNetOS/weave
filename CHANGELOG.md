@@ -1,8 +1,111 @@
 # Changelog
 
-## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
+## [Unreleased] — multi-provider lifecycle hook templates (WL-042)
 
 ### Added
+- **`weave setup --provider <claude|codex|gemini|aider>` (WL-042, `cross_agent_session_resumer`
+  / casr parity).** `weave setup` (and `weave uninstall`) now generalize from
+  Claude-only to four coding-agent hosts, each wired into its own config file
+  Rust-natively. Default `--provider claude` is **unchanged** (byte-for-byte —
+  regression-tested). Each provider write uses the SAME discipline as the Claude
+  path: idempotent (re-run = no-op / in-place refresh of a stale entry), never
+  clobbers foreign content, atomic temp+rename with a one-time `.weave.bak`
+  snapshot at `0o600`, and **read-back verified** (re-read + re-parse + assert
+  weave's entry landed and every foreign entry survived; a non-NotFound read error
+  aborts without writing — never truncates a populated file). Targets and
+  mechanisms:
+  - **`codex`** → `~/.codex/config.toml`: sets the top-level `notify` argv key
+    (`notify = ["<weave>", "hook", "wake"]`) — Codex's documented automation hook,
+    mapped to weave's drain (Codex has no per-event granularity). Line-based TOML
+    merge, **no `toml` dependency added** to the bin crate; written Rust-natively
+    (NOT via the ecc `.codex` sidecar — drift guard).
+  - **`gemini`** → `~/.gemini/settings.json`: merges the same Claude-shaped
+    `hooks.{event}` block. ⚠ **Caveat:** Gemini CLI's exact lifecycle-hook key is
+    **unconfirmed**; weave scaffolds the documented best-known (Claude-compatible)
+    shape and prints the caveat. Update the writer if Gemini confirms a different key.
+  - **`aider`** → `~/.aider.conf.yml`: appends a minimal hand-templated `weave-hook:`
+    YAML stanza, **no `serde_yaml`/YAML dependency added** (manual compose +
+    read-back line-presence check). ⚠ **Caveat:** Aider has no rich lifecycle-hook
+    surface; this is a best-effort scaffold that may be ignored until Aider grows
+    one. Tracked as a gap in `docs/MULTI-SURFACE-PARITY.md`.
+  CLI-only admin capability — **no new MCP tool, no new standing token**, no
+  `Store`/schema change.
+
+## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
+
+### Security
+- **Read-back verification for destructive config/hook writes (WL-041, casr "verify
+  before declaring success" parity).** `weave setup`, `weave uninstall`,
+  `weave setup --git-hooks`, and `weave restore` now **re-open and re-parse** every
+  config/hook file they rewrite and confirm the intended content actually landed
+  before reporting success — never trusting the write blindly (mirrors the WL-035
+  backup archive read-back). Concretely: `setup` asserts weave's four lifecycle
+  hooks are present AND every pre-existing foreign hook (rtk, repowire, …) survived;
+  `uninstall` asserts no weave hook remains AND foreign hooks survived; the git
+  pre-commit install asserts the guard line landed, the shebang is present on a
+  freshly created hook, and any pre-existing foreign content was preserved (append
+  only); `restore` asserts the restored `config.toml` / `settings.json` bytes match
+  the archived payload and that settings.json re-parses as a JSON object. A write
+  whose re-read does not contain the intended weave entries — or that lost a
+  pre-existing foreign hook — now **fails loudly with a descriptive error** (naming
+  the `.bak`/`settings.json.weave.bak` recovery path) instead of silently
+  succeeding. CLI-only behavior — no new MCP tool, no new standing token.
+
+### Added
+- **Canonical session export/import (WL-040), `weave session export` / `weave session
+  import` (CLI):** a portable, schema-versioned JSON interchange format for resuming a
+  session — its **messages** and its **mesh memory** — across distinct weave instances
+  whose row ids and minted correlation ids deliberately do not match (`cross_agent_session_resumer`
+  / casr parity). Distinct from the two prior "export" surfaces: **WL-034** `weave export`
+  is HTML *presentation*, **WL-035** `weave backup` is a byte-exact host-local DB *snapshot*;
+  **WL-040** is the *logical, portable, versioned* interchange. Export reads messages via
+  `Store::history`, asks via `list_asks` (recorded for fidelity), and the filesystem mesh
+  memory; the document is written atomically (sibling-temp + rename) and read-back-verified.
+  Import re-inserts messages via the existing `Store::send` — minting fresh local ids (free
+  id-remap) and deduping on `idempotency_key` (a deterministic synthetic key
+  `wl040:<identity>:<id>` is used for keyless legacy messages) so **re-import is idempotent**
+  — and writes memory via `memory_write`; identity is remapped via `--as` (occurrences of
+  the source identity become the importing identity; third-party names preserved). `--dry-run`
+  reports counts without writing. The import file is treated as **untrusted external input**:
+  every field is bounded (`check_ident`, `MAX_BODY`, subject cap, idempotency/trace shape)
+  before any store write; all writes go through the parameterized `Store::send`; no shell, no
+  embedded path fields, `--in`/`--out` are UTF-8- and traversal-guarded. **No new `Store`
+  method, no schema change, no new standing MCP tool** (CLI is the zero-standing-cost path).
+  Asks are recorded in the envelope but **not replayed** in this version (faithful ask-state
+  replay needs a new dual-backend `Store::import_ask` accepting out-of-order `AskState` —
+  tracked as **WL-040b**); peers are excluded by design (host/mux/birth-cert-local; takeover
+  hazard). See `docs/FORMAT-session-export.md`.
+- **Idle notification dedup (WL-039), `weave notify --dedup-idle` (CLI) and a `dedupIdle`
+  property on `weave_notify` (MCP, zero standing-token cost):** a new idle/notification
+  "still waiting" ping from a sender auto-supersedes that sender's prior **unread** idle
+  ping(s) to the **same recipient**, so idempotent "are you there?" pings collapse to just
+  the latest instead of piling up N-deep. Reuses the WL-037 `superseded_by` spine: the
+  superseded predecessors drop out of every unread/peek/inbox/nudge surface while staying
+  (flagged) in history/thread/search — no new hide mechanism. **Opt-in** at the call site
+  (`--dedup-idle` / `dedupIdle:true`); plain `weave send` / `weave_send` are never touched.
+  **Hard safety boundary — dedup can NEVER touch a real message or another session's
+  pings:** the supersede `UPDATE` is scoped to rows with `kind = 'idle'` (set only on the
+  notify dedup path), `sender = caller` (self-only authz, same spine as `supersede`),
+  `recipient` match, still-unread (same definition as `unread_count`), `superseded_by IS
+  NULL`, and `id <> new_id` (an idempotency-key replay is a clean no-op). Additive nullable
+  `messages.kind` column (NULL/`'normal'` == ordinary message), mirrored across both
+  backends with a guarded `ALTER TABLE ADD COLUMN` migration. New
+  `Store::supersede_prior_idle(sender, recipient, new_id) -> usize`. **No new standing MCP
+  tool** (`dedupIdle` lives in the `weave_notify` catalog op).
+- **Ephemeral messages with TTL (WL-038), `weave send --ttl <secs>` (CLI) and a `ttl`
+  property on `weave_send` (MCP, zero standing-token cost):** a sender marks a message
+  ephemeral by attaching a TTL in seconds; weave stamps a nullable absolute deadline
+  `messages.expires_at = ts + ttl`. Before the deadline the message behaves exactly like
+  a normal message; at/after it the row is **deleted** (delete-on-sweep — an expired
+  ephemeral message is not reconstructable) and excluded from every read surface
+  (inbox, unread count, nudge/peek, history, search, inbox_since). Expiry is enforced two
+  ways: folded into the existing `gc()` retention pass **and** a new
+  `sweep_expired_messages()` called opportunistically before unread/read surfaces (so
+  expiry holds with no explicit gc). TTL is capped at `MAX_MSG_TTL_SECS = 86400` (24h),
+  validated at both the CLI and MCP seams (`ttl_valid`). Additive nullable
+  `messages.expires_at` column, mirrored across both backends; carries through the
+  cross-store intent/outbox→pull path via `outbox.ttl` (re-stamped to an absolute
+  deadline on commit). **No new standing MCP tool.**
 - **Mailbox backup/restore (WL-035), `weave backup --out <path> [--force]` /
   `weave restore --in <path> [--force]`:** a portable **dependency-free uncompressed
   USTAR** archive of a consistent SQLite snapshot (`VACUUM INTO`, never a raw live-DB

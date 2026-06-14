@@ -117,6 +117,7 @@ weave-core/          library: model + config + Store trait + both backends + sig
   src/memory.rs        agent memory store (write/read/search/list/delete)
   src/export.rs        pure `render_mailbox_html` + the centralized `html_escape` (no I/O)
   src/archive.rs       pure uncompressed-USTAR writer/reader + `safe_entry_name` traversal guard (no I/O, no deps)
+  src/session.rs       pure WL-040 session-export (de)serialize: envelope structs + to_json/from_json + synth key (no I/O)
   src/llm.rs           OPTIONAL chat-completion client for thread summarization (cfg(feature="llm"))
   src/testenv.rs       test-only env lock / guard helpers
 weave-inject/        library: native multi-mux injector + `Injector` trait
@@ -343,9 +344,36 @@ governs the separate `obscura` binary via a **spawn-and-speak MCP-client** model
   [--stop] [--lease-ttl N] [--audit]` routes through the SAME `tool_web` path (CLI
   parity, zero standing tokens).
 
-### `setup.rs` — Claude Code wiring
+### `setup.rs` — host wiring (multi-provider)
 
-`run(exe)` registers the MCP server (`claude mcp add`) and merges weave's lifecycle hooks into `~/.claude/settings.json` (atomic temp+rename write, one-time backup, idempotent, preserving unrelated hooks); `uninstall()` reverses it. (Legacy note, ignore: "not yet
+`run_provider(exe, provider)` wires weave into the selected coding-agent host;
+`uninstall_provider(provider)` reverses it. The `Provider` enum has four variants
+(`Claude` default, `Codex`, `Gemini`, `Aider`), surfaced by the CLI flag
+`weave setup --provider <…>`. **All four share the same write discipline** — only
+the target file and serialization format differ:
+
+| Provider | Target file | Merge strategy | Mechanism |
+|---|---|---|---|
+| `Claude` | `~/.claude/settings.json` | JSON `hooks.{event}[]` merge + `claude mcp add` | **confirmed** (baseline, unchanged) |
+| `Codex` | `~/.codex/config.toml` | line-based TOML merge of the top-level `notify = [...]` argv key (no `toml` dep) | partially confirmed (`notify`→drain) |
+| `Gemini` | `~/.gemini/settings.json` | the SAME Claude `hooks.{event}` JSON merge (`merge_hooks_at`) | ⚠ unconfirmed key — scaffold-with-caveat |
+| `Aider` | `~/.aider.conf.yml` | append a hand-templated `weave-hook:` YAML stanza (no `serde_yaml` dep) | ⚠ limited surface — scaffold-with-caveat |
+
+Shared **merge primitives** are factored to take a target path: `read_json`/
+`write_json_atomic` (JSON providers), `write_bytes_atomic` (every provider — atomic
+temp+rename, one-time `<name>.weave.bak` 0o600 snapshot, mode-preserving), and the
+read/parse-guard that on a **non-NotFound** read error ABORTS without writing (never
+truncates a populated config). **Every destructive rewrite is read-back-verified
+(WL-041):** after the atomic write, the per-provider writer re-opens and re-parses
+the file and asserts weave's intended entry is present (merge) or absent (prune)
+AND — for the JSON providers — that every pre-existing **foreign** hook captured
+before the write survived, returning a descriptive `Err` (naming the `.weave.bak`
+recovery path) on mismatch rather than a silent `Ok`. The Codex/Aider read-backs
+assert their weave-owned line/marker landed (merge) or is gone (prune). This
+mirrors the WL-035 backup-archive read-back; `weave restore` does the same for the
+restored `config.toml`/`settings.json` bytes. The provider config files are
+**sidecar config** (the host's own settings), not build/runtime inputs of weave —
+so this adds **no language drift and no new dependency**. (Legacy note, ignore: "not yet
 implemented" line and return `Ok(())`. They exist so the CLI surface
 (`weave setup` / `weave uninstall`) is stable while the real implementation —
 registering the MCP server and merging lifecycle hooks into
@@ -454,6 +482,34 @@ read-only and counts). The **remote libSQL** backend has no local file to vacuum
 so it bails with a clear message. This is the snapshot primitive `weave backup`
 archives (and the GAP-2 hardening makes the `weave export` write report its path
 on failure).
+
+### Three distinct "export" surfaces — do not conflate
+
+weave has **three** export-shaped commands with very different jobs:
+
+| Surface | Command | Form | Purpose |
+|---|---|---|---|
+| **WL-034** | `weave export` | self-contained HTML | offline *presentation* of a mailbox (viewer) |
+| **WL-035** | `weave backup` / `restore` | USTAR tar (binary DB snapshot) | **byte-exact, host-local** backup/restore |
+| **WL-040** | `weave session export` / `import` | **canonical JSON** | **logical, portable, versioned** session interchange |
+
+The one-line rule: **WL-040 is logical + portable + versioned; WL-035 is byte-exact
++ host-local.** WL-040 (`weave-core/src/session.rs` pure (de)serialize +
+`weave/src/session.rs` I/O handler) serializes one identity's **messages** (read via
+`Store::history`) plus its **mesh memory** (the filesystem-backed scoped memory) into
+a schema-versioned JSON envelope, and re-imports it into a *different* instance whose
+row ids will not match. **Import reuses `Store::send`** — no new backend method, no
+schema change — so id-remap is free (fresh local ids) and re-import is idempotent
+(dedup on `idempotency_key`, with a deterministic synthetic key
+`wl040:<identity>:<id>` for keyless legacy messages). Identity is remapped via `--as`.
+Asks are recorded in the envelope but **not replayed** in v1 (faithful ask-state
+replay needs a new dual-backend `Store::import_ask` — tracked as WL-040b); **peers
+are excluded by design** (host/mux/birth-cert-local liveness, a takeover hazard
+elsewhere). The import file is **untrusted external input**: every field is bounded
+(`check_ident`, `MAX_BODY`, subject cap, id-shape) before any write, all writes go
+through parameterized `Store::send`, no shell is spawned, the format embeds no path
+fields, and `--in`/`--out` are traversal-guarded (the `backup.rs` discipline). The
+full contract lives in `docs/FORMAT-session-export.md`.
 
 `open_store()` in `main.rs` picks the backend from `Config::backend()`. Selecting
 `libsql` in a binary built without the feature fails with a clear message rather
@@ -754,6 +810,48 @@ jobs        (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TE
   **sender-only** — `supersede` looks up `old_id`'s sender and rejects unless it equals
   the caller (a censorship/DoS guard; advisory like the rest of `from` until `sign`).
   Supersede is **replacement** and is orthogonal to `in_reply_to` **threading**.
+  **`expires_at`** (WL-038) is a second additive nullable column (`ADD COLUMN`,
+  mirrored across both backends; **NULL == permanent**, so legacy DBs upgrade inert).
+  A sender marks a message **ephemeral** with `weave send --ttl <secs>` / the `ttl`
+  property on `weave_send`: the store stamps the **absolute deadline**
+  `expires_at = ts + ttl` (storing the deadline — not the relative ttl — makes every
+  sweep a single `WHERE expires_at <= now()`, mirroring `leases.expires`). The TTL is
+  capped at `MAX_MSG_TTL_SECS = 86400` (24h), validated by `ttl_valid` at both the CLI
+  and MCP seams (the `expires_at = ts + ttl` deadline uses `saturating_add`, so the cap
+  also forecloses an overflow). The lifecycle is **delete-on-sweep, not filter** — an
+  expired ephemeral message must not be reconstructable, so the row (and its `reads`)
+  are **deleted**, not merely hidden. Expiry is enforced two ways: (1) folded into the
+  existing `gc()` pass (the WL-016 fold-into-gc precedent — gc deletes
+  `expires_at IS NOT NULL AND expires_at <= now()` in the same transaction, even when
+  `ts >= cutoff`), and (2) a new `sweep_expired_messages()` called **opportunistically**
+  at the top of every unread/read entry point (`inbox`/`peek_oldest_unread`/`history`/
+  `search`/`inbox_since`), so expiry holds even with no explicit gc. As belt-and-
+  suspenders for the tiny between-sweep window, every read surface also carries an
+  `AND (expires_at IS NULL OR expires_at > now())` guard, so an expired-but-unswept row
+  is still invisible. Ephemeral messages carry through the **cross-store** intent path
+  via an additive `outbox.ttl` (the *relative* ttl, since the receiver re-stamps `ts` on
+  commit) — re-stamped to an absolute `expires_at` on pull-commit beside the priority
+  carry. A broadcast may be ephemeral: delete-on-sweep removes the row and all its
+  per-reader `reads` together.
+  **`kind`** (WL-039) is a third additive nullable column (`ADD COLUMN`, mirrored
+  across both backends; **NULL/`'normal'` == ordinary message**, so legacy DBs
+  upgrade inert). It marks an **idle/notification "still waiting" ping** (`kind =
+  'idle'`), set **only** on the notify dedup path. It powers **idle notification
+  dedup**, an *automatic* `supersede` on the notify path (reusing the WL-037
+  `superseded_by` spine — no new hide mechanism): when a sender fires a new idle ping
+  with `weave notify --dedup-idle` / the `dedupIdle` property on `weave_notify`,
+  `Store::supersede_prior_idle(sender, recipient, new_id)` stamps the new row
+  `kind='idle'` and then stamps `superseded_by = new_id` on the sender's prior
+  **unread** idle ping(s) to the same recipient, collapsing a pile of idempotent
+  "are you there?" pings to just the latest. Dedup is **opt-in** (the flag /
+  property; plain `send` is never touched) and is bounded by a hard **real-message
+  safety boundary**: the supersede `UPDATE` only matches rows where ALL hold —
+  `kind = 'idle'` (excludes every real message), `sender = caller` (self-only authz,
+  the same censorship/DoS guard as `supersede`), `recipient` match, still-unread (the
+  same `NOT EXISTS (reads…)` definition as `unread_count`), `superseded_by IS NULL`,
+  and `id <> new_id` (so an idempotency-key replay that returns the existing id is a
+  clean no-op, never self-supersede). It can therefore never dedup a distinct real
+  message or another session's pings.
 - **`reads`** — per-`(message, reader)` read state. This is what makes a
   broadcast deliverable exactly once per reader and keeps each session's "unread"
   independent.

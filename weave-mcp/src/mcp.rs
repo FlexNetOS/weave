@@ -600,6 +600,17 @@ fn tool_send(
         }
         other => other,
     };
+    // WL-038: optional ephemeral TTL (seconds). Validated against the cap at this
+    // seam (the `lease_ttl_valid` precedent) before any DB bind.
+    let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
+        Some(t) if !model::ttl_valid(t) => {
+            return Err(format!(
+                "'ttl' must be between 1 and {} seconds.",
+                model::MAX_MSG_TTL_SECS
+            ));
+        }
+        other => other,
+    };
     let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
@@ -639,6 +650,7 @@ fn tool_send(
                 idempotency_key,
                 trace_id.as_deref(),
                 priority,
+                ttl.unwrap_or(0),
             )
             .map_err(e)?;
         // WL-036: a queued cross-store intent IS a send ⇒ fire `Send` hooks. The
@@ -669,6 +681,11 @@ fn tool_send(
         .map_err(e)?;
     if let Some(p) = priority {
         let _ = store.set_message_priority(mid, p);
+    }
+    // WL-038: post-stamp the ephemeral expiry after the send (the
+    // `set_message_priority` post-stamp precedent). `ttl` is already cap-validated.
+    if let Some(t) = ttl {
+        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
     }
     // WL-037: post-stamp the supersede link after the send (the `set_message_priority`
     // post-stamp precedent). Authorization (caller == original sender) + id existence
@@ -850,6 +867,16 @@ fn tool_notify(
         .get("priority")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    // WL-038: optional ephemeral TTL, cap-validated at the seam.
+    let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
+        Some(t) if !model::ttl_valid(t) => {
+            return Err(format!(
+                "'ttl' must be between 1 and {} seconds.",
+                model::MAX_MSG_TTL_SECS
+            ));
+        }
+        other => other,
+    };
     let trace_id = Some(model::mint_trace_id());
 
     // Persist via the EXISTING send path (no new persistence — notify is a normal
@@ -868,6 +895,21 @@ fn tool_notify(
         .map_err(e)?;
     if let Some(p) = priority {
         let _ = store.set_message_priority(mid, p);
+    }
+    // WL-038: post-stamp the ephemeral expiry after persist.
+    if let Some(t) = ttl {
+        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
+    }
+    // WL-039: opt-in idle-notification dedup. Stamp this ping idle and supersede
+    // this sender's prior UNREAD idle pings to `to` (collapse "still waiting"
+    // pings to the latest). Best-effort post-persist — a dedup failure never sinks
+    // the notify. Never touches a real message or another sender's pings.
+    let dedup_idle = args
+        .get("dedupIdle")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if dedup_idle {
+        let _ = store.supersede_prior_idle(&from, &to, mid);
     }
 
     // Trace: queued after persist (best-effort, never sinks the path).
@@ -1713,8 +1755,22 @@ fn tool_reply(
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
     let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
+    // WL-038: optional ephemeral TTL, cap-validated at the seam.
+    let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
+        Some(t) if !model::ttl_valid(t) => {
+            return Err(format!(
+                "'ttl' must be between 1 and {} seconds.",
+                model::MAX_MSG_TTL_SECS
+            ));
+        }
+        other => other,
+    };
 
     let mid = store.reply(&from, in_reply_to, &body).map_err(e)?;
+    // WL-038: post-stamp the ephemeral expiry after persist.
+    if let Some(t) = ttl {
+        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
+    }
     let mut out = format!("Replied to #{in_reply_to} as message #{mid} from '{from}'.");
 
     // Native push: nudge the reply's recipient if it resolved to a registered
@@ -3233,7 +3289,8 @@ fn tool_catalog() -> Vec<Value> {
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
                 "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
                 "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
-                "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."}
+                "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."},
+                "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400). The message is auto-deleted (delete-on-sweep) after this many seconds and excluded from every read surface; omit for a permanent message."}
             },"required":["to","body"]}
         },
         {
@@ -3245,7 +3302,9 @@ fn tool_catalog() -> Vec<Value> {
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
                 "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
-                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
+                "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400); the message is auto-deleted after this many seconds."},
+                "dedupIdle":{"type":"boolean","description":"Idle-notification dedup: mark this as an idle 'still waiting' ping and auto-supersede YOUR prior UNREAD idle pings to this recipient so they collapse to just the latest. Never touches a real message or another sender's pings (default false)."}
             },"required":["to","body"]}
         },
         {
@@ -3347,7 +3406,8 @@ fn tool_catalog() -> Vec<Value> {
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "in_reply_to":{"type":"integer","description":"The message id you're replying to."},
                 "body":{"type":"string"},
-                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
+                "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
+                "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400); the reply is auto-deleted after this many seconds."}
             },"required":["in_reply_to","body"]}
         },
         {
@@ -5714,6 +5774,83 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("unknown operation"), "{err}");
+    }
+
+    // ---- WL-038: ephemeral TTL on weave_send ------------------------------
+
+    /// `weave_send {ttl}` stamps an absolute expiry on the persisted message.
+    #[test]
+    fn weave_send_ttl_stamps_expiry() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let out = call(
+            "weave_send",
+            json!({"from":"a","to":"b","body":"ephemeral","ttl":600}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("send succeeds");
+        assert!(out.contains("Sent message"));
+        let hist = st.history("b", None, 50).unwrap();
+        let m = hist
+            .iter()
+            .find(|m| m.body == "ephemeral")
+            .expect("persisted");
+        let exp = m.expires_at.expect("ttl stamped an expiry");
+        let now = weave_core::model::now();
+        assert!(
+            exp > now + 500 && exp <= now + 600,
+            "expiry {exp} vs now {now}"
+        );
+    }
+
+    /// `weave_send {ttl: 0}` is rejected at the seam (cap guard), no row written.
+    #[test]
+    fn weave_send_ttl_zero_is_rejected() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        let err = call(
+            "weave_send",
+            json!({"from":"a","to":"b","body":"x","ttl":0}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(err.contains("ttl"), "{err}");
+        assert!(
+            st.history("b", None, 50).unwrap().is_empty(),
+            "no row on reject"
+        );
+    }
+
+    /// The catalog `weave_send` schema now lists `ttl` (zero standing-token cost —
+    /// it lives only in the meta-tool catalog, NOT as a new standing tool).
+    #[test]
+    fn catalog_weave_send_lists_ttl() {
+        let send = tool_catalog()
+            .into_iter()
+            .find(|t| t["name"] == "weave_send")
+            .expect("weave_send in catalog");
+        assert!(
+            send["inputSchema"]["properties"].get("ttl").is_some(),
+            "weave_send catalog schema must expose ttl"
+        );
+    }
+
+    /// WL-039: `dedupIdle` is exposed on the `weave_notify` CATALOG op (progressive
+    /// disclosure), never as a new standing tool — the standing budget stays green.
+    #[test]
+    fn catalog_weave_notify_lists_dedup_idle() {
+        let notify = tool_catalog()
+            .into_iter()
+            .find(|t| t["name"] == "weave_notify")
+            .expect("weave_notify in catalog");
+        assert!(
+            notify["inputSchema"]["properties"]
+                .get("dedupIdle")
+                .is_some(),
+            "weave_notify catalog schema must expose dedupIdle"
+        );
     }
 
     /// `mode=call` dispatches to exactly the same handler as a direct flat call — the

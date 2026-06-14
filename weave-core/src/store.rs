@@ -314,6 +314,7 @@ pub trait Store: Send {
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
         priority: Option<&str>,
+        ttl: i64,
     ) -> Result<i64>;
 
     /// Tier-2: read intents from THIS store's `outbox` addressed to `for_recipient`
@@ -713,6 +714,19 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn set_message_priority(&self, id: i64, priority: &str) -> Result<()>;
 
+    /// WL-038: stamp an ephemeral message's absolute expiry deadline (epoch secs)
+    /// after creation. Post-insert stamp (the `set_message_priority` precedent), so
+    /// `Store::send`'s signature is unchanged. Write path.
+    #[allow(dead_code)]
+    fn set_message_expiry(&self, id: i64, expires_at: i64) -> Result<()>;
+
+    /// WL-038: delete all expired ephemeral messages (and their `reads`) where
+    /// `expires_at <= now()`. Returns the count of messages removed. Delete-on-sweep
+    /// (an expired ephemeral message must not be reconstructable). Called
+    /// opportunistically before read surfaces and folded into `gc()`. Write path.
+    #[allow(dead_code)]
+    fn sweep_expired_messages(&self) -> Result<usize>;
+
     /// WL-037: mark `old_id` as superseded by `new_id` (replacement, distinct from
     /// `in_reply_to` threading). Stamps `messages.superseded_by = new_id` on the
     /// predecessor so it drops out of every reader's unread inbox while remaining
@@ -726,6 +740,26 @@ pub trait Store: Send {
     /// never touches the `reads` table.
     #[allow(dead_code)]
     fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()>;
+
+    /// WL-039: idle-notification dedup. Mark `new_id` as an idle ping
+    /// (`kind = 'idle'`), then auto-supersede every *prior* still-**unread** idle
+    /// ping from `sender` to `recipient` by stamping `superseded_by = new_id` on
+    /// them — collapsing a sender's pile of "still waiting" pings to just the
+    /// latest. Reuses the WL-037 `superseded_by` hide-from-unread spine: the
+    /// superseded predecessors drop out of every unread/peek/inbox/nudge surface
+    /// while staying (flagged) in history/thread/search. Returns the number of
+    /// predecessors superseded.
+    ///
+    /// HARD safety boundary — dedup can NEVER touch a real message or another
+    /// session's pings. It is scoped to rows where ALL hold: `kind = 'idle'` (set
+    /// only by the notify path), `sender = sender` (authz — you can only supersede
+    /// your OWN prior idle pings, same spine as [`Store::supersede`]),
+    /// `recipient = recipient`, the predecessor is still unread by `recipient`
+    /// (same unread definition as `unread_count`), `superseded_by IS NULL`, and
+    /// `id <> new_id` (so an idempotency-key replay where `send` returns the
+    /// existing id is a clean no-op). Never injects, never touches `reads`.
+    #[allow(dead_code)]
+    fn supersede_prior_idle(&self, sender: &str, recipient: &str, new_id: i64) -> Result<usize>;
 
     /// WL-032: set a peer's contact policy.
     #[allow(dead_code)]
@@ -1381,7 +1415,9 @@ CREATE TABLE IF NOT EXISTS messages (
     idempotency_key TEXT UNIQUE,
     trace_id        TEXT,
     priority        TEXT NOT NULL DEFAULT 'normal',
-    superseded_by   INTEGER
+    superseded_by   INTEGER,
+    expires_at      INTEGER,
+    kind            TEXT
 );
 CREATE TABLE IF NOT EXISTS reads (
     message_id INTEGER NOT NULL,
@@ -1424,7 +1460,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     sig             TEXT NOT NULL DEFAULT '',
     idempotency_key TEXT,
     trace_id        TEXT,
-    priority        TEXT NOT NULL DEFAULT 'normal'
+    priority        TEXT NOT NULL DEFAULT 'normal',
+    ttl             INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pull_cursor (
     source  TEXT PRIMARY KEY,
@@ -1603,6 +1640,14 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
         // populate it; projections that omit it (legacy) read back `None`. The
         // migration guarantees the column exists.
         superseded_by: r.get("superseded_by").unwrap_or(None),
+        // WL-038: read by name; `SELECT *` and projections listing the column
+        // populate it, projections that omit it read back `None`. The migration
+        // guarantees the column exists.
+        expires_at: r.get("expires_at").unwrap_or(None),
+        // WL-039: read by name; `SELECT *` and projections listing the column
+        // populate it, projections that omit it read back `None`. The migration
+        // guarantees the column exists.
+        kind: r.get("kind").unwrap_or(None),
     })
 }
 
@@ -1777,10 +1822,11 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND m.superseded_by IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > ?2)
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
-    Ok(conn.query_row(&sql, params![me], |r| r.get(0))?)
+    Ok(conn.query_row(&sql, params![me, now()], |r| r.get(0))?)
 }
 
 /// The oldest unread message for `me`, if any. Used by the wake hook to surface
@@ -1788,15 +1834,16 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
 #[cfg(feature = "sqlite")]
 fn peek_oldest_unread_conn(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority, superseded_by FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority, superseded_by, expires_at, kind FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND m.superseded_by IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > ?2)
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params![me])?;
+    let mut rows = stmt.query(params![me, now()])?;
     match rows.next()? {
         Some(r) => Ok(Some(row_to_message(r)?)),
         None => Ok(None),
@@ -1856,6 +1903,7 @@ fn row_to_intent(r: &Row) -> rusqlite::Result<Intent> {
         idempotency_key: r.get(8).unwrap_or(None),
         trace_id: r.get(9).unwrap_or(None),
         priority: r.get(10).unwrap_or("normal".to_string()),
+        ttl: r.get(11).unwrap_or(0),
     })
 }
 
@@ -2249,6 +2297,24 @@ fn migrate(conn: &Connection) -> Result<()> {
     // existing row reads back NULL (== not superseded).
     if !column_exists(conn, "messages", "superseded_by")? {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN superseded_by INTEGER;")?;
+    }
+    // WL-038: ephemeral-message absolute deadline (`ts + ttl`). Nullable (NULL ==
+    // permanent), no DEFAULT — present on fresh DBs via SCHEMA, added here for DBs
+    // created before ephemeral messages existed. `ADD COLUMN` is O(1) and every
+    // existing row reads back NULL (== permanent). Carried on the outbox as the
+    // *relative* ttl (the receiver re-stamps `ts` on commit).
+    if !column_exists(conn, "messages", "expires_at")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN expires_at INTEGER;")?;
+    }
+    if !column_exists(conn, "outbox", "ttl")? {
+        conn.execute_batch("ALTER TABLE outbox ADD COLUMN ttl INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    // WL-039: idle-notification marker. Nullable (NULL == ordinary message), no
+    // DEFAULT — present on fresh DBs via SCHEMA, added here for DBs created before
+    // idle dedup existed. `ADD COLUMN` is O(1) and every existing row reads back
+    // NULL (== not an idle ping). Set to 'idle' only on the notify dedup path.
+    if !column_exists(conn, "messages", "kind")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN kind TEXT;")?;
     }
     // WL-032: per-peer contact policies.
     if !column_exists(conn, "peers", "contact_policy")? {
@@ -2707,6 +2773,14 @@ pub fn commit_pulled(
                     if !intent.priority.is_empty() && intent.priority != "normal" {
                         let _ = local.set_message_priority(mid, &intent.priority);
                     }
+                    // WL-038: re-stamp the absolute expiry from the carried relative
+                    // ttl against the receiver's own `now()` (the priority precedent).
+                    if intent.ttl > 0 {
+                        let _ = local.set_message_expiry(
+                            mid,
+                            crate::model::expiry_from_ttl(now(), intent.ttl),
+                        );
+                    }
                     committed += 1;
                 }
                 Err(e) => {
@@ -2987,12 +3061,18 @@ impl Store for SqliteStore {
         mark_read: bool,
         limit: i64,
     ) -> Result<(Vec<Message>, i64)> {
+        // WL-038: opportunistically delete any expired ephemeral rows before the
+        // read so expiry holds even with no explicit gc; best-effort.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
+        // WL-038: also exclude expired-but-not-yet-swept rows (belt-and-suspenders
+        // for the tiny window between sweeps).
         let sql = if include_read {
             format!(
                 "SELECT * FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                    AND superseded_by IS NULL
+                   AND (expires_at IS NULL OR expires_at > ?3)
                  ORDER BY id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
             )
@@ -3001,6 +3081,7 @@ impl Store for SqliteStore {
                 "SELECT m.* FROM messages m
                  WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
                    AND m.superseded_by IS NULL
+                   AND (m.expires_at IS NULL OR m.expires_at > ?3)
                    AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                  ORDER BY m.id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
@@ -3013,10 +3094,11 @@ impl Store for SqliteStore {
         // message in between the read and the count.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
+        let now_cut = now();
         let mut rows: Vec<Message> = {
             let mut stmt = tx.prepare(&sql)?;
             let v = stmt
-                .query_map(params![me, limit], row_to_message)?
+                .query_map(params![me, limit, now_cut], row_to_message)?
                 .collect::<rusqlite::Result<_>>()?;
             v
         };
@@ -3038,30 +3120,35 @@ impl Store for SqliteStore {
     }
 
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so history never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
+        let now_cut = now();
         let mut rows: Vec<Message> = if let Some(p) = peer {
             let sql = format!(
                 "SELECT * FROM messages
-                 WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
-                    OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
+                 WHERE ((sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
+                    OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc})))
+                   AND (expires_at IS NULL OR expires_at > ?4)
                  ORDER BY id DESC LIMIT ?3",
                 bc = BROADCAST_SQL
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let v = stmt
-                .query_map(params![me, p, limit], row_to_message)?
+                .query_map(params![me, p, limit, now_cut], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             v
         } else {
             let sql = format!(
                 "SELECT * FROM messages
-                 WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
+                 WHERE (sender = ?1 OR recipient = ?1 OR recipient IN {bc})
+                   AND (expires_at IS NULL OR expires_at > ?3)
                  ORDER BY id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let v = stmt
-                .query_map(params![me, limit], row_to_message)?
+                .query_map(params![me, limit, now_cut], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             v
         };
@@ -3070,31 +3157,37 @@ impl Store for SqliteStore {
     }
 
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so search never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
         let sql = "SELECT * FROM messages
              WHERE id IN (
                  SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
              )
+             AND (expires_at IS NULL OR expires_at > ?3)
              ORDER BY id DESC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
-            .query_map(params![query, limit], row_to_message)?
+            .query_map(params![query, limit, now()], row_to_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     fn inbox_since(&self, me: &str, since_id: i64, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so the drain never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         let limit = clamp_limit(limit);
         let sql = format!(
             "SELECT * FROM messages
              WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
                AND superseded_by IS NULL
+               AND (expires_at IS NULL OR expires_at > ?4)
              ORDER BY id ASC LIMIT ?3",
             bc = BROADCAST_SQL
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![me, since_id, limit], row_to_message)?
+            .query_map(params![me, since_id, limit, now()], row_to_message)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -3195,6 +3288,8 @@ impl Store for SqliteStore {
     }
 
     fn peek_oldest_unread(&self, me: &str) -> Result<Option<Message>> {
+        // WL-038: opportunistic sweep so the wake hook never surfaces an expired row.
+        let _ = self.sweep_expired_messages();
         peek_oldest_unread_conn(&self.conn, me)
     }
 
@@ -3225,6 +3320,20 @@ impl Store for SqliteStore {
             params![cutoff],
         )?;
         tx.execute("DELETE FROM messages WHERE ts < ?1", params![cutoff])?;
+        // WL-038: fold the ephemeral expiry into the SAME gc pass — delete expired
+        // messages (and their reads) even if `ts >= cutoff` (delete-on-sweep). The
+        // opportunistic `sweep_expired_messages` covers the between-gc window; this
+        // guarantees expired rows are reaped by any gc too.
+        let expiry_cut = now();
+        tx.execute(
+            "DELETE FROM reads WHERE message_id IN
+                (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+            params![expiry_cut],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![expiry_cut],
+        )?;
         // P6: prune the delivery trace by the SAME retention cutoff so it is bounded
         // by the existing gc pass (no new sweeper). Mirrors the `messages` prune;
         // the count returned still reflects messages only (the trace is metadata).
@@ -3596,7 +3705,7 @@ impl Store for SqliteStore {
                 SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
             )
             SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                   m.idempotency_key, m.trace_id, m.priority, m.superseded_by
+                   m.idempotency_key, m.trace_id, m.priority, m.superseded_by, m.expires_at, m.kind
             FROM messages m JOIN t ON m.id = t.id
             ORDER BY m.id ASC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
@@ -3615,6 +3724,11 @@ impl Store for SqliteStore {
                     priority: r.get(9).unwrap_or("normal".to_string()),
                     // WL-037: keep superseded rows in a thread, flagged.
                     superseded_by: r.get(10).unwrap_or(None),
+                    // WL-038: carry the ephemeral deadline (expired rows are already
+                    // deleted by sweep/gc, so a surviving thread row reads its value).
+                    expires_at: r.get(11).unwrap_or(None),
+                    // WL-039: carry the idle-ping marker (flagged in history/thread).
+                    kind: r.get(12).unwrap_or(None),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3651,16 +3765,20 @@ impl Store for SqliteStore {
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
         priority: Option<&str>,
+        ttl: i64,
     ) -> Result<i64> {
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
         check_host(to_host)?;
         check_body(body)?;
         let p = priority.unwrap_or("normal");
+        // WL-038: carry the *relative* ttl (the receiver re-stamps `ts` on commit).
+        // `<= 0` normalizes to 0 (no TTL); the CLI/MCP seam already validated the cap.
+        let ttl = ttl.max(0);
         self.conn.execute(
-            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![now(), to, to_host, from, subject, body, sig, idempotency_key, trace_id, p],
+            "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![now(), to, to_host, from, subject, body, sig, idempotency_key, trace_id, p, ttl],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -3668,7 +3786,7 @@ impl Store for SqliteStore {
     fn list_outbox(&self, for_recipient: &str, since_id: i64, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl FROM outbox
              WHERE to_peer = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
         )?;
@@ -3681,7 +3799,7 @@ impl Store for SqliteStore {
     fn outbox_all(&self, limit: i64) -> Result<Vec<Intent>> {
         let limit = clamp_limit(limit);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority FROM outbox
+            "SELECT id, ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl FROM outbox
              ORDER BY id ASC LIMIT ?1",
         )?;
         let rows = stmt
@@ -4962,6 +5080,33 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn set_message_expiry(&self, id: i64, expires_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET expires_at = ?1 WHERE id = ?2",
+            params![expires_at, id],
+        )?;
+        Ok(())
+    }
+
+    fn sweep_expired_messages(&self) -> Result<usize> {
+        let now = now();
+        // Delete-on-sweep: remove the reads first (mirroring the gc reads prune),
+        // then the messages, in one IMMEDIATE tx so a reader can't observe a
+        // half-swept row. The count returned reflects messages removed.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM reads WHERE message_id IN
+                (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+            params![now],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
         // Both ids must exist; the new id is looked up so a typo'd/forged
         // successor can't strand the predecessor pointing at a phantom row.
@@ -4996,6 +5141,33 @@ impl Store for SqliteStore {
             params![old_id, new_id],
         )?;
         Ok(())
+    }
+
+    fn supersede_prior_idle(&self, sender: &str, recipient: &str, new_id: i64) -> Result<usize> {
+        // Stamp the new ping as idle so it (and only it) is eligible to be
+        // superseded by the NEXT idle ping. Scoped to `sender` so a caller can
+        // never re-kind another session's message (authz, the WL-037 spine).
+        self.conn.execute(
+            "UPDATE messages SET kind = ?3 WHERE id = ?1 AND sender = ?2",
+            params![new_id, sender, crate::model::KIND_IDLE],
+        )?;
+        // Auto-supersede the sender's prior UNREAD idle pings to this recipient.
+        // The predicate is the hard safety boundary: kind='idle' excludes every
+        // real message; sender=? is the self-only authz; recipient=? scopes to
+        // the same mailbox; id<>new_id makes an idempotency-key replay a no-op;
+        // superseded_by IS NULL skips already-chained rows; the NOT EXISTS clause
+        // is the SAME unread definition as `unread_count_conn` (a just-read ping
+        // is not superseded).
+        let n = self.conn.execute(
+            "UPDATE messages SET superseded_by = ?1
+             WHERE sender = ?2 AND recipient = ?3
+               AND kind = ?4
+               AND superseded_by IS NULL
+               AND id <> ?1
+               AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = messages.id AND r.reader = ?3)",
+            params![new_id, sender, recipient, crate::model::KIND_IDLE],
+        )?;
+        Ok(n)
     }
 
     fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
@@ -6383,6 +6555,7 @@ mod tests {
                 Some("ik"),
                 Some("tk"),
                 None,
+                0,
             )
             .unwrap();
         let intents = s.outbox_all(10).unwrap();
@@ -7547,6 +7720,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         let _i2 = s
@@ -7560,10 +7734,11 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         let i3 = s
-            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None)
+            .enqueue_intent("bob", "", "alice", None, "body3", "", None, None, None, 0)
             .unwrap();
 
         // Self-inspection sees all three, oldest-first.
@@ -7595,22 +7770,22 @@ mod tests {
     fn enqueue_intent_enforces_caps() {
         let s = mem();
         assert!(s
-            .enqueue_intent("", "", "a", None, "x", "", None, None, None)
+            .enqueue_intent("", "", "a", None, "x", "", None, None, None, 0)
             .is_err());
         assert!(s
-            .enqueue_intent("b", "", "", None, "x", "", None, None, None)
+            .enqueue_intent("b", "", "", None, "x", "", None, None, None, 0)
             .is_err());
         assert!(
-            s.enqueue_intent("b", "h\nx", "a", None, "x", "", None, None, None)
+            s.enqueue_intent("b", "h\nx", "a", None, "x", "", None, None, None, 0)
                 .is_err(),
             "control char in to_host rejected"
         );
         let big = "x".repeat(MAX_BODY + 1);
         assert!(s
-            .enqueue_intent("b", "", "a", None, &big, "", None, None, None)
+            .enqueue_intent("b", "", "a", None, &big, "", None, None, None, 0)
             .is_err());
         assert!(s
-            .enqueue_intent("b", "", "a", None, "ok", "", None, None, None)
+            .enqueue_intent("b", "", "a", None, "ok", "", None, None, None, 0)
             .is_ok());
     }
 
@@ -7659,6 +7834,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    0,
                 )
                 .unwrap();
             }
@@ -7727,6 +7903,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         }
@@ -7780,6 +7957,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .unwrap();
         }
@@ -7817,7 +7995,7 @@ mod tests {
         let s = SqliteStore::open(&path).unwrap();
         // The new tables exist and work.
         let id = s
-            .enqueue_intent("bob", "", "alice", None, "x", "", None, None, None)
+            .enqueue_intent("bob", "", "alice", None, "x", "", None, None, None, 0)
             .unwrap();
         assert!(id > 0);
         assert_eq!(s.pull_cursor_get("src").unwrap(), 0);
@@ -8002,7 +8180,7 @@ mod tests {
         ) -> StoreSource {
             let p = dir.join(format!("{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None, 0)
                 .unwrap();
             StoreSource::Local(p)
         }
@@ -8136,7 +8314,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None, 0)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8341,7 +8519,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None, 0)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8428,7 +8606,7 @@ mod tests {
             tag += 1;
             let p = dir.join(format!("s{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
-            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None)
+            a.enqueue_intent("bob", "", from, None, body, sig, None, None, None, 0)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8502,7 +8680,7 @@ mod tests {
             let p = dir.join(format!("r{tag}.db"));
             let a = SqliteStore::open(&p).unwrap();
             let sig = sign_intent(pk_signer, "alice", "bob", body);
-            a.enqueue_intent("bob", "", "alice", None, body, &sig, None, None, None)
+            a.enqueue_intent("bob", "", "alice", None, body, &sig, None, None, None, 0)
                 .unwrap();
             StoreSource::Local(p)
         };
@@ -8856,6 +9034,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .unwrap();
         let source = StoreSource::Local(src_path);
@@ -8920,6 +9099,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .unwrap();
         let source = StoreSource::Local(src_path);
@@ -10242,6 +10422,142 @@ mod tests {
         assert_eq!(superseded_by_of(&s2, "b", a), Some(b));
     }
 
+    // ---- WL-039: idle-notification dedup -----------------------------------
+
+    #[test]
+    fn supersede_prior_idle_replaces_prior_unread_idle() {
+        let s = mem();
+        // Two idle pings a->b: each notify stamps idle + supersedes the prior one.
+        let p1 = s
+            .send("a", "b", None, "still waiting?", None, None)
+            .unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", p1).unwrap(), 0);
+        let p2 = s
+            .send("a", "b", None, "still waiting??", None, None)
+            .unwrap();
+        assert_eq!(s.supersede_prior_idle("a", "b", p2).unwrap(), 1);
+        // Only the latest ping is unread; the first is superseded + hidden.
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(inbox.iter().any(|m| m.id == p2));
+        assert!(!inbox.iter().any(|m| m.id == p1));
+        assert_eq!(superseded_by_of(&s, "b", p1), Some(p2));
+        // Nudge/wake path also skips the superseded predecessor.
+        assert_eq!(s.peek_oldest_unread("b").unwrap().unwrap().id, p2);
+    }
+
+    #[test]
+    fn idle_dedup_never_touches_real_messages() {
+        let s = mem();
+        // A REAL message (no idle stamp) between two idle pings must survive.
+        let p1 = s.send("a", "b", None, "ping 1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", p1).unwrap();
+        let real = s
+            .send("a", "b", Some("work"), "real content", None, None)
+            .unwrap();
+        let p2 = s.send("a", "b", None, "ping 2", None, None).unwrap();
+        let n = s.supersede_prior_idle("a", "b", p2).unwrap();
+        // Exactly the prior idle ping was superseded — NOT the real message.
+        assert_eq!(n, 1);
+        assert_eq!(superseded_by_of(&s, "b", p1), Some(p2));
+        assert_eq!(superseded_by_of(&s, "b", real), None);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(
+            inbox.iter().any(|m| m.id == real),
+            "real message must stay unread"
+        );
+        assert!(inbox.iter().any(|m| m.id == p2));
+        assert!(!inbox.iter().any(|m| m.id == p1));
+    }
+
+    #[test]
+    fn idle_dedup_only_supersedes_unread() {
+        let s = mem();
+        let p1 = s.send("a", "b", None, "ping 1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", p1).unwrap();
+        // b READS the first ping (mark_read=true drains the unread).
+        let _ = s.inbox("b", false, true, 50).unwrap();
+        let p2 = s.send("a", "b", None, "ping 2", None, None).unwrap();
+        // A read predecessor is NOT superseded (only unread pings are replaced).
+        let n = s.supersede_prior_idle("a", "b", p2).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(superseded_by_of(&s, "b", p1), None);
+    }
+
+    #[test]
+    fn idle_dedup_scoped_to_same_sender_recipient() {
+        let s = mem();
+        // a->b, c->b, and a->z idle pings.
+        let a_b1 = s.send("a", "b", None, "a1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", a_b1).unwrap();
+        let c_b = s.send("c", "b", None, "c1", None, None).unwrap();
+        s.supersede_prior_idle("c", "b", c_b).unwrap();
+        let a_z = s.send("a", "z", None, "az1", None, None).unwrap();
+        s.supersede_prior_idle("a", "z", a_z).unwrap();
+        // A new a->b ping supersedes ONLY a's prior a->b ping.
+        let a_b2 = s.send("a", "b", None, "a2", None, None).unwrap();
+        let n = s.supersede_prior_idle("a", "b", a_b2).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(superseded_by_of(&s, "b", a_b1), Some(a_b2));
+        // c's ping and a's ping to z are untouched.
+        assert_eq!(superseded_by_of(&s, "b", c_b), None);
+        assert_eq!(superseded_by_of(&s, "z", a_z), None);
+    }
+
+    #[test]
+    fn idle_dedup_authz_self_only() {
+        let s = mem();
+        // a sends an idle ping to b.
+        let a_b = s.send("a", "b", None, "a1", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", a_b).unwrap();
+        // c sends an idle ping to b, then tries to dedup as if it were a's ping:
+        // c's call is scoped to sender='c', so a's ping is NOT superseded.
+        let c_b = s.send("c", "b", None, "c1", None, None).unwrap();
+        let n = s.supersede_prior_idle("c", "b", c_b).unwrap();
+        assert_eq!(n, 0, "c cannot supersede a's prior idle ping");
+        assert_eq!(superseded_by_of(&s, "b", a_b), None);
+    }
+
+    #[test]
+    fn idle_dedup_idempotency_replay_is_noop() {
+        let s = mem();
+        // A notify carrying an idempotency key: a re-send returns the SAME id, so
+        // the dedup `id <> new_id` guard makes it a clean no-op (never self-supersede).
+        let p1 = s.send("a", "b", None, "ping", Some("k-1"), None).unwrap();
+        s.supersede_prior_idle("a", "b", p1).unwrap();
+        let replay = s.send("a", "b", None, "ping", Some("k-1"), None).unwrap();
+        assert_eq!(replay, p1, "idempotency replay returns the existing id");
+        let n = s.supersede_prior_idle("a", "b", replay).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            superseded_by_of(&s, "b", p1),
+            None,
+            "must not self-supersede"
+        );
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+    }
+
+    #[test]
+    fn idle_dedup_kind_column_is_migrated_idempotently() {
+        // The guarded ADD COLUMN kind must survive a re-open (migrate re-run).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weave-kind-mig-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let p1;
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            p1 = s.send("a", "b", None, "p1", None, None).unwrap();
+            s.supersede_prior_idle("a", "b", p1).unwrap();
+        }
+        let s2 = SqliteStore::open(&path).unwrap();
+        let p2 = s2.send("a", "b", None, "p2", None, None).unwrap();
+        assert_eq!(s2.supersede_prior_idle("a", "b", p2).unwrap(), 1);
+        assert_eq!(superseded_by_of(&s2, "b", p1), Some(p2));
+    }
+
     // ---- WL-035: Store::snapshot_to (VACUUM INTO + read-back) ---------------
 
     #[test]
@@ -10275,5 +10591,127 @@ mod tests {
         s.snapshot_to(&dest).unwrap();
         let snap = SqliteStore::open_readonly(&dest).unwrap();
         assert_eq!(snap.total_messages().unwrap(), 0);
+    }
+
+    // ---- WL-038: ephemeral messages with TTL + auto-sweep ------------------
+
+    #[test]
+    fn expiry_stamps_and_excludes_from_unread() {
+        let s = mem();
+        let live = s
+            .send("a", "b", Some("keep"), "permanent", None, None)
+            .unwrap();
+        let eph = s
+            .send("a", "b", Some("v"), "ephemeral", None, None)
+            .unwrap();
+        // Stamp the ephemeral row already expired (now - 1).
+        s.set_message_expiry(eph, now() - 1).unwrap();
+        // Any read surface triggers the opportunistic sweep + excludes the row.
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(inbox.iter().any(|m| m.id == live));
+        assert!(
+            !inbox.iter().any(|m| m.id == eph),
+            "expired ephemeral must not appear in unread inbox"
+        );
+        // Delete-on-sweep: the row is GONE (not just filtered).
+        assert_eq!(s.total_messages().unwrap(), 1);
+        assert!(s
+            .history("b", None, 100)
+            .unwrap()
+            .iter()
+            .all(|m| m.id != eph));
+        assert!(s
+            .inbox_since("b", 0, 100)
+            .unwrap()
+            .iter()
+            .all(|m| m.id != eph));
+        assert!(s
+            .search("ephemeral", 50)
+            .unwrap()
+            .iter()
+            .all(|m| m.id != eph));
+        // The oldest-unread (nudge/wake path) skips it too.
+        let oldest = s.peek_oldest_unread("b").unwrap().unwrap();
+        assert_eq!(oldest.id, live);
+    }
+
+    #[test]
+    fn sweep_expired_messages_deletes_expired_keeps_live() {
+        let s = mem();
+        let expired = s.send("a", "b", None, "gone", None, None).unwrap();
+        let future = s.send("a", "b", None, "soon", None, None).unwrap();
+        let permanent = s.send("a", "b", None, "forever", None, None).unwrap();
+        // Mark all read so we can assert the expired row's `reads` are pruned too.
+        // (Do this BEFORE stamping expiry, since the inbox read triggers a sweep.)
+        let _ = s.inbox("b", false, true, 50).unwrap();
+        s.set_message_expiry(expired, now() - 5).unwrap();
+        s.set_message_expiry(future, now() + 10_000).unwrap();
+        let n = s.sweep_expired_messages().unwrap();
+        assert_eq!(n, 1, "exactly the one expired row is swept");
+        let hist = s.history("b", None, 100).unwrap();
+        assert!(hist.iter().any(|m| m.id == future));
+        assert!(hist.iter().any(|m| m.id == permanent));
+        assert!(hist.iter().all(|m| m.id != expired));
+        // Its reads row is gone (no orphan).
+        assert!(s.receipts(expired).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_also_reaps_expired_ephemeral() {
+        let s = mem();
+        // A message NEWER than any retention cutoff but already expired.
+        let eph = s
+            .send("a", "b", None, "fresh-but-expired", None, None)
+            .unwrap();
+        s.set_message_expiry(eph, now() - 1).unwrap();
+        // gc with a huge retention window would normally keep a fresh `ts`, but the
+        // ephemeral fold-in deletes it anyway.
+        s.gc(86_400 * 365).unwrap();
+        assert_eq!(s.total_messages().unwrap(), 0);
+    }
+
+    #[test]
+    fn non_ephemeral_message_is_never_swept() {
+        let s = mem();
+        let mid = s.send("a", "b", None, "forever", None, None).unwrap();
+        // A permanent (expires_at IS NULL) row survives both sweep and gc.
+        assert_eq!(s.sweep_expired_messages().unwrap(), 0);
+        s.gc(86_400 * 365).unwrap();
+        let hist = s.history("b", None, 100).unwrap();
+        assert!(
+            hist.iter().any(|m| m.id == mid),
+            "permanent message survives sweep + gc"
+        );
+    }
+
+    #[test]
+    fn expires_at_column_is_migrated_idempotently() {
+        let s = mem();
+        // Fresh DB has the column (via SCHEMA); migrate() is also re-run on open.
+        assert!(column_exists(&s.conn, "messages", "expires_at").unwrap());
+        assert!(column_exists(&s.conn, "outbox", "ttl").unwrap());
+    }
+
+    #[test]
+    fn cross_store_intent_carries_ttl_to_expiry() {
+        let dir = std::env::temp_dir().join(format!("weave-ttl-xstore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+        let _ = std::fs::remove_file(&a_path);
+        let _ = std::fs::remove_file(&b_path);
+        let a = SqliteStore::open(&a_path).unwrap();
+        // Queue an intent for bob with a 600s ttl in A's outbox.
+        a.enqueue_intent("bob", "", "alice", None, "hi", "", None, None, None, 600)
+            .unwrap();
+        let b = SqliteStore::open(&b_path).unwrap();
+        let allow = vec![StoreSource::Local(a_path.clone())];
+        let pulled = pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
+        assert_eq!(pulled.committed, 1);
+        // The committed message carries an expiry roughly now()+600.
+        let hist = b.history("bob", None, 100).unwrap();
+        let m = hist.iter().find(|m| m.body == "hi").expect("committed");
+        let exp = m.expires_at.expect("ttl re-stamped as expiry");
+        assert!(exp > now() + 500 && exp <= now() + 600);
     }
 }

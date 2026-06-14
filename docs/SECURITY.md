@@ -222,6 +222,23 @@ discipline as the injector and the WL-047 spawn path:
   messages and requires an explicit `confirm:true`; the default scope only marks
   the caller's own inbox read.
 
+### Read-back verification for config/hook rewrites (WL-041)
+
+Every operation that **rewrites** a config or hook file re-opens, re-parses, and
+verifies the result before reporting success — it never trusts the write blindly
+(mirroring the WL-035 backup-archive read-back). `weave setup` confirms its four
+lifecycle hooks landed *and* that every pre-existing **foreign** hook (rtk,
+repowire, …) survived; `weave uninstall` confirms no weave hook remains *and*
+foreign hooks survived; `weave setup --git-hooks` confirms the guard line landed,
+the shebang is present on a freshly created hook, and any pre-existing foreign
+content was preserved (the install is append-only); `weave restore` confirms the
+restored `config.toml` / `settings.json` bytes equal the archived payload and that
+settings.json re-parses as a JSON object. A write whose re-read is missing the
+intended weave entries — or that lost a foreign hook — fails loudly with a
+descriptive error naming the recovery `.bak` (`settings.json.weave.bak`), rather
+than silently succeeding on a partial/corrupt write. The read-back is pure file
+I/O + `serde_json` (no shell, no second mutation; it never rewrites the file).
+
 ### File permissions
 
 - **Database (`0600`).** After open, `harden_permissions()` tightens the on-disk

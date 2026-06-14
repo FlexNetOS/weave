@@ -172,6 +172,8 @@ mod tests {
             trace_id: None,
             priority: "normal".to_string(),
             superseded_by: None,
+            expires_at: None,
+            kind: None,
         }
     }
 

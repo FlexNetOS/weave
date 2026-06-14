@@ -1,17 +1,22 @@
 ---
-session_started: 2026-06-13
-session_type: WL loop cycle (autonomous resume → owner-driven batch via /verify)
-cycles_this_session: 4
-cycles_total: 44
-cycle_budget: 3 (owner overrode for this interactive batch — "implement the next 3 tasks")
-worktree: main checkout /home/drdave/Desktop/meta/weave (all cycle worktrees pruned; branch list clean)
-branch: develop
-last_item: WL-037 (last of the WL-035/036/037 batch) — merged #91
-last_update: 2026-06-13
+session_started: 2026-06-14
+session_type: WL loop batch (owner-driven: "resume and drive the next 5 tasks to 100% + healthy")
+cycles_this_session: 5
+cycles_total: 49
+cycle_budget: 5 (owner override for this interactive batch — "drive the next 5 tasks")
+worktree: /home/drdave/Desktop/meta/weave-wl038-042 (batch); main checkout = /home/drdave/Desktop/meta/weave
+branch: develop (PR target); cycle branch wl-038-042-batch
+last_item: WL-042 (last of the WL-038..042 batch) — APPROVED, delivering
+last_update: 2026-06-14
 status: |
-  HANDED OFF at budget+1. develop @ c366582 (master syncing via sync-master). Shipped + MERGED this
-  session: WL-034 (#90 export), WL-035/036/037 (#91 batch: backup/restore, post-send hooks, supersede
-  chains) + GAP-2 export-write fix. /verify drove the real export CLI in headless Chrome — XSS proven
-  inert, scoping isolation proven. Combined gate GREEN (626 sqlite / 581 libsql); guardian APPROVE on
-  all axes. Pruned 5 stale worktrees + 16 merged local branches. Next open: WL-038 (ephemeral TTL).
+  Resumed from #92 checkpoint (develop @ 83bf523, trunks converged). Drove the next 5 mechanical
+  backlog items in one batch worktree: WL-038 (ephemeral TTL msgs), WL-039 (idle-notification dedup),
+  WL-040 (canonical session export/import + WL-040b filed for ask-replay), WL-041 (read-back verify of
+  destructive config/hook writes), WL-042 (multi-provider setup --provider claude|codex|gemini|aider).
+  Pipeline: 5 parallel planners -> 5 serial implementers -> combined verifier (GREEN) -> guardian APPROVE.
+  Combined gate GREEN: 706 sqlite / 657 libsql / 697 libsql.sign, clippy -D warnings clean on
+  sqlite+libsql+sign+surfaces, fmt clean; standing-MCP token budget + BROADCAST drift-guard green;
+  +91 tests. Two additive nullable columns (messages.expires_at idx 11, messages.kind idx 12) mirrored
+  + projection-aligned across both backends. ZERO new deps/crates. Delivering as one PR into develop.
+  Next open: WL-044 (5 Dependabot vulns, P1) / WL-045 (README status) / WL-040b (ask-replay).
 ---
