@@ -1,50 +1,50 @@
-# HANDOFF — weave (multi-surface write/commands session)
+# HANDOFF — weave (weave-loop: resume + /verify + WL-035/036/037 batch)
 
-closed_utc: 2026-06-13T23:50Z
-branch: develop @ 0137af7 (master syncing via sync-master)
-worktree: main checkout + 2 session worktrees still present (see cleanup below)
-last_item: WL-052a (dashboard write) + WL-052b (bot commands) — in PR #88 (armed, not yet merged)
-next_item: shepherd #88 to merge, then WL-052b Slack wiring / WL-052a HTML form
-gate_status: PASS locally — 610 surfaces tests; clippy clean default/libsql/surfaces/libsql+surfaces
+closed_utc: 2026-06-14T03:10Z
+branch: develop @ c366582 (master 306dcd3 syncing forward via sync-master — wait for it to converge)
+worktree: main checkout /home/drdave/Desktop/meta/weave (ALL cycle worktrees pruned; local branches = develop + master only)
+cycle_budget: 3 (this session ran 4 — owner overrode with an interactive "/verify … implement the next 3 tasks")
+cycles_this_session: WL-034, WL-035, WL-036, WL-037 (+ /verify pass + GAP-2 fix)
+cycles_total: 44
+last_item: WL-037 (supersede chains) — merged #91
+next_item: WL-038 (ephemeral messages with TTL + auto-sweep, atm-core parity) — first open mechanical backlog item
+orchestrator_phase: complete (plan→implement→verify→guardian ran for WL-034 and the WL-035/036/037 batch)
+gate_status: PASS — combined batch GREEN: 626 sqlite / 581 libsql passed, clippy clean under -D warnings on sqlite+libsql+surfaces+sign+libsql·sign, fmt clean
+pr_url: (none open) — PRs #90, #91 both MERGED
 
-## Landed / in-flight this session ("knock out the next three")
-- #87 ci: concurrency group + push scoped to master/develop — **MERGED** (kills the
-  duplicate-run flake that forced reruns all last session).
-- #88 feat(surfaces): **WL-052a dashboard write** + **WL-052b bot commands** — **ARMED auto-merge,
-  updated onto develop, NOT yet merged.** Both obey the one-handler-many-surfaces law.
+## Landed this session (all merged to develop)
+- #90 feat(export): WL-034 self-contained mailbox HTML export (`weave export`)
+- #91 feat: WL-035 backup/restore + WL-036 post-send hooks + WL-037 supersede chains (4-commit batch) + GAP-2 export-write error-context fix
 
-## What #88 contains
-- **WL-052a:** `weave dashboard --write` → bearer-gated `POST /api` JSON-RPC route dispatched
-  through the SAME `dispatch_request → call_tool` as MCP/CLI (caps, params! SQL, destructive
-  gating, nudge-inject inherited). Read-only default (POST → 403). +2 integration tests.
-  Files: `weave-mcp/src/http.rs` (serve_dashboard + handler), `weave-mcp/src/mcp.rs`
-  (`PullConsent::empty()`), `weave/src/main.rs` (Cmd::Dashboard `--write`).
-- **WL-052b:** Telegram `/inbox` `/peers` `/sessions` `/help` via the same handler; ordinary
-  text still relays. Read-only v1 (mutating cmds hit `dangerous=false`). Pure parser/mapper/
-  formatter + 3 unit tests. File: `weave/src/telegram.rs`.
+## State (verified)
+- develop @ **c366582**, working tree clean, 0 open PRs, ONE worktree (main), branches = {develop, master}.
+- master (306dcd3) trails develop — **sync-master** is propagating the #91 batch; it FFs master once the six required checks are green on the develop tip. Do NOT push master directly; just let it converge (verify with the converged check below).
+- Pruned this session: 5 stale worktrees (weave-batch/-ci-concurrency/-handoff-ckpt/-hf2/-wl052a-dash) + 16 merged local branches (all had MERGED PRs #63–#85; squash-merge artifacts, not orphaned work). 19 merged branches still exist remote-only on origin (optional GitHub-side cleanup; left deliberately).
 
-## RESUME — do this first
-1. `cd` main checkout, `git fetch`. If #88 still open + BEHIND: `cd ../weave-wl052a-dash`,
-   `git merge origin/develop && git push` to re-arm (merge-train — each PR goes BEHIND as
-   siblings merge; the CI concurrency fix is now in, so flakes should drop).
-2. After #88 merges: **clean up worktrees** — `git worktree remove ../weave-ci-concurrency
-   ../weave-wl052a-dash ../weave-hf2 --force; git worktree prune`.
-3. verify-on-resume: `cargo test --all-targets` (expect ~581) + `--no-default-features
-   --features libsql` (~541) + `--features surfaces` (~610).
+## What WL-034/035/036/037 shipped (so the next session doesn't re-investigate)
+- **WL-034 export**: `weave export --out <p> [--for <id>] [--limit N]` → self-contained offline XSS-safe HTML, client-side search. Pure `render_mailbox_html` + CENTRALIZED `html_escape` in `weave-core/src/export.rs` (dashboard reuses it). XSS hinge: JSON in `<script type=application/json>` with `</`→`<\/`, rendered via textContent. Reuses `Store::history` (per-identity). WL-034b filed = whole-DB cross-identity export (needs new dual-backend `all_messages()` + a privacy decision) — DEFERRED.
+- **WL-035 backup/restore**: `weave backup`/`weave restore` → hand-rolled uncompressed USTAR tar (`weave-core/src/archive.rs`, ZERO new deps) of a `VACUUM INTO` snapshot (`Store::snapshot_to`, both backends; remote libSQL bails) + config + settings.json + MANIFEST. Read-back-verified both ends; `safe_entry_name` traversal guard; `--force`-gated (+`.bak`). Restore note: run `weave setup` after to re-register MCP.
+- **WL-036 post-send hooks**: config `[[post_send_hook]]` → `weave-inject::fire_post_send_hooks` (one shared helper) fired from CLI+MCP send/notify/ack. NO-SHELL argv-only; `argv[0]` trusted-dir-constrained; message fields as `WEAVE_HOOK_*` env ONLY (body never exported); pure `*`/exact/BROADCAST matcher; caps + timeout + fault-isolated. Guardian called the spawn "airtight."
+- **WL-037 supersede**: `weave send --supersedes <id>` + `weave_send` catalog property (zero standing-token). Additive nullable `messages.superseded_by` (both backends, guarded migration); `Store::supersede` post-stamp; **sender-only authz** (rejects cross-identity censorship). Read: hidden from unread/nudge, retained+flagged in history/thread/search/export. libsql positional projection = trailing col, mapper index 10.
 
-## Open backlog (owner's pick)
-- WL-052b Slack wiring (reuse the telegram grammar — `parse_bot_command`/`bot_command_rpc`/
-  `format_bot_reply` are surface-agnostic) + `/ask`/`/send` write commands.
-- WL-052a HTML send form + per-message/job read views (the API is the substrate; form is a leaf).
-- WL-052 design law (durable, ICM): a human surface routes to the SAME handler as CLI/MCP, never
-  a parallel impl. Also: deny `git push`/`gh pr` to weave-* subagents; WL-043 single-crate (deferred).
+## Dead-ends / hazards (do not re-trip)
+- **Guardian BLOCKs on docs-sync every cycle** (WL-034 and the batch both): weave-implementer subagents ship clean code+tests but defer docs → guardian blocks on the code↔docs fork → costs a round-trip. FIX FORWARD: put the exact doc entries (CHANGELOG/README/ARCHITECTURE/SECURITY/PARITY) IN the implementer prompt with the code. (Saved to file-memory `guardian-docs-block-pattern.md` + ICM.)
+- **Agent self-delivery hazard** (standing): weave-* subagents were told NOT to git push/commit/gh; the LEADER owns delivery and diff-math-checks before push. Held this session (no sneak-pushes).
+- **/verify is worth running on shipped features**: it found GAP-2 (bare os-error) that tests missed, and DISPROVED two false-alarm "gaps" (the raw `</script>` was weave's own structural boundary; `--for a/../../etc` is consistent freeform-id behavior, safe via bound SQL). Drive the REAL CLI, render HTML in headless Chrome.
+- **squash-merge ancestry**: `git merge-base --is-ancestor branch develop` returns false for squash-merged branches — use `gh pr list --head <b> --state all` (merged?) + `git cherry develop <b>` to classify, NOT ancestry.
 
-## Cross-repo inbox (NOT weave tasks — parked on owner decisions)
-- #96 lane: multi-hop vs pivot to Phase A1 obscura. #97 harness_hub: use-the-harness (envctl-kasetto
-  verify, archon-port). #98 handoff: HFTASK-0033 (fleet-ledger-427 + hf-sync-confirm).
+## Open backlog (next session — mechanical order)
+- **WL-038** ephemeral messages w/ TTL + auto-sweep (atm-core parity) — NEXT.
+- WL-039 idle-notification dedup; WL-040 session export/import (casr); WL-041 read-back verify (casr — partly satisfied by WL-035's pattern); WL-042 multi-provider hook templates (casr).
+- **WL-044 Resolve 5 Dependabot vulns (1 high, P1)** — standing security debt, owner-flagged; not mechanical-order but P1.
+- WL-045 refresh README "Status" (P2, stale v0.1.0 numbers). WL-043 single-crate collapse (P1, DEFERRED until meta workspace aligned). WL-034b whole-DB export. WL-052b bot command grammar.
+
+## icm_stored
+- context-weave 01KV1TXFD4… (WL-034), 01KV20Z9FQ… (verify + WL-035/036/037 batch). file-memory: guardian-docs-block-pattern.md added.
 
 ## verify_on_resume
-- `git fetch origin && git status --porcelain` (main checkout clean)
-- `cargo test --all-targets` && `cargo test --no-default-features --features libsql` && `cargo test --features surfaces`
+- `git fetch origin && [ "$(git rev-parse origin/master)" = "$(git rev-parse origin/develop)" ] && echo converged`  # expect converged once sync-master FFs master to c366582+
+- `git status --porcelain` empty; `git worktree list` = main only
+- `cargo test --all-targets` (default sqlite) and `cargo test --no-default-features --features libsql` — expect ~626 sqlite / ~581 libsql green
 
-resume_command: /session-relay resume
+resume_command: /weave-loop resume   (reads this packet; jumps to WL-038)
