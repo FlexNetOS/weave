@@ -1,0 +1,71 @@
+# cargo-deny configuration — supply-chain / advisory gate for weave (WL-044).
+#
+# weave's DEFAULT build is dependency-light and has ZERO exposure to the
+# advisories below: `cargo tree -i rustls-webpki` on default features matches
+# nothing. Every ignored advisory is confined to the OPTIONAL `libsql` feature's
+# remote-Turso TLS stack (libsql -> hyper-rustls 0.25 -> rustls 0.22 ->
+# rustls-webpki 0.102), which is only compiled when `--features libsql` is set
+# AND only reachable when the operator configures a remote `libsql_url`.
+#
+# The patched rustls-webpki (>=0.103) requires rustls 0.23 / hyper-rustls 0.27,
+# which libsql (incl. 0.10.0-pre) does NOT yet depend on — the resolver rejects
+# forcing it (`libsql requires hyper-rustls ^0.25`). These are therefore
+# UPSTREAM-PINNED, not weave-fixable today. Tracked by WL-044b: remove each id
+# below the moment libsql adopts the rustls 0.23 stack (re-run `cargo audit` /
+# `cargo deny check advisories` to confirm the id is gone, then delete it here).
+#
+# This file does NOT silence future problems: any advisory NOT explicitly listed
+# here fails `cargo deny check advisories` (wired into CI). The exception is
+# explicit, scoped, and time-bounded — never a blanket "ignore everything".
+
+[graph]
+# Scan the UNION of all features. The default (sqlite) graph contains NONE of the
+# libsql remote-TLS crates, so a default-feature scan would never see — and never
+# gate — the advisories this config governs. cargo-deny only resolves metadata
+# (it does not compile), so the mutually-exclusive sqlite+libsql features coexist
+# fine here. This makes the gate have teeth on every feature's dependency tree.
+all-features = true
+
+[advisories]
+version = 2
+# Each entry is an upstream-pinned advisory in the libsql remote-TLS stack.
+ignore = [
+    # --- rustls-webpki 0.102.8 (4 advisories) — fixed in >=0.103, gated by libsql ---
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki name-constraints (URI) — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name-constraints — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL Distribution Point matching — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL-parse reachable panic — optional libsql remote-TLS only; fix needs rustls 0.23 (libsql-pinned). Track: WL-044b." },
+    # --- unmaintained (informational) — both inside the libsql tree ---
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — pulled by libsql; no weave code uses it directly. Track: WL-044b." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — pulled by libsql's rustls-native-certs. Track: WL-044b." },
+]
+
+[bans]
+# Advisory-focused for WL-044; do not fail the build on duplicate versions
+# (the meta workspace legitimately carries some). Tightened later if needed.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[licenses]
+# License policy is out of scope for WL-044 (advisory gate). Allow the permissive
+# set weave + its deps actually use so `cargo deny check` doesn't block on
+# licensing; a dedicated license sweep can tighten this later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"  # the fnx-* crates are pulled via Cargo git dependencies
