@@ -39,6 +39,7 @@ compile_error!(
 #[cfg(not(any(feature = "sqlite", feature = "libsql")))]
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
+mod backup;
 mod git;
 mod harness;
 mod setup;
@@ -51,12 +52,12 @@ use weave_core::sign;
 #[cfg(test)]
 mod testenv;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
-use weave_core::config::Config;
+use weave_core::config::{Config, HookEvent};
 use weave_core::memory::{self, MemoryScope};
 use weave_core::store::{is_alive, Store};
 use weave_core::{config, model, store};
@@ -224,6 +225,12 @@ enum Cmd {
         /// Message priority: low, normal, high, urgent (default normal).
         #[arg(long)]
         priority: Option<String>,
+        /// WL-037: id of a prior message of YOURS this one replaces. The
+        /// predecessor is marked superseded and hidden from the recipient's unread
+        /// inbox (kept, flagged, in history). You may only supersede your own
+        /// messages.
+        #[arg(long)]
+        supersedes: Option<i64>,
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
@@ -850,6 +857,28 @@ enum Cmd {
         /// Max messages to include (clamped to the store's MAX_LIMIT).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// WL-035: write a portable, dependency-free archive of this mailbox — a
+    /// consistent SQLite snapshot (`VACUUM INTO`) plus `config.toml` and weave's
+    /// installed Claude `settings.json` hooks. Read-back-verified before success.
+    Backup {
+        /// Output path for the archive (uncompressed USTAR tar).
+        #[arg(long)]
+        out: PathBuf,
+        /// Overwrite `--out` if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// WL-035: restore a mailbox from a `weave backup` archive. Restores the DB and
+    /// config by default; `settings.json` is overwritten only with `--force` (a
+    /// `.bak` of the current file is written first). Traversal-guarded extraction.
+    Restore {
+        /// Path to the archive produced by `weave backup`.
+        #[arg(long = "in")]
+        in_path: PathBuf,
+        /// Overwrite existing DB/config/settings (writes a `.bak` of settings first).
+        #[arg(long)]
+        force: bool,
     },
     /// WL-049 / ADR-0002: governed stealth web access via obscura (deny-by-default).
     /// `weave web <op> [--url …] [--arg k=v …]` runs a single browser op through the
@@ -2777,6 +2806,10 @@ fn main() -> Result<()> {
         Cmd::Completions { shell } => return print_completions(*shell),
         Cmd::Man => return print_man(),
         Cmd::Harness { cmd } => return run_harness(cmd),
+        // Restore replaces the live store/config — it must NOT open the store first
+        // (the on-disk DB may be absent or about to be overwritten). It opens only a
+        // verified snapshot of its own.
+        Cmd::Restore { in_path, force } => return backup::run_restore(&cfg, in_path, *force),
         _ => {}
     }
 
@@ -2789,8 +2822,13 @@ fn main() -> Result<()> {
         | Cmd::Config { .. }
         | Cmd::Completions { .. }
         | Cmd::Man
-        | Cmd::Harness { .. } => {
+        | Cmd::Harness { .. }
+        | Cmd::Restore { .. } => {
             unreachable!("handled above")
+        }
+
+        Cmd::Backup { out, force } => {
+            backup::run_backup(&cfg, store, &out, force)?;
         }
 
         Cmd::Mcp { session } => {
@@ -2846,6 +2884,7 @@ fn main() -> Result<()> {
             no_memory,
             idempotency_key,
             priority,
+            supersedes,
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
@@ -2862,6 +2901,15 @@ fn main() -> Result<()> {
                         anyhow::bail!(
                             "cross-store broadcast is not supported; send to a named recipient \
                              (Tier-2 is directed-only)."
+                        );
+                    }
+                    // WL-037: supersede is a local-inbox concept (the predecessor
+                    // lives in THIS store); it has no meaning for a cross-store
+                    // intent, so reject rather than silently ignore.
+                    if supersedes.is_some() {
+                        anyhow::bail!(
+                            "--supersedes is not supported with --to-store \
+                             (supersede targets a message in this store, not a cross-store intent)."
                         );
                     }
                     let host = to_host.as_deref().unwrap_or("");
@@ -2896,7 +2944,18 @@ fn main() -> Result<()> {
                     if let Some(p) = priority {
                         let _ = store.set_message_priority(mid, &p);
                     }
-                    println!("sent #{mid}: {from} -> {to}");
+                    // WL-037: post-stamp the supersede link (the priority post-stamp
+                    // precedent). Authorization + id existence are enforced in
+                    // `Store::supersede`; a bad id bails with a clear message.
+                    if let Some(old) = supersedes {
+                        if old <= 0 {
+                            anyhow::bail!("--supersedes must be a positive message id.");
+                        }
+                        store.supersede(&from, old, mid)?;
+                        println!("sent #{mid}: {from} -> {to} (supersedes #{old})");
+                    } else {
+                        println!("sent #{mid}: {from} -> {to}");
+                    }
                     let _ = inject_and_trace(
                         store,
                         &cfg,
@@ -2906,6 +2965,16 @@ fn main() -> Result<()> {
                         &to,
                         &body,
                     )?;
+                    // WL-036: best-effort post-send hooks. Fires AFTER the message is
+                    // persisted + injected; a failing/slow hook never sinks the send.
+                    inject::fire_post_send_hooks(
+                        &cfg,
+                        HookEvent::Send,
+                        &from,
+                        &to,
+                        subject.as_deref().unwrap_or(""),
+                        mid,
+                    );
                 }
             }
         }
@@ -2954,6 +3023,15 @@ fn main() -> Result<()> {
                 &body,
             )?;
             println!("notified '{to}' (#{mid}, no reply expected) [{verdict}]");
+            // WL-036: notify is a point-to-point send ⇒ fire `Send` hooks.
+            inject::fire_post_send_hooks(
+                &cfg,
+                HookEvent::Send,
+                &from,
+                &to,
+                subject.as_deref().unwrap_or(""),
+                mid,
+            );
         }
 
         Cmd::BroadcastNotify {
@@ -3263,6 +3341,16 @@ fn main() -> Result<()> {
             refresh_presence(store, &from, explicit);
             store.ack(&from, &id, message.as_deref())?;
             println!("closed ask {id} (acked)");
+            // WL-036: fire `Ack` hooks post-state-change. The acker is the sender; the
+            // original asker (who learns of the ack) is the recipient. Best-effort
+            // lookup — a miss just yields an empty recipient (a `*` hook still fires).
+            let asker = store
+                .get_ask(&id)
+                .ok()
+                .flatten()
+                .map(|a| a.asker)
+                .unwrap_or_default();
+            inject::fire_post_send_hooks(&cfg, HookEvent::Ack, &from, &asker, &id, 0);
         }
 
         Cmd::Asks {
@@ -3711,7 +3799,8 @@ fn main() -> Result<()> {
             let limit = limit.unwrap_or(10_000) as i64;
             let rows = store.history(&me, None, limit)?;
             let html = weave_core::export::render_mailbox_html(&rows);
-            std::fs::write(&out, html)?;
+            std::fs::write(&out, html)
+                .with_context(|| format!("failed to write export to {}", out.display()))?;
             println!(
                 "exported {} message(s) for '{me}' -> {}",
                 rows.len(),

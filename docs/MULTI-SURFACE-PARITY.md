@@ -39,6 +39,9 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 | **Daemon** (start / stop / status) | ✅ | ✅ | — | — | Process-lifecycle; agent/operator surface. |
 | **Summarize** (text / thread, LLM) | ✅ | ✅ | ❌ | ❌ | `--features llm`. |
 | **Admin** (setup / uninstall / clear / gc / config) | ✅ | ◐ | — | — | Some admin ops are CLI-only by design (host wiring, retention). |
+| **Backup / restore** (atm-core, WL-035) | ✅ | — | — | — | CLI-only by design (host-local file I/O on a consistent snapshot); MCP does not expose it. |
+| **Supersede** (atm-core, WL-037) | ✅ | ✅ | ❌ | ❌ | `weave send --supersedes` / `weave_send {supersedes}` (zero standing-token cost — a `weave_send` property, not a new tool). |
+| **Post-send hooks** (atm-core, WL-036) | ✅ | ✅ | — | — | Operator config (`[[post_send_hook]]`); fires on send/notify/ack from both agent surfaces. No new standing MCP tool. |
 
 ### The headline result
 

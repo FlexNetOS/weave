@@ -592,6 +592,14 @@ fn tool_send(
         .get("priority")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    // WL-037: optional id of a prior message this one replaces. Validated as a
+    // positive message id before any DB bind (the `in_reply_to` precedent).
+    let supersedes = match args.get("supersedes").and_then(|v| v.as_i64()) {
+        Some(id) if id <= 0 => {
+            return Err("'supersedes' must be a positive message id.".into());
+        }
+        other => other,
+    };
     let trace_id = Some(model::mint_trace_id());
 
     // Cross-store routing (Tier-2): when `to_store` is supplied, the recipient
@@ -633,6 +641,17 @@ fn tool_send(
                 priority,
             )
             .map_err(e)?;
+        // WL-036: a queued cross-store intent IS a send ⇒ fire `Send` hooks. The
+        // message was NOT delivered locally (no inbox row / inject), but the send
+        // event happened. Best-effort; never sinks the queued result.
+        weave_inject::fire_post_send_hooks(
+            &weave_core::config::Config::load(),
+            weave_core::config::HookEvent::Send,
+            &from,
+            to,
+            subject.unwrap_or(""),
+            id,
+        );
         return Ok(format!(
             "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
         ));
@@ -651,12 +670,22 @@ fn tool_send(
     if let Some(p) = priority {
         let _ = store.set_message_priority(mid, p);
     }
+    // WL-037: post-stamp the supersede link after the send (the `set_message_priority`
+    // post-stamp precedent). Authorization (caller == original sender) + id existence
+    // are enforced in `Store::supersede`; a bad id surfaces as an error string.
+    if let Some(old) = supersedes {
+        store.supersede(&from, old, mid).map_err(e)?;
+    }
     let dest = if model::is_broadcast(to) {
         "broadcast"
     } else {
         to
     };
-    let mut out = format!("Sent message #{mid} from '{from}' to '{dest}'.");
+    let mut out = if let Some(old) = supersedes {
+        format!("Sent message #{mid} from '{from}' to '{dest}' (supersedes #{old}).")
+    } else {
+        format!("Sent message #{mid} from '{from}' to '{dest}'.")
+    };
 
     // P6 delivery trace (point-to-point only — broadcast is not injected and is not
     // traced in P6, keeping the trace bounded). Best-effort: never sinks the send.
@@ -723,6 +752,18 @@ fn tool_send(
             );
         }
     }
+    // WL-036: best-effort post-send hooks, fired AFTER persist + inject. Failures log
+    // to STDERR (never the JSON-RPC stdout frame) and never sink the send. Config is
+    // loaded here (the `Config::load()` precedent already used by other MCP tools) so
+    // the full `Config` need not be plumbed through `serve`.
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Send,
+        &from,
+        to,
+        subject.unwrap_or(""),
+        mid,
+    );
     Ok(out)
 }
 
@@ -851,6 +892,16 @@ fn tool_notify(
         &to,
         stage,
         outcome,
+    );
+
+    // WL-036: notify is a point-to-point send ⇒ fire `Send` hooks (best-effort).
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Send,
+        &from,
+        &to,
+        subject.as_deref().unwrap_or(""),
+        mid,
     );
 
     Ok(format!(
@@ -2631,6 +2682,23 @@ fn tool_ack(store: &dyn Store, def: &Option<String>, args: &Value) -> Result<Str
     if message.is_some() {
         out.push_str(" Note recorded.");
     }
+    // WL-036: fire `Ack` hooks post-state-change. The acker is the sender; the asker
+    // (who learns of the ack) is the recipient. Best-effort lookup — a miss yields an
+    // empty recipient (a `*` hook still fires). Failures log to stderr, never sink.
+    let asker = store
+        .get_ask(cid_raw)
+        .ok()
+        .flatten()
+        .map(|a| a.asker)
+        .unwrap_or_default();
+    weave_inject::fire_post_send_hooks(
+        &weave_core::config::Config::load(),
+        weave_core::config::HookEvent::Ack,
+        &from,
+        &asker,
+        cid_raw,
+        0,
+    );
     Ok(out)
 }
 
@@ -3164,7 +3232,8 @@ fn tool_catalog() -> Vec<Value> {
                 "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
                 "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
-                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."}
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
+                "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."}
             },"required":["to","body"]}
         },
         {

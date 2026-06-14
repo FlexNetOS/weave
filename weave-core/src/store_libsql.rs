@@ -72,7 +72,8 @@ const SCHEMA: &[&str] = &[
         in_reply_to     INTEGER,
         idempotency_key TEXT UNIQUE,
         trace_id        TEXT,
-        priority        TEXT NOT NULL DEFAULT 'normal'
+        priority        TEXT NOT NULL DEFAULT 'normal',
+        superseded_by   INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -314,6 +315,11 @@ pub struct LibsqlStore {
     /// the connect used. Inert on a local handle (`block_on_bounded` runs it
     /// unbounded).
     remote_timeout: Option<u64>,
+    /// WL-035: the on-disk path of a LOCAL-file backend, or `None` for a remote
+    /// (Turso) backend. `snapshot_to` needs a real local file to `VACUUM INTO`; a
+    /// remote backend has none and bails. Set from `cfg.db_path()` on a local
+    /// `open`, `None` for remote/read-only-remote opens.
+    local_path: Option<std::path::PathBuf>,
 }
 
 /// Convert a libsql row column into our owned `Message`. Column order matches
@@ -332,6 +338,9 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         idempotency_key: r.get::<Option<String>>(7).ok().flatten(),
         trace_id: r.get::<Option<String>>(8).ok().flatten(),
         priority: r.get::<String>(9).unwrap_or_else(|_| "normal".to_string()),
+        // WL-037: positional index 10 — EVERY explicit projection feeding this
+        // mapper MUST list `superseded_by` as the trailing (11th) column.
+        superseded_by: r.get::<Option<i64>>(10).ok().flatten(),
     })
 }
 
@@ -494,6 +503,13 @@ impl LibsqlStore {
         let url = cfg.libsql_url.clone();
         let token = cfg.libsql_auth_token.clone();
         let path = cfg.db_path();
+        // WL-035: a local-file backend (no remote URL) snapshots from this path;
+        // a remote backend has no local file (`None`).
+        let local_path = if cfg.libsql_url.is_none() {
+            Some(path.clone())
+        } else {
+            None
+        };
 
         let (db, conn) = rt.block_on(async move {
             let is_remote = url.is_some();
@@ -1031,6 +1047,8 @@ impl LibsqlStore {
             for (table, col, ddl) in [
                 ("messages", "priority", "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
                 ("outbox", "priority", "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"),
+                // WL-037: nullable (NULL == not superseded), no DEFAULT.
+                ("messages", "superseded_by", "ALTER TABLE messages ADD COLUMN superseded_by INTEGER"),
             ] {
                 let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
                 let mut it = conn.query(&probe, ()).await?;
@@ -1082,6 +1100,7 @@ impl LibsqlStore {
             _db: db,
             read_only: false,
             remote_timeout: None,
+            local_path,
         })
     }
 
@@ -1138,6 +1157,7 @@ impl LibsqlStore {
             _db: db,
             read_only: true,
             remote_timeout: None,
+            local_path: None,
         })
     }
 
@@ -1194,6 +1214,7 @@ impl LibsqlStore {
             _db: db,
             read_only: true,
             remote_timeout: timeout_ms,
+            local_path: None,
         })
     }
 
@@ -1481,15 +1502,17 @@ impl Store for LibsqlStore {
         self.rt.block_on(async {
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
+                       AND superseded_by IS NULL
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
                 )
             } else {
                 format!(
-                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority FROM messages m
+                    "SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to, m.idempotency_key, m.trace_id, m.priority, m.superseded_by FROM messages m
                      WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+                       AND m.superseded_by IS NULL
                        AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                      ORDER BY m.id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1535,7 +1558,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE (sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc}))
                      ORDER BY id DESC LIMIT ?3",
@@ -1550,7 +1573,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                      WHERE sender = ?1 OR recipient = ?1 OR recipient IN {bc}
                      ORDER BY id DESC LIMIT ?2",
                     bc = BROADCAST_SQL
@@ -1571,7 +1594,7 @@ impl Store for LibsqlStore {
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
-            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                  WHERE id IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT ?2
                  )
@@ -1592,8 +1615,9 @@ impl Store for LibsqlStore {
         let limit = clamp_limit(limit);
         self.rt.block_on(async {
             let sql = format!(
-                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages
+                "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+                   AND superseded_by IS NULL
                  ORDER BY id ASC LIMIT ?3",
                 bc = BROADCAST_SQL
             );
@@ -1664,6 +1688,41 @@ impl Store for LibsqlStore {
     fn total_messages(&self) -> Result<i64> {
         self.rt
             .block_on(async { self.total_messages_async().await })
+    }
+
+    fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
+        // A remote (Turso) backend has NO local file to vacuum-into a client-side
+        // path; bail clearly rather than silently producing nothing. Snapshot the
+        // Turso DB server-side instead.
+        let _src = self.local_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "backup is not supported for the remote libsql backend \
+                 (snapshot the Turso database server-side)"
+            )
+        })?;
+        let dest_str = dest.to_str().ok_or_else(|| {
+            anyhow::anyhow!("snapshot destination path is not valid UTF-8: {dest:?}")
+        })?;
+        // libSQL's bundled SQLite supports VACUUM INTO. The destination path is
+        // BOUND as a parameter — never inlined — and must not already exist.
+        self.rt
+            .block_on(async {
+                self.conn
+                    .execute("VACUUM INTO ?1", params(vec![dest_str.into()]))
+                    .await
+            })
+            .map_err(|e| anyhow::anyhow!("VACUUM INTO failed for {}: {e}", dest.display()))?;
+        // Read-back verify (WL-041 spirit): the snapshot must re-open read-only and
+        // be a valid weave store before we declare success.
+        let snap = LibsqlStore::open_readonly(dest)
+            .map_err(|e| anyhow::anyhow!("snapshot at {} did not re-open: {e}", dest.display()))?;
+        snap.total_messages().map_err(|e| {
+            anyhow::anyhow!(
+                "snapshot at {} is not a valid weave store: {e}",
+                dest.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn clear_inbox(&self, me: &str) -> Result<usize> {
@@ -1888,7 +1947,7 @@ impl Store for LibsqlStore {
                     SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
                 )
                 SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                       m.idempotency_key, m.trace_id, m.priority
+                       m.idempotency_key, m.trace_id, m.priority, m.superseded_by
                 FROM messages m JOIN t ON m.id = t.id
                 ORDER BY m.id ASC LIMIT ?2";
             let mut rows = self
@@ -4108,6 +4167,51 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
+        self.guard_writable()?;
+        self.rt.block_on(async {
+            // Both ids must exist; look up the predecessor's sender for the
+            // authorization check.
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT sender FROM messages WHERE id = ?1",
+                    params(vec![old_id.into()]),
+                )
+                .await?;
+            let old_sender = match it.next().await? {
+                Some(r) => r.get::<String>(0)?,
+                None => anyhow::bail!("cannot supersede: message #{old_id} does not exist"),
+            };
+            drop(it);
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT 1 FROM messages WHERE id = ?1",
+                    params(vec![new_id.into()]),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                anyhow::bail!("cannot supersede: successor message #{new_id} does not exist");
+            }
+            drop(it);
+            // Authorization: only the ORIGINAL SENDER of old_id may supersede it
+            // (best-effort same-identity guard; censorship/DoS protection).
+            if old_sender != caller {
+                anyhow::bail!(
+                    "cannot supersede: #{old_id} was sent by '{old_sender}', not '{caller}'"
+                );
+            }
+            self.conn
+                .execute(
+                    "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+                    params(vec![old_id.into(), new_id.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
     fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()> {
         let p = crate::model::ContactPolicy::parse(policy);
         self.guard_writable()?;
@@ -4274,6 +4378,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
@@ -4286,8 +4391,9 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
@@ -7503,5 +7609,113 @@ mod tests {
         assert!(s.delete_summary(1).unwrap());
         assert!(!s.delete_summary(1).unwrap());
         assert!(s.get_summary(1).unwrap().is_none());
+    }
+
+    // ---- WL-037: supersede on the libsql backend (positional-projection trap)
+
+    /// Count of `me`'s unread messages via the inbox unread branch (libsql has no
+    /// inherent `unread_count`; the unread inbox query is the equivalent surface).
+    fn unread_ids(s: &LibsqlStore, me: &str) -> Vec<i64> {
+        s.inbox(me, false, false, 50)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn superseded_by_of(s: &LibsqlStore, me: &str, id: i64) -> Option<i64> {
+        s.history(me, None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("message #{id} not in {me} history"))
+            .superseded_by
+    }
+
+    #[test]
+    fn supersede_stamps_and_hides_from_unread_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        assert_eq!(unread_ids(&s, "b").len(), 2);
+        s.supersede("a", a, b).unwrap();
+        // Positional projection (index 10) must align: predecessor stamped, hidden.
+        assert_eq!(superseded_by_of(&s, "b", a), Some(b));
+        assert_eq!(superseded_by_of(&s, "b", b), None);
+        let unread = unread_ids(&s, "b");
+        assert_eq!(unread, vec![b], "only the successor remains unread");
+        // peek_oldest_unread (nudge/wake path) skips the superseded predecessor.
+        assert_eq!(s.peek_oldest_unread("b").unwrap().unwrap().id, b);
+    }
+
+    #[test]
+    fn supersede_chain_and_history_flag_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("a", "b", None, "B", None, None).unwrap();
+        let c = s.send("a", "b", None, "C", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        s.supersede("a", b, c).unwrap();
+        assert_eq!(unread_ids(&s, "b"), vec![c]);
+        // history keeps the superseded rows AND populates the flag (positional read).
+        let hist = s.history("b", None, 100).unwrap();
+        assert_eq!(
+            hist.iter().find(|m| m.id == a).unwrap().superseded_by,
+            Some(b)
+        );
+        assert_eq!(
+            hist.iter().find(|m| m.id == b).unwrap().superseded_by,
+            Some(c)
+        );
+    }
+
+    #[test]
+    fn supersede_rejects_foreign_and_missing_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("c", "b", None, "C", None, None).unwrap();
+        assert!(s.supersede("c", a, b).is_err(), "foreign sender rejected");
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+        assert!(
+            s.supersede("a", 999_999, a).is_err(),
+            "missing old rejected"
+        );
+        assert!(
+            s.supersede("a", a, 999_999).is_err(),
+            "missing new rejected"
+        );
+    }
+
+    #[test]
+    fn supersede_broadcast_drops_from_all_readers_libsql() {
+        let s = mem();
+        let bcast = "all";
+        let a = s.send("a", bcast, None, "v1", None, None).unwrap();
+        let b = s.send("a", bcast, None, "v2", None, None).unwrap();
+        assert_eq!(unread_ids(&s, "r1").len(), 2);
+        assert_eq!(unread_ids(&s, "r2").len(), 2);
+        s.supersede("a", a, b).unwrap();
+        assert_eq!(unread_ids(&s, "r1"), vec![b]);
+        assert_eq!(unread_ids(&s, "r2"), vec![b]);
+    }
+
+    // ---- WL-035: snapshot_to on the local libsql backend -------------------
+
+    #[test]
+    fn snapshot_to_roundtrips_messages_libsql() {
+        let s = mem();
+        s.send("a", "b", Some("s"), "hi", None, None).unwrap();
+        s.send("a", "b", None, "again", None, None).unwrap();
+        let src_count = s.total_messages().unwrap();
+        assert_eq!(src_count, 2);
+        let dir = std::env::temp_dir().join(format!("weave-libsql-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+        // The local VACUUM INTO snapshot opens read-only with the same count.
+        let snap = LibsqlStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), src_count);
     }
 }

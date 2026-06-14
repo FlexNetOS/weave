@@ -95,3 +95,260 @@ axes passed). Added exactly three doc entries to match the final code; no code t
 
 `cargo fmt --all --check` — **clean** (docs only). `git status` now shows `README.md`,
 `ARCHITECTURE.md`, `CHANGELOG.md` modified alongside the WL-034 code/test files.
+
+---
+
+# WL-035 + GAP-2 — Mailbox backup/restore + export-write context — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl035_plan.md` + leader decisions. No commit / push / gh (leader owns delivery).
+**Scope held:** WL-035 + the GAP-2 export-write fix only. Did NOT touch the send
+path, schema/messages table, or config hook structs (WL-036/WL-037).
+
+## Files touched
+
+| File | Change | Rationale |
+|---|---|---|
+| `weave-core/src/archive.rs` **(new, pure)** | Hand-rolled uncompressed USTAR tar: `write_archive(&[(&str,&[u8])]) -> Result<Vec<u8>>`, `read_archive(&[u8]) -> Result<Vec<ArchiveEntry>>`, `safe_entry_name(&str) -> Result<()>` traversal guard, `ArchiveEntry`, entry-name constants + `KNOWN_ENTRY_NAMES`. 9 unit tests (round-trip, empty/512-aligned bodies, truncation + checksum rejection, traversal-guard accept/reject). ZERO new deps. | No-dep portable container; pure → unit-testable with no FS. |
+| `weave-core/src/lib.rs` | `pub mod archive;` | Expose the module. |
+| `weave-core/src/store.rs` | Added `fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>` to the `Store` trait; `SqliteStore` impl issues parameterized `VACUUM INTO ?1` then read-back-verifies (`open_readonly` + `total_messages`). | Consistent snapshot; trait method mirrored in both backends. |
+| `weave-core/src/store_libsql.rs` | Mirrored `snapshot_to` on `LibsqlStore` (local `VACUUM INTO ?1` via the `params()` helper + read-back verify); added `local_path: Option<PathBuf>` field (set on local `open`, `None` for remote/read-only); **remote backend bails** with a clear message (no local file to vacuum). | Dual-backend mirror invariant; remote has no local file. |
+| `weave/src/backup.rs` **(new)** | `run_backup(cfg, store, out, force)` + `run_restore(cfg, in_path, force)`. Backup: snapshot→verify#1→read config/settings→build archive→atomic rename→**read-back verify#2** (re-parse archive + re-open the embedded DB, assert counts match). Restore: parse→`safe_entry_name` on EVERY entry→stage DB to temp→**verify before touching live store**→clobber guards (`--force`, `.bak` first)→atomic move; **settings.json only with `--force`**; prints "run `weave setup` to re-register the MCP server." All file writes context-wrapped. | One orchestration seam; keeps `main.rs` thin; verify-the-write at both ends. |
+| `weave/src/main.rs` | `mod backup;`; `Cmd::Backup { out, force }` + `Cmd::Restore { in_path, force }`; dispatch (Restore in the no-store early block since it replaces the live store; Backup in the main match with the open store); `use anyhow::{Context, Result}`. **GAP-2:** wrapped the `Cmd::Export` final write with `.with_context(\|\| format!("failed to write export to {}", out.display()))?`. | CLI surface + dispatch + the GAP-2 export-write context fix. |
+| `weave/src/setup.rs` | `settings_path()` made `pub`. | backup/restore must read/restore the installed `settings.json` hooks. |
+
+## Snapshot + traversal-guard approach
+
+- **Snapshot:** `Store::snapshot_to` uses parameterized `VACUUM INTO ?1` (path BOUND,
+  never inlined) — a fully-checkpointed consistent copy, never `fs::copy` of a live
+  WAL DB. Both backends read-back-verify the snapshot (re-open read-only + count)
+  before returning Ok. Remote libsql has no local file → `bail!` with guidance.
+- **Traversal guard:** `safe_entry_name` rejects empty / >100-byte / NUL / absolute /
+  any `/`/`\`/`:` separator / `.`/`..`, AND requires the name to be one of the closed
+  set `KNOWN_ENTRY_NAMES` (`messages.db`, `config.toml`, `settings.json`, `MANIFEST`).
+  `run_restore` runs it on EVERY parsed entry before using any. Read-back verification
+  at both ends: backup re-opens the written archive + embedded DB and compares counts;
+  restore stages the DB to a temp path and opens+counts it BEFORE replacing the live DB.
+- **No shell / argv-only:** entirely in-process Rust + SQLite C calls; no `Command`.
+- **Archive contents:** `messages.db` (snapshot) + optional `config.toml` + optional
+  `settings.json` + a text `MANIFEST` (version/backend/counts/membership).
+
+## Boundary crossed
+
+**Yes — `Store` trait boundary crossed.** New trait method `snapshot_to` added and
+mirrored in BOTH backends (`store.rs` sqlite + `store_libsql.rs` libsql). No schema /
+column changes, so no migration needed.
+
+## Build results
+
+- `cargo build --release` (default sqlite) — **green**.
+- `cargo build --no-default-features --features libsql` — **green**.
+- `cargo clippy --all-targets` (default) — **clean (no issues)**.
+- `cargo clippy --no-default-features --features libsql` — **clean (no issues)**.
+- `cargo fmt --all` — **applied**.
+- `cargo test -p weave-core archive::` — **9 passed** (sanity; full verifier pass runs later).
+
+Tests beyond the archive unit suite were intentionally NOT added (combined verifier
+pass owns the integration/security/prop layers). Docs (README/ARCHITECTURE/CHANGELOG)
+not yet synced — flagged for the verifier/docs pass per the plan's "Docs to sync".
+
+---
+
+# WL-037 — Message supersede / successor chains — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl037_plan.md` + leader decisions. No commit / push / gh (leader owns
+delivery). **Scope held to WL-037 only** — did not touch archive.rs/backup.rs (WL-035)
+or config hook structs (WL-036).
+
+## Schema / migration (additive, both backends)
+
+New nullable `messages.superseded_by INTEGER` (NULL == not superseded). Added to:
+- **sqlite** `weave-core/src/store.rs`: SCHEMA `messages` (trailing column after
+  `priority`) + guarded `if !column_exists(... "superseded_by") { ALTER TABLE messages
+  ADD COLUMN superseded_by INTEGER }` in `migrate()` (the WL-031 priority precedent).
+- **libsql** `weave-core/src/store_libsql.rs`: SCHEMA `messages` + a new
+  `("messages","superseded_by","ALTER TABLE messages ADD COLUMN superseded_by INTEGER")`
+  entry in the `pragma_table_info`-probe migration loop.
+- `model.rs`: `Message.superseded_by: Option<i64>` with `#[serde(default)]` (old JSON
+  still deserializes). Both `row_to_message` mappers populate it: sqlite **by name**
+  (`r.get("superseded_by").unwrap_or(None)`), libsql **by position** at the new index
+  **10**.
+
+## Store API — `supersede`
+
+New trait method `fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()>`
+declared after `set_message_priority`, mirrored in BOTH backends. Behavior:
+- Parameterized `SELECT sender FROM messages WHERE id=?1` for `old_id`; bail if it does
+  not exist. Parameterized existence probe for `new_id`; bail if missing.
+- **Authorization:** bail unless `old_sender == caller` (best-effort same-identity guard;
+  censorship/DoS protection — documented as advisory until `sign`).
+- `UPDATE messages SET superseded_by=?2 WHERE id=?1` (parameterized). `send` unchanged.
+
+## Projections updated (the libsql positional trap)
+
+EVERY explicit `SELECT id,ts,…,priority` projection feeding a message mapper got
+`superseded_by` appended as the trailing (11th) column, in BOTH backends:
+- sqlite: `peek_oldest_unread_conn`, the `thread` recursive-CTE projection (read index 10).
+  inbox/history/search use `SELECT *` so they pick the column up by name — no projection
+  edit needed there.
+- libsql (positional, the risk item): `inbox` (both branches), `history` (both branches),
+  `search`, `inbox_since`, `peek_oldest_unread_on`, and the `thread` CTE — all extended
+  + the mapper reads index 10. Proven aligned by running the libsql inbox/history/thread/
+  peek/search/reply/priority tests (see below).
+
+## Read semantics — hide-from-unread, flag-in-history
+
+`AND superseded_by IS NULL` added to the unread/nudge paths in BOTH backends:
+- sqlite: `unread_count_conn`, `peek_oldest_unread_conn`, `inbox` (include_read AND
+  unread branches), `inbox_since`.
+- libsql: `unread_count_on` (covers `unread_count` + `unread_count_tx`),
+  `peek_oldest_unread_on`, `inbox` (both branches), `inbox_since`.
+- `history`/`thread`/`search` KEEP superseded rows and populate the flag (audit). No-op
+  on a legacy store (column NULL everywhere).
+
+## CLI + MCP
+
+- **CLI** `weave/src/main.rs`: `Cmd::Send` gains `--supersedes: Option<i64>`. Local-send
+  branch post-stamps `store.supersede(&from, old, mid)` after the priority stamp (rejects
+  `old <= 0`); prints `(supersedes #N)`. Cross-store (`--to-store`) branch rejects
+  `--supersedes` (no `superseded_by` on `outbox`; refuse rather than silently ignore).
+- **MCP** `weave-mcp/src/mcp.rs`: `tool_send` reads optional `supersedes` (rejects `<= 0`),
+  post-stamps `store.supersede(&from, old, mid)` after the priority stamp, surfaces a bad
+  id as the error string. `tool_catalog()` `weave_send` inputSchema gains a `supersedes`
+  integer property. **No new standing tool** — `standing` budget test still passes.
+
+## Test helpers fixed
+
+Two `#[cfg(test)]` `Message { … }` literals needed the new field: `weave-core/src/export.rs`
+and `weave-mcp/src/dashboard.rs` (added `superseded_by: None`). The full new WL-037 test
+layer (supersede stamps/chain/auth/broadcast, integration, MCP, security, proptest) is the
+combined verifier's job per instructions — NOT added here.
+
+## Boundary crossed
+
+**Yes — `Store` trait + schema boundary crossed.** New `supersede` method + new
+`messages.superseded_by` column + changed read SQL, all mirrored in BOTH backends; both
+`sqlite` (default) and `--features libsql` compile.
+
+## Build / lint / test results (from worktree root)
+
+- `cargo build --release` (default sqlite) — **green**.
+- `cargo build --no-default-features --features libsql` — **green**.
+- `cargo clippy --lib --bins` (default) — **no issues**.
+- `cargo clippy --no-default-features --features libsql -- -D warnings` — **no issues**.
+- `cargo fmt --all` applied; `cargo fmt --all --check` — **clean**.
+- **libsql positional-mapper proof** (the highest-risk item): `cargo test
+  --no-default-features --features libsql` for `inbox` (6), `history` (1), and
+  `thread/peek/unread/search/reply/priority` (20) — **all pass**, confirming every
+  extended projection lines up with the index-10 read.
+- `cargo test -p weave-mcp standing` — **passes** (no standing-token regression).
+
+Docs (CHANGELOG/README/ARCHITECTURE) not yet synced — flagged for the verifier/docs pass
+per the plan's "Docs to sync".
+
+
+---
+
+# WL-036 — Post-send hooks — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl036_plan.md` + leader decisions. Built ON TOP of the already-committed
+WL-035/WL-037 send path (the `--supersedes` post-stamp). No commit / push / PR — leader
+owns delivery. No `Store`/schema change; `store_libsql.rs` untouched. No new standing MCP
+tool. Docs (CHANGELOG/ARCHITECTURE/README/OPERATIONS/SECURITY/PARITY) NOT yet synced —
+flagged for the verifier/docs pass per the plan's "Docs to sync". Full test layer NOT yet
+written (combined verifier pass later, per leader).
+
+## Files touched
+
+| File | Change | Rationale |
+|---|---|---|
+| `weave-core/src/config.rs` | `HookEvent` enum (Send/Ack, total parse, default Send); `PostSendHook` struct (`recipient`/`argv`/`event`/`timeout_ms`, all `#[serde(default)]`) + helpers (`hook_event`, `recipient_pattern` defaulting empty→`*`, `timeout` clamped, `is_valid`); pure `hook_recipient_matches(pattern, recipient)` reusing `model::is_broadcast`; caps `MAX_POST_SEND_HOOKS=16`/`MAX_HOOK_ARGV=64`/`MAX_HOOK_ARG_LEN=4096`/`HOOK_TIMEOUT_MS_DEFAULT=5000`; `post_send_hook: Option<Vec<PostSendHook>>` field (+ Debug line); `Config::hooks_for(event, recipient)` (pure selection, validity drop, `MAX_POST_SEND_HOOKS` bound). | Config schema + pure matcher in the lowest layer (no I/O), reusable by both send paths; broadcast alias single-source via `model::is_broadcast`. |
+| `weave-inject/src/inject.rs` | `run_post_send_hook(argv, env, timeout)` — the argv-only/no-shell bounded spawn primitive (resolves `argv[0]` via the existing `resolve_trusted_program`, `.args(&argv[1..])`, message fields via `.envs` only, `try_wait`/kill bounded-wait mirroring `run_bounded_env`); `fire_post_send_hooks(&Config, HookEvent, sender, recipient, subject, message_id)` orchestration (selects via `hooks_for`, builds env, spawns each best-effort, stderr-logs failures); `hook_env` builds the `WEAVE_HOOK_*` vector (+ `WEAVE_HOOK_PAYLOAD` JSON; BODY deliberately NOT exported); `json_escape` tiny helper (no `serde_json` dep added to weave-inject). | The spawn primitive + orchestration sit in `weave-inject` — reachable from BOTH `weave` and `weave-mcp` with no upward dep (single source of truth, plan Option A). |
+| `weave-inject/src/lib.rs` | Re-export `fire_post_send_hooks` + `run_post_send_hook`. | Reachable from bin + mcp. |
+| `weave/src/main.rs` | Import `HookEvent`; fire `Send` hooks in `Cmd::Send` local (`None`) branch after `inject_and_trace`, in `Cmd::Notify` after the verdict print; fire `Ack` hooks in `Cmd::Ack` after `store.ack` (best-effort `get_ask` for the asker as recipient). | CLI send/notify/ack must fire hooks. |
+| `weave-mcp/src/mcp.rs` | Fire `Send` hooks in `tool_send` (BOTH the cross-store-intent early-return per Q3 AND the local-send end before `Ok(out)`) and `tool_notify`; fire `Ack` hooks in `tool_ack` (best-effort `get_ask` asker). Config via `weave_core::config::Config::load()` (the existing in-tool `Config::load()` precedent — avoids plumbing `Config` through `serve`). | MCP send/notify/ack must fire hooks; no new standing tool, no `serve` signature churn. |
+
+## Injection-safe spawn design (the load-bearing invariant)
+
+`run_post_send_hook` is a **no-shell** spawn. `argv` is the FIXED operator-authored Vec from
+`config.toml`; weave NEVER substitutes message text into an argv element. `argv[0]` is
+resolved to a TRUSTED absolute path via `resolve_trusted_program` (same constraint as a
+spawned child program — a hook cannot launch an arbitrary `$PATH` binary; a `None` resolve ⇒
+logged to stderr, send unaffected). Remaining elements pass WHOLE via `Command::args`.
+Message-derived strings reach the child ONLY as `Command::envs` values
+(`WEAVE_HOOK_EVENT`/`SENDER`/`RECIPIENT`/`SUBJECT`/`MESSAGE_ID` + `WEAVE_HOOK_PAYLOAD` JSON);
+the BODY is NOT exported (no leak into child env / `ps e`). A hostile subject `"; rm -rf /"`
+/ `"$(reboot)"` is an inert env value — no shell exists on this path. Each argv element is
+re-validated (`spawn_arg_ok`: len + NUL/control reject) and the count bounded by
+`MAX_SPAWN_ARGS` at the spawn primitive; the config layer pre-bounds via `is_valid`. The
+wait is bounded (try_wait/kill at `timeout`) so a slow hook never hangs send; every failure
+(missing trusted binary / non-zero exit / timeout / spawn error) is caught and logged to
+STDERR only (`eprintln!` in inject; never the JSON-RPC stdout frame), NEVER propagated.
+
+## Fire call-sites instrumented (single shared helper `inject::fire_post_send_hooks`)
+
+1. CLI `Cmd::Send` local `None` branch — `Send`, after `inject_and_trace`.
+2. CLI `Cmd::Send` cross-store `Some(store_path)` branch — N/A in CLI (the supersede/intent
+   guard rejects early; the MCP cross-store intent DOES fire per Q3, see 6).
+3. CLI `Cmd::Notify` — `Send`, after the verdict print.
+4. CLI `Cmd::Ack` — `Ack`, after `store.ack` (recipient = `get_ask().asker`, best-effort).
+5. MCP `tool_send` local end — `Send`, before `Ok(out)`.
+6. MCP `tool_send` cross-store intent early-return — `Send` (Q3: a queued intent IS a send).
+7. MCP `tool_notify` — `Send`, before the return.
+8. MCP `tool_ack` — `Ack` (recipient = `get_ask().asker`, best-effort).
+
+Decisions applied (no re-litigation): Q1 empty/missing `recipient` ⇒ `*` (match all).
+Q2 whole-string `*` only (no glob crate, no substring matcher). Q3 cross-store intent fires
+`Send`. Q4 BODY not exported. Q5 bounded-synchronous spawn. Q7 broadcast fires once per send
+(fire point is the send call-site). Ack hooks use subject-slot = correlation id, message_id = 0.
+
+## Config schema
+
+```toml
+[[post_send_hook]]
+recipient  = "agent-a"        # "*" = any; a BROADCAST alias matches a broadcast; else exact. omit/empty ⇒ "*"
+argv       = ["/usr/bin/tee", "/tmp/sentinel"]   # argv[0] resolved to a TRUSTED abs path; no shell
+event      = "send"           # "send" (default) | "ack"
+timeout_ms = 5000             # clamped [MIN_TIMEOUT_MS=50, MAX_TIMEOUT_MS=600000]; omit ⇒ 5000
+```
+File-only (DELIBERATELY no env overlay — a hook is a program to spawn; env injection of one
+would be unsafe). Set capped at `MAX_POST_SEND_HOOKS=16`; invalid/oversized rules dropped at
+selection with a one-line stderr note.
+
+## Build results (from worktree root)
+
+- `cargo build --release` (default sqlite) — GREEN.
+- `cargo build --no-default-features --features libsql` — GREEN.
+- `cargo build --features surfaces` — GREEN.
+- `cargo clippy --all-targets` — no issues.
+- `cargo fmt --all` applied; `cargo fmt --all --check` — clean.
+
+(The `unused import: JobState` warning in `weave-core/src/store.rs` is PRE-EXISTING and
+unrelated to WL-036.)
+
+---
+
+# Docs sync (WL-035/036/037) — guardian BLOCK follow-up (docs only, NO code change)
+
+The guardian's `04_guardian_review.md` Section 3 BLOCKed solely on a code↔docs fork —
+all security/correctness invariants and the Rust-native drift guard PASS; zero doc files
+had been touched for three user-facing features. This pass adds exactly the enumerated
+docs, matching each file's existing voice/format. **No code, no `git`/`gh`.**
+
+| File | Change | Rationale |
+|---|---|---|
+| `CHANGELOG.md` | `[Unreleased]` → `### Added`: three entries (WL-035 backup/restore + GAP-2, WL-037 supersede, WL-036 post-send hooks) prepended above the WL-034 entry | User-facing features belong in the changelog |
+| `README.md` | `## CLI`: added `weave backup`/`weave restore` lines + a `weave send --supersedes` example; new `## Post-send hooks (\[\[post_send_hook\]\])` section with the config block, the `WEAVE_HOOK_*` env table, body-not-exported note, and the recursion footgun | Default-build CLI surface + the new config block must be documented |
+| `ARCHITECTURE.md` | `weave-core` tree note for `archive.rs`; `Store::snapshot_to` note (parameterized `VACUUM INTO`, dual-backend, remote bail, read-back verify); `messages.superseded_by` schema note (additive nullable, hide-from-unread/flag-in-history, sender-only authz, orthogonal to `in_reply_to`); §7 threat-model bullets for the post-send-hook seam (no-shell/env-only) and the backup traversal guard | Keep the layer/schema/threat-model description in sync |
+| `docs/SECURITY.md` | §3: new "Post-send hooks: argv-only, env-only execution (WL-036)" subsection — no-shell/`argv[0]` trusted-program/env-only/body-never-exported/bounded-fault-isolation/footgun | New attack surface belongs in SECURITY |
+| `docs/OPERATIONS.md` | Operations CLI lines for backup/restore; §4 new `[[post_send_hook]]` config subsection (block + `WEAVE_HOOK_*` table + recursion footgun, cross-ref SECURITY §3) + a backup/restore runbook subsection | Operator config + runbook (OPERATIONS exists) |
+| `docs/REPOWIRE-PARITY.md` | §1 row (supersede, WL-037), §7 row (post-send hooks, WL-036), §9 item 14 (backup/restore, WL-035) — labeled atm-core parity | Tick the atm-core parity rows the plans cite (no pre-existing atm-core rows → added) |
+| `docs/MULTI-SURFACE-PARITY.md` | Capability matrix: three rows (Backup/restore CLI-only; Supersede CLI+MCP; Post-send hooks CLI+MCP) | Surface-axis parity for the three features |
+
+`cargo fmt --all --check` — **clean** (docs only). `git status` shows the seven doc
+files (`ARCHITECTURE.md`, `CHANGELOG.md`, `README.md`, `docs/MULTI-SURFACE-PARITY.md`,
+`docs/OPERATIONS.md`, `docs/REPOWIRE-PARITY.md`, `docs/SECURITY.md`) modified alongside
+the pre-existing WL-035/036/037 code/test files. No `Store`/backend boundary crossed in
+this pass (docs only).

@@ -713,6 +713,20 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn set_message_priority(&self, id: i64, priority: &str) -> Result<()>;
 
+    /// WL-037: mark `old_id` as superseded by `new_id` (replacement, distinct from
+    /// `in_reply_to` threading). Stamps `messages.superseded_by = new_id` on the
+    /// predecessor so it drops out of every reader's unread inbox while remaining
+    /// (flagged) in history/thread/search. Authorization: only the ORIGINAL SENDER
+    /// of `old_id` may supersede it (best-effort same-identity guard — `from` is
+    /// advisory until the `sign` feature makes it unforgeable — preventing a
+    /// hostile session from censoring another agent's message). Both ids must
+    /// exist, else a clean error (never a silent no-op). Superseding an
+    /// already-superseded message re-points the link forward, forming a chain
+    /// (A→B→C); only the tail (`superseded_by IS NULL`) is unread. Never injects,
+    /// never touches the `reads` table.
+    #[allow(dead_code)]
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()>;
+
     /// WL-032: set a peer's contact policy.
     #[allow(dead_code)]
     fn set_peer_policy(&self, name: &str, policy: &str) -> Result<()>;
@@ -748,6 +762,16 @@ pub trait Store: Send {
     /// WL-033: delete a cached summary.
     #[allow(dead_code)]
     fn delete_summary(&self, root_id: i64) -> Result<bool>;
+
+    /// WL-035: write a *consistent* snapshot of this store to `dest` (a fresh
+    /// path — `VACUUM INTO` refuses an existing file). The backend uses
+    /// parameterized `VACUUM INTO ?1` (never a raw file copy of a live WAL DB) and
+    /// MUST read-back-verify the snapshot (re-open it read-only and count rows)
+    /// before returning Ok, so a corrupt/unreadable snapshot never passes silently.
+    /// A remote (no local file) backend has nothing to vacuum-into locally and
+    /// `bail!`s with a clear message.
+    #[allow(dead_code)]
+    fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -1356,7 +1380,8 @@ CREATE TABLE IF NOT EXISTS messages (
     in_reply_to     INTEGER,
     idempotency_key TEXT UNIQUE,
     trace_id        TEXT,
-    priority        TEXT NOT NULL DEFAULT 'normal'
+    priority        TEXT NOT NULL DEFAULT 'normal',
+    superseded_by   INTEGER
 );
 CREATE TABLE IF NOT EXISTS reads (
     message_id INTEGER NOT NULL,
@@ -1574,6 +1599,10 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
         idempotency_key: r.get("idempotency_key").unwrap_or(None),
         trace_id: r.get("trace_id").unwrap_or(None),
         priority: r.get("priority").unwrap_or("normal".to_string()),
+        // WL-037: read by name so `SELECT *` and projections that list the column
+        // populate it; projections that omit it (legacy) read back `None`. The
+        // migration guarantees the column exists.
+        superseded_by: r.get("superseded_by").unwrap_or(None),
     })
 }
 
@@ -1747,6 +1776,7 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)",
         bc = BROADCAST_SQL
     );
@@ -1758,8 +1788,9 @@ fn unread_count_conn(conn: &Connection, me: &str) -> Result<i64> {
 #[cfg(feature = "sqlite")]
 fn peek_oldest_unread_conn(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, priority, superseded_by FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+           AND m.superseded_by IS NULL
            AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
          ORDER BY m.id ASC LIMIT 1",
         bc = BROADCAST_SQL
@@ -2211,6 +2242,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE outbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';",
         )?;
+    }
+    // WL-037: message supersede/successor chains. Nullable (NULL == not
+    // superseded), no DEFAULT — present on fresh DBs via SCHEMA, added here for
+    // DBs created before supersede existed. `ADD COLUMN` is O(1) and every
+    // existing row reads back NULL (== not superseded).
+    if !column_exists(conn, "messages", "superseded_by")? {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN superseded_by INTEGER;")?;
     }
     // WL-032: per-peer contact policies.
     if !column_exists(conn, "peers", "contact_policy")? {
@@ -2954,6 +2992,7 @@ impl Store for SqliteStore {
             format!(
                 "SELECT * FROM messages
                  WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
+                   AND superseded_by IS NULL
                  ORDER BY id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
             )
@@ -2961,6 +3000,7 @@ impl Store for SqliteStore {
             format!(
                 "SELECT m.* FROM messages m
                  WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
+                   AND m.superseded_by IS NULL
                    AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.message_id = m.id AND r.reader = ?1)
                  ORDER BY m.id DESC LIMIT ?2",
                 bc = BROADCAST_SQL
@@ -3048,6 +3088,7 @@ impl Store for SqliteStore {
         let sql = format!(
             "SELECT * FROM messages
              WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1 AND id > ?2
+               AND superseded_by IS NULL
              ORDER BY id ASC LIMIT ?3",
             bc = BROADCAST_SQL
         );
@@ -3104,6 +3145,30 @@ impl Store for SqliteStore {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
+    }
+
+    fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        // VACUUM INTO writes a fully-checkpointed, consistent copy (no WAL/torn
+        // write hazard, unlike fs::copy of a live DB). The destination path is
+        // BOUND as a parameter — never inlined into the SQL — and must not already
+        // exist (VACUUM INTO refuses an existing file).
+        let dest_str = dest.to_str().ok_or_else(|| {
+            anyhow::anyhow!("snapshot destination path is not valid UTF-8: {dest:?}")
+        })?;
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest_str])
+            .map_err(|e| anyhow::anyhow!("VACUUM INTO failed for {}: {e}", dest.display()))?;
+        // Read-back verify (WL-041 spirit): the snapshot must re-open read-only and
+        // be a valid weave store before we declare success.
+        let snap = SqliteStore::open_readonly(dest)
+            .map_err(|e| anyhow::anyhow!("snapshot at {} did not re-open: {e}", dest.display()))?;
+        snap.total_messages().map_err(|e| {
+            anyhow::anyhow!(
+                "snapshot at {} is not a valid weave store: {e}",
+                dest.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn clear_inbox(&self, me: &str) -> Result<usize> {
@@ -3531,7 +3596,7 @@ impl Store for SqliteStore {
                 SELECT m.id FROM messages m JOIN t ON m.in_reply_to = t.id
             )
             SELECT m.id, m.ts, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
-                   m.idempotency_key, m.trace_id, m.priority
+                   m.idempotency_key, m.trace_id, m.priority, m.superseded_by
             FROM messages m JOIN t ON m.id = t.id
             ORDER BY m.id ASC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
@@ -3548,6 +3613,8 @@ impl Store for SqliteStore {
                     idempotency_key: r.get(7).unwrap_or(None),
                     trace_id: r.get(8).unwrap_or(None),
                     priority: r.get(9).unwrap_or("normal".to_string()),
+                    // WL-037: keep superseded rows in a thread, flagged.
+                    superseded_by: r.get(10).unwrap_or(None),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -4891,6 +4958,42 @@ impl Store for SqliteStore {
         self.conn.execute(
             "UPDATE messages SET priority = ?1 WHERE id = ?2",
             params![p.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
+        // Both ids must exist; the new id is looked up so a typo'd/forged
+        // successor can't strand the predecessor pointing at a phantom row.
+        let old_sender: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sender FROM messages WHERE id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(old_sender) = old_sender else {
+            anyhow::bail!("cannot supersede: message #{old_id} does not exist");
+        };
+        let new_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+            params![new_id],
+            |r| r.get(0),
+        )?;
+        if !new_exists {
+            anyhow::bail!("cannot supersede: successor message #{new_id} does not exist");
+        }
+        // Authorization: only the ORIGINAL SENDER of old_id may supersede it.
+        // Best-effort same-identity guard (`from` is advisory until the `sign`
+        // feature makes it unforgeable) that blocks a hostile session from
+        // hiding another agent's message from inboxes (censorship/DoS vector).
+        if old_sender != caller {
+            anyhow::bail!("cannot supersede: #{old_id} was sent by '{old_sender}', not '{caller}'");
+        }
+        self.conn.execute(
+            "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+            params![old_id, new_id],
         )?;
         Ok(())
     }
@@ -10004,5 +10107,173 @@ mod tests {
         assert!(s.delete_summary(1).unwrap());
         assert!(!s.delete_summary(1).unwrap());
         assert!(s.get_summary(1).unwrap().is_none());
+    }
+
+    // ---- WL-037: message supersede / successor chains ----------------------
+
+    /// Helper: read a single message's `superseded_by` from `me`'s full history.
+    fn superseded_by_of(s: &SqliteStore, me: &str, id: i64) -> Option<i64> {
+        s.history(me, None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("message #{id} not in {me} history"))
+            .superseded_by
+    }
+
+    #[test]
+    fn supersede_stamps_predecessor() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        // The predecessor now points at its successor; the successor is unstamped.
+        assert_eq!(superseded_by_of(&s, "b", a), Some(b));
+        assert_eq!(superseded_by_of(&s, "b", b), None);
+    }
+
+    #[test]
+    fn superseded_message_hidden_from_unread() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        assert_eq!(s.unread_count("b").unwrap(), 2);
+        s.supersede("a", a, b).unwrap();
+        // Only the successor remains unread.
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(inbox.iter().any(|m| m.id == b));
+        assert!(
+            !inbox.iter().any(|m| m.id == a),
+            "superseded predecessor must not appear in unread inbox"
+        );
+        // The oldest-unread (nudge/wake path) skips the superseded predecessor.
+        let oldest = s.peek_oldest_unread("b").unwrap().unwrap();
+        assert_eq!(oldest.id, b);
+    }
+
+    #[test]
+    fn history_retains_superseded_with_flag() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        // History keeps the superseded row (audit) AND populates the flag.
+        let hist = s.history("b", None, 100).unwrap();
+        let row_a = hist.iter().find(|m| m.id == a).expect("history keeps A");
+        assert_eq!(row_a.superseded_by, Some(b));
+    }
+
+    #[test]
+    fn supersede_chain_only_tail_unread() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("a", "b", None, "B", None, None).unwrap();
+        let c = s.send("a", "b", None, "C", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        s.supersede("a", b, c).unwrap();
+        // A->B->C: only the tail C remains unread.
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert_eq!(inbox.iter().filter(|m| m.id == c).count(), 1);
+        assert!(!inbox.iter().any(|m| m.id == a || m.id == b));
+    }
+
+    #[test]
+    fn supersede_rejects_foreign_sender() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("c", "b", None, "C", None, None).unwrap();
+        // 'c' is not the sender of A => rejected, A unchanged.
+        assert!(s.supersede("c", a, b).is_err());
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+        assert_eq!(s.unread_count("b").unwrap(), 2);
+    }
+
+    #[test]
+    fn supersede_rejects_missing_ids() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        // Missing old id.
+        assert!(s.supersede("a", 999_999, a).is_err());
+        // Missing new id (successor does not exist).
+        assert!(s.supersede("a", a, 999_999).is_err());
+        // No panic, A unchanged.
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+    }
+
+    #[test]
+    fn supersede_broadcast_drops_from_all_readers() {
+        let s = mem();
+        let bcast = "all";
+        let a = s.send("a", bcast, None, "v1", None, None).unwrap();
+        let b = s.send("a", bcast, None, "v2", None, None).unwrap();
+        // Two distinct readers each have both broadcasts unread.
+        assert_eq!(s.unread_count("r1").unwrap(), 2);
+        assert_eq!(s.unread_count("r2").unwrap(), 2);
+        s.supersede("a", a, b).unwrap();
+        // The per-message stamp drops the superseded broadcast from EVERY reader.
+        assert_eq!(s.unread_count("r1").unwrap(), 1);
+        assert_eq!(s.unread_count("r2").unwrap(), 1);
+        let (in1, _) = s.inbox("r1", false, false, 50).unwrap();
+        assert!(in1.iter().any(|m| m.id == b) && !in1.iter().any(|m| m.id == a));
+    }
+
+    #[test]
+    fn supersede_migration_is_idempotent() {
+        // The guarded ADD COLUMN must be a no-op on a store that already has it:
+        // re-opening the same DB twice (each runs migrate) must not error and the
+        // column must be present (a supersede succeeds).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weave-mig-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let a;
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            a = s.send("a", "b", None, "A", None, None).unwrap();
+        }
+        // Second open re-runs migrate(): must be idempotent, column still present.
+        let s2 = SqliteStore::open(&path).unwrap();
+        let b = s2.send("a", "b", None, "B", None, None).unwrap();
+        s2.supersede("a", a, b).unwrap();
+        assert_eq!(superseded_by_of(&s2, "b", a), Some(b));
+    }
+
+    // ---- WL-035: Store::snapshot_to (VACUUM INTO + read-back) ---------------
+
+    #[test]
+    fn snapshot_to_roundtrips_messages() {
+        let s = mem();
+        s.send("a", "b", Some("s"), "hi", None, None).unwrap();
+        s.send("a", "b", None, "again", None, None).unwrap();
+        let src_count = s.total_messages().unwrap();
+        assert_eq!(src_count, 2);
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-snap-{}-{}", std::process::id(), src_count));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+
+        // The snapshot opens read-only and reports the same count.
+        let snap = SqliteStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), src_count);
+    }
+
+    #[test]
+    fn snapshot_to_empty_db_is_valid() {
+        let s = mem();
+        assert_eq!(s.total_messages().unwrap(), 0);
+        let dir = std::env::temp_dir().join(format!("weave-snap-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("empty-snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+        let snap = SqliteStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), 0);
     }
 }

@@ -59,6 +59,7 @@ ungoverned hosted relay.
 | `ask_many` / `ask_many_result` | `weave_ask_many` / `weave_ask_many_result` | ✅ HAVE | `ask_groups` parent-id correlation |
 | Reminder injection (unacked asks resurface) | prompt-hook reminder nudge | ✅ HAVE | WL-014 |
 | Structured tool-approval questions | `weave_ask_permission` + `weave_permission_*` | ✅ HAVE | WL-021 (PreToolUse gate) |
+| Message supersede / successor chains (atm-core) | `weave send --supersedes <id>` / `weave_send {supersedes}` | ✅ HAVE | **WL-037**; additive `messages.superseded_by` (both backends); hide-from-unread, flag-in-history; sender-only authz |
 
 ## 2. Session / peer lifecycle
 
@@ -110,6 +111,7 @@ ungoverned hosted relay.
 | Bearer token auth (HTTP/WS/hooks) | bearer-auth HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
 | Spawn allowlists (`daemon.spawn.allowed_paths`) | `spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS` + `trusted_dirs()` (two-layer gate) | ✅ HAVE | **WL-047**; cwd allowlist (deny-by-default, MCP hard-deny) + trusted child `argv[0]` |
 | PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` | ✅ HAVE | WL-021 |
+| Post-send hooks (atm-core `[[post_send_hook]]`) | config `[[post_send_hook]]` (CLI/MCP send/notify/ack) | ✅ HAVE | **WL-036**; argv-only/no-shell, `argv[0]` trusted-dir, message fields env-only (body never exported), bounded/fault-isolated; no new standing tool |
 | CORS restricted to localhost | localhost-only HTTP surface | ✅ HAVE | WL-022 |
 | **No E2E encryption on relay (acknowledged gap)** | no relay at all; ed25519 signed identity + owner-only cross-store pull | 🟢 SUPERSET | `sign.rs`; closes repowire's own acknowledged weakness |
 
@@ -142,6 +144,7 @@ These have **no repowire equivalent** — they are why weave is a *superset*, no
 11. **GitHub review queue** across peers (`weave_review_*`; WL-020).
 12. **`weave_doctor`** federation-health + signature verify rollup.
 13. **One dependency-light static Rust binary, Python-free, no daemon** — the whole thing, vs repowire's Python runtime + daemon + Next.js stack.
+14. **Portable mailbox backup/restore** (atm-core parity) — `weave backup`/`weave restore`, a dependency-free uncompressed-USTAR snapshot of the DB (`VACUUM INTO`, never a raw live copy) + config + Claude settings, read-back-verified, traversal-guarded (`archive.rs`; **WL-035**).
 
 Beyond parity, weave **extends past repowire entirely** with **governed web
 access via obscura** (WL-049 / **ADR-0002**, ✅ shipped behind `--features

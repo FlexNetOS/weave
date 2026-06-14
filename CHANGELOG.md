@@ -3,6 +3,31 @@
 ## [Unreleased] — fix: honest `weave kill` result (WL-047 follow-up)
 
 ### Added
+- **Mailbox backup/restore (WL-035), `weave backup --out <path> [--force]` /
+  `weave restore --in <path> [--force]`:** a portable **dependency-free uncompressed
+  USTAR** archive of a consistent SQLite snapshot (`VACUUM INTO`, never a raw live-DB
+  copy) + `config.toml` + the installed Claude `settings.json` hooks + a `MANIFEST`.
+  Read-back-verified at both ends; **traversal-guarded** extraction (closed allow-list
+  `safe_entry_name`); restore gates DB/config and `settings.json` (with a `.bak`)
+  overwrite behind `--force`; remote libSQL is unsupported (no local file to snapshot).
+  Re-run `weave setup` after restore to re-register the MCP server. Also: `weave export`
+  write now reports its path on failure (GAP-2).
+- **Message supersede / successor chains (WL-037), `weave send --supersedes <id>` (CLI)
+  and a `supersedes` property on `weave_send` (MCP, zero standing-token cost):** a sender
+  replaces a prior message; the predecessor is stamped `superseded_by` and **hidden from
+  the recipient's unread inbox** (kept and flagged in history/thread/search for audit).
+  Chains supported (only the tail is unread). **Sender-only authorization** — you may
+  only supersede your own messages (censorship/DoS guard). Additive nullable
+  `messages.superseded_by` column, mirrored across both backends; distinct from
+  `in_reply_to` threading.
+- **Post-send hooks (WL-036), config `[[post_send_hook]]`:** run an operator-authored
+  external program after a matching send/ack. **argv-only, no-shell** spawn (`argv[0]`
+  constrained to a trusted dir); message fields reach the child ONLY as `WEAVE_HOOK_*`
+  env vars (the message **body is never exported**); recipient matching supports `*`
+  (universal) + exact + `BROADCAST` aliases. Fault-isolated and bounded (a slow/failing/
+  missing hook never breaks send; failures log to stderr); fired from CLI `weave send`/
+  `notify`/`ack` and MCP `weave_send`/`weave_notify`/`weave_ack` via one shared helper.
+  **No new standing MCP tool.**
 - **Static mailbox export (WL-034), `weave export --out <path> [--for <id>] [--limit N]`:**
   renders a **self-contained, offline, XSS-safe portable HTML** bundle of the caller's
   mailbox with **client-side search** (mcp_agent_mail parity). The file double-click-opens

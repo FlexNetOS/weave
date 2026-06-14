@@ -284,6 +284,7 @@ mod tests {
             idempotency_key: None,
             trace_id: None,
             priority: "normal".to_string(),
+            superseded_by: None,
         }
     }
 

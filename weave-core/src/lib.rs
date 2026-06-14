@@ -1,4 +1,5 @@
 #![allow(clippy::should_implement_trait)]
+pub mod archive;
 pub mod config;
 pub mod export;
 pub mod memory;

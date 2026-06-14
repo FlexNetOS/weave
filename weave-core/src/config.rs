@@ -228,6 +228,29 @@ pub const MIN_TIMEOUT_MS: u64 = 50;
 /// drain hang ~forever. Mirrors the `clamp_limit` input-cap discipline.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+/// WL-036 post-send hooks: max number of `[[post_send_hook]]` rules honored. A
+/// config carrying more is truncated to this many (with a one-line stderr note),
+/// the same finite-bound posture as every other input cap. Generous for a real
+/// deployment (a handful of integrations) yet finite so a hostile/garbage config
+/// cannot register an unbounded set of programs to spawn on every send.
+pub const MAX_POST_SEND_HOOKS: usize = 16;
+
+/// WL-036: max argv length for a single post-send hook. Mirrors the spawn layer's
+/// `MAX_SPAWN_ARGS` discipline — a hook whose argv exceeds this is dropped (it cannot
+/// be a legitimate small launch line). Kept local to the config layer (no upward dep
+/// on `weave-inject`); the spawn layer re-checks too.
+pub const MAX_HOOK_ARGV: usize = 64;
+
+/// WL-036: per-argv-element byte cap for a post-send hook, mirroring the spawn
+/// layer's `MAX_SPAWN_ARG_LEN`. An element longer than this (or one carrying a NUL /
+/// control byte) makes the whole hook invalid and it is dropped at load.
+pub const MAX_HOOK_ARG_LEN: usize = 4096;
+
+/// WL-036: default per-hook wall-clock bound (ms) when a hook omits `timeout_ms`.
+/// A post-send hook runs bounded-synchronously, so this is also the longest a single
+/// unconfigured hook can delay `send`. Clamped into `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`.
+pub const HOOK_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+
 /// Lower clamp on the `weave sessions --watch` poll interval (seconds). A `0`s
 /// interval would busy-spin the read loop, so a foot-gun `--interval 0` is raised
 /// to this floor. Mirrors the `MIN_TIMEOUT_MS` input-cap discipline.
@@ -524,6 +547,119 @@ pub const MAX_FP_ENTRY_LEN: usize = 256;
 /// `weave gc` CLI default so the opportunistic and explicit sweeps agree.
 pub const DEFAULT_RETENTION_SECS: i64 = 2_592_000;
 
+/// WL-036: which lifecycle event a [`PostSendHook`] fires on. Pure data — TEXT
+/// parsed totally, defaulting to [`HookEvent::Send`] on any unknown/empty value (the
+/// [`crate::model::MessagePriority`]/`AskRole` precedent: a total parse never errors).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HookEvent {
+    /// A message was sent (CLI `weave send`/`notify`, MCP `weave_send`/`weave_notify`).
+    #[default]
+    Send,
+    /// An ask was acked (CLI `weave ack`, MCP `weave_ack`).
+    Ack,
+}
+
+impl HookEvent {
+    /// The canonical lower-case token, also the value of the `WEAVE_HOOK_EVENT` env
+    /// var handed to the child.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::Send => "send",
+            HookEvent::Ack => "ack",
+        }
+    }
+    /// Parse a config/`event` string; total — an empty/unknown value ⇒ [`Send`].
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ack" => HookEvent::Ack,
+            _ => HookEvent::Send,
+        }
+    }
+}
+
+/// One post-send hook rule (WL-036, atm-core parity). Runs an external program
+/// (argv-only, **NO shell**) after a matching send/ack. Message fields reach the
+/// child ONLY as `WEAVE_HOOK_*` env vars — they are NEVER concatenated into argv, so
+/// a hostile subject/sender is an inert env value, never shell input (there is no
+/// shell on this path). The program (`argv[0]`) is resolved to a TRUSTED absolute
+/// path at spawn time, so a hook cannot launch an arbitrary `$PATH` binary.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct PostSendHook {
+    /// Recipient pattern: `*` matches ANY recipient; a `BROADCAST` alias
+    /// (`all`/`everyone`/`broadcast`/`*`) matches a broadcast send; otherwise an
+    /// exact, case-sensitive match. `None`/empty ⇒ treated as `*` (match all), the
+    /// most useful default (atm-core fires on match).
+    #[serde(default)]
+    pub recipient: Option<String>,
+    /// The command to run as an explicit argv vector. `argv[0]` is the program
+    /// (resolved to a TRUSTED absolute path at spawn time); the rest are passed as
+    /// DISCRETE argv elements. NEVER a shell line — weave never substitutes message
+    /// text into an element.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// `"send"` (default) or `"ack"`. Parsed via [`HookEvent::parse`]; unknown ⇒ Send.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Per-hook wall-clock bound (ms); clamped to `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]`;
+    /// `None` ⇒ [`HOOK_TIMEOUT_MS_DEFAULT`].
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl PostSendHook {
+    /// The event this hook fires on (defaulting to [`HookEvent::Send`]).
+    pub fn hook_event(&self) -> HookEvent {
+        self.event
+            .as_deref()
+            .map(HookEvent::parse)
+            .unwrap_or_default()
+    }
+    /// The recipient pattern, defaulting an absent/empty value to the universal `*`.
+    pub fn recipient_pattern(&self) -> &str {
+        match self.recipient.as_deref() {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => "*",
+        }
+    }
+    /// The resolved, clamped wall-clock bound for this hook.
+    pub fn timeout(&self) -> std::time::Duration {
+        let ms = self
+            .timeout_ms
+            .unwrap_or(HOOK_TIMEOUT_MS_DEFAULT)
+            .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+        std::time::Duration::from_millis(ms)
+    }
+    /// Is this hook a well-formed, spawnable rule? A non-empty argv whose length and
+    /// every element are within the input caps (length + no NUL/control bytes). A
+    /// malformed hook is dropped at selection time (never reaches a spawn).
+    pub fn is_valid(&self) -> bool {
+        !self.argv.is_empty()
+            && self.argv.len() <= MAX_HOOK_ARGV
+            && self.argv.iter().all(|a| {
+                a.len() <= MAX_HOOK_ARG_LEN && !a.chars().any(|c| c == '\0' || c.is_control())
+            })
+    }
+}
+
+/// Does a hook `pattern` match a message `recipient`? PURE; total on any input.
+/// Single source of truth for the alias set: it reuses [`crate::model::is_broadcast`]
+/// so the broadcast alias list never drifts. Rules:
+///   - `"*"` (the universal wildcard) matches ANY recipient (it is ALSO a broadcast
+///     alias, so treating it as universal is a strict superset — it still fires on
+///     broadcasts);
+///   - a (non-`*`) BROADCAST alias pattern matches a recipient that is itself a
+///     broadcast send (`is_broadcast(recipient)`), and ONLY such a recipient;
+///   - otherwise exact, case-sensitive equality.
+pub fn hook_recipient_matches(pattern: &str, recipient: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if crate::model::is_broadcast(pattern) {
+        return crate::model::is_broadcast(recipient);
+    }
+    pattern == recipient
+}
+
 #[derive(Deserialize, Default, Clone)]
 pub struct Config {
     pub session: Option<String>,
@@ -741,6 +877,17 @@ pub struct Config {
     /// `WEAVE_OBSCURA_TOKEN`. Inert without the `obscura` feature.
     #[serde(default)]
     pub obscura_token: Option<String>,
+    /// WL-036 post-send hooks: external programs run AFTER a matching send/ack.
+    /// File-only (DELIBERATELY no env overlay): a hook is an argv-to-spawn, so
+    /// exposing it through an env var would let an ambient/inherited env inject a
+    /// program for weave to run — file-only is the safe posture. Each entry is an
+    /// argv-only, no-shell launch whose message metadata reaches the child as
+    /// `WEAVE_HOOK_*` env vars (never argv). `None`/empty ⇒ no hooks (identical to
+    /// today). The set is capped at [`MAX_POST_SEND_HOOKS`] at selection time and
+    /// each rule is independently validated. `#[serde(default)]` keeps configs that
+    /// omit the key loading unchanged.
+    #[serde(default)]
+    pub post_send_hook: Option<Vec<PostSendHook>>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -805,6 +952,7 @@ impl std::fmt::Debug for Config {
                 "obscura_token",
                 &self.obscura_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("post_send_hook", &self.post_send_hook)
             .finish()
     }
 }
@@ -1673,6 +1821,41 @@ impl Config {
     /// `None` ⇒ the server uses its built-in default nudge text.
     pub fn nudge_template(&self) -> Option<&str> {
         self.nudge_template.as_deref()
+    }
+
+    /// WL-036: the post-send hooks that should fire for `event` and a message bound
+    /// for `recipient`, in config order. Selection is PURE (no I/O): it keeps only
+    /// VALID rules ([`PostSendHook::is_valid`]) whose `event` matches and whose
+    /// `recipient` pattern matches via [`hook_recipient_matches`], and bounds the
+    /// returned set to [`MAX_POST_SEND_HOOKS`] (excess dropped, the input-cap
+    /// posture). `None` config ⇒ empty. A rule that is configured but invalid is
+    /// dropped here with a one-line stderr note so a malformed hook never silently
+    /// vanishes nor reaches a spawn.
+    pub fn hooks_for(&self, event: HookEvent, recipient: &str) -> Vec<&PostSendHook> {
+        let Some(hooks) = self.post_send_hook.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<&PostSendHook> = Vec::new();
+        for h in hooks {
+            if h.hook_event() != event || !hook_recipient_matches(h.recipient_pattern(), recipient)
+            {
+                continue;
+            }
+            if !h.is_valid() {
+                eprintln!(
+                    "[weave] ignoring post_send_hook (invalid/oversized argv, max {MAX_HOOK_ARGV} args)"
+                );
+                continue;
+            }
+            if out.len() == MAX_POST_SEND_HOOKS {
+                eprintln!(
+                    "[weave] post_send_hook: more than {MAX_POST_SEND_HOOKS} matching rules; dropping excess"
+                );
+                break;
+            }
+            out.push(h);
+        }
+        out
     }
 
     /// The configured mux preference, if any. Returned as the raw config string
@@ -3423,5 +3606,173 @@ mod tests {
     fn mux_preference_missing_is_none() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.mux_preference(), None);
+    }
+
+    // ---- WL-036: post-send hook config + pure matcher ----------------------
+
+    #[test]
+    fn hook_recipient_matches_wildcard_exact_broadcast_case() {
+        // "*" matches ANY recipient (including a broadcast alias).
+        assert!(hook_recipient_matches("*", "agent-a"));
+        assert!(hook_recipient_matches("*", "all"));
+        assert!(hook_recipient_matches("*", "everyone"));
+        // exact, case-sensitive equality.
+        assert!(hook_recipient_matches("agent-a", "agent-a"));
+        assert!(!hook_recipient_matches("agent-a", "agent-b"));
+        assert!(
+            !hook_recipient_matches("Agent-A", "agent-a"),
+            "match is case-sensitive"
+        );
+        // a (non-*) BROADCAST alias pattern matches ONLY a broadcast recipient.
+        assert!(hook_recipient_matches("all", "broadcast"));
+        assert!(hook_recipient_matches("all", "everyone"));
+        assert!(
+            !hook_recipient_matches("all", "agent-a"),
+            "a broadcast-alias pattern must not match a named recipient"
+        );
+    }
+
+    #[test]
+    fn hook_event_parse_is_total() {
+        assert_eq!(HookEvent::parse("send"), HookEvent::Send);
+        assert_eq!(HookEvent::parse("ack"), HookEvent::Ack);
+        assert_eq!(HookEvent::parse("ACK"), HookEvent::Ack);
+        // unknown/empty/whitespace ⇒ default Send (total parse, never errors).
+        assert_eq!(HookEvent::parse(""), HookEvent::Send);
+        assert_eq!(HookEvent::parse("nonsense"), HookEvent::Send);
+        assert_eq!(HookEvent::parse("  ack  "), HookEvent::Ack);
+        assert_eq!(HookEvent::Send.as_str(), "send");
+        assert_eq!(HookEvent::Ack.as_str(), "ack");
+    }
+
+    #[test]
+    fn post_send_hook_toml_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[post_send_hook]]
+            recipient  = "agent-a"
+            argv       = ["/usr/bin/tee", "/tmp/sentinel"]
+            event      = "send"
+            timeout_ms = 1234
+
+            [[post_send_hook]]
+            argv = ["/bin/true"]
+            "#,
+        )
+        .expect("post_send_hook block parses");
+        let hooks = cfg.post_send_hook.as_ref().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].recipient.as_deref(), Some("agent-a"));
+        assert_eq!(hooks[0].argv, vec!["/usr/bin/tee", "/tmp/sentinel"]);
+        assert_eq!(hooks[0].hook_event(), HookEvent::Send);
+        assert_eq!(hooks[0].timeout().as_millis(), 1234);
+        // Omitted recipient ⇒ universal "*".
+        assert_eq!(hooks[1].recipient_pattern(), "*");
+        // Omitted timeout ⇒ default.
+        assert_eq!(
+            hooks[1].timeout().as_millis() as u64,
+            HOOK_TIMEOUT_MS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn post_send_hook_timeout_is_clamped() {
+        let tiny = PostSendHook {
+            argv: vec!["/bin/true".into()],
+            timeout_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(tiny.timeout().as_millis() as u64, MIN_TIMEOUT_MS);
+        let huge = PostSendHook {
+            argv: vec!["/bin/true".into()],
+            timeout_ms: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(huge.timeout().as_millis() as u64, MAX_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn post_send_hook_is_valid_caps() {
+        // Empty argv ⇒ invalid.
+        let empty = PostSendHook {
+            argv: vec![],
+            ..Default::default()
+        };
+        assert!(!empty.is_valid());
+        // Over the argv-count cap ⇒ invalid.
+        let too_many = PostSendHook {
+            argv: vec!["x".to_string(); MAX_HOOK_ARGV + 1],
+            ..Default::default()
+        };
+        assert!(!too_many.is_valid());
+        // An over-long element ⇒ invalid.
+        let long_arg = PostSendHook {
+            argv: vec!["a".to_string(), "b".repeat(MAX_HOOK_ARG_LEN + 1)],
+            ..Default::default()
+        };
+        assert!(!long_arg.is_valid());
+        // A NUL/control byte in an element ⇒ invalid.
+        let ctrl = PostSendHook {
+            argv: vec!["a".to_string(), "b\0c".to_string()],
+            ..Default::default()
+        };
+        assert!(!ctrl.is_valid());
+        // A well-formed rule is valid.
+        let ok = PostSendHook {
+            argv: vec!["/bin/true".to_string(), "arg".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.is_valid());
+    }
+
+    #[test]
+    fn hooks_for_selects_by_event_recipient_and_validity() {
+        let cfg = Config {
+            post_send_hook: Some(vec![
+                // matches agent-a on send.
+                PostSendHook {
+                    recipient: Some("agent-a".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+                // an ack hook ⇒ must NOT fire on a send.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("ack".into()),
+                    timeout_ms: None,
+                },
+                // invalid (empty argv) ⇒ dropped at selection.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec![],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+                // a universal send hook ⇒ also matches agent-a.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+            ]),
+            ..Config::default()
+        };
+        // Send to agent-a selects the exact + universal send rules (2), not the ack
+        // rule and not the invalid one.
+        let selected = cfg.hooks_for(HookEvent::Send, "agent-a");
+        assert_eq!(selected.len(), 2);
+        // A non-matching recipient selects only the universal rule.
+        let other = cfg.hooks_for(HookEvent::Send, "agent-z");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].recipient_pattern(), "*");
+        // The ack event selects only the universal ack rule.
+        let ack = cfg.hooks_for(HookEvent::Ack, "agent-a");
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].hook_event(), HookEvent::Ack);
+        // No hooks configured ⇒ empty.
+        assert!(Config::default().hooks_for(HookEvent::Send, "x").is_empty());
     }
 }

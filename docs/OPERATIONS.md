@@ -210,6 +210,8 @@ own inbox under an explicit identity refreshes your heartbeat.
 ```bash
 weave doctor                     # diagnostics (see §9)
 weave gc                         # retention sweep (see §7)
+weave backup --out mailbox.tar   # no-dep snapshot of DB + config + Claude settings (--force to overwrite)
+weave restore --in mailbox.tar   # restore that snapshot (traversal-guarded; --force to clobber DB/config/settings)
 weave config init                # scaffold ~/.config/weave/config.toml
 weave completions bash           # emit a completion script (bash|zsh|fish)
 weave man                        # emit a roff man page
@@ -270,6 +272,54 @@ Keys (all optional):
 trivial — e.g. start one agent with `WEAVE_SESSION=envctl` and another with
 `WEAVE_SESSION=desktop` from the same config. The resolved `db` and `config`
 paths are shown by `weave doctor`.
+
+### Post-send hooks (`[[post_send_hook]]`)
+
+Run an operator-authored external program after a matching send/ack. Hooks are
+**config-file-only** — there is **deliberately no env overlay** (a hook is a program
+to spawn; injecting one through the environment would be unsafe). Each rule is a
+TOML array-of-tables entry:
+
+```toml
+[[post_send_hook]]
+recipient  = "agent-a"        # "*" = any (the default if omitted/empty); a BROADCAST alias matches a broadcast; else exact
+argv       = ["/usr/bin/tee", "/tmp/weave-sentinel"]   # argv[0] resolved to a TRUSTED abs path; no shell, ever
+event      = "send"           # "send" (default) | "ack"
+timeout_ms = 5000             # clamped to [50, 600000]; omit ⇒ 5000
+```
+
+The program is spawned **argv-only (no shell)**; message text is never substituted
+into an argv element. Message fields reach the child **only** as environment
+variables — the **body is never exported**:
+
+| Env var | Value |
+|---|---|
+| `WEAVE_HOOK_EVENT` | `send` or `ack` |
+| `WEAVE_HOOK_SENDER` | the sender identity |
+| `WEAVE_HOOK_RECIPIENT` | the recipient identity (or broadcast alias) |
+| `WEAVE_HOOK_SUBJECT` | the message subject |
+| `WEAVE_HOOK_MESSAGE_ID` | the message id |
+| `WEAVE_HOOK_PAYLOAD` | a small JSON object of the fields above |
+
+Hooks are **fault-isolated and bounded**: a missing/slow/failing hook never breaks
+the send (the wait is bounded by `timeout_ms`; failures log to stderr only). The set
+is capped at `MAX_POST_SEND_HOOKS`; invalid/oversized rules are dropped at selection.
+
+> **Footgun — hook recursion.** A hook must **not** call back into `weave
+> send`/`notify`/`ack` for the same event class, or it re-fires itself in a loop.
+> Keep hook programs out-of-band (write a file, post to an external system), not back
+> into the mesh. See `docs/SECURITY.md` §3 for the full execution model.
+
+### Backup / restore (`weave backup` / `weave restore`)
+
+`weave backup --out <path>` writes a portable **dependency-free uncompressed USTAR**
+archive of a consistent SQLite snapshot (via `VACUUM INTO`, never a raw live-DB copy)
+plus `config.toml`, the installed Claude `settings.json` hooks, and a `MANIFEST`; the
+archive is read-back-verified before it is declared good. `weave restore --in <path>`
+extracts it with a closed traversal allow-list. Both refuse to overwrite without
+`--force` (restore takes a `.bak` of `settings.json` first). **Remote libSQL is
+unsupported** (there is no local file to snapshot). After a restore, re-run `weave
+setup` to re-register the MCP server.
 
 ---
 
