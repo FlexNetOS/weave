@@ -95,3 +95,59 @@ axes passed). Added exactly three doc entries to match the final code; no code t
 
 `cargo fmt --all --check` — **clean** (docs only). `git status` now shows `README.md`,
 `ARCHITECTURE.md`, `CHANGELOG.md` modified alongside the WL-034 code/test files.
+
+---
+
+# WL-035 + GAP-2 — Mailbox backup/restore + export-write context — implementer change log
+
+Worktree: `/home/drdave/Desktop/meta/weave-batch` (branch `wl-035-037-batch`).
+Implemented per `wl035_plan.md` + leader decisions. No commit / push / gh (leader owns delivery).
+**Scope held:** WL-035 + the GAP-2 export-write fix only. Did NOT touch the send
+path, schema/messages table, or config hook structs (WL-036/WL-037).
+
+## Files touched
+
+| File | Change | Rationale |
+|---|---|---|
+| `weave-core/src/archive.rs` **(new, pure)** | Hand-rolled uncompressed USTAR tar: `write_archive(&[(&str,&[u8])]) -> Result<Vec<u8>>`, `read_archive(&[u8]) -> Result<Vec<ArchiveEntry>>`, `safe_entry_name(&str) -> Result<()>` traversal guard, `ArchiveEntry`, entry-name constants + `KNOWN_ENTRY_NAMES`. 9 unit tests (round-trip, empty/512-aligned bodies, truncation + checksum rejection, traversal-guard accept/reject). ZERO new deps. | No-dep portable container; pure → unit-testable with no FS. |
+| `weave-core/src/lib.rs` | `pub mod archive;` | Expose the module. |
+| `weave-core/src/store.rs` | Added `fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>` to the `Store` trait; `SqliteStore` impl issues parameterized `VACUUM INTO ?1` then read-back-verifies (`open_readonly` + `total_messages`). | Consistent snapshot; trait method mirrored in both backends. |
+| `weave-core/src/store_libsql.rs` | Mirrored `snapshot_to` on `LibsqlStore` (local `VACUUM INTO ?1` via the `params()` helper + read-back verify); added `local_path: Option<PathBuf>` field (set on local `open`, `None` for remote/read-only); **remote backend bails** with a clear message (no local file to vacuum). | Dual-backend mirror invariant; remote has no local file. |
+| `weave/src/backup.rs` **(new)** | `run_backup(cfg, store, out, force)` + `run_restore(cfg, in_path, force)`. Backup: snapshot→verify#1→read config/settings→build archive→atomic rename→**read-back verify#2** (re-parse archive + re-open the embedded DB, assert counts match). Restore: parse→`safe_entry_name` on EVERY entry→stage DB to temp→**verify before touching live store**→clobber guards (`--force`, `.bak` first)→atomic move; **settings.json only with `--force`**; prints "run `weave setup` to re-register the MCP server." All file writes context-wrapped. | One orchestration seam; keeps `main.rs` thin; verify-the-write at both ends. |
+| `weave/src/main.rs` | `mod backup;`; `Cmd::Backup { out, force }` + `Cmd::Restore { in_path, force }`; dispatch (Restore in the no-store early block since it replaces the live store; Backup in the main match with the open store); `use anyhow::{Context, Result}`. **GAP-2:** wrapped the `Cmd::Export` final write with `.with_context(\|\| format!("failed to write export to {}", out.display()))?`. | CLI surface + dispatch + the GAP-2 export-write context fix. |
+| `weave/src/setup.rs` | `settings_path()` made `pub`. | backup/restore must read/restore the installed `settings.json` hooks. |
+
+## Snapshot + traversal-guard approach
+
+- **Snapshot:** `Store::snapshot_to` uses parameterized `VACUUM INTO ?1` (path BOUND,
+  never inlined) — a fully-checkpointed consistent copy, never `fs::copy` of a live
+  WAL DB. Both backends read-back-verify the snapshot (re-open read-only + count)
+  before returning Ok. Remote libsql has no local file → `bail!` with guidance.
+- **Traversal guard:** `safe_entry_name` rejects empty / >100-byte / NUL / absolute /
+  any `/`/`\`/`:` separator / `.`/`..`, AND requires the name to be one of the closed
+  set `KNOWN_ENTRY_NAMES` (`messages.db`, `config.toml`, `settings.json`, `MANIFEST`).
+  `run_restore` runs it on EVERY parsed entry before using any. Read-back verification
+  at both ends: backup re-opens the written archive + embedded DB and compares counts;
+  restore stages the DB to a temp path and opens+counts it BEFORE replacing the live DB.
+- **No shell / argv-only:** entirely in-process Rust + SQLite C calls; no `Command`.
+- **Archive contents:** `messages.db` (snapshot) + optional `config.toml` + optional
+  `settings.json` + a text `MANIFEST` (version/backend/counts/membership).
+
+## Boundary crossed
+
+**Yes — `Store` trait boundary crossed.** New trait method `snapshot_to` added and
+mirrored in BOTH backends (`store.rs` sqlite + `store_libsql.rs` libsql). No schema /
+column changes, so no migration needed.
+
+## Build results
+
+- `cargo build --release` (default sqlite) — **green**.
+- `cargo build --no-default-features --features libsql` — **green**.
+- `cargo clippy --all-targets` (default) — **clean (no issues)**.
+- `cargo clippy --no-default-features --features libsql` — **clean (no issues)**.
+- `cargo fmt --all` — **applied**.
+- `cargo test -p weave-core archive::` — **9 passed** (sanity; full verifier pass runs later).
+
+Tests beyond the archive unit suite were intentionally NOT added (combined verifier
+pass owns the integration/security/prop layers). Docs (README/ARCHITECTURE/CHANGELOG)
+not yet synced — flagged for the verifier/docs pass per the plan's "Docs to sync".

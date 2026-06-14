@@ -314,6 +314,11 @@ pub struct LibsqlStore {
     /// the connect used. Inert on a local handle (`block_on_bounded` runs it
     /// unbounded).
     remote_timeout: Option<u64>,
+    /// WL-035: the on-disk path of a LOCAL-file backend, or `None` for a remote
+    /// (Turso) backend. `snapshot_to` needs a real local file to `VACUUM INTO`; a
+    /// remote backend has none and bails. Set from `cfg.db_path()` on a local
+    /// `open`, `None` for remote/read-only-remote opens.
+    local_path: Option<std::path::PathBuf>,
 }
 
 /// Convert a libsql row column into our owned `Message`. Column order matches
@@ -494,6 +499,13 @@ impl LibsqlStore {
         let url = cfg.libsql_url.clone();
         let token = cfg.libsql_auth_token.clone();
         let path = cfg.db_path();
+        // WL-035: a local-file backend (no remote URL) snapshots from this path;
+        // a remote backend has no local file (`None`).
+        let local_path = if cfg.libsql_url.is_none() {
+            Some(path.clone())
+        } else {
+            None
+        };
 
         let (db, conn) = rt.block_on(async move {
             let is_remote = url.is_some();
@@ -1082,6 +1094,7 @@ impl LibsqlStore {
             _db: db,
             read_only: false,
             remote_timeout: None,
+            local_path,
         })
     }
 
@@ -1138,6 +1151,7 @@ impl LibsqlStore {
             _db: db,
             read_only: true,
             remote_timeout: None,
+            local_path: None,
         })
     }
 
@@ -1194,6 +1208,7 @@ impl LibsqlStore {
             _db: db,
             read_only: true,
             remote_timeout: timeout_ms,
+            local_path: None,
         })
     }
 
@@ -1664,6 +1679,41 @@ impl Store for LibsqlStore {
     fn total_messages(&self) -> Result<i64> {
         self.rt
             .block_on(async { self.total_messages_async().await })
+    }
+
+    fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
+        // A remote (Turso) backend has NO local file to vacuum-into a client-side
+        // path; bail clearly rather than silently producing nothing. Snapshot the
+        // Turso DB server-side instead.
+        let _src = self.local_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "backup is not supported for the remote libsql backend \
+                 (snapshot the Turso database server-side)"
+            )
+        })?;
+        let dest_str = dest.to_str().ok_or_else(|| {
+            anyhow::anyhow!("snapshot destination path is not valid UTF-8: {dest:?}")
+        })?;
+        // libSQL's bundled SQLite supports VACUUM INTO. The destination path is
+        // BOUND as a parameter — never inlined — and must not already exist.
+        self.rt
+            .block_on(async {
+                self.conn
+                    .execute("VACUUM INTO ?1", params(vec![dest_str.into()]))
+                    .await
+            })
+            .map_err(|e| anyhow::anyhow!("VACUUM INTO failed for {}: {e}", dest.display()))?;
+        // Read-back verify (WL-041 spirit): the snapshot must re-open read-only and
+        // be a valid weave store before we declare success.
+        let snap = LibsqlStore::open_readonly(dest)
+            .map_err(|e| anyhow::anyhow!("snapshot at {} did not re-open: {e}", dest.display()))?;
+        snap.total_messages().map_err(|e| {
+            anyhow::anyhow!(
+                "snapshot at {} is not a valid weave store: {e}",
+                dest.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn clear_inbox(&self, me: &str) -> Result<usize> {

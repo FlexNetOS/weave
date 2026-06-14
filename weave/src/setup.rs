@@ -29,8 +29,10 @@ fn home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Path to the user-scope Claude Code settings file.
-fn settings_path() -> PathBuf {
+/// Path to the user-scope Claude Code settings file. `pub` so `backup`/`restore`
+/// (WL-035) can include / restore weave's installed hooks, which live merged into
+/// this file (`setup.rs` does not drop standalone hook scripts).
+pub fn settings_path() -> PathBuf {
     home().join(".claude").join("settings.json")
 }
 

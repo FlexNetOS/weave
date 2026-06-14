@@ -748,6 +748,16 @@ pub trait Store: Send {
     /// WL-033: delete a cached summary.
     #[allow(dead_code)]
     fn delete_summary(&self, root_id: i64) -> Result<bool>;
+
+    /// WL-035: write a *consistent* snapshot of this store to `dest` (a fresh
+    /// path — `VACUUM INTO` refuses an existing file). The backend uses
+    /// parameterized `VACUUM INTO ?1` (never a raw file copy of a live WAL DB) and
+    /// MUST read-back-verify the snapshot (re-open it read-only and count rows)
+    /// before returning Ok, so a corrupt/unreadable snapshot never passes silently.
+    /// A remote (no local file) backend has nothing to vacuum-into locally and
+    /// `bail!`s with a clear message.
+    #[allow(dead_code)]
+    fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>;
 }
 
 /// Where a federated row came from. `Local` is this session's own store;
@@ -3104,6 +3114,30 @@ impl Store for SqliteStore {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
+    }
+
+    fn snapshot_to(&self, dest: &Path) -> Result<()> {
+        // VACUUM INTO writes a fully-checkpointed, consistent copy (no WAL/torn
+        // write hazard, unlike fs::copy of a live DB). The destination path is
+        // BOUND as a parameter — never inlined into the SQL — and must not already
+        // exist (VACUUM INTO refuses an existing file).
+        let dest_str = dest.to_str().ok_or_else(|| {
+            anyhow::anyhow!("snapshot destination path is not valid UTF-8: {dest:?}")
+        })?;
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest_str])
+            .map_err(|e| anyhow::anyhow!("VACUUM INTO failed for {}: {e}", dest.display()))?;
+        // Read-back verify (WL-041 spirit): the snapshot must re-open read-only and
+        // be a valid weave store before we declare success.
+        let snap = SqliteStore::open_readonly(dest)
+            .map_err(|e| anyhow::anyhow!("snapshot at {} did not re-open: {e}", dest.display()))?;
+        snap.total_messages().map_err(|e| {
+            anyhow::anyhow!(
+                "snapshot at {} is not a valid weave store: {e}",
+                dest.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn clear_inbox(&self, me: &str) -> Result<usize> {
