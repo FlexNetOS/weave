@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Security (dependency advisory gate — WL-044)
+- **Added a `cargo-deny` advisory gate to CI** (`audit` job) + a `deny.toml`
+  policy — continuous supply-chain enforcement that did not exist before. The
+  **default shippable binary is advisory-clean** (`cargo tree -i rustls-webpki`
+  on default features matches nothing). The 4 open `rustls-webpki 0.102.8`
+  advisories (RUSTSEC-2026-0098/0099/0049/0104) + 2 unmaintained warnings
+  (`bincode`, `rustls-pemfile`) are confined to the **optional `libsql` feature's
+  remote-Turso TLS stack** and are **upstream-pinned** (the patched `rustls-webpki
+  >=0.103` needs `rustls 0.23`/`hyper-rustls 0.27`, which `libsql` — incl.
+  `0.10.0-pre` — does not depend on). They are listed in `deny.toml` with a
+  rationale + removal trigger; the gate fails on any advisory **not** explicitly
+  listed. Tracked for removal by **WL-044b** (bump the libsql TLS stack once
+  upstream adopts rustls 0.23). See `docs/SECURITY.md` §5.
+
 ### Added (faithful ask-thread replay on session import — WL-040b)
 - **`weave session import` now replays tracked ask threads + ask-many groups
   (WL-040b, completes WL-040 / casr parity).** WL-040 already exported the `asks`

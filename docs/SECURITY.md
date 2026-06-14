@@ -330,6 +330,29 @@ The operator accepted these for a single-binary, no-daemon, local-trust tool.
 They would warrant revisiting (dependency audit, reproducible builds, pinning) if
 weave ever crossed a trust boundary.
 
+### Dependency advisories: continuous audit + a scoped, tracked exception (WL-044)
+A `cargo-deny` advisory gate now runs in CI (`audit` job) against the RustSec
+database — a gate that did not exist before WL-044. The **default shippable
+binary is advisory-clean**: `cargo tree -i rustls-webpki` on default features
+matches nothing.
+
+The only open advisories are confined to the **optional `libsql` feature's
+remote-Turso TLS stack** and are **upstream-pinned**, not weave-fixable today:
+
+| Advisory | Crate | Why it can't be fixed yet |
+|---|---|---|
+| RUSTSEC-2026-0098 / -0099 / -0049 / -0104 | `rustls-webpki 0.102.8` | Fixed in `>=0.103`, which needs `rustls 0.23` / `hyper-rustls 0.27`. `libsql` (incl. `0.10.0-pre`) hard-pins `hyper-rustls ^0.25` → `rustls 0.22` → `rustls-webpki 0.102`; the resolver rejects forcing the patched line. |
+| RUSTSEC-2025-0141 | `bincode 1.x` (unmaintained) | Pulled transitively by `libsql`; no weave code uses it directly. |
+| RUSTSEC-2025-0134 | `rustls-pemfile` (unmaintained) | Pulled by `libsql`'s `rustls-native-certs`. |
+
+These are reachable **only** when `--features libsql` is compiled **and** the
+operator configures a remote `libsql_url` (a Turso endpoint they own, over a
+TLS handshake they initiate). They are listed — each with a rationale and a
+removal trigger — in `deny.toml`'s `[advisories].ignore`; the gate fails on any
+advisory **not** in that explicit list. **WL-044b** tracks removing each id the
+moment `libsql` adopts the `rustls 0.23` stack. This is an explicit, scoped,
+time-bounded exception — carried forward as tracked work, never a blanket silence.
+
 ---
 
 ## 6. Explicit non-goals

@@ -141,3 +141,21 @@ jobs:
         run: cargo build --no-default-features --features "libsql surfaces"
       - name: test (libsql + surfaces)
         run: cargo test --no-default-features --features "libsql surfaces"
+
+  audit:
+    # WL-044: supply-chain advisory gate (this job did not exist before WL-044).
+    # cargo-deny scans the dependency graph against the RustSec advisory DB.
+    # deny.toml sets `[graph] all-features = true` — REQUIRED so the scan sees the
+    # libsql remote-TLS crates (absent from the default sqlite graph); without it
+    # the gate would never see the very advisories it governs. weave's default
+    # build is advisory-clean; the ONLY exceptions are the upstream-pinned libsql
+    # remote-TLS advisories documented (rationale + removal trigger) in deny.toml,
+    # tracked by WL-044b. Any advisory NOT in that explicit list fails this job —
+    # proven by the negative test (dropping an id → `error[vulnerability]`, exit 1).
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
