@@ -1,11 +1,11 @@
 name: sync-master
 
-# Promote develop → master after develop's six required checks pass.
+# Promote develop → master after develop's seven required checks pass.
 #
 # develop is the integration / PR-gated branch; master is the protected default
-# mirror. weave's master requires the six checks (rustfmt, clippy, test,
-# build (libsql backend), sign, libsql + sign) — so unlike a blind ff, this
-# WAITS for those checks to be green on the develop tip, then fast-forwards.
+# mirror. weave's master requires the seven checks (rustfmt, clippy, test,
+# build (libsql backend), sign, libsql + sign, audit) — so unlike a blind ff,
+# this WAITS for those checks to be green on the develop tip, then fast-forwards.
 # Because check-runs are commit-scoped, the same green runs that pass on develop
 # satisfy master's branch protection on the fast-forward, so master stays
 # genuinely gated and no bypass token / PAT is needed.
@@ -37,13 +37,13 @@ jobs:
           ref: develop
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Wait for the six required checks on the develop tip
+      - name: Wait for the seven required checks on the develop tip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
-          required=("rustfmt" "clippy" "test" "build (libsql backend)" "sign" "libsql + sign")
+          required=("rustfmt" "clippy" "test" "build (libsql backend)" "sign" "libsql + sign" "audit")
           echo "Waiting for ${#required[@]} required check(s) on $SHA"
           deadline=$(( $(date +%s) + 2700 ))   # 45 min budget
           while :; do
