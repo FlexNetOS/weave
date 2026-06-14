@@ -3856,6 +3856,280 @@ fn kill_refuses_invalid_target_id() {
 }
 
 // ---------------------------------------------------------------------------
+// WL-035: backup/restore extraction is traversal-safe.
+// ---------------------------------------------------------------------------
+
+/// A crafted archive whose entry name escapes the extraction directory must be
+/// REFUSED by `weave restore`, and nothing may be written outside the target.
+#[test]
+fn restore_refuses_path_traversal_entry() {
+    use std::path::Path;
+
+    // Build a hostile tar via the pure archive API: one entry named `../escape`.
+    // (`write_archive` enforces only length/NUL; the `..` traversal guard lives in
+    // the restore extractor's `safe_entry_name`, which is exactly what we test.)
+    let evil_body = b"this should never land on disk";
+    let bytes = weave_core::archive::write_archive(&[("../escape", &evil_body[..])])
+        .expect("write_archive accepts the name; safe_entry_name must reject it on restore");
+
+    let dir = std::env::temp_dir().join(format!(
+        "weave-sec-traversal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = dir.join("evil.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    // The path the `../escape` entry would resolve to if extraction were naive.
+    let escape_target = dir.parent().unwrap().join("escape");
+    let _ = std::fs::remove_file(&escape_target);
+
+    let db = TestDb::new();
+    let (ok, _out, err) = run(&db, &["restore", "--in", &archive.to_string_lossy()]);
+    assert!(!ok, "restore of a traversal archive must fail");
+    assert!(
+        err.contains("unsafe entry")
+            || err.contains("not a known weave member")
+            || err.contains("separator")
+            || err.contains("path component"),
+        "error should name the traversal guard rejection: {err:?}"
+    );
+    assert!(
+        !Path::new(&escape_target).exists(),
+        "the traversal entry must NOT have been written outside the target dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// WL-037: supersede authorization is a censorship/DoS guard.
+// ---------------------------------------------------------------------------
+
+/// A hostile session must not be able to hide ANOTHER agent's message from
+/// inboxes by superseding it (cross-identity supersede is rejected).
+#[test]
+fn supersede_cannot_censor_another_agents_message() {
+    let db = TestDb::new();
+    let a_out = run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "important",
+        ],
+    );
+    let a_id: i64 = a_out
+        .split_whitespace()
+        .find(|t| t.starts_with('#'))
+        .unwrap()
+        .trim_start_matches('#')
+        .trim_end_matches(':')
+        .parse()
+        .unwrap();
+
+    // mallory tries to supersede alice's message (a censorship vector).
+    let (ok, _o, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "mallory",
+            "--to",
+            "bob",
+            "--body",
+            "censor",
+            "--supersedes",
+            &a_id.to_string(),
+        ],
+    );
+    assert!(!ok, "cross-identity supersede must be rejected");
+    assert!(
+        err.contains("cannot supersede") || err.contains("was sent by"),
+        "the censorship guard must reject: {err:?}"
+    );
+
+    // alice's message is still unread for bob (not censored).
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    let bodies: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str())
+        .collect();
+    assert!(
+        bodies.contains(&"important"),
+        "the targeted message must remain unread (not censored): {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WL-036: post-send hooks are argv-only / no-shell / fault-isolated.
+// ---------------------------------------------------------------------------
+
+/// Build a trusted-dir + sentinel-writer harness identical to the integration
+/// one. Returns (mux_dir, helper_abs, cfg_dir).
+fn make_hook_harness(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!(
+        "weave-sec-hook-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mux_dir = base.join("bin");
+    let cfg_dir = base.join("config");
+    std::fs::create_dir_all(&mux_dir).unwrap();
+    std::fs::create_dir_all(cfg_dir.join("weave")).unwrap();
+
+    let helper = mux_dir.join("weave-hook-helper");
+    // The helper records env values to argv[1]. If a shell HAD expanded the
+    // hostile subject, a file named by that injected command would appear — it
+    // never does, because weave execs the helper directly (no `sh -c`) and the
+    // subject travels only as an inert env VALUE.
+    let script = r#"#!/bin/sh
+out="$1"
+{
+  echo "SUBJECT<<$WEAVE_HOOK_SUBJECT>>"
+  echo "SENDER<<$WEAVE_HOOK_SENDER>>"
+} > "$out"
+"#;
+    std::fs::write(&helper, script).unwrap();
+    let mut perm = std::fs::metadata(&helper).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&helper, perm).unwrap();
+    (mux_dir, helper, cfg_dir)
+}
+
+/// A hostile message subject (`; rm -rf /`, `$(reboot)`, backticks) reaches the
+/// hook child as an INERT env value — no shell evaluates it (the sentinel holds
+/// the literal string and no injected-command canary appears).
+#[test]
+fn post_send_hook_hostile_subject_is_inert() {
+    let db = TestDb::new();
+    let (mux_dir, helper, cfg_dir) = make_hook_harness("inert");
+    let sentinel = cfg_dir.join("sentinel.txt");
+    // A canary the injected command would create if a shell ran the subject.
+    let canary = cfg_dir.join("PWNED");
+    let _ = std::fs::remove_file(&canary);
+
+    let config = format!(
+        "[[post_send_hook]]\nrecipient = \"*\"\nargv = [\"{}\", \"{}\"]\n",
+        helper.to_string_lossy(),
+        sentinel.to_string_lossy(),
+    );
+    std::fs::write(cfg_dir.join("weave").join("config.toml"), config).unwrap();
+
+    let env: &[(&str, &str)] = &[
+        ("XDG_CONFIG_HOME", &cfg_dir.to_string_lossy()),
+        ("WEAVE_MUX_DIR", &mux_dir.to_string_lossy()),
+    ];
+
+    let hostile = format!("; touch {} ; $(reboot) `id`", canary.to_string_lossy());
+    run_ok_env(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            &hostile,
+            "--body",
+            "body",
+        ],
+        env,
+    );
+
+    let mut content = String::new();
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&sentinel) {
+            if !s.is_empty() {
+                content = s;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!content.is_empty(), "hook must have run");
+    // The subject is delivered VERBATIM as an env value (inert), and no shell ran.
+    assert!(
+        content.contains(&hostile),
+        "the hostile subject must reach the child verbatim as an env value: {content}"
+    );
+    assert!(
+        !canary.exists(),
+        "NO shell evaluated the subject — the injected `touch` canary must not exist"
+    );
+
+    let _ = std::fs::remove_dir_all(mux_dir.parent().unwrap());
+}
+
+/// A hook whose `argv[0]` is NOT in a trusted directory is refused (no spawn), and
+/// the send still succeeds (fault isolation — a misconfigured hook never sinks a send).
+#[test]
+fn post_send_hook_untrusted_program_refused_send_still_succeeds() {
+    let db = TestDb::new();
+    let (_mux_dir, _helper, cfg_dir) = make_hook_harness("untrusted");
+
+    // Point argv[0] at an executable in a dir we DO NOT vouch for (no WEAVE_MUX_DIR
+    // entry for it), so resolve_trusted_program returns None ⇒ the hook is refused.
+    let untrusted_dir = cfg_dir.join("untrusted");
+    std::fs::create_dir_all(&untrusted_dir).unwrap();
+    let evil = untrusted_dir.join("evil");
+    let sentinel = cfg_dir.join("should-not-exist.txt");
+    let script = format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.to_string_lossy());
+    std::fs::write(&evil, script).unwrap();
+    let mut perm = std::fs::metadata(&evil).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&evil, perm).unwrap();
+
+    let config = format!(
+        "[[post_send_hook]]\nrecipient = \"*\"\nargv = [\"{}\"]\n",
+        evil.to_string_lossy(),
+    );
+    std::fs::write(cfg_dir.join("weave").join("config.toml"), config).unwrap();
+
+    // Deliberately do NOT set WEAVE_MUX_DIR to the untrusted dir.
+    let env: &[(&str, &str)] = &[("XDG_CONFIG_HOME", &cfg_dir.to_string_lossy())];
+
+    // The send must SUCCEED even though the hook program is refused.
+    let out = run_ok_env(
+        &db,
+        &["send", "--from", "alice", "--to", "bob", "--body", "ok"],
+        env,
+    );
+    assert!(out.contains("sent #"), "send must still succeed: {out:?}");
+
+    // Give any (wrongly-spawned) hook a moment, then assert it never ran.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !sentinel.exists(),
+        "an untrusted hook program must be refused (no spawn)"
+    );
+    // The message landed regardless.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json"]);
+    assert!(
+        inbox.contains("\"body\": \"ok\""),
+        "message persisted: {inbox}"
+    );
+
+    let _ = std::fs::remove_dir_all(cfg_dir.parent().unwrap());
+}
+
+// ---------------------------------------------------------------------------
 // WL-048: human surfaces — XSS end-to-end + bot-token secrecy (surfaces feature).
 // ---------------------------------------------------------------------------
 

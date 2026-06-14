@@ -10108,4 +10108,172 @@ mod tests {
         assert!(!s.delete_summary(1).unwrap());
         assert!(s.get_summary(1).unwrap().is_none());
     }
+
+    // ---- WL-037: message supersede / successor chains ----------------------
+
+    /// Helper: read a single message's `superseded_by` from `me`'s full history.
+    fn superseded_by_of(s: &SqliteStore, me: &str, id: i64) -> Option<i64> {
+        s.history(me, None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("message #{id} not in {me} history"))
+            .superseded_by
+    }
+
+    #[test]
+    fn supersede_stamps_predecessor() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        // The predecessor now points at its successor; the successor is unstamped.
+        assert_eq!(superseded_by_of(&s, "b", a), Some(b));
+        assert_eq!(superseded_by_of(&s, "b", b), None);
+    }
+
+    #[test]
+    fn superseded_message_hidden_from_unread() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        assert_eq!(s.unread_count("b").unwrap(), 2);
+        s.supersede("a", a, b).unwrap();
+        // Only the successor remains unread.
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert!(inbox.iter().any(|m| m.id == b));
+        assert!(
+            !inbox.iter().any(|m| m.id == a),
+            "superseded predecessor must not appear in unread inbox"
+        );
+        // The oldest-unread (nudge/wake path) skips the superseded predecessor.
+        let oldest = s.peek_oldest_unread("b").unwrap().unwrap();
+        assert_eq!(oldest.id, b);
+    }
+
+    #[test]
+    fn history_retains_superseded_with_flag() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        // History keeps the superseded row (audit) AND populates the flag.
+        let hist = s.history("b", None, 100).unwrap();
+        let row_a = hist.iter().find(|m| m.id == a).expect("history keeps A");
+        assert_eq!(row_a.superseded_by, Some(b));
+    }
+
+    #[test]
+    fn supersede_chain_only_tail_unread() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("a", "b", None, "B", None, None).unwrap();
+        let c = s.send("a", "b", None, "C", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        s.supersede("a", b, c).unwrap();
+        // A->B->C: only the tail C remains unread.
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        let (inbox, _) = s.inbox("b", false, false, 50).unwrap();
+        assert_eq!(inbox.iter().filter(|m| m.id == c).count(), 1);
+        assert!(!inbox.iter().any(|m| m.id == a || m.id == b));
+    }
+
+    #[test]
+    fn supersede_rejects_foreign_sender() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("c", "b", None, "C", None, None).unwrap();
+        // 'c' is not the sender of A => rejected, A unchanged.
+        assert!(s.supersede("c", a, b).is_err());
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+        assert_eq!(s.unread_count("b").unwrap(), 2);
+    }
+
+    #[test]
+    fn supersede_rejects_missing_ids() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        // Missing old id.
+        assert!(s.supersede("a", 999_999, a).is_err());
+        // Missing new id (successor does not exist).
+        assert!(s.supersede("a", a, 999_999).is_err());
+        // No panic, A unchanged.
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+    }
+
+    #[test]
+    fn supersede_broadcast_drops_from_all_readers() {
+        let s = mem();
+        let bcast = "all";
+        let a = s.send("a", bcast, None, "v1", None, None).unwrap();
+        let b = s.send("a", bcast, None, "v2", None, None).unwrap();
+        // Two distinct readers each have both broadcasts unread.
+        assert_eq!(s.unread_count("r1").unwrap(), 2);
+        assert_eq!(s.unread_count("r2").unwrap(), 2);
+        s.supersede("a", a, b).unwrap();
+        // The per-message stamp drops the superseded broadcast from EVERY reader.
+        assert_eq!(s.unread_count("r1").unwrap(), 1);
+        assert_eq!(s.unread_count("r2").unwrap(), 1);
+        let (in1, _) = s.inbox("r1", false, false, 50).unwrap();
+        assert!(in1.iter().any(|m| m.id == b) && !in1.iter().any(|m| m.id == a));
+    }
+
+    #[test]
+    fn supersede_migration_is_idempotent() {
+        // The guarded ADD COLUMN must be a no-op on a store that already has it:
+        // re-opening the same DB twice (each runs migrate) must not error and the
+        // column must be present (a supersede succeeds).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weave-mig-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let a;
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            a = s.send("a", "b", None, "A", None, None).unwrap();
+        }
+        // Second open re-runs migrate(): must be idempotent, column still present.
+        let s2 = SqliteStore::open(&path).unwrap();
+        let b = s2.send("a", "b", None, "B", None, None).unwrap();
+        s2.supersede("a", a, b).unwrap();
+        assert_eq!(superseded_by_of(&s2, "b", a), Some(b));
+    }
+
+    // ---- WL-035: Store::snapshot_to (VACUUM INTO + read-back) ---------------
+
+    #[test]
+    fn snapshot_to_roundtrips_messages() {
+        let s = mem();
+        s.send("a", "b", Some("s"), "hi", None, None).unwrap();
+        s.send("a", "b", None, "again", None, None).unwrap();
+        let src_count = s.total_messages().unwrap();
+        assert_eq!(src_count, 2);
+
+        let dir =
+            std::env::temp_dir().join(format!("weave-snap-{}-{}", std::process::id(), src_count));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+
+        // The snapshot opens read-only and reports the same count.
+        let snap = SqliteStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), src_count);
+    }
+
+    #[test]
+    fn snapshot_to_empty_db_is_valid() {
+        let s = mem();
+        assert_eq!(s.total_messages().unwrap(), 0);
+        let dir = std::env::temp_dir().join(format!("weave-snap-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("empty-snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+        let snap = SqliteStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), 0);
+    }
 }

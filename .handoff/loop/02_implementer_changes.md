@@ -327,3 +327,28 @@ selection with a one-line stderr note.
 
 (The `unused import: JobState` warning in `weave-core/src/store.rs` is PRE-EXISTING and
 unrelated to WL-036.)
+
+---
+
+# Docs sync (WL-035/036/037) — guardian BLOCK follow-up (docs only, NO code change)
+
+The guardian's `04_guardian_review.md` Section 3 BLOCKed solely on a code↔docs fork —
+all security/correctness invariants and the Rust-native drift guard PASS; zero doc files
+had been touched for three user-facing features. This pass adds exactly the enumerated
+docs, matching each file's existing voice/format. **No code, no `git`/`gh`.**
+
+| File | Change | Rationale |
+|---|---|---|
+| `CHANGELOG.md` | `[Unreleased]` → `### Added`: three entries (WL-035 backup/restore + GAP-2, WL-037 supersede, WL-036 post-send hooks) prepended above the WL-034 entry | User-facing features belong in the changelog |
+| `README.md` | `## CLI`: added `weave backup`/`weave restore` lines + a `weave send --supersedes` example; new `## Post-send hooks (\[\[post_send_hook\]\])` section with the config block, the `WEAVE_HOOK_*` env table, body-not-exported note, and the recursion footgun | Default-build CLI surface + the new config block must be documented |
+| `ARCHITECTURE.md` | `weave-core` tree note for `archive.rs`; `Store::snapshot_to` note (parameterized `VACUUM INTO`, dual-backend, remote bail, read-back verify); `messages.superseded_by` schema note (additive nullable, hide-from-unread/flag-in-history, sender-only authz, orthogonal to `in_reply_to`); §7 threat-model bullets for the post-send-hook seam (no-shell/env-only) and the backup traversal guard | Keep the layer/schema/threat-model description in sync |
+| `docs/SECURITY.md` | §3: new "Post-send hooks: argv-only, env-only execution (WL-036)" subsection — no-shell/`argv[0]` trusted-program/env-only/body-never-exported/bounded-fault-isolation/footgun | New attack surface belongs in SECURITY |
+| `docs/OPERATIONS.md` | Operations CLI lines for backup/restore; §4 new `[[post_send_hook]]` config subsection (block + `WEAVE_HOOK_*` table + recursion footgun, cross-ref SECURITY §3) + a backup/restore runbook subsection | Operator config + runbook (OPERATIONS exists) |
+| `docs/REPOWIRE-PARITY.md` | §1 row (supersede, WL-037), §7 row (post-send hooks, WL-036), §9 item 14 (backup/restore, WL-035) — labeled atm-core parity | Tick the atm-core parity rows the plans cite (no pre-existing atm-core rows → added) |
+| `docs/MULTI-SURFACE-PARITY.md` | Capability matrix: three rows (Backup/restore CLI-only; Supersede CLI+MCP; Post-send hooks CLI+MCP) | Surface-axis parity for the three features |
+
+`cargo fmt --all --check` — **clean** (docs only). `git status` shows the seven doc
+files (`ARCHITECTURE.md`, `CHANGELOG.md`, `README.md`, `docs/MULTI-SURFACE-PARITY.md`,
+`docs/OPERATIONS.md`, `docs/REPOWIRE-PARITY.md`, `docs/SECURITY.md`) modified alongside
+the pre-existing WL-035/036/037 code/test files. No `Store`/backend boundary crossed in
+this pass (docs only).

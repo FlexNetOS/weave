@@ -7610,4 +7610,112 @@ mod tests {
         assert!(!s.delete_summary(1).unwrap());
         assert!(s.get_summary(1).unwrap().is_none());
     }
+
+    // ---- WL-037: supersede on the libsql backend (positional-projection trap)
+
+    /// Count of `me`'s unread messages via the inbox unread branch (libsql has no
+    /// inherent `unread_count`; the unread inbox query is the equivalent surface).
+    fn unread_ids(s: &LibsqlStore, me: &str) -> Vec<i64> {
+        s.inbox(me, false, false, 50)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn superseded_by_of(s: &LibsqlStore, me: &str, id: i64) -> Option<i64> {
+        s.history(me, None, 100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("message #{id} not in {me} history"))
+            .superseded_by
+    }
+
+    #[test]
+    fn supersede_stamps_and_hides_from_unread_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let b = s.send("a", "b", Some("v2"), "second", None, None).unwrap();
+        assert_eq!(unread_ids(&s, "b").len(), 2);
+        s.supersede("a", a, b).unwrap();
+        // Positional projection (index 10) must align: predecessor stamped, hidden.
+        assert_eq!(superseded_by_of(&s, "b", a), Some(b));
+        assert_eq!(superseded_by_of(&s, "b", b), None);
+        let unread = unread_ids(&s, "b");
+        assert_eq!(unread, vec![b], "only the successor remains unread");
+        // peek_oldest_unread (nudge/wake path) skips the superseded predecessor.
+        assert_eq!(s.peek_oldest_unread("b").unwrap().unwrap().id, b);
+    }
+
+    #[test]
+    fn supersede_chain_and_history_flag_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("a", "b", None, "B", None, None).unwrap();
+        let c = s.send("a", "b", None, "C", None, None).unwrap();
+        s.supersede("a", a, b).unwrap();
+        s.supersede("a", b, c).unwrap();
+        assert_eq!(unread_ids(&s, "b"), vec![c]);
+        // history keeps the superseded rows AND populates the flag (positional read).
+        let hist = s.history("b", None, 100).unwrap();
+        assert_eq!(
+            hist.iter().find(|m| m.id == a).unwrap().superseded_by,
+            Some(b)
+        );
+        assert_eq!(
+            hist.iter().find(|m| m.id == b).unwrap().superseded_by,
+            Some(c)
+        );
+    }
+
+    #[test]
+    fn supersede_rejects_foreign_and_missing_libsql() {
+        let s = mem();
+        let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let b = s.send("c", "b", None, "C", None, None).unwrap();
+        assert!(s.supersede("c", a, b).is_err(), "foreign sender rejected");
+        assert_eq!(superseded_by_of(&s, "b", a), None);
+        assert!(
+            s.supersede("a", 999_999, a).is_err(),
+            "missing old rejected"
+        );
+        assert!(
+            s.supersede("a", a, 999_999).is_err(),
+            "missing new rejected"
+        );
+    }
+
+    #[test]
+    fn supersede_broadcast_drops_from_all_readers_libsql() {
+        let s = mem();
+        let bcast = "all";
+        let a = s.send("a", bcast, None, "v1", None, None).unwrap();
+        let b = s.send("a", bcast, None, "v2", None, None).unwrap();
+        assert_eq!(unread_ids(&s, "r1").len(), 2);
+        assert_eq!(unread_ids(&s, "r2").len(), 2);
+        s.supersede("a", a, b).unwrap();
+        assert_eq!(unread_ids(&s, "r1"), vec![b]);
+        assert_eq!(unread_ids(&s, "r2"), vec![b]);
+    }
+
+    // ---- WL-035: snapshot_to on the local libsql backend -------------------
+
+    #[test]
+    fn snapshot_to_roundtrips_messages_libsql() {
+        let s = mem();
+        s.send("a", "b", Some("s"), "hi", None, None).unwrap();
+        s.send("a", "b", None, "again", None, None).unwrap();
+        let src_count = s.total_messages().unwrap();
+        assert_eq!(src_count, 2);
+        let dir = std::env::temp_dir().join(format!("weave-libsql-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("snapshot.db");
+        let _ = std::fs::remove_file(&dest);
+        s.snapshot_to(&dest).unwrap();
+        // The local VACUUM INTO snapshot opens read-only with the same count.
+        let snap = LibsqlStore::open_readonly(&dest).unwrap();
+        assert_eq!(snap.total_messages().unwrap(), src_count);
+    }
 }

@@ -159,6 +159,39 @@ session's pane (a UX / prompt-injection concern, §5), not code execution. A fai
 or impossible injection degrades to next-turn hook delivery; it never crashes the
 sender, because the message is **persisted before injection is attempted**.
 
+### Post-send hooks: argv-only, env-only execution (WL-036)
+A configured `[[post_send_hook]]` spawns an **operator-authored** external program
+after a matching send/ack. It is a new spawn surface, so it is held to the same
+discipline as the injector and the WL-047 spawn path:
+
+- **No shell, argv-only.** `run_post_send_hook` is
+  `Command::new(&prog_abs).args(&argv[1..]).envs(...)` — never `sh -c`, never a
+  string-built command. The `argv` is the **fixed operator vector** from
+  `config.toml`; weave **never** substitutes message text into an argv element.
+- **`argv[0]` is trusted-program constrained.** It is resolved via
+  `resolve_trusted_program(argv[0])` — a bare name resolved against weave's trusted
+  dirs, or an absolute path whose canonicalized parent is a trusted dir — so a hook
+  cannot launch an arbitrary `$PATH` binary; a `None` resolve bails (logged, send
+  unaffected).
+- **Message fields reach the child only as env, never argv; the body is never
+  exported.** `Command::envs` sets
+  `WEAVE_HOOK_{EVENT,SENDER,RECIPIENT,SUBJECT,MESSAGE_ID,PAYLOAD}` (the `PAYLOAD`
+  JSON is hand-escaped). The **message body is not in the vector** — no leak into the
+  child's `environ` or `ps e`. A hostile subject like `"; rm -rf /"` / `"$(reboot)"`
+  is an inert env value: there is no shell on this path and no code substitutes
+  message text into an argv element.
+- **Input caps.** Each argv element is re-validated (`spawn_arg_ok`: length +
+  NUL/control reject), the argv count is bounded (`MAX_SPAWN_ARGS`), and the config
+  layer pre-bounds the hook set (`MAX_POST_SEND_HOOKS`, `MAX_HOOK_ARGV`,
+  `MAX_HOOK_ARG_LEN`); an empty argv bails.
+- **Fault-isolated and bounded.** The wait is bounded by the hook's `timeout_ms`
+  (try_wait/kill); a missing/slow/failing/non-zero-exit hook never breaks send — every
+  error is caught and logged to **stderr only** (`eprintln!`), never propagated and
+  never on the MCP JSON-RPC stdout frame (the MCP path fires hooks *after* the result
+  is built).
+- **Operational footgun.** A hook must not call back into `weave send`/`notify`/`ack`
+  for the same event class or it re-fires in a loop; keep hook programs out-of-band.
+
 ---
 
 ## 4. Store layer & at-rest secrecy

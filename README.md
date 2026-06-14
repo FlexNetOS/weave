@@ -59,8 +59,11 @@ weave sessions --watch               # live read-only presence dashboard, groupe
 weave sessions --watch --interval 5 --repo weave  # re-render every 5s, narrowed to one repo
 weave connect --to envctl            # probe whether a peer can be live-nudged right now (verdict only)
 weave send --from desktop --to envctl --body "apply the rtk fix"
+weave send --to envctl --body "use the v2 schema instead" --supersedes 41   # REPLACE msg #41 (hidden from unread, flagged in history); supersede=replacement, reply=threading
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
 weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id> to scope; --limit N to cap)
+weave backup --out mailbox.tar       # no-dep snapshot of DB + config + Claude settings (--force to overwrite)
+weave restore --in mailbox.tar       # restore that snapshot (traversal-guarded; --force to clobber DB/config/settings; remote libSQL unsupported)
 
 # Tracked ask/answer/ack (correlation-tracked request/response — distinct from send/reply)
 weave ask --from desktop --to envctl --body "can you confirm the schema?" --subject "schema"
@@ -612,6 +615,46 @@ host; `--audit` records a durable job. Web access reuses weave's existing
 permission/lease/job primitives (the same gate as any other mesh work) and
 `weave_web` is gated as a **dangerous** tool (blocked in safe HTTP mode). The
 obscura child's stderr and any proxy/token secrets are never logged. See ADR-0002.
+
+## Post-send hooks (`[[post_send_hook]]`)
+
+Run an operator-authored external program after a matching send/ack — useful for an
+out-of-band notification, a metric, or a sentinel write. Hooks are **config-file-only**
+(deliberately **no env overlay** — a hook is a program to spawn, so injecting one via the
+environment would be unsafe) and live in `config.toml`:
+
+```toml
+[[post_send_hook]]
+recipient  = "agent-a"        # "*" = any (the default if omitted/empty); a BROADCAST alias matches a broadcast; else exact
+argv       = ["/usr/bin/tee", "/tmp/weave-sentinel"]   # argv[0] resolved to a TRUSTED abs path; no shell, ever
+event      = "send"           # "send" (default) | "ack"
+timeout_ms = 5000             # clamped to [50, 600000]; omit ⇒ 5000
+```
+
+The spawn is **argv-only — no shell, ever.** weave never substitutes message text into an
+argv element; `argv[0]` must resolve inside weave's trusted directories. Message fields
+reach the child **only** as environment variables (`Command::envs`), never as argv:
+
+| Env var | Value |
+|---|---|
+| `WEAVE_HOOK_EVENT` | `send` or `ack` |
+| `WEAVE_HOOK_SENDER` | the sender identity |
+| `WEAVE_HOOK_RECIPIENT` | the recipient identity (or broadcast alias) |
+| `WEAVE_HOOK_SUBJECT` | the message subject |
+| `WEAVE_HOOK_MESSAGE_ID` | the message id |
+| `WEAVE_HOOK_PAYLOAD` | a small JSON object of the fields above |
+
+The **message body is NOT exported** (no leak into the child's `environ` / `ps e`). Hooks
+are **fault-isolated and bounded**: a missing/slow/failing hook never breaks the send — the
+wait is bounded by `timeout_ms` and every failure is logged to stderr only, never
+propagated and never on the MCP JSON-RPC stdout frame. There is **no new standing MCP
+tool**; hooks fire from `weave send`/`notify`/`ack` and `weave_send`/`weave_notify`/
+`weave_ack` via one shared helper.
+
+> **Footgun — hook recursion.** A hook must **not** call back into `weave send` (or
+> `notify`/`ack`) for the same event class, or it will re-fire itself in a loop. Keep
+> hook programs out-of-band (write a file, post to an external system), not back into
+> the mesh.
 
 ## Storage
 

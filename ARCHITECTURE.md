@@ -116,6 +116,7 @@ weave-core/          library: model + config + Store trait + both backends + sig
   src/store_libsql.rs  feature-gated libSQL/Turso backend (cfg(feature="libsql"))
   src/memory.rs        agent memory store (write/read/search/list/delete)
   src/export.rs        pure `render_mailbox_html` + the centralized `html_escape` (no I/O)
+  src/archive.rs       pure uncompressed-USTAR writer/reader + `safe_entry_name` traversal guard (no I/O, no deps)
   src/llm.rs           OPTIONAL chat-completion client for thread summarization (cfg(feature="llm"))
   src/testenv.rs       test-only env lock / guard helpers
 weave-inject/        library: native multi-mux injector + `Injector` trait
@@ -445,6 +446,15 @@ schema idempotently (`CREATE TABLE IF NOT EXISTS`). The on-disk SQLite format is
 **libSQL-compatible**, so the same file is portable between backends with no
 migration — the file is the broker.
 
+**`Store::snapshot_to(dest)`** (WL-035, mirrored across both backends) writes a
+consistent point-in-time copy via a **parameterized `VACUUM INTO ?1`** (the
+destination path is *bound*, never inlined) — a fully-checkpointed copy, never an
+`fs::copy` of a live WAL DB — then read-back-verifies it (re-opens the snapshot
+read-only and counts). The **remote libSQL** backend has no local file to vacuum,
+so it bails with a clear message. This is the snapshot primitive `weave backup`
+archives (and the GAP-2 hardening makes the `weave export` write report its path
+on failure).
+
 `open_store()` in `main.rs` picks the backend from `Config::backend()`. Selecting
 `libsql` in a binary built without the feature fails with a clear message rather
 than silently falling back, so configuration mistakes are loud. The default
@@ -731,7 +741,19 @@ jobs        (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', description TE
 ```
 
 - **`messages`** — the append-only mailbox. `recipient` is a session name or a
-  broadcast alias.
+  broadcast alias. **`superseded_by`** (WL-037) is an additive nullable column
+  (`ADD COLUMN`, mirrored across both backends; **NULL == not superseded**, so a
+  legacy DB upgrades in place inert). A sender **replaces** a prior message with
+  `weave send --supersedes <id>` / the `supersedes` property on `weave_send`: the
+  predecessor is stamped `superseded_by = <successor id>`. The read-semantics rule is
+  **hide-from-unread, flag-in-history**: every unread/inbox/nudge path adds
+  `AND superseded_by IS NULL` (so a reader never sees a superseded message as a fresh
+  unread — if the sender supersedes before the recipient drains, only the successor
+  surfaces), while `history`/`thread`/`search` **retain and flag** the superseded row
+  for audit. Chains are supported (only the tail is unread). Authorization is
+  **sender-only** — `supersede` looks up `old_id`'s sender and rejects unless it equals
+  the caller (a censorship/DoS guard; advisory like the rest of `from` until `sign`).
+  Supersede is **replacement** and is orthogonal to `in_reply_to` **threading**.
 - **`reads`** — per-`(message, reader)` read state. This is what makes a
   broadcast deliverable exactly once per reader and keeps each session's "unread"
   independent.
@@ -1157,6 +1179,26 @@ injected and stored text is handled**, not on network attackers.
   `WEAVE_BIRTH_CERT` (§6), so a spawned peer's identity cannot be hijacked. This is
   the Rust-native equivalent of repowire's `daemon.spawn.allowed_paths`
   (`docs/REPOWIRE-PARITY.md` §7).
+- **Post-send hooks are no-shell, env-only (WL-036).** A configured
+  `[[post_send_hook]]` runs an operator-authored external program on the send/ack
+  path, and is a security-invariant surface held to the same no-shell discipline as
+  spawn: the `argv` is the **fixed operator-authored vector** from `config.toml` —
+  weave **never** substitutes message text into an argv element — and `argv[0]` is
+  resolved via `resolve_trusted_program(argv[0])` (the trusted-dir constraint above),
+  so a hook cannot launch an arbitrary `$PATH` binary. Message-derived strings reach
+  the child **only** as environment values (`Command::envs`:
+  `WEAVE_HOOK_{EVENT,SENDER,RECIPIENT,SUBJECT,MESSAGE_ID,PAYLOAD}`); the **body is
+  never exported**, and a hostile subject is an inert env value because no shell
+  exists on this path. The wait is bounded (a slow hook never hangs send) and every
+  failure is logged to stderr only — never propagated, never on the MCP JSON-RPC
+  stdout frame. See §SECURITY for the full execution model.
+- **Backup extraction is traversal-guarded (WL-035).** `weave restore` runs
+  `archive::safe_entry_name` on **every** parsed USTAR entry before using it — a
+  closed allow-list (`messages.db`/`config.toml`/`settings.json`/`MANIFEST`) that
+  rejects absolute paths, any path separator, `.`/`..`, NUL, and over-long names — so
+  a hostile archive cannot write outside the target. The snapshot is a parameterized
+  `VACUUM INTO ?1` (the path is **bound**, never inlined), never a raw copy of a live
+  WAL DB, and is read-back-verified at both ends.
 - **Identity is advisory.** Session names are free strings with no
   authentication — appropriate for a single-user local mesh. weave does not
   defend one local session against another impersonating it; that is out of

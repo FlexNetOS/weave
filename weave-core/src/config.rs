@@ -3607,4 +3607,172 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.mux_preference(), None);
     }
+
+    // ---- WL-036: post-send hook config + pure matcher ----------------------
+
+    #[test]
+    fn hook_recipient_matches_wildcard_exact_broadcast_case() {
+        // "*" matches ANY recipient (including a broadcast alias).
+        assert!(hook_recipient_matches("*", "agent-a"));
+        assert!(hook_recipient_matches("*", "all"));
+        assert!(hook_recipient_matches("*", "everyone"));
+        // exact, case-sensitive equality.
+        assert!(hook_recipient_matches("agent-a", "agent-a"));
+        assert!(!hook_recipient_matches("agent-a", "agent-b"));
+        assert!(
+            !hook_recipient_matches("Agent-A", "agent-a"),
+            "match is case-sensitive"
+        );
+        // a (non-*) BROADCAST alias pattern matches ONLY a broadcast recipient.
+        assert!(hook_recipient_matches("all", "broadcast"));
+        assert!(hook_recipient_matches("all", "everyone"));
+        assert!(
+            !hook_recipient_matches("all", "agent-a"),
+            "a broadcast-alias pattern must not match a named recipient"
+        );
+    }
+
+    #[test]
+    fn hook_event_parse_is_total() {
+        assert_eq!(HookEvent::parse("send"), HookEvent::Send);
+        assert_eq!(HookEvent::parse("ack"), HookEvent::Ack);
+        assert_eq!(HookEvent::parse("ACK"), HookEvent::Ack);
+        // unknown/empty/whitespace ⇒ default Send (total parse, never errors).
+        assert_eq!(HookEvent::parse(""), HookEvent::Send);
+        assert_eq!(HookEvent::parse("nonsense"), HookEvent::Send);
+        assert_eq!(HookEvent::parse("  ack  "), HookEvent::Ack);
+        assert_eq!(HookEvent::Send.as_str(), "send");
+        assert_eq!(HookEvent::Ack.as_str(), "ack");
+    }
+
+    #[test]
+    fn post_send_hook_toml_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[post_send_hook]]
+            recipient  = "agent-a"
+            argv       = ["/usr/bin/tee", "/tmp/sentinel"]
+            event      = "send"
+            timeout_ms = 1234
+
+            [[post_send_hook]]
+            argv = ["/bin/true"]
+            "#,
+        )
+        .expect("post_send_hook block parses");
+        let hooks = cfg.post_send_hook.as_ref().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].recipient.as_deref(), Some("agent-a"));
+        assert_eq!(hooks[0].argv, vec!["/usr/bin/tee", "/tmp/sentinel"]);
+        assert_eq!(hooks[0].hook_event(), HookEvent::Send);
+        assert_eq!(hooks[0].timeout().as_millis(), 1234);
+        // Omitted recipient ⇒ universal "*".
+        assert_eq!(hooks[1].recipient_pattern(), "*");
+        // Omitted timeout ⇒ default.
+        assert_eq!(
+            hooks[1].timeout().as_millis() as u64,
+            HOOK_TIMEOUT_MS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn post_send_hook_timeout_is_clamped() {
+        let tiny = PostSendHook {
+            argv: vec!["/bin/true".into()],
+            timeout_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(tiny.timeout().as_millis() as u64, MIN_TIMEOUT_MS);
+        let huge = PostSendHook {
+            argv: vec!["/bin/true".into()],
+            timeout_ms: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(huge.timeout().as_millis() as u64, MAX_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn post_send_hook_is_valid_caps() {
+        // Empty argv ⇒ invalid.
+        let empty = PostSendHook {
+            argv: vec![],
+            ..Default::default()
+        };
+        assert!(!empty.is_valid());
+        // Over the argv-count cap ⇒ invalid.
+        let too_many = PostSendHook {
+            argv: vec!["x".to_string(); MAX_HOOK_ARGV + 1],
+            ..Default::default()
+        };
+        assert!(!too_many.is_valid());
+        // An over-long element ⇒ invalid.
+        let long_arg = PostSendHook {
+            argv: vec!["a".to_string(), "b".repeat(MAX_HOOK_ARG_LEN + 1)],
+            ..Default::default()
+        };
+        assert!(!long_arg.is_valid());
+        // A NUL/control byte in an element ⇒ invalid.
+        let ctrl = PostSendHook {
+            argv: vec!["a".to_string(), "b\0c".to_string()],
+            ..Default::default()
+        };
+        assert!(!ctrl.is_valid());
+        // A well-formed rule is valid.
+        let ok = PostSendHook {
+            argv: vec!["/bin/true".to_string(), "arg".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.is_valid());
+    }
+
+    #[test]
+    fn hooks_for_selects_by_event_recipient_and_validity() {
+        let cfg = Config {
+            post_send_hook: Some(vec![
+                // matches agent-a on send.
+                PostSendHook {
+                    recipient: Some("agent-a".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+                // an ack hook ⇒ must NOT fire on a send.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("ack".into()),
+                    timeout_ms: None,
+                },
+                // invalid (empty argv) ⇒ dropped at selection.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec![],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+                // a universal send hook ⇒ also matches agent-a.
+                PostSendHook {
+                    recipient: Some("*".into()),
+                    argv: vec!["/bin/true".into()],
+                    event: Some("send".into()),
+                    timeout_ms: None,
+                },
+            ]),
+            ..Config::default()
+        };
+        // Send to agent-a selects the exact + universal send rules (2), not the ack
+        // rule and not the invalid one.
+        let selected = cfg.hooks_for(HookEvent::Send, "agent-a");
+        assert_eq!(selected.len(), 2);
+        // A non-matching recipient selects only the universal rule.
+        let other = cfg.hooks_for(HookEvent::Send, "agent-z");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].recipient_pattern(), "*");
+        // The ack event selects only the universal ack rule.
+        let ack = cfg.hooks_for(HookEvent::Ack, "agent-a");
+        assert_eq!(ack.len(), 1);
+        assert_eq!(ack[0].hook_event(), HookEvent::Ack);
+        // No hooks configured ⇒ empty.
+        assert!(Config::default().hooks_for(HookEvent::Send, "x").is_empty());
+    }
 }
