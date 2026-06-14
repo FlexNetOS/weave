@@ -1,8 +1,16 @@
 # Changelog
 
-## [Unreleased] — multi-provider lifecycle hook templates (WL-042)
+## [Unreleased]
 
-### Added
+### Changed
+- **README "Status" refreshed to v0.2.0 reality (WL-045).** Replaced the stale
+  `v0.1.0 — 38 tests green … injection to be confirmed` block with the current
+  state: the four-crate workspace linking one binary, **706 sqlite / 657 libsql**
+  tests green under clippy `-D warnings` + fmt, the token-light single-meta-tool
+  MCP surface (ADR-0003), live tmux/zellij injection **validated end-to-end**, and
+  the default-OFF zero-added-dep optional features (`libsql`/`sign`/`llm`/`surfaces`/`obscura`).
+
+### Added (multi-provider lifecycle hook templates — WL-042)
 - **`weave setup --provider <claude|codex|gemini|aider>` (WL-042, `cross_agent_session_resumer`
   / casr parity).** `weave setup` (and `weave uninstall`) now generalize from
   Claude-only to four coding-agent hosts, each wired into its own config file
