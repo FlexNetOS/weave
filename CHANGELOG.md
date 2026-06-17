@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added (enforcing PreToolUse approval gate — WL-055)
+- **A real PreToolUse hook that actually BLOCKS dangerous tool calls.** weave had
+  the approval *primitive* (`weave_ask_permission` / `permission_verdict` + a
+  `DANGEROUS_TOOLS` list) but installed no PreToolUse hook, so nothing enforced it.
+  New `weave hook pretooluse` drain reads Claude's PreToolUse JSON, and for a
+  dangerous tool (`Bash`/`Edit`/`Write`/`MultiEdit`/`NotebookEdit` + weave's
+  dangerous MCP tools) raises a blocking approval on the existing ToolPermission
+  machinery, emitting `{"hookSpecificOutput":{"permissionDecision":…}}`. **Deny by
+  default, fail closed:** `approve` ⇒ `allow`; deny / no-approver / our own short
+  timeout ⇒ `deny`. It enforces its OWN timeout (`pretooluse_timeout_secs`, default
+  30s, clamped [1,300]) because Claude's hook timeout fails *open*. Malformed stdin
+  or a non-dangerous tool ⇒ `defer` (never breaks the session). stdout is pure JSON.
+- **Opt-in wiring:** `weave setup --pretooluse` (Claude only) ALSO installs the
+  `hooks.PreToolUse` entry (matcher `Bash|Edit|Write`) with the same idempotent,
+  never-clobber-foreign, atomic, read-back-verified discipline as the other hooks;
+  `weave uninstall` prunes it. Default `weave setup` does NOT install it (so it
+  never surprise-blocks). New config keys `pretooluse_approver` /
+  `pretooluse_timeout_secs` (+ `WEAVE_PRETOOLUSE_*` env). **No new standing MCP
+  tool** (token-light invariant upheld).
+
 ### Changed (libsql dependency surface trimmed — WL-044b)
 - **`libsql` is now pulled with `default-features = false, features =
   ["core", "remote", "tls"]`** — only what weave uses (`Builder::new_local`

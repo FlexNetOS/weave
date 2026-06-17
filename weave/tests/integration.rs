@@ -1533,6 +1533,166 @@ fn hook_session_registers_and_prompt_drains_marks_read() {
     );
 }
 
+// ── WL-055: the enforcing PreToolUse approval gate (black-box, BOTH backends) ──
+// These drive the compiled `weave hook pretooluse` binary, so they run under sqlite
+// (default) AND `--features libsql` via the CI matrix — the dual-backend coverage
+// the Store-trait drain logic requires. stdout must be PURE decision JSON.
+
+/// Parse the single PreToolUse decision object out of a drain's stdout.
+fn pretooluse_decision(out: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .unwrap_or_else(|e| panic!("pretooluse stdout was not pure JSON ({e}): {out:?}"))
+}
+
+#[test]
+fn pretooluse_safe_tool_defers_blackbox() {
+    let db = TestDb::new();
+    let (ok, out, _e) = run_hook(
+        &db,
+        "pretooluse",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/x"}}"#,
+    );
+    assert!(ok, "drain must exit 0 (fail open)");
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("defer"),
+        "a non-dangerous tool is never blocked: {out}"
+    );
+}
+
+#[test]
+fn pretooluse_malformed_stdin_fails_open_blackbox() {
+    let db = TestDb::new();
+    let (ok, out, _e) = run_hook(&db, "pretooluse", "not json at all");
+    assert!(ok, "drain must never break the session on bad stdin");
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("defer"),
+        "malformed stdin ⇒ defer (fail open): {out}"
+    );
+}
+
+#[test]
+fn pretooluse_dangerous_no_approver_denies_blackbox() {
+    let db = TestDb::new();
+    // No WEAVE_PRETOOLUSE_APPROVER set ⇒ deny-by-default for a dangerous tool.
+    let (ok, out, _e) = run_hook(
+        &db,
+        "pretooluse",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+    );
+    assert!(ok, "deny is emitted via exit 0 + JSON, not a crash");
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("deny"),
+        "dangerous tool + no approver ⇒ deny: {out}"
+    );
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/hookEventName")
+            .and_then(|x| x.as_str()),
+        Some("PreToolUse")
+    );
+}
+
+#[test]
+fn pretooluse_dangerous_denies_on_timeout_blackbox() {
+    let db = TestDb::new();
+    // An approver is configured but never answers ⇒ the drain's OWN short timeout
+    // fires and DENIES (it must NOT rely on Claude's fail-open timeout).
+    let (ok, out, _e) = run_hook_env(
+        &db,
+        "pretooluse",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/x"}}"#,
+        &[
+            ("WEAVE_PRETOOLUSE_APPROVER", "approver"),
+            ("WEAVE_PRETOOLUSE_TIMEOUT_SECS", "1"),
+        ],
+    );
+    assert!(ok);
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("deny"),
+        "no approval within the internal timeout ⇒ deny: {out}"
+    );
+}
+
+#[test]
+fn pretooluse_dangerous_allows_on_approve_blackbox() {
+    let db = TestDb::new();
+    // Spawn the drain in the background (it will block waiting for approval), then
+    // approve the freshly-opened ask via the CLI as the approver peer.
+    let payload = r#"{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"/tmp/x"}}"#;
+    let approve_handle = {
+        let db_path = db.path_str();
+        std::thread::spawn(move || {
+            // Poll the approver's open asks (as askee) for the freshly-opened
+            // ToolPermission ask, then answer it `approve`.
+            for _ in 0..240 {
+                let out = std::process::Command::new(env!("CARGO_BIN_EXE_weave"))
+                    .args(["asks", "--me", "approver", "--role", "askee", "--json"])
+                    .env("WEAVE_DB", &db_path)
+                    .env(
+                        "XDG_CONFIG_HOME",
+                        std::env::temp_dir().join("weave-it-noconfig"),
+                    )
+                    .env_remove("WEAVE_SESSION")
+                    .env_remove("WEAVE_BACKEND")
+                    .output()
+                    .expect("run weave asks");
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+                if let Some(id) = parsed
+                    .pointer("/asks/0/id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned)
+                {
+                    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_weave"))
+                        .args([
+                            "answer", "--id", &id, "--from", "approver", "--body", "approve",
+                        ])
+                        .env("WEAVE_DB", &db_path)
+                        .env(
+                            "XDG_CONFIG_HOME",
+                            std::env::temp_dir().join("weave-it-noconfig"),
+                        )
+                        .env_remove("WEAVE_SESSION")
+                        .env_remove("WEAVE_BACKEND")
+                        .output();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        })
+    };
+
+    let (ok, out, _e) = run_hook_env(
+        &db,
+        "pretooluse",
+        payload,
+        &[
+            ("WEAVE_PRETOOLUSE_APPROVER", "approver"),
+            ("WEAVE_PRETOOLUSE_TIMEOUT_SECS", "8"),
+        ],
+    );
+    let _ = approve_handle.join();
+    assert!(ok);
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("allow"),
+        "an approve verdict ⇒ allow: {out}"
+    );
+}
+
 #[test]
 fn hook_stop_peeks_and_does_not_consume() {
     let db = TestDb::new();

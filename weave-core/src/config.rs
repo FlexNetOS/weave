@@ -547,6 +547,22 @@ pub const MAX_FP_ENTRY_LEN: usize = 256;
 /// `weave gc` CLI default so the opportunistic and explicit sweeps agree.
 pub const DEFAULT_RETENTION_SECS: i64 = 2_592_000;
 
+/// WL-055: default SHORT internal timeout (seconds) the enforcing PreToolUse drain
+/// waits for an approval verdict before DENYING by timeout. Deliberately short — a
+/// PreToolUse hook blocks the agent's tool call while it waits, and Claude's own
+/// hook timeout fails *open* (proceeds), so the drain must decide quickly and
+/// fail *closed*. Clamped to `[MIN, MAX]_PRETOOLUSE_TIMEOUT_SECS` by
+/// [`Config::pretooluse_timeout`].
+pub const DEFAULT_PRETOOLUSE_TIMEOUT_SECS: i64 = 30;
+/// WL-055: floor for the PreToolUse internal timeout. A configured 0/negative would
+/// deny every dangerous tool instantly (no chance to approve); we raise it to this
+/// minimum so an approver always has at least a moment to respond.
+pub const MIN_PRETOOLUSE_TIMEOUT_SECS: i64 = 1;
+/// WL-055: ceiling for the PreToolUse internal timeout. The hook blocks the agent
+/// while it waits, so a hostile/foot-gun huge value is capped here (well under
+/// Claude's 600s fail-open default, so weave always decides first).
+pub const MAX_PRETOOLUSE_TIMEOUT_SECS: i64 = 300;
+
 /// WL-036: which lifecycle event a [`PostSendHook`] fires on. Pure data — TEXT
 /// parsed totally, defaulting to [`HookEvent::Send`] on any unknown/empty value (the
 /// [`crate::model::MessagePriority`]/`AskRole` precedent: a total parse never errors).
@@ -888,6 +904,28 @@ pub struct Config {
     /// omit the key loading unchanged.
     #[serde(default)]
     pub post_send_hook: Option<Vec<PostSendHook>>,
+    /// WL-055 PreToolUse approval gate: the weave peer the enforcing PreToolUse
+    /// hook raises its blocking ToolPermission ask TO when a dangerous tool is
+    /// about to run. The drain waits up to [`pretooluse_timeout`](Self::pretooluse_timeout)
+    /// for that peer to `weave answer … approve`; an approve ⇒ `allow`, anything
+    /// else (deny / timeout) ⇒ `deny`. **DENY-BY-DEFAULT:** `None`/empty ⇒ there is
+    /// no approver, so every dangerous tool is denied (the gate is only useful once
+    /// an approver peer is configured). NOT a secret. Overlaid by
+    /// `WEAVE_PRETOOLUSE_APPROVER`. `#[serde(default)]` keeps configs that omit the
+    /// key loading unchanged. (Flat key, like the rest of this config — there is no
+    /// nested `[pretooluse]` table in weave's config model.)
+    #[serde(default)]
+    pub pretooluse_approver: Option<String>,
+    /// WL-055: the SHORT internal wall-clock budget (seconds) the PreToolUse drain
+    /// waits for an approval verdict before it DENIES by timeout. This is weave's
+    /// OWN bound — Claude's PreToolUse hook fails *open* (its 600s default timeout
+    /// lets the tool proceed), so the drain must enforce its own short timeout and
+    /// emit an explicit `deny`, never relying on Claude's. `None` ⇒ the
+    /// [`DEFAULT_PRETOOLUSE_TIMEOUT_SECS`] default (30s). Clamped to a sane range by
+    /// [`pretooluse_timeout`](Self::pretooluse_timeout). Overlaid by
+    /// `WEAVE_PRETOOLUSE_TIMEOUT_SECS`.
+    #[serde(default)]
+    pub pretooluse_timeout_secs: Option<i64>,
 }
 
 // Manual Debug that REDACTS the libSQL auth token so it can never leak via a
@@ -953,6 +991,8 @@ impl std::fmt::Debug for Config {
                 &self.obscura_token.as_ref().map(|_| "<redacted>"),
             )
             .field("post_send_hook", &self.post_send_hook)
+            .field("pretooluse_approver", &self.pretooluse_approver)
+            .field("pretooluse_timeout_secs", &self.pretooluse_timeout_secs)
             .finish()
     }
 }
@@ -1214,6 +1254,17 @@ impl Config {
         }
         if let Some(v) = nonempty("WEAVE_OBSCURA_TOKEN") {
             cfg.obscura_token = Some(v);
+        }
+        // WL-055 PreToolUse gate overlays.
+        if let Some(v) = nonempty("WEAVE_PRETOOLUSE_APPROVER") {
+            cfg.pretooluse_approver = Some(v);
+        }
+        // A non-numeric value is ignored (leaves the config / default in place)
+        // rather than silently changing the deny-on-timeout window.
+        if let Some(v) =
+            nonempty("WEAVE_PRETOOLUSE_TIMEOUT_SECS").and_then(|s| s.parse::<i64>().ok())
+        {
+            cfg.pretooluse_timeout_secs = Some(v);
         }
         cfg
     }
@@ -1815,6 +1866,27 @@ impl Config {
         self.retention_secs.unwrap_or(DEFAULT_RETENTION_SECS).max(0)
     }
 
+    /// WL-055: the resolved approver peer for the enforcing PreToolUse gate, or
+    /// `None` (⇒ deny-by-default — every dangerous tool is denied). An empty
+    /// configured value is treated as unset.
+    pub fn pretooluse_approver(&self) -> Option<&str> {
+        self.pretooluse_approver
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// WL-055: the resolved SHORT internal timeout (seconds) the PreToolUse drain
+    /// waits before DENYING by timeout. Falls back to
+    /// [`DEFAULT_PRETOOLUSE_TIMEOUT_SECS`] when unset and is clamped to
+    /// `[MIN, MAX]_PRETOOLUSE_TIMEOUT_SECS` so a 0/negative value can never deny
+    /// instantly nor a huge value block the agent past Claude's fail-open window.
+    pub fn pretooluse_timeout(&self) -> i64 {
+        self.pretooluse_timeout_secs
+            .unwrap_or(DEFAULT_PRETOOLUSE_TIMEOUT_SECS)
+            .clamp(MIN_PRETOOLUSE_TIMEOUT_SECS, MAX_PRETOOLUSE_TIMEOUT_SECS)
+    }
+
     /// The configured nudge template, if any. Plumbed into the MCP server so its
     /// live-injection nudges honor the same `nudge_template` the CLI uses (the
     /// template carries `{from}`/`{body}` placeholders; see [`Config::nudge`]).
@@ -2082,6 +2154,20 @@ pub const CONFIG_TEMPLATE: &str = "\
 # prefix check. Mirrors repowire's daemon.spawn.allowed_paths. Overridable via
 # WEAVE_SPAWN_DIRS (path-list separated, `:` on unix / `;` on windows).
 # spawn_allowed_dirs = [\"/home/me/agents\", \"/srv/work\"]
+
+# PRETOOLUSE APPROVAL GATE (WL-055): the enforcing PreToolUse hook (opt-in via
+# `weave setup --pretooluse`, Claude only) raises a BLOCKING approval ask TO this
+# peer whenever a dangerous tool (Bash/Edit/Write + weave's dangerous MCP tools) is
+# about to run. The peer answers `approve` (⇒ allow) or anything else (⇒ deny) with
+# `weave answer`. DENY-BY-DEFAULT: unset/blank ⇒ every dangerous tool is denied (the
+# gate is only useful once an approver is configured). Overridable via
+# WEAVE_PRETOOLUSE_APPROVER.
+# pretooluse_approver = \"desktop\"
+# Short internal wall-clock budget (seconds) the drain waits for that verdict before
+# it DENIES by timeout. weave decides FAIL-CLOSED here because Claude's own PreToolUse
+# timeout fails OPEN (proceeds). Default 30s; clamped to [1, 300]. Overridable via
+# WEAVE_PRETOOLUSE_TIMEOUT_SECS.
+# pretooluse_timeout_secs = 30
 ";
 
 /// Outcome of `weave config init`, so the CLI can report precisely what happened
@@ -2241,6 +2327,51 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(negative.retention(), 0, "negative clamps to disabled");
+    }
+
+    /// WL-055: the PreToolUse approver resolves to `None` when unset/blank
+    /// (deny-by-default), and the internal timeout defaults to 30s and is clamped to
+    /// `[MIN, MAX]_PRETOOLUSE_TIMEOUT_SECS` (so 0/negative can never deny instantly
+    /// and a huge value can never out-wait Claude's 600s fail-open window).
+    #[test]
+    fn pretooluse_approver_and_timeout_resolve_and_clamp() {
+        let base = Config::default();
+        assert_eq!(
+            base.pretooluse_approver(),
+            None,
+            "no approver ⇒ deny-by-default"
+        );
+        assert_eq!(base.pretooluse_timeout(), DEFAULT_PRETOOLUSE_TIMEOUT_SECS);
+
+        let blank = Config {
+            pretooluse_approver: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(blank.pretooluse_approver(), None, "blank approver is unset");
+
+        let set = Config {
+            pretooluse_approver: Some("  desktop  ".to_string()),
+            pretooluse_timeout_secs: Some(10),
+            ..Config::default()
+        };
+        assert_eq!(set.pretooluse_approver(), Some("desktop"));
+        assert_eq!(set.pretooluse_timeout(), 10);
+
+        let too_small = Config {
+            pretooluse_timeout_secs: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(
+            too_small.pretooluse_timeout(),
+            MIN_PRETOOLUSE_TIMEOUT_SECS,
+            "0 clamps up to the floor (never an instant deny)"
+        );
+
+        let too_big = Config {
+            pretooluse_timeout_secs: Some(99_999),
+            ..Config::default()
+        };
+        assert_eq!(too_big.pretooluse_timeout(), MAX_PRETOOLUSE_TIMEOUT_SECS);
     }
 
     /// `peer_db_paths` is default-empty (no federation configured ⇒ `[]`, the
