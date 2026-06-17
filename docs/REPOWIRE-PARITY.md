@@ -27,23 +27,32 @@ the code.
 
 | | Count |
 |---|---|
-| repowire features that weave **HAS or SUPERSETS** | **35 of 36** |
-| **Genuine gaps**, all tracked | **2** — minor only (agents-scaffold, `SOUL.md` file) |
-| **Superseded by design** (no-daemon) | **2** — hosted relay, API-key relay isolation → cross-store pull |
+| repowire features that weave **HAS or SUPERSETS** | **33 of 36** |
+| **Genuine gaps**, all tracked | **4** — WL-055 PreToolUse enforcing hook (medium), WL-056 cross-machine push (medium), + agents-scaffold & `SOUL.md` file (minor) |
+| **Superseded by design** (no-daemon) | **1** — API-key relay isolation → per-source token/owner-only-writes |
+| repowire agent-runtimes not yet wired | **3** — Antigravity, OpenCode, Pi (weave wires Claude/Codex/Gemini/Aider) |
 | weave capabilities repowire **does NOT have** | **13** (§4) |
 
-**Conclusion: the superset claim holds.** Every repowire *messaging,
-orchestration, scheduling, memory, presence, security, and transport* primitive
-is present or exceeded. With **agent spawn/kill shipped** (WL-047), **the human
-surfaces shipped** (WL-048 — Rust-native web dashboard + Telegram/Slack behind
-`--features surfaces`), **and governed web reach shipped** (WL-049 — stealth
-browsing via obscura behind `--features obscura`), the remaining gaps are **two
-minor conveniences** only. weave additionally ships **13** capabilities repowire
-never had (signing, summarization, leases, FTS, federation, dual backend, graph
-analytics, …), and now **EXCEEDS** repowire's hosted-relay web reach with
-*governed stealth browsing* (WL-049 / ADR-0002): web access **without a daemon**,
-gated + leased + audited + SSRF-guarded, where repowire offered only an
-ungoverned hosted relay.
+**Conclusion: weave covers nearly all of repowire, with real new capability —
+but two medium gaps remain.** **agent spawn/kill DID ship** (WL-047), **the human
+surfaces DID ship** (WL-048 — Rust-native web dashboard + Telegram/Slack behind
+`--features surfaces`), **and governed web reach DID ship** (WL-049 — stealth
+browsing via obscura behind `--features obscura`) — these are real, not aspirational.
+weave additionally ships **13** capabilities repowire never had (signing,
+summarization, leases, FTS, federation, dual backend, graph analytics, …), and
+**EXCEEDS** repowire's hosted-relay web reach with *governed stealth browsing*
+(WL-049 / ADR-0002): web access **without a daemon**, gated + leased + audited +
+SSRF-guarded, where repowire offered only an ungoverned hosted relay.
+
+Two **medium** gaps remain honest, however: there is **no enforcing PreToolUse
+hook** (the approval primitive exists and is tested, but nothing actually *blocks*
+a tool call — WL-055), and **push-based cross-machine reach is absent** (weave
+delivers pull-only; repowire's relay pushed A→B, and weave's ARCHITECTURE.md
+currently marks cross-machine a non-goal — WL-056). Beyond those, **3 repowire
+agent-runtimes are not yet wired** (Antigravity, OpenCode, Pi — weave wires
+Claude/Codex/Gemini/Aider) and **2 minor conveniences** are missing
+(agents-folder scaffold, the `SOUL.md` persona-file convention). All five are
+tracked.
 
 ---
 
@@ -58,7 +67,7 @@ ungoverned hosted relay.
 | `broadcast` (fan-out to circle) | `weave_send --to all`, `weave_broadcast_notify`, `weave_broadcast_ask` | 🟢 SUPERSET | broadcast **ask** too (WL-027), not just notify |
 | `ask_many` / `ask_many_result` | `weave_ask_many` / `weave_ask_many_result` | ✅ HAVE | `ask_groups` parent-id correlation |
 | Reminder injection (unacked asks resurface) | prompt-hook reminder nudge | ✅ HAVE | WL-014 |
-| Structured tool-approval questions | `weave_ask_permission` + `weave_permission_*` | ✅ HAVE | WL-021 (PreToolUse gate) |
+| Structured tool-approval questions | `weave_ask_permission` + `weave_permission_*` | ✅ HAVE | WL-021 (advisory approval primitive: ask + deny-on-timeout; NO PreToolUse hook event installed — not an enforcing gate. Tracked: WL-055) |
 | Message supersede / successor chains (atm-core) | `weave send --supersedes <id>` / `weave_send {supersedes}` | ✅ HAVE | **WL-037**; additive `messages.superseded_by` (both backends); hide-from-unread, flag-in-history; sender-only authz |
 | Idle notification dedup (atm-core) | `weave notify --dedup-idle` / `weave_notify {dedupIdle}` | ✅ HAVE | **WL-039**; reuses `messages.superseded_by`; eligible only on `kind='idle'` rows + same (sender,recipient) + unread; sender-scoped; additive nullable `messages.kind` (both backends); never dedups a real message or another sender's pings |
 | Ephemeral messages / TTL auto-sweep (atm-core) | `weave send --ttl <secs>` / `weave_send {ttl}` | ✅ HAVE | **WL-038**; additive nullable `messages.expires_at` (both backends); delete-on-sweep via `gc()` fold-in + opportunistic `sweep_expired_messages`; TTL-capped (`MAX_MSG_TTL_SECS = 86400`); cross-store via `outbox.ttl` |
@@ -115,7 +124,7 @@ ungoverned hosted relay.
 |---|---|---|---|
 | Bearer token auth (HTTP/WS/hooks) | bearer-auth HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
 | Spawn allowlists (`daemon.spawn.allowed_paths`) | `spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS` + `trusted_dirs()` (two-layer gate) | ✅ HAVE | **WL-047**; cwd allowlist (deny-by-default, MCP hard-deny) + trusted child `argv[0]` |
-| PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` | ✅ HAVE | WL-021 |
+| PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` | 🔶 PARTIAL | approval primitive present + tested, but weave installs only SessionStart/UserPromptSubmit/Stop/SubagentStop hooks — there is NO PreToolUse hook, so nothing BLOCKS a tool call (repowire's was enforcing). Enforcing gate tracked: WL-055 |
 | Post-send hooks (atm-core `[[post_send_hook]]`) | config `[[post_send_hook]]` (CLI/MCP send/notify/ack) | ✅ HAVE | **WL-036**; argv-only/no-shell, `argv[0]` trusted-dir, message fields env-only (body never exported), bounded/fault-isolated; no new standing tool |
 | CORS restricted to localhost | localhost-only HTTP surface | ✅ HAVE | WL-022 |
 | **No E2E encryption on relay (acknowledged gap)** | no relay at all; ed25519 signed identity + owner-only cross-store pull | 🟢 SUPERSET | `sign.rs`; closes repowire's own acknowledged weakness |
@@ -126,8 +135,8 @@ ungoverned hosted relay.
 |---|---|---|---|
 | stdio MCP server | `weave mcp` (stdio) | ✅ HAVE | `mcp.rs` |
 | Streamable HTTP MCP (localhost, bearer) | HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
-| Hosted relay (`repowire.io`, outbound WSS) | cross-store federation (Tier-1) + Tier-2 cross-machine pull | 🧭 SUPERSEDED | no-daemon; owner-only writes, no inbound port, no tunnel |
-| Self-hosted relay | Tier-2 pull from remote sources | 🧭 SUPERSEDED | ARCHITECTURE §10 |
+| Hosted relay (`repowire.io`, outbound WSS) | cross-store federation (Tier-1) + Tier-2 cross-machine pull | ⏳ GAP (non-goal) | repowire's relay was PUSH cross-machine (A→B with B idle). weave delivers PULL-only (B must pull) + needs non-default `--features libsql` + a Turso remote; default sqlite build rejects remote sources. weave's own ARCHITECTURE.md marks cross-machine a non-goal. Push reach tracked: WL-056 |
+| Self-hosted relay | Tier-2 pull from remote sources | ⏳ GAP (non-goal) | pull-only (Tier-2), not push; WL-056 |
 | API-key scoped relay isolation | per-source token/timeout parity on federated pull | 🧭 SUPERSEDED | ARCHITECTURE §10 |
 
 ---
@@ -139,7 +148,7 @@ These have **no repowire equivalent** — they are why weave is a *superset*, no
 1. **ed25519 signed sender identity** — sign/verify, multi-key rotation, revocation audit log (`sign.rs`, `weave_doctor` verify-summary).
 2. **LLM thread summarization** — cached in-store summaries (`llm.rs`, `summaries` table; WL-033).
 3. **Advisory leases** — path leases with TTL expiry, prefix conflict detection, auto-sweep, pre-commit guard (`leases` table; WL-024/029/030).
-4. **FTS5 full-text search** over messages/threads/subjects, with libSQL LIKE fallback (`weave_search`; WL-028).
+4. **FTS5 full-text search** over messages/threads/subjects (libSQL backend also uses fts5 MATCH; there is no LIKE-only fallback path) (`weave_search`; WL-028).
 5. **Dual storage backend** — bundled sqlite **and** libSQL/Turso behind one `Store` trait (repowire is SQLite-only).
 6. **Cross-store federation (Tier-1)** + **Tier-2 cross-machine pull** with idempotency keys + trace IDs (WL-026) — relay-free remote reach.
 7. **Message priority** (low/normal/high/urgent) + **per-peer contact policies** (open/auto/contacts_only/block_all) (WL-031/032).
@@ -168,6 +177,9 @@ capability repowire's hosted relay never provided, and one weave delivers
 | Rust-native human surfaces (dashboard/Telegram/Slack) | **WL-048 / WL-052** | over `weave-mcp/http.rs`, `--features surfaces`, no Next.js/Python |
 | `agents create` folder scaffolding | *(candidate WL)* | minor convenience; `weave config init` already scaffolds config |
 | `SOUL.md` persona-file precedence | *(candidate WL)* | persona memory **scope** already exists; only the file convention is missing |
+| PreToolUse **enforcing** hook | **WL-055** | the approval primitive exists (ask + deny-on-timeout) but no PreToolUse hook event is wired, so nothing blocks a tool call |
+| Cross-machine **PUSH** delivery | **WL-056** | revisit the non-goal via ADR; deliver push (A→B without B polling) without a default daemon |
+| Wire repowire's remaining agent-runtimes | *(candidate WL)* | Antigravity, OpenCode, Pi (weave currently wires Claude/Codex/Gemini/Aider) |
 | ~~Governed web reach (beyond repowire)~~ | **WL-049** ✅ done | ADR-0002 (accepted) — obscura-as-capability via spawn-and-speak MCP client, `weave_web`/`weave web`, deny-by-default + SSRF-guarded, no V8/tokio in core (§7, §9) |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
 

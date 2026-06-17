@@ -93,3 +93,8 @@ amputation. `token-light` is now a first-class invariant (peer of dependency-lig
 
 ## Found by /verify (2026-06-13)
 - [x] WL-053: **Capture the mux socket in the peer target (tmux `-L`/`-S`)** (P2) — **DONE (#83).** `$TMUX` socket captured at registration (persisted on the existing `peers.socket` column — no schema change) and threaded as `tmux -S <socket>` through inject/spawn/kill/liveness; socket-less peers keep the historical default-server argv.
+
+## Found by independent broker/repowire→weave absorption audit (2026-06-17)
+- [x] WL-054: **Parity-doc accuracy corrections** — corrected REPOWIRE-PARITY.md (PreToolUse advisory-not-enforcing, hosted-relay push = non-goal gap not superseded, FTS5 MATCH not LIKE, recomputed §0 tally, 3 unwired runtimes) per independent broker/repowire→weave absorption audit (2026-06-17). Broker absorption verified COMPLETE; repowire substantially complete.
+- [ ] WL-055: **Enforcing PreToolUse approval hook** (P1) — wire a PreToolUse lifecycle hook in setup.rs + a blocking `weave hook pretooluse` drain that, for DANGEROUS_TOOLS (Bash/Edit/Write), raises weave_ask_permission and DENIES-by-default on timeout. Today only an advisory primitive exists (no PreToolUse hook → nothing blocks). Token-light (hook/CLI path, no new standing tool); both-backend tests.
+- [ ] WL-056: **Cross-machine PUSH delivery** (P1, needs ADR) — restore repowire's push reach (A→B without B polling) WITHOUT a default daemon and WITHOUT breaking owner-only-writes: remote peer POSTs to B's opt-in bearer-gated `weave serve` HTTP endpoint → B writes its OWN store + injects into its OWN pane. Revisit the cross-machine non-goal in a new ADR first. Both-backend tests.
