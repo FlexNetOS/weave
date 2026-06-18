@@ -11737,6 +11737,320 @@ mod surfaces_dashboard {
 }
 
 // ---------------------------------------------------------------------------
+// WL-056 / ADR-0005: cross-machine PUSH delivery (consent-based, daemon-free).
+//
+// These drive the *compiled* binary as a black box: a `weave dashboard --write`
+// server is the RECEIVER (B) — the bearer-gated `POST /api` surface where the
+// `weave_push` receive handler commits into B's OWN inbox via the SAME Tier-2
+// pull-commit pipeline. The SENDER (A) is either a raw `POST /api` client (to drive
+// the receive handler directly with crafted args) or the `weave push` CLI verb.
+// Owner-only-writes is structural: A never opens B's store; B commits its own row.
+// Run on BOTH backends (sqlite default + libsql via --no-default-features).
+// ---------------------------------------------------------------------------
+#[cfg(feature = "surfaces")]
+mod surfaces_push {
+    use super::{scrub_env, weave_bin, TestDb};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        l.local_addr().unwrap().port()
+    }
+
+    struct Server {
+        child: Child,
+        port: u16,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Spawn `weave dashboard --write` (the WL-052a `POST /api` receive surface) with
+    /// extra env (e.g. WEAVE_TRUST / WEAVE_STRICT_VERIFY / XDG_CONFIG_HOME so the
+    /// receive handler's `Config::load()` VerifyPolicy + key table are populated).
+    fn spawn_receiver(db: &TestDb, token: &str, extra_env: &[(&str, &str)]) -> Server {
+        let port = free_port();
+        let mut cmd = Command::new(weave_bin());
+        cmd.args([
+            "dashboard",
+            "--port",
+            &port.to_string(),
+            "--token",
+            token,
+            "--write",
+        ]);
+        scrub_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn weave dashboard --write");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("receiver did not start listening on port {port}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Server { child, port }
+    }
+
+    /// Raw `POST /api` (optionally bearer) → full raw HTTP response text.
+    fn http_post(port: u16, bearer: Option<&str>, body: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut req = String::from("POST /api HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(t) = bearer {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        req.push_str("Connection: close\r\n\r\n");
+        req.push_str(body);
+        s.write_all(req.as_bytes()).expect("write request");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A `weave_push` JSON-RPC envelope with the given arguments object.
+    fn push_rpc(args: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"weave_push","arguments":args}
+        })
+        .to_string()
+    }
+
+    /// Read B's inbox via the same POST /api surface (proves the write hit B's store).
+    fn inbox_via_api(port: u16, token: &str, me: &str) -> String {
+        http_post(
+            port,
+            Some(token),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"weave_inbox","arguments":{"me":me,"include_read":true}}
+            })
+            .to_string(),
+        )
+    }
+
+    /// HAPPY PATH (no sign feature needed for the advisory commit): A POSTs a
+    /// `weave_push` to B's bearer-gated endpoint → 200, and exactly one row from
+    /// `from` lands in B's inbox with the matching body. B assigns the id/ts (B-local).
+    #[test]
+    fn push_happy_path_commits_one_row_to_b() {
+        let b = TestDb::new();
+        let recv = spawn_receiver(&b, "tok-b", &[]);
+        let resp = http_post(
+            recv.port,
+            Some("tok-b"),
+            &push_rpc(serde_json::json!({
+                "from":"alice","to":"bob","body":"x-machine hello"
+            })),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "push POST should be 200:\n{resp}"
+        );
+        assert!(
+            resp.contains("\"isError\":false") || resp.contains("\"isError\": false"),
+            "push should commit (advisory accept): {resp}"
+        );
+        // Read back via B's own API: exactly one message from alice with the body.
+        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        assert!(
+            inbox.contains("x-machine hello"),
+            "the pushed message is delivered to B's inbox: {inbox}"
+        );
+        assert!(
+            inbox.contains("from alice"),
+            "the row is attributed to the sender 'alice': {inbox}"
+        );
+    }
+
+    /// IDEMPOTENCY: the same idempotency_key pushed twice commits exactly ONE row
+    /// (push has no pull_cursor — dedup rests on the key, via Store::send).
+    #[test]
+    fn push_is_idempotent_on_repeated_key() {
+        let b = TestDb::new();
+        let recv = spawn_receiver(&b, "tok-b", &[]);
+        let body = push_rpc(serde_json::json!({
+            "from":"alice","to":"bob","body":"dup-body","idempotency_key":"k-1"
+        }));
+        let r1 = http_post(recv.port, Some("tok-b"), &body);
+        assert!(r1.starts_with("HTTP/1.1 200"), "first push 200:\n{r1}");
+        // Second identical POST: the receive handler rejects (already delivered) OR
+        // returns success — either way B must hold EXACTLY ONE row.
+        let _r2 = http_post(recv.port, Some("tok-b"), &body);
+        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        let count = inbox.matches("dup-body").count();
+        assert_eq!(
+            count, 1,
+            "a re-POSTed push (same key) must not double-commit: {inbox}"
+        );
+    }
+
+    /// BEARER GATE: a POST without the token is 401 and commits nothing.
+    #[test]
+    fn push_without_bearer_is_rejected_no_commit() {
+        let b = TestDb::new();
+        let recv = spawn_receiver(&b, "tok-b", &[]);
+        let resp = http_post(
+            recv.port,
+            None,
+            &push_rpc(serde_json::json!({
+                "from":"mallory","to":"bob","body":"unauthorized"
+            })),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 401") || resp.starts_with("HTTP/1.1 403"),
+            "missing bearer must be 401/403:\n{resp}"
+        );
+        // Nothing committed.
+        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        assert!(
+            !inbox.contains("unauthorized"),
+            "an unauthenticated push must not commit: {inbox}"
+        );
+    }
+
+    /// SIGNED HAPPY PATH + FORGED REJECTED (sign feature): under a configured trust
+    /// set + strict, B commits a push whose ed25519 signature verifies against the
+    /// sender's registered key, and REJECTS a push carrying a tampered signature.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn signed_push_verified_and_forged_rejected() {
+        use super::{pubkey_from_gen, run_ok_env, unique_config_home};
+        let a = TestDb::new();
+        let b = TestDb::new();
+        let a_cfg = unique_config_home();
+        let b_cfg = unique_config_home();
+        let a_cfg_s = a_cfg.to_string_lossy().into_owned();
+        let b_cfg_s = b_cfg.to_string_lossy().into_owned();
+
+        // A generates a keypair; B registers A's pubkey so it can verify.
+        let keygen = run_ok_env(
+            &a,
+            &["key", "gen", "--me", "alice"],
+            &[("XDG_CONFIG_HOME", &a_cfg_s)],
+        );
+        let alice_pub = pubkey_from_gen(&keygen);
+        run_ok_env(
+            &b,
+            &["key", "add", "alice", &alice_pub],
+            &[("XDG_CONFIG_HOME", &b_cfg_s)],
+        );
+        let alice_full = alice_pub.clone();
+
+        // B (the receiver) runs with a trust set + strict so ONLY a verified push
+        // commits. Its `tool_push` loads this Config via Config::load() (XDG_CONFIG_HOME).
+        let recv = spawn_receiver(
+            &b,
+            "tok-b",
+            &[
+                ("XDG_CONFIG_HOME", &b_cfg_s),
+                ("WEAVE_TRUST", &alice_full),
+                ("WEAVE_STRICT_VERIFY", "1"),
+            ],
+        );
+
+        // A signs the canonical (from,to,body) and PUSHes via the CLI verb to B.
+        let host = format!("127.0.0.1:{}", recv.port);
+        let signed = run_ok_env(
+            &a,
+            &[
+                "push",
+                "--me",
+                "alice",
+                "--to",
+                "bob",
+                "--host",
+                &host,
+                "--token",
+                "tok-b",
+                "--body",
+                "signed x-machine push",
+            ],
+            &[("XDG_CONFIG_HOME", &a_cfg_s)],
+        );
+        assert!(
+            signed.contains("delivered to 'bob'") || signed.to_lowercase().contains("deliver"),
+            "the CLI push reports B's success: {signed}"
+        );
+        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        assert!(
+            inbox.contains("signed x-machine push"),
+            "a verified signed push commits under strict trust: {inbox}"
+        );
+
+        // FORGED: a push CLAIMING alice with a garbage signature is rejected at commit
+        // under strict (no row). Sent as a raw POST so we control the bad sig.
+        let forged = http_post(
+            recv.port,
+            Some("tok-b"),
+            &push_rpc(serde_json::json!({
+                "from":"alice","to":"bob","body":"forged payload",
+                "sig":"deadbeef","idempotency_key":"forged-1"
+            })),
+        );
+        // The handler returns a tool-level error (isError:true) — never a commit.
+        assert!(
+            forged.contains("\"isError\":true") || forged.contains("\"isError\": true"),
+            "a forged signature must be rejected at commit: {forged}"
+        );
+        let inbox2 = inbox_via_api(recv.port, "tok-b", "bob");
+        assert!(
+            !inbox2.contains("forged payload"),
+            "a forged push must not commit any row: {inbox2}"
+        );
+
+        drop(recv);
+        let _ = std::fs::remove_dir_all(&a_cfg);
+        let _ = std::fs::remove_dir_all(&b_cfg);
+    }
+
+    /// BIND FAIL-CLOSED: `weave serve --bind 0.0.0.0` with NO token refuses to start
+    /// (no open listener on a routable address). Drives the compiled binary directly.
+    #[test]
+    fn serve_routable_bind_without_token_fails_closed() {
+        let db = TestDb::new();
+        let port = free_port();
+        let mut cmd = Command::new(weave_bin());
+        cmd.args(["serve", "--bind", "0.0.0.0", "--port", &port.to_string()]);
+        scrub_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        let out = cmd
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn weave serve");
+        assert!(
+            !out.status.success(),
+            "serve on a routable bind with no token must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("refusing to bind a routable address without a bearer token"),
+            "fail-closed message expected on stderr: {stderr}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WL-049 / ADR-0002: governed web access via a FAKE `obscura` binary.
 //
 // The stub is a chmod-755 `obscura` script that speaks the obscura MCP framing on

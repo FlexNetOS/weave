@@ -838,6 +838,11 @@ enum Cmd {
         /// Port to listen on (default 8787).
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Address to bind (default 127.0.0.1 — loopback only). WL-056 / ADR-0005:
+        /// expose cross-machine push by binding a routable address (e.g. 0.0.0.0 or a
+        /// Tailscale address); a non-loopback bind REQUIRES a bearer token (fail-closed).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
         /// Bearer token for authentication. If omitted, a random token is generated
         /// and printed to stderr.
         #[arg(long)]
@@ -867,6 +872,10 @@ enum Cmd {
         /// Port to listen on (default 8788).
         #[arg(long, default_value_t = 8788)]
         port: u16,
+        /// Address to bind (default 127.0.0.1 — loopback only). A non-loopback bind
+        /// REQUIRES a bearer token (fail-closed), same posture as `weave serve`.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
         /// Bearer token. If omitted, a random token is generated and printed to stderr.
         #[arg(long)]
         token: Option<String>,
@@ -874,6 +883,45 @@ enum Cmd {
         /// Off by default — the dashboard is read-only unless this is set.
         #[arg(long)]
         write: bool,
+    },
+    /// WL-056 / ADR-0005: PUSH a message to a recipient on ANOTHER machine. The
+    /// A-initiated dual of a Tier-2 pull: sign the canonical (from,to,body) if keyed,
+    /// then POST the Intent to B's bearer-gated `weave serve --write` endpoint, where
+    /// B commits it into its OWN inbox and lights its OWN pane WITHOUT polling.
+    /// `--host` is EXPLICIT-ONLY (never auto-resolved from message content — SSRF
+    /// avoidance). Body from `--body` or stdin.
+    #[cfg(feature = "surfaces")]
+    Push {
+        /// Recipient session name on the remote machine.
+        #[arg(long)]
+        to: String,
+        /// Remote endpoint, `host:port` (or a full `http://host:port`). EXPLICIT-ONLY.
+        #[arg(long)]
+        host: String,
+        /// Bearer token for B's endpoint. Falls back to $WEAVE_PUSH_TOKEN, then config.
+        #[arg(long)]
+        token: Option<String>,
+        /// Message body. If omitted, the body is read from stdin.
+        #[arg(long)]
+        body: Option<String>,
+        /// Optional subject line.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Optional host hint disambiguating the recipient name (advisory).
+        #[arg(long = "to-host")]
+        to_host: Option<String>,
+        /// Optional message priority: low, normal, high, urgent.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Optional ephemeral TTL in seconds (1..=86400).
+        #[arg(long)]
+        ttl: Option<i64>,
+        /// Optional idempotency key (a retried push with the same key never double-delivers).
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+        /// Your session name (overrides the resolved identity).
+        #[arg(long)]
+        me: Option<String>,
     },
     /// WL-048: run the Telegram bridge (poll-only): relay between a Telegram chat
     /// and the weave mesh. Token from config/`WEAVE_TELEGRAM_TOKEN`.
@@ -1623,6 +1671,185 @@ fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
 #[cfg(not(feature = "sign"))]
 fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
     String::new()
+}
+
+/// WL-056 / ADR-0005: arguments for `weave push` (the cross-machine SEND verb).
+/// Grouped into one struct so the dispatch arm threads a single value rather than
+/// ten positional params (the `clippy::too_many_arguments` precedent).
+#[cfg(feature = "surfaces")]
+struct PushArgs {
+    to: String,
+    host: String,
+    token: Option<String>,
+    body: Option<String>,
+    subject: Option<String>,
+    to_host: Option<String>,
+    priority: Option<String>,
+    ttl: Option<i64>,
+    idempotency_key: Option<String>,
+    me: Option<String>,
+}
+
+/// WL-056 / ADR-0005: PUSH a message to a recipient on ANOTHER machine — the
+/// A-initiated dual of a Tier-2 pull. Resolve `from`, read the body from `--body` or
+/// stdin, sign the canonical `(from,to,body)` if a key is configured (the SAME
+/// `sign_intent_if_keyed` the cross-store send uses), build a JSON-RPC
+/// `tools/call {name:"weave_push",...}`, and POST it to B's `http://<host>/api`
+/// endpoint with `Authorization: Bearer <token>`. B verifies + commits into its OWN
+/// inbox and lights its OWN pane (owner-only-writes). A non-200 / B-side error is
+/// surfaced as a CLI error.
+///
+/// SSRF avoidance: `--host` is EXPLICIT-ONLY — never auto-resolved from message
+/// content. The token comes from `--token` > `$WEAVE_PUSH_TOKEN` > config (the
+/// telegram/slack token-resolution precedent). Reuses the EXISTING blocking+rustls
+/// `reqwest` client (no new HTTP dep) with a bounded timeout.
+#[cfg(feature = "surfaces")]
+fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    use std::time::Duration;
+
+    let from = resolve_me(args.me, None, cfg);
+
+    // Body from --body, else stdin (the `summarize`/`hook` stdin precedent).
+    let body = match args.body {
+        Some(b) => b,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| anyhow::anyhow!("reading push body from stdin: {e}"))?;
+            buf
+        }
+    };
+    let body = body.trim_end_matches(['\n', '\r']).to_string();
+    if body.is_empty() {
+        anyhow::bail!("push body is empty (pass --body or pipe it on stdin)");
+    }
+
+    // Token: --token > $WEAVE_PUSH_TOKEN. (The serve/dashboard bearer token is
+    // CLI/random, not a config key, so there is no config fallback here.)
+    let token = args.token.filter(|t| !t.is_empty()).or_else(|| {
+        std::env::var("WEAVE_PUSH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    });
+
+    // Normalize the explicit --host into a full http URL ending in /api. We accept
+    // `host:port`, `http://host:port`, or a trailing /api and converge them. NO
+    // auto-resolution from message content (SSRF avoidance) — `--host` is the only
+    // source of the endpoint.
+    let base = args.host.trim().trim_end_matches('/');
+    let url = if base.starts_with("http://") || base.starts_with("https://") {
+        if base.ends_with("/api") {
+            base.to_string()
+        } else {
+            format!("{base}/api")
+        }
+    } else if base.ends_with("/api") {
+        format!("http://{base}")
+    } else {
+        format!("http://{base}/api")
+    };
+
+    // Sign the canonical (from,to,body) if keyed (reuse the cross-store signer).
+    let sig = sign_intent_if_keyed(&from, &args.to, &body);
+
+    // Always populate the idempotency key (so a retried POST never double-commits on
+    // B). If the caller didn't supply one, synthesize a stable key from (from,body)
+    // via an FNV-1a digest — no rand/hash crate (weave is dependency-light).
+    let idempotency_key = args
+        .idempotency_key
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| synth_push_key(&from, &body));
+
+    // Build the weave_push arguments object (the Intent wire form).
+    let mut push_args = serde_json::Map::new();
+    push_args.insert("from".into(), serde_json::Value::from(from.clone()));
+    push_args.insert("to".into(), serde_json::Value::from(args.to.clone()));
+    push_args.insert("body".into(), serde_json::Value::from(body));
+    push_args.insert(
+        "idempotency_key".into(),
+        serde_json::Value::from(idempotency_key),
+    );
+    if !sig.is_empty() {
+        push_args.insert("sig".into(), serde_json::Value::from(sig));
+    }
+    if let Some(s) = args.subject.filter(|s| !s.is_empty()) {
+        push_args.insert("subject".into(), serde_json::Value::from(s));
+    }
+    if let Some(h) = args.to_host.filter(|s| !s.is_empty()) {
+        push_args.insert("to_host".into(), serde_json::Value::from(h));
+    }
+    if let Some(p) = args.priority.filter(|s| !s.is_empty()) {
+        push_args.insert("priority".into(), serde_json::Value::from(p));
+    }
+    if let Some(t) = args.ttl {
+        push_args.insert("ttl".into(), serde_json::Value::from(t));
+    }
+
+    let rpc = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "weave_push", "arguments": serde_json::Value::Object(push_args)},
+    });
+
+    // Reuse the EXISTING blocking+rustls reqwest client (shared with telegram/slack/
+    // llm) — NO new HTTP dep. Bounded timeout so a dead endpoint cannot hang the CLI.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
+    let mut req = client.post(&url).json(&rpc);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| anyhow::anyhow!("POST {url} failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("push rejected by '{url}': HTTP {status}: {text}");
+    }
+    // The body is the JSON-RPC reply; surface B's tool result. A tool-level error
+    // (isError:true) is reported as a CLI error so the operator sees a rejected push.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(err) = v.get("error") {
+            anyhow::bail!("push rejected by '{url}': {err}");
+        }
+        let result = &v["result"];
+        let is_error = result
+            .get("isError")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let msg = result
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or(&text);
+        if is_error {
+            anyhow::bail!("push rejected by '{url}': {msg}");
+        }
+        println!("{msg}");
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// FNV-1a digest helper for a synthetic push idempotency key — mirrors the
+/// receive-side `synth_push_idempotency_key` so a keyless push from the CLI is keyed
+/// identically (no rand/hash crate).
+#[cfg(feature = "surfaces")]
+fn synth_push_key(from: &str, body: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in body.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("push:{from}:{h:x}")
 }
 
 /// Best-effort Tier-2 pull: commit any cross-store intents addressed to `me` from
@@ -4786,6 +5013,7 @@ fn main() -> Result<()> {
 
         Cmd::Serve {
             port,
+            bind,
             token,
             dangerous,
         } => {
@@ -4807,6 +5035,7 @@ fn main() -> Result<()> {
                 &RealInjector {
                     preferred_mux: parse_mux_preference(&cfg),
                 },
+                &bind,
                 port,
                 &token,
                 dangerous,
@@ -4895,7 +5124,12 @@ fn main() -> Result<()> {
         }
 
         #[cfg(feature = "surfaces")]
-        Cmd::Dashboard { port, token, write } => {
+        Cmd::Dashboard {
+            port,
+            bind,
+            token,
+            write,
+        } => {
             // Reuse WL-022 bearer auth: generate a random token if none given and
             // print it to stderr (never stdout — MCP stdout discipline), like Serve.
             let token = match token {
@@ -4919,9 +5153,46 @@ fn main() -> Result<()> {
             let injector = RealInjector {
                 preferred_mux: parse_mux_preference(&cfg),
             };
-            weave_mcp::serve_dashboard(port, &token, write, me_default, &injector, move || {
-                open_store(&cfg_for_factory)
-            })?;
+            weave_mcp::serve_dashboard(
+                &bind,
+                port,
+                &token,
+                write,
+                me_default,
+                &injector,
+                move || open_store(&cfg_for_factory),
+            )?;
+        }
+
+        #[cfg(feature = "surfaces")]
+        Cmd::Push {
+            to,
+            host,
+            token,
+            body,
+            subject,
+            to_host,
+            priority,
+            ttl,
+            idempotency_key,
+            me,
+        } => {
+            push_to_remote(
+                store,
+                &cfg,
+                PushArgs {
+                    to,
+                    host,
+                    token,
+                    body,
+                    subject,
+                    to_host,
+                    priority,
+                    ttl,
+                    idempotency_key,
+                    me,
+                },
+            )?;
         }
 
         #[cfg(feature = "surfaces")]

@@ -38,6 +38,30 @@
   never surprise-blocks). New config keys `pretooluse_approver` /
   `pretooluse_timeout_secs` (+ `WEAVE_PRETOOLUSE_*` env). **No new standing MCP
   tool** (token-light invariant upheld).
+### Added (cross-machine PUSH delivery — WL-056 / ADR-0005)
+- **Consent-based cross-machine push**: a sender A on machine 1 delivers a message
+  to recipient B on machine 2 and **B's pane lights up without B polling** — the
+  A-initiated dual of the existing Tier-2 pull, over **one** commit pipeline.
+- **Receive** is a new `weave_push` write action on the existing `--features
+  surfaces` bearer-gated `POST /api` surface (`weave dashboard --write`). The handler
+  (`mcp::tool_push`) commits via the **existing** `store::commit_pulled` — re-validate,
+  verify the ed25519 signature under the receiver's `VerifyPolicy`, `Store::send`
+  (B assigns id/ts), `idempotency_key` dedup — then fires the existing caller-side
+  consent nudge into **B's own** pane. No new `Store` method, no schema change, **no
+  new standing MCP tool** (the catalog op only).
+- **Send**: `weave push --to <name> --host <url:port> [--token …] [--subject …]
+  [--to-host …] [--priority …] [--ttl …] [--idempotency-key …]` (body from `--body`
+  or stdin). Signs the canonical `(from,to,body)` if keyed and POSTs the Intent to B's
+  `/api` with `Authorization: Bearer <token>` (token from `--token`/`$WEAVE_PUSH_TOKEN`),
+  reusing the existing blocking+rustls `reqwest` client (no new dep). `--host` is
+  **EXPLICIT-ONLY** (never auto-resolved from message content — SSRF avoidance).
+- **Bind opt-in**: `weave serve`/`weave dashboard` gain `--bind <addr>` (default
+  `127.0.0.1`, posture unchanged). A non-loopback bind with an **empty** bearer token
+  is **refused before the socket opens** (fail-closed — no open listener on a routable
+  address).
+- Invariants preserved: owner-only-writes (B commits its own row), no-daemon-by-default
+  (default `cargo build` byte-identical, `cargo tree` unchanged), verify-on-commit,
+  token-light (standing budget test unaffected), dual-backend, no new crate.
 
 ### Changed (libsql dependency surface trimmed — WL-044b)
 - **`libsql` is now pulled with `default-features = false, features =

@@ -13,15 +13,40 @@ use weave_inject::Injector;
 
 const DEFAULT_PROTOCOL: &str = "HTTP/1.1";
 
+/// WL-056 / ADR-0005: is `bind` a loopback address (the safe default that needs no
+/// token)? Parses the address as an `IpAddr` and asks the stdlib; a bare `localhost`
+/// is treated as loopback too. A non-parseable / non-loopback address is NOT
+/// loopback, so `serve_http` will require a bearer token for it (fail-closed). This
+/// is a pure function (unit-tested) — the routable-bind fail-closed gate rests on it.
+fn is_loopback_bind(bind: &str) -> bool {
+    let host = bind.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // Unknown / unparseable host is treated as NOT loopback → token required
+        // (fail-closed: never assume an unrecognized bind is safe).
+        Err(_) => false,
+    }
+}
+
 /// WL-048: how long the SSE accept thread sleeps between dashboard snapshots
 /// pushed to a `GET /events` client. A bounded interval (no busy loop); a
 /// keep-alive comment is interleaved so intermediaries do not time out.
 #[cfg(feature = "surfaces")]
 const SSE_TICK_SECS: u64 = 2;
 
-/// Start a blocking HTTP server on `127.0.0.1:port`. Only POST / is accepted.
+/// Start a blocking HTTP server on `<bind>:port`. Only POST / is accepted.
 /// Bearer token is required unless `token` is empty. Dangerous tools are
 /// filtered unless `dangerous` is true.
+///
+/// `bind` defaults to `127.0.0.1` (loopback — the only safe default, posture
+/// unchanged from before WL-056). Cross-machine PUSH (ADR-0005) requires the
+/// operator to *deliberately* expose B by passing a routable `--bind` (e.g.
+/// `0.0.0.0` or a Tailscale address). FAIL-CLOSED: a non-loopback bind with an
+/// EMPTY bearer token is refused — weave never opens an unauthenticated listener on
+/// a routable address.
 #[allow(clippy::too_many_arguments)]
 pub fn serve_http(
     store: &dyn weave_core::store::Store,
@@ -30,11 +55,21 @@ pub fn serve_http(
     extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
     injector: &dyn Injector,
+    bind: &str,
     port: u16,
     token: &str,
     dangerous: bool,
 ) -> anyhow::Result<()> {
-    let addr = format!("127.0.0.1:{port}");
+    // FAIL-CLOSED: refuse to bind a routable address without a bearer token (no open
+    // listener on the network). Checked BEFORE TcpListener::bind so we never even
+    // open the socket. A loopback bind keeps today's posture (empty token allowed).
+    if !is_loopback_bind(bind) && token.is_empty() {
+        anyhow::bail!(
+            "refusing to bind a routable address without a bearer token \
+             (bind='{bind}'); pass --token or bind 127.0.0.1"
+        );
+    }
+    let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr)?;
     log(&format!("HTTP MCP server listening on http://{addr}"));
     for stream in listener.incoming() {
@@ -70,7 +105,9 @@ pub fn serve_http(
 /// boundary; a per-connection handle is the clean, lock-free answer for read-only
 /// snapshots. Bearer auth (WL-022) gates both routes; an empty `token` ⇒ open.
 #[cfg(feature = "surfaces")]
+#[allow(clippy::too_many_arguments)]
 pub fn serve_dashboard<F>(
+    bind: &str,
     port: u16,
     token: &str,
     write: bool,
@@ -81,7 +118,16 @@ pub fn serve_dashboard<F>(
 where
     F: Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync + 'static,
 {
-    let addr = format!("127.0.0.1:{port}");
+    // FAIL-CLOSED: same routable-bind-requires-token rule as `serve_http`. The
+    // `POST /api` write surface (`--write`) is the cross-machine push receive seam,
+    // so an exposed dashboard must carry a token too.
+    if !is_loopback_bind(bind) && token.is_empty() {
+        anyhow::bail!(
+            "refusing to bind a routable address without a bearer token \
+             (bind='{bind}'); pass --token or bind 127.0.0.1"
+        );
+    }
+    let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr)?;
     log(&format!(
         "dashboard listening on http://{addr} ({})",
@@ -494,4 +540,30 @@ fn write_http_html(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_bind;
+
+    #[test]
+    fn loopback_addresses_are_recognized() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("127.0.0.5"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("  127.0.0.1  "));
+    }
+
+    #[test]
+    fn routable_or_unknown_addresses_are_not_loopback() {
+        // Routable → requires a token (fail-closed).
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.10"));
+        assert!(!is_loopback_bind("10.0.0.1"));
+        assert!(!is_loopback_bind("100.64.0.1")); // Tailscale CGNAT range
+                                                  // Unparseable / hostname → NOT loopback (never assume an unknown bind is safe).
+        assert!(!is_loopback_bind("example.com"));
+        assert!(!is_loopback_bind(""));
+    }
 }
