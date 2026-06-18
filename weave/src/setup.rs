@@ -87,6 +87,92 @@ pub fn settings_path() -> PathBuf {
     home().join(".claude").join("settings.json")
 }
 
+/// The binary path `weave setup` should persist into a host's config, plus an
+/// optional warning to surface to the operator (WL-057). See [`resolve_setup_exe`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SetupExeChoice {
+    /// The path to write into config (MCP registration + hook commands).
+    pub path: String,
+    /// A non-fatal advisory to `eprintln!` (e.g. an ephemeral build path was the
+    /// only candidate). `None` when the resolved path is stable.
+    pub warning: Option<String>,
+}
+
+/// True iff `p` looks like an EPHEMERAL build/worktree binary path that must NOT be
+/// persisted into a global host config (WL-057, fixes #107). These markers identify
+/// a path that vanishes when a cargo build output or a meta git worktree is removed,
+/// leaving the global MCP+hooks dangling:
+///
+/// * `/target/debug/`   — `cargo build` / `cargo run` debug output,
+/// * `/target/release/` — `cargo build --release` output,
+/// * `/.worktrees/`     — a meta-managed git worktree checkout.
+///
+/// Case-sensitive (these are literal cargo/meta path components). Pure — no I/O.
+pub fn is_ephemeral_exe(p: &str) -> bool {
+    p.contains("/target/debug/") || p.contains("/target/release/") || p.contains("/.worktrees/")
+}
+
+/// Decide which binary path `weave setup` persists into a host's config (WL-057,
+/// fixes #107), in strict precedence order. PURE: takes every filesystem/env fact
+/// as an argument (the caller in `main.rs` does the I/O) so it is fully unit-testable.
+///
+/// Precedence: (1) `explicit` (from `--exe`) wins — use it verbatim, no warning
+/// (the caller validates it exists). (2) else if `current_exe` is NOT ephemeral,
+/// use `current_exe`, no warning — the normal installed/system path; default
+/// behavior is byte-identical to before this fix. (3) else (`current_exe` IS
+/// ephemeral) prefer a stable fallback: `cargo_bin` if `Some` (`~/.cargo/bin/weave`
+/// exists, no warning); else `path_weave` if `Some` and itself non-ephemeral (a
+/// `weave` resolved on `$PATH`, no warning); else fall back to `current_exe` WITH a
+/// warning recommending the operator install a stable binary (`cargo install --path
+/// .`) or pin one explicitly (`weave setup --exe <stable-path>`), because an
+/// unstable build/worktree path was the only candidate and will dangle once that
+/// build is gone.
+pub fn resolve_setup_exe(
+    current_exe: &str,
+    explicit: Option<&str>,
+    cargo_bin: Option<&str>,
+    path_weave: Option<&str>,
+) -> SetupExeChoice {
+    if let Some(e) = explicit {
+        return SetupExeChoice {
+            path: e.to_string(),
+            warning: None,
+        };
+    }
+    if !is_ephemeral_exe(current_exe) {
+        return SetupExeChoice {
+            path: current_exe.to_string(),
+            warning: None,
+        };
+    }
+    // current_exe is ephemeral — find the most stable available fallback.
+    if let Some(cb) = cargo_bin {
+        return SetupExeChoice {
+            path: cb.to_string(),
+            warning: None,
+        };
+    }
+    if let Some(pw) = path_weave {
+        if !is_ephemeral_exe(pw) {
+            return SetupExeChoice {
+                path: pw.to_string(),
+                warning: None,
+            };
+        }
+    }
+    SetupExeChoice {
+        path: current_exe.to_string(),
+        warning: Some(format!(
+            "weave setup is persisting an UNSTABLE build/worktree path into the host \
+             config:\n        {current_exe}\n      This path disappears when that build \
+             or worktree is removed, dangling the global MCP+hooks. Install a stable \
+             binary with `cargo install --path .` (puts weave on ~/.cargo/bin) and \
+             re-run `weave setup`, or pin one explicitly with \
+             `weave setup --exe <stable-path>`."
+        )),
+    }
+}
+
 /// Wire weave into the selected coding-agent host. Dispatches to the per-provider
 /// writer; the Claude branch (`run_claude`) is the original `run` body,
 /// byte-for-byte. The default-Claude path is preserved unchanged.
@@ -1459,12 +1545,96 @@ fn uninstall_aider() -> Result<()> {
 mod tests {
     use super::{
         aider_stanza, codex_notify_line, foreign_commands, has_weave_command_for, hook_command,
-        is_weave_command, merge_aider_stanza, merge_codex_notify, merge_hooks_at,
+        is_ephemeral_exe, is_weave_command, merge_aider_stanza, merge_codex_notify, merge_hooks_at,
         merge_pretooluse_hook_at, prune_aider_stanza, prune_codex_notify, prune_hooks_at,
-        shell_single_quote, verify_codex_notify_present, verify_git_hook_written,
-        verify_settings_merged, verify_settings_pruned, AIDER_MARKER, PRETOOLUSE_MATCHER,
+        resolve_setup_exe, shell_single_quote, verify_codex_notify_present,
+        verify_git_hook_written, verify_settings_merged, verify_settings_pruned, AIDER_MARKER,
+        PRETOOLUSE_MATCHER,
     };
     use serde_json::json;
+
+    // --- WL-057 (#107): ephemeral-exe detection + setup-exe resolver -------------
+
+    #[test]
+    fn ephemeral_exe_detection() {
+        // Ephemeral: cargo debug/release build outputs and meta worktree checkouts.
+        assert!(is_ephemeral_exe("/x/target/debug/weave"));
+        assert!(is_ephemeral_exe("/x/target/release/weave"));
+        assert!(is_ephemeral_exe(
+            "/home/u/.worktrees/foo/weave/target/debug/weave"
+        ));
+        // Stable: installed/system paths.
+        assert!(!is_ephemeral_exe("/usr/local/bin/weave"));
+        assert!(!is_ephemeral_exe("/home/u/.cargo/bin/weave"));
+    }
+
+    #[test]
+    fn resolve_explicit_wins_over_everything() {
+        // --exe override takes precedence over current_exe, cargo_bin, and $PATH.
+        let c = resolve_setup_exe(
+            "/x/target/debug/weave",
+            Some("/opt/weave"),
+            Some("/home/u/.cargo/bin/weave"),
+            Some("/usr/local/bin/weave"),
+        );
+        assert_eq!(c.path, "/opt/weave");
+        assert!(c.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_non_ephemeral_current_exe_is_byte_identical_default() {
+        // The byte-identical default: a stable running binary, no --exe → itself,
+        // and NO warning. This is the regression guard for the default behavior.
+        let c = resolve_setup_exe("/home/u/.cargo/bin/weave", None, None, None);
+        assert_eq!(c.path, "/home/u/.cargo/bin/weave");
+        assert!(c.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_ephemeral_prefers_cargo_bin() {
+        let c = resolve_setup_exe(
+            "/x/target/release/weave",
+            None,
+            Some("/home/u/.cargo/bin/weave"),
+            Some("/usr/local/bin/weave"),
+        );
+        assert_eq!(c.path, "/home/u/.cargo/bin/weave");
+        assert!(c.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_ephemeral_falls_back_to_non_ephemeral_path_weave() {
+        // No cargo_bin, but a non-ephemeral weave on $PATH → use it, no warning.
+        let c = resolve_setup_exe(
+            "/x/target/debug/weave",
+            None,
+            None,
+            Some("/usr/local/bin/weave"),
+        );
+        assert_eq!(c.path, "/usr/local/bin/weave");
+        assert!(c.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_ephemeral_path_weave_also_ephemeral_is_ignored() {
+        // A $PATH weave that is itself ephemeral must NOT be chosen; with nothing
+        // else stable we fall back to current_exe + warning.
+        let c = resolve_setup_exe(
+            "/x/target/debug/weave",
+            None,
+            None,
+            Some("/y/target/debug/weave"),
+        );
+        assert_eq!(c.path, "/x/target/debug/weave");
+        assert!(c.warning.is_some());
+    }
+
+    #[test]
+    fn resolve_ephemeral_nothing_stable_warns() {
+        let c = resolve_setup_exe("/x/target/debug/weave", None, None, None);
+        assert_eq!(c.path, "/x/target/debug/weave");
+        assert!(c.warning.is_some());
+    }
 
     /// A fresh unique temp settings.json path for a HOME-independent test.
     fn tmp_settings(tag: &str) -> std::path::PathBuf {

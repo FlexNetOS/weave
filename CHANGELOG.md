@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed (WL-057 — `weave setup` no longer persists an ephemeral exe path, fixes #107)
+- **`weave setup` stopped writing a transient build/worktree binary path into the
+  GLOBAL host config.** It used `std::env::current_exe()` verbatim, so when run from
+  `…/target/{debug,release}/weave` (a cargo build output) or a `…/.worktrees/…`
+  checkout, that path got persisted into `~/.claude/settings.json` (MCP registration
+  + hook commands); once the build/worktree was removed, every session errored on
+  the dangling path. setup now resolves a STABLE path to persist: a pure
+  `resolve_setup_exe` picks (in precedence order) an explicit `--exe`, else the
+  running binary when it is non-ephemeral (the default path is byte-identical), else
+  `~/.cargo/bin/weave`, else a non-ephemeral `weave` on `$PATH`, else it falls back
+  to the running binary with a loud warning recommending `cargo install --path .`
+  (or `weave setup --exe <stable-path>`).
+- **New `weave setup --exe <PATH>`** to pin the exact binary path written into the
+  host config (highest precedence; validated to exist). The `serve`/daemon
+  self-spawn path is unaffected (it spawns a child of the same running process and
+  persists nothing).
+
 ### Added (enforcing PreToolUse approval gate — WL-055)
 - **A real PreToolUse hook that actually BLOCKS dangerous tool calls.** weave had
   the approval *primitive* (`weave_ask_permission` / `permission_verdict` + a

@@ -89,7 +89,7 @@ A small Cargo **workspace** that links to one binary; strictly layered **crates*
 
 ```
 weave (bin)        main.rs    clap CLI + glue; resolve_me() = explicit flag > $WEAVE_SESSION > basename(cwd)
-                   setup.rs   `weave setup`/`uninstall`: MCP register + idempotent settings.json hook merge
+                   setup.rs   `weave setup`/`uninstall`: MCP register + idempotent settings.json hook merge; `resolve_setup_exe` pins a STABLE binary path (never an ephemeral target/.worktrees build) — override with `--exe <PATH>`
                    harness.rs `weave harness ide-merge-ide`: dry-run/execute the Codex 7-layer loop
                    git.rs     worktree / cwd-derived session git tagging
   └ weave-mcp      mcp.rs     MCP stdio JSON-RPC 2.0 server (weave_* tools); live nudge-inject on send

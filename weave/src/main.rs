@@ -201,6 +201,14 @@ enum Cmd {
         /// approver every dangerous tool is DENIED (deny-by-default).
         #[arg(long)]
         pretooluse: bool,
+        /// WL-057: pin the exact binary path written into the host config (MCP +
+        /// hook commands). Use this when the running `weave` is an ephemeral build
+        /// or worktree binary (`…/target/{debug,release}/weave`, `…/.worktrees/…`)
+        /// whose path would dangle once that build is gone. The override has highest
+        /// precedence; if omitted, weave persists the running binary when it is
+        /// stable, else falls back to `~/.cargo/bin/weave` or a `weave` on `$PATH`.
+        #[arg(long)]
+        exe: Option<String>,
     },
     /// Remove weave's host wiring (`--provider` selects the host; default claude).
     Uninstall {
@@ -2864,6 +2872,44 @@ fn run_harness(cmd: &HarnessCmd) -> Result<()> {
     }
 }
 
+/// WL-057: `Some(path)` iff `<home>/.cargo/bin/weave` exists as a file — the
+/// canonical stable install location preferred when the running binary is an
+/// ephemeral build/worktree path. Uses `$HOME` (the same resolution the setup
+/// module uses); `None` if `$HOME` is unset or the file is absent.
+fn setup_cargo_bin_weave() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::Path::new(&home)
+        .join(".cargo")
+        .join("bin")
+        .join("weave");
+    if path.is_file() {
+        Some(path.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+/// WL-057: resolve a `weave` binary on `$PATH` (a dependency-free which-style scan;
+/// no `which` crate). Returns the first `<dir>/weave` that exists as a file whose
+/// path is NOT ephemeral (a `target/{debug,release}` or `.worktrees` entry on PATH
+/// would just re-introduce the dangle we're avoiding). `None` if none is found.
+fn setup_path_weave() -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join("weave");
+        if candidate.is_file() {
+            let s = candidate.to_string_lossy().into_owned();
+            if !setup::is_ephemeral_exe(&s) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load();
@@ -2874,11 +2920,36 @@ fn main() -> Result<()> {
             provider,
             git_hooks,
             pretooluse,
+            exe,
         } => {
-            let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-            setup::run_provider(&exe, (*provider).into(), *pretooluse)?;
+            let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
+
+            // WL-057 (#107): never persist an EPHEMERAL build/worktree path into a
+            // global host config — it dangles once that build is gone. Validate an
+            // explicit --exe override, then resolve the stable path to persist. The
+            // resolver is PURE; we gather the filesystem facts (cargo-bin, $PATH weave)
+            // here and pass them in.
+            if let Some(p) = exe {
+                if !std::path::Path::new(p).is_file() {
+                    anyhow::bail!("--exe path does not exist: {p}");
+                }
+            }
+            let cargo_bin = setup_cargo_bin_weave();
+            let path_weave = setup_path_weave();
+            let choice = setup::resolve_setup_exe(
+                &current_exe,
+                exe.as_deref(),
+                cargo_bin.as_deref(),
+                path_weave.as_deref(),
+            );
+            if let Some(warning) = &choice.warning {
+                eprintln!("warning: {warning}");
+            }
+            let resolved = &choice.path;
+
+            setup::run_provider(resolved, (*provider).into(), *pretooluse)?;
             if *git_hooks {
-                setup::install_git_precommit_hook(&exe)?;
+                setup::install_git_precommit_hook(resolved)?;
             }
             return Ok(());
         }
@@ -6657,6 +6728,28 @@ mod tests {
             via: String::new(),
             turn_state: String::new(),
             description: String::new(),
+        }
+    }
+
+    /// WL-057 (#107): `weave setup --exe <path>` parses into `Cmd::Setup{ exe: Some }`.
+    #[test]
+    fn setup_exe_flag_parses() {
+        let cli = Cli::try_parse_from(["weave", "setup", "--exe", "/tmp/x"])
+            .expect("`weave setup --exe /tmp/x` should parse");
+        match cli.cmd {
+            Cmd::Setup { exe, .. } => assert_eq!(exe.as_deref(), Some("/tmp/x")),
+            _ => panic!("expected Cmd::Setup"),
+        }
+    }
+
+    /// Default `weave setup` (no `--exe`) parses with `exe: None` — the byte-identical
+    /// default path is preserved.
+    #[test]
+    fn setup_without_exe_flag_parses_none() {
+        let cli = Cli::try_parse_from(["weave", "setup"]).expect("`weave setup` should parse");
+        match cli.cmd {
+            Cmd::Setup { exe, .. } => assert!(exe.is_none()),
+            _ => panic!("expected Cmd::Setup"),
         }
     }
 
