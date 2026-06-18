@@ -11466,30 +11466,61 @@ mod surfaces_dashboard {
     /// Spawn `weave dashboard --port P --token T` against `db`, then poll the
     /// port until it accepts a connection (or time out).
     fn spawn_dashboard(db: &TestDb, token: &str) -> Dashboard {
-        let port = free_port();
-        let mut cmd = Command::new(weave_bin());
-        cmd.args(["dashboard", "--port", &port.to_string(), "--token", token]);
-        scrub_env(&mut cmd);
-        cmd.env("WEAVE_DB", db.path_str());
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn weave dashboard");
+        spawn_dashboard_inner(db, token, false)
+    }
 
-        // Wait for the listener to come up.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
+    /// Shared, race-robust spawner for both the read-only and `--write` dashboards.
+    ///
+    /// `free_port()` is inherently TOCTOU: it binds `127.0.0.1:0`, reads the
+    /// assigned port, and *drops* the listener — so between picking the port and
+    /// the child binding it, a concurrent test (full-suite parallel `cargo test`)
+    /// can win the same reused port. The loser child fails to bind and exits, yet a
+    /// naive `TcpStream::connect(port)` readiness check would still succeed —
+    /// against the *other* test's server — handing back a port we don't own (the
+    /// cause of the `dashboard_readonly_rejects_post` CI flake). So we treat
+    /// **child-exited-before-listening** as the collision signal and retry with a
+    /// fresh port; readiness requires our child to be *alive* AND the port to
+    /// accept, which (since only one process can hold a port) means it's ours.
+    fn spawn_dashboard_inner(db: &TestDb, token: &str, write: bool) -> Dashboard {
+        for _attempt in 0..8 {
+            let port = free_port();
+            let mut cmd = Command::new(weave_bin());
+            cmd.args(["dashboard", "--port", &port.to_string(), "--token", token]);
+            if write {
+                cmd.arg("--write");
             }
-            if Instant::now() > deadline {
-                panic!("dashboard did not start listening on port {port}");
+            scrub_env(&mut cmd);
+            cmd.env("WEAVE_DB", db.path_str());
+            let mut child = cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn weave dashboard");
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                // Child exited before it started listening → it lost the port race
+                // (bind failed). Reap and retry with a fresh port.
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.wait();
+                    break;
+                }
+                // Child still alive AND the port accepts → only one process can hold
+                // a port, so the live child is the owner. This Dashboard is ours.
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Dashboard { child, port };
+                }
+                if Instant::now() > deadline {
+                    // Stuck (not a clean collision) — kill and retry on a new port.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
-        Dashboard { child, port }
+        panic!("dashboard did not start listening after 8 fresh-port attempts");
     }
 
     /// Send a raw `GET <path>` (optionally with a bearer token) and return the
@@ -11513,35 +11544,7 @@ mod surfaces_dashboard {
     /// Spawn `weave dashboard --write` (WL-052a): the read-only server plus the
     /// bearer-gated `POST /api` action surface.
     fn spawn_dashboard_write(db: &TestDb, token: &str) -> Dashboard {
-        let port = free_port();
-        let mut cmd = Command::new(weave_bin());
-        cmd.args([
-            "dashboard",
-            "--port",
-            &port.to_string(),
-            "--token",
-            token,
-            "--write",
-        ]);
-        scrub_env(&mut cmd);
-        cmd.env("WEAVE_DB", db.path_str());
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn weave dashboard --write");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            if Instant::now() > deadline {
-                panic!("dashboard did not start listening on port {port}");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Dashboard { child, port }
+        spawn_dashboard_inner(db, token, true)
     }
 
     /// Send a raw `POST <path>` with a JSON body (optionally bearer) and return the
