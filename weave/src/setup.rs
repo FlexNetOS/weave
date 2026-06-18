@@ -90,9 +90,13 @@ pub fn settings_path() -> PathBuf {
 /// Wire weave into the selected coding-agent host. Dispatches to the per-provider
 /// writer; the Claude branch (`run_claude`) is the original `run` body,
 /// byte-for-byte. The default-Claude path is preserved unchanged.
-pub fn run_provider(exe: &str, provider: Provider) -> Result<()> {
+pub fn run_provider(exe: &str, provider: Provider, with_pretooluse: bool) -> Result<()> {
     match provider {
-        Provider::Claude => run_claude(exe),
+        // WL-055: the enforcing PreToolUse approval gate is Claude-specific (the
+        // PreToolUse contract is Claude Code's), so `--pretooluse` only affects the
+        // Claude provider. The other providers ignore the flag (it never writes a
+        // PreToolUse entry for codex/gemini/aider).
+        Provider::Claude => run_claude(exe, with_pretooluse),
         Provider::Codex => run_codex(exe),
         Provider::Gemini => run_gemini(exe),
         Provider::Aider => run_aider(exe),
@@ -100,10 +104,18 @@ pub fn run_provider(exe: &str, provider: Provider) -> Result<()> {
 }
 
 /// The original Claude wiring: register the MCP server and merge the four
-/// lifecycle hooks into `~/.claude/settings.json`. UNCHANGED by WL-042.
-fn run_claude(exe: &str) -> Result<()> {
+/// lifecycle hooks into `~/.claude/settings.json`. UNCHANGED by WL-042. WL-055 adds
+/// an OPT-IN fifth hook: when `with_pretooluse` is set, ALSO merge the enforcing
+/// `PreToolUse` entry (matcher `Bash|Edit|Write`). Default (flag absent) leaves
+/// PreToolUse uninstalled so the gate never surprise-blocks a session.
+fn run_claude(exe: &str, with_pretooluse: bool) -> Result<()> {
     register_mcp(exe);
     let added = merge_hooks(exe).context("merging weave hooks into settings.json")?;
+    let pretooluse_added = if with_pretooluse {
+        merge_pretooluse_hook(exe).context("merging weave PreToolUse hook into settings.json")?
+    } else {
+        false
+    };
 
     println!("weave setup complete:");
     println!("  exe:      {exe}");
@@ -113,6 +125,17 @@ fn run_claude(exe: &str) -> Result<()> {
         println!("  hooks:    already present (no changes)");
     } else {
         println!("  hooks:    added {}", added.join(", "));
+    }
+    if with_pretooluse {
+        if pretooluse_added {
+            println!("  pretooluse: enforcing approval gate INSTALLED (matcher Bash|Edit|Write)");
+        } else {
+            println!("  pretooluse: already present (no changes)");
+        }
+        println!(
+            "  note:     set `pretooluse_approver` (or WEAVE_PRETOOLUSE_APPROVER) — \
+             without an approver every dangerous tool is DENIED (deny-by-default)."
+        );
     }
     Ok(())
 }
@@ -418,27 +441,32 @@ fn is_shellish(c: char) -> bool {
 /// a shell-operator-free absolute path. See [`is_clean_unquoted_prefix`].
 fn is_weave_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
-    ["session", "prompt", "stop", "wake"].iter().any(|event| {
-        // Quoted form: '<exe>' hook <event>, where <exe> ends in (…/)weave.
-        let quoted_suffix = format!("weave' hook {event}");
-        if let Some(prefix) = cmd.strip_suffix(&quoted_suffix) {
-            // `prefix` is everything up to and including the opening quote and the
-            // path before `weave`. It must be `'…/` or `'` (bare) with a clean,
-            // operator-free absolute path inside the quotes.
-            if let Some(inner) = prefix.strip_prefix('\'') {
-                // No stray unescaped quote may appear inside the path.
-                return is_clean_quoted_inner(inner);
+    // `pretooluse` is the WL-055 opt-in event; recognizing it here is what lets
+    // `prune_hooks_at` (uninstall) and the merge idempotency rule treat the
+    // PreToolUse hook as weave's own across all events.
+    ["session", "prompt", "stop", "wake", "pretooluse"]
+        .iter()
+        .any(|event| {
+            // Quoted form: '<exe>' hook <event>, where <exe> ends in (…/)weave.
+            let quoted_suffix = format!("weave' hook {event}");
+            if let Some(prefix) = cmd.strip_suffix(&quoted_suffix) {
+                // `prefix` is everything up to and including the opening quote and the
+                // path before `weave`. It must be `'…/` or `'` (bare) with a clean,
+                // operator-free absolute path inside the quotes.
+                if let Some(inner) = prefix.strip_prefix('\'') {
+                    // No stray unescaped quote may appear inside the path.
+                    return is_clean_quoted_inner(inner);
+                }
+                return false;
             }
-            return false;
-        }
 
-        // Legacy unquoted form: <exe> hook <event>.
-        let suffix = format!("weave hook {event}");
-        match cmd.strip_suffix(&suffix) {
-            Some(prefix) => is_clean_unquoted_prefix(prefix),
-            None => false,
-        }
-    })
+            // Legacy unquoted form: <exe> hook <event>.
+            let suffix = format!("weave hook {event}");
+            match cmd.strip_suffix(&suffix) {
+                Some(prefix) => is_clean_unquoted_prefix(prefix),
+                None => false,
+            }
+        })
 }
 
 /// Validate the path that appears inside the single quotes of the quoted hook
@@ -534,6 +562,95 @@ fn merge_hooks_at(path: &Path, exe: &str) -> Result<Vec<String>> {
         )
     })?;
     verify_settings_merged(&written, &foreign_before, exe)?;
+
+    Ok(added)
+}
+
+/// WL-055: the PreToolUse matcher weave installs — the dangerous host tools the
+/// enforcing approval gate watches. Unlike weave's other hooks (matcher `""`),
+/// PreToolUse is structurally per-tool, so this entry carries a NON-EMPTY matcher.
+const PRETOOLUSE_MATCHER: &str = "Bash|Edit|Write";
+
+/// Merge weave's enforcing PreToolUse hook into Claude's settings.json idempotently.
+/// Thin wrapper over [`merge_pretooluse_hook_at`] at [`settings_path`].
+fn merge_pretooluse_hook(exe: &str) -> Result<bool> {
+    merge_pretooluse_hook_at(&settings_path(), exe)
+}
+
+/// Merge the opt-in `hooks.PreToolUse` entry (`{matcher:"Bash|Edit|Write", hooks:[
+/// {type:"command", command:"<exe> hook pretooluse"}]}`) into the Claude-shaped
+/// settings file at `path`, with the SAME never-clobber-foreign + idempotent +
+/// atomic + read-back-verify discipline as [`merge_hooks_at`]. Returns `true` if a
+/// PreToolUse entry was newly added/healed, `false` if it was already correct.
+///
+/// PreToolUse differs structurally from the matcher-empty events: an entry MUST carry
+/// the tool matcher. So this writer (a) preserves a present non-weave matcher entry
+/// untouched, and (b) when adding/healing the weave command, writes it under an entry
+/// whose matcher is [`PRETOOLUSE_MATCHER`]. Idempotency keys on `is_weave_command`
+/// (so a stale exe path is healed in place), exactly like `merge_hooks_at`.
+fn merge_pretooluse_hook_at(path: &Path, exe: &str) -> Result<bool> {
+    let mut settings = read_json(path)?;
+    let foreign_before = foreign_commands(&settings);
+
+    let root = settings
+        .as_object_mut()
+        .context("settings root is not an object")?;
+    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        anyhow::bail!("`hooks` is not an object in {}", path.display());
+    }
+    let hooks = hooks.as_object_mut().unwrap();
+
+    let command = hook_command(exe, "pretooluse");
+
+    let entries = hooks
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| json!([]));
+    if !entries.is_array() {
+        anyhow::bail!("hooks.PreToolUse is not an array in {}", path.display());
+    }
+    let entries = entries.as_array_mut().unwrap();
+
+    // Heal a stale weave command in place; otherwise append our matcher-bearing entry.
+    let added = if let Some(existing) = find_weave_command_mut(entries) {
+        if existing.as_str() == Some(command.as_str()) {
+            false // already correct.
+        } else {
+            *existing = json!(command);
+            true
+        }
+    } else {
+        entries.push(json!({
+            "matcher": PRETOOLUSE_MATCHER,
+            "hooks": [ { "type": "command", "command": command } ]
+        }));
+        true
+    };
+
+    write_json_atomic(path, &settings)?;
+
+    // Read-back verify: re-open, re-parse, confirm OUR command landed and no foreign
+    // hook was clobbered. Mirrors the WL-041 merge contract.
+    let written = read_json(path).with_context(|| {
+        format!(
+            "{} read-back verification failed: cannot re-read after PreToolUse merge \
+             (recover from the .weave.bak snapshot)",
+            path.display()
+        )
+    })?;
+    if !has_weave_command_for(&written, exe, "pretooluse") {
+        anyhow::bail!(
+            "settings.json read-back verification failed: weave PreToolUse hook is missing \
+             or does not point at `{exe}` after the merge (recover from settings.json.weave.bak)"
+        );
+    }
+    let foreign_after = foreign_commands(&written);
+    if let Some(lost) = foreign_before.difference(&foreign_after).next() {
+        anyhow::bail!(
+            "settings.json read-back verification failed: a pre-existing foreign hook was \
+             lost during the PreToolUse merge: `{lost}` (recover from settings.json.weave.bak)"
+        );
+    }
 
     Ok(added)
 }
@@ -1341,12 +1458,27 @@ fn uninstall_aider() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        aider_stanza, codex_notify_line, foreign_commands, hook_command, is_weave_command,
-        merge_aider_stanza, merge_codex_notify, prune_aider_stanza, prune_codex_notify,
+        aider_stanza, codex_notify_line, foreign_commands, has_weave_command_for, hook_command,
+        is_weave_command, merge_aider_stanza, merge_codex_notify, merge_hooks_at,
+        merge_pretooluse_hook_at, prune_aider_stanza, prune_codex_notify, prune_hooks_at,
         shell_single_quote, verify_codex_notify_present, verify_git_hook_written,
-        verify_settings_merged, verify_settings_pruned, AIDER_MARKER,
+        verify_settings_merged, verify_settings_pruned, AIDER_MARKER, PRETOOLUSE_MATCHER,
     };
     use serde_json::json;
+
+    /// A fresh unique temp settings.json path for a HOME-independent test.
+    fn tmp_settings(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-ut-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
 
     #[test]
     fn matches_only_real_weave_hooks() {
@@ -1702,5 +1834,194 @@ mod tests {
         let (again, removed2) = prune_aider_stanza(&pruned);
         assert!(!removed2);
         assert_eq!(again, pruned);
+    }
+
+    // ── WL-055: PreToolUse opt-in gate setup wiring ───────────────────────────
+
+    /// Read the inner `command` strings under a given event in a settings file.
+    fn commands_under(path: &std::path::Path, event: &str) -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        if let Some(entries) = v
+            .pointer(&format!("/hooks/{event}"))
+            .and_then(|e| e.as_array())
+        {
+            for entry in entries {
+                if let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) {
+                    for h in inner {
+                        if let Some(c) = h.get("command").and_then(|c| c.as_str()) {
+                            out.push(c.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pretooluse_merge_writes_matcher_bearing_entry_and_read_back_verifies() {
+        let path = tmp_settings("pretooluse-write");
+        let exe = "/home/u/.cargo/bin/weave";
+        // A pre-existing FOREIGN PreToolUse hook (a different matcher) must survive.
+        std::fs::write(
+            &path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [ { "type": "command", "command": "/usr/bin/audit run" } ] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let added = merge_pretooluse_hook_at(&path, exe).unwrap();
+        assert!(added, "first merge installs the PreToolUse hook");
+
+        // Read-back: weave's command landed and points at exe.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(has_weave_command_for(&written, exe, "pretooluse"));
+
+        // The weave entry carries the documented matcher; the foreign one survives.
+        let entries = written
+            .pointer("/hooks/PreToolUse")
+            .and_then(|e| e.as_array())
+            .unwrap();
+        let weave_entry = entries
+            .iter()
+            .find(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(is_weave_command)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("weave PreToolUse entry present");
+        assert_eq!(
+            weave_entry.get("matcher").and_then(|m| m.as_str()),
+            Some(PRETOOLUSE_MATCHER)
+        );
+        // Foreign hook preserved untouched.
+        assert!(commands_under(&path, "PreToolUse").contains(&"/usr/bin/audit run".to_string()));
+
+        // Idempotent: a second merge is a no-op (no duplicate entry).
+        let added2 = merge_pretooluse_hook_at(&path, exe).unwrap();
+        assert!(!added2, "second merge is idempotent");
+        let weave_cmds: Vec<_> = commands_under(&path, "PreToolUse")
+            .into_iter()
+            .filter(|c| is_weave_command(c))
+            .collect();
+        assert_eq!(weave_cmds.len(), 1, "exactly one weave PreToolUse command");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn pretooluse_merge_heals_a_stale_exe_path_in_place() {
+        let path = tmp_settings("pretooluse-heal");
+        // A weave PreToolUse hook pointing at an OLD/moved exe path.
+        std::fs::write(
+            &path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": PRETOOLUSE_MATCHER, "hooks": [
+                            { "type": "command", "command": "'/old/path/weave' hook pretooluse" }
+                        ] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let exe = "/new/path/weave";
+        let added = merge_pretooluse_hook_at(&path, exe).unwrap();
+        assert!(added, "stale path is healed (reported as a change)");
+        let cmds: Vec<_> = commands_under(&path, "PreToolUse")
+            .into_iter()
+            .filter(|c| is_weave_command(c))
+            .collect();
+        assert_eq!(cmds.len(), 1, "healed in place, not duplicated");
+        assert_eq!(cmds[0], hook_command(exe, "pretooluse"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_setup_does_not_write_pretooluse_then_optin_does_then_uninstall_prunes() {
+        let path = tmp_settings("pretooluse-default");
+        let exe = "/bin/weave";
+
+        // DEFAULT setup = the four standing hooks, NO PreToolUse (regression guard).
+        merge_hooks_at(&path, exe).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            written.pointer("/hooks/PreToolUse").is_none(),
+            "default setup must NOT install PreToolUse"
+        );
+        assert!(!has_weave_command_for(&written, exe, "pretooluse"));
+
+        // Opt-in adds it alongside the four.
+        assert!(merge_pretooluse_hook_at(&path, exe).unwrap());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(has_weave_command_for(&written, exe, "pretooluse"));
+        // The four standing hooks still present.
+        assert!(has_weave_command_for(&written, exe, "session"));
+
+        // Uninstall (prune) removes EVERY weave hook, PreToolUse included.
+        let removed = prune_hooks_at(&path).unwrap();
+        assert!(removed >= 5, "pruned all five weave hooks (got {removed})");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!has_weave_command_for(&written, exe, "pretooluse"));
+        assert!(!has_weave_command_for(&written, exe, "session"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn pretooluse_uninstall_preserves_foreign_pretooluse_hook() {
+        let path = tmp_settings("pretooluse-foreign-prune");
+        let exe = "/bin/weave";
+        std::fs::write(
+            &path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [ { "type": "command", "command": "/usr/bin/audit run" } ] }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        merge_pretooluse_hook_at(&path, exe).unwrap();
+        // Prune weave; the foreign PreToolUse hook must remain.
+        prune_hooks_at(&path).unwrap();
+        let cmds = commands_under(&path, "PreToolUse");
+        assert!(cmds.contains(&"/usr/bin/audit run".to_string()));
+        assert!(!cmds.iter().any(|c| is_weave_command(c)));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn pretooluse_command_is_recognized_as_weave() {
+        // The whole prune/idempotency story hinges on this.
+        assert!(is_weave_command(
+            "'/home/u/.cargo/bin/weave' hook pretooluse"
+        ));
+        assert!(is_weave_command("/bin/weave hook pretooluse")); // legacy unquoted
+        assert!(!is_weave_command("/usr/bin/audit hook pretooluse")); // foreign
     }
 }

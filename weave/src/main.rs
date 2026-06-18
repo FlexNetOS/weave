@@ -3,7 +3,8 @@
 //! Subcommands:
 //!   weave mcp            run the MCP stdio server (register with `claude mcp add`)
 //!   weave setup          wire weave into a coding-agent host (MCP + hooks);
-//!                        --provider <claude|codex|gemini|aider> (default claude)
+//!                        --provider <claude|codex|gemini|aider> (default claude);
+//!                        --pretooluse also installs the enforcing PreToolUse gate (Claude)
 //!   weave uninstall      remove weave's host wiring (--provider <…>, default claude)
 //!   weave send           send a message (CLI; --to-store deposits a cross-store intent)
 //!   weave outbox         list pending cross-store intents (Tier-2)
@@ -22,7 +23,7 @@
 //!   weave config init    scaffold a commented ~/.config/weave/config.toml
 //!   weave completions    print a shell completion script (bash|zsh|fish)
 //!   weave man            print a roff man page to stdout
-//!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|wake|notification
+//!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|wake|notification|pretooluse
 //!   weave harness        dry-run/run autonomous orchestration harnesses (Codex 7-layer)
 
 // The MCP `tools()` registry is a single large `json!([...])` literal; each added
@@ -194,6 +195,12 @@ enum Cmd {
         /// Also install the git pre-commit hook in the current repo.
         #[arg(long)]
         git_hooks: bool,
+        /// WL-055: ALSO install the enforcing PreToolUse approval gate (Claude only;
+        /// matcher `Bash|Edit|Write`). Default OFF so it never surprise-blocks. With
+        /// it on, set `pretooluse_approver` (or WEAVE_PRETOOLUSE_APPROVER) — without an
+        /// approver every dangerous tool is DENIED (deny-by-default).
+        #[arg(long)]
+        pretooluse: bool,
     },
     /// Remove weave's host wiring (`--provider` selects the host; default claude).
     Uninstall {
@@ -781,7 +788,10 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Claude Code lifecycle hook: session|prompt|stop|wake|notification (reads JSON on stdin).
+    /// Claude Code lifecycle hook: session|prompt|stop|wake|notification|pretooluse
+    /// (reads JSON on stdin). `pretooluse` is the WL-055 enforcing approval gate: it
+    /// emits a `permissionDecision` (allow|deny|defer) on stdout — deny-by-default for
+    /// dangerous tools unless an approver answers `approve` within the internal timeout.
     Hook {
         event: String,
         /// Enable blocking wake on stop: drain inbox, mark read, and emit a
@@ -2863,9 +2873,10 @@ fn main() -> Result<()> {
         Cmd::Setup {
             provider,
             git_hooks,
+            pretooluse,
         } => {
             let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-            setup::run_provider(&exe, (*provider).into())?;
+            setup::run_provider(&exe, (*provider).into(), *pretooluse)?;
             if *git_hooks {
                 setup::install_git_precommit_hook(&exe)?;
             }
@@ -6322,9 +6333,267 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
         "notification" => {
             set_turn_state_best_effort(store, &me, model::TurnState::AwaitingInput);
         }
+        // WL-055: PreToolUse approval gate. Distinct codepath (`handle_pretooluse_hook`)
+        // because the contract differs from the other hooks: it reads its OWN stdin
+        // JSON shape (`tool_name`/`tool_input`), emits a `hookSpecificOutput`
+        // permission decision to stdout as PURE JSON, and must FAIL CLOSED (deny) on
+        // any ambiguity for a dangerous tool. We re-route here BEFORE this arm's
+        // `me`/inbox handling so the PreToolUse drain never marks an inbox read.
+        "pretooluse" => {
+            // The generic `handle_hook` body above already consumed stdin into `v`;
+            // pass the parsed payload + parse-ok flag straight through.
+            return handle_pretooluse_hook(store, cfg, &v, payload_ok);
+        }
         other => eprintln!("[weave] unknown hook event: {other}"),
     }
     Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WL-055 — the enforcing PreToolUse approval gate.
+//
+// weave already had the approval *primitive* (the `weave_ask_permission` /
+// `weave answer … approve` ToolPermission ask + the read-time `permission_verdict`,
+// and the `DANGEROUS_TOOLS` list), but installed NO PreToolUse hook, so nothing ever
+// *blocked* a tool call. This drain closes that gap: it is the command Claude runs
+// for `hooks.PreToolUse`, and it raises a BLOCKING approval on the existing
+// machinery, emitting Claude's `permissionDecision`.
+//
+// Contract (Claude Code, verified): stdin carries `{tool_name, tool_input, …}`. To
+// DENY, stdout is `{"hookSpecificOutput":{"hookEventName":"PreToolUse",
+// "permissionDecision":"deny","permissionDecisionReason":"…"}}` and we exit 0.
+// `permissionDecision ∈ allow|deny|ask|defer`. The hook FAILS OPEN (Claude's 600s
+// default timeout lets the tool proceed on timeout), so this drain enforces its OWN
+// short internal timeout (`Config::pretooluse_timeout`) and emits an explicit `deny`
+// — it NEVER relies on Claude's timeout. stdout is PURE JSON (no banner noise; all
+// diagnostics go to stderr).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Claude-native tools the matcher (`Bash|Edit|Write`) routes to this gate. weave's
+/// own `DANGEROUS_TOOLS` list (`weave_*`) does not name these host tools, so we treat
+/// the matched filesystem/shell mutators as dangerous here too. The PreToolUse
+/// *matcher* already narrows which tools reach the drain; this is the in-drain
+/// confirmation so a mis-registered (over-broad) matcher still can't sneak a benign
+/// read-only tool into a blocking ask, and a future widened matcher fails closed only
+/// for genuinely dangerous tools.
+const PRETOOLUSE_NATIVE_DANGEROUS: &[&str] =
+    &["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Is `tool` one the PreToolUse gate must block on? Reuses weave's existing
+/// `is_dangerous_tool` (the `weave_*` MCP tools) and adds the Claude-native mutators
+/// the matcher routes here. Case-sensitive on the native set (Claude tool names are
+/// fixed PascalCase).
+fn pretooluse_is_dangerous(tool: &str) -> bool {
+    weave_mcp::mcp::is_dangerous_tool(tool) || PRETOOLUSE_NATIVE_DANGEROUS.contains(&tool)
+}
+
+/// Build the pure-JSON PreToolUse response for `decision` (allow|deny|defer|ask) with
+/// `reason`. This is the ONLY thing that must reach stdout.
+fn pretooluse_response(decision: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    })
+}
+
+/// Emit a PreToolUse decision as pure JSON on stdout and return `Ok(())` (exit 0).
+fn emit_pretooluse(decision: &str, reason: &str) -> Result<()> {
+    println!("{}", pretooluse_response(decision, reason));
+    Ok(())
+}
+
+/// The enforcing PreToolUse drain (WL-055). `v` is the already-parsed stdin payload
+/// (parsed tolerantly by `handle_hook`); `payload_ok` is false when stdin was empty
+/// or unparseable.
+///
+/// FAIL-OPEN on ambiguity that is NOT a dangerous tool (malformed stdin, missing
+/// `tool_name`, a non-dangerous tool) — emit `defer`/`allow` and exit 0 so we never
+/// break the user's session. FAIL-CLOSED (`deny`) for a dangerous tool whenever we
+/// cannot positively prove approval (no approver configured, deny verdict, or our own
+/// short timeout).
+fn handle_pretooluse_hook(
+    store: &dyn Store,
+    cfg: &Config,
+    v: &serde_json::Value,
+    payload_ok: bool,
+) -> Result<()> {
+    let (decision, reason) = pretooluse_decision(store, cfg, v, payload_ok);
+    emit_pretooluse(decision, &reason)
+}
+
+/// The pure decision core of the PreToolUse gate: given the parsed stdin payload,
+/// return `(permissionDecision, reason)`. Side effects are confined to the store
+/// (opening/polling the approval ask) and a best-effort live nudge — never stdout, so
+/// this is unit-testable. `handle_pretooluse_hook` is the thin stdout-emitting shell.
+fn pretooluse_decision(
+    store: &dyn Store,
+    cfg: &Config,
+    v: &serde_json::Value,
+    payload_ok: bool,
+) -> (&'static str, String) {
+    // Tolerant parse: a garbled/empty payload means we cannot identify the tool, so
+    // we must not block — defer to Claude's normal flow (fail open).
+    if !payload_ok {
+        eprintln!("[weave] pretooluse: unparseable/empty stdin; deferring (fail-open)");
+        return (
+            "defer",
+            "weave: no parseable PreToolUse payload".to_string(),
+        );
+    }
+    let Some(tool_name) = v.get("tool_name").and_then(|x| x.as_str()) else {
+        eprintln!("[weave] pretooluse: no tool_name in payload; deferring (fail-open)");
+        return (
+            "defer",
+            "weave: no tool_name in PreToolUse payload".to_string(),
+        );
+    };
+
+    // Not a dangerous tool → passthrough (defer; let Claude's own permission flow
+    // decide). The gate only ever blocks dangerous tools.
+    if !pretooluse_is_dangerous(tool_name) {
+        return ("defer", format!("weave: '{tool_name}' is not gated"));
+    }
+
+    // Dangerous tool. DENY-BY-DEFAULT unless we can positively prove an approval.
+    let Some(approver) = cfg.pretooluse_approver() else {
+        eprintln!(
+            "[weave] pretooluse: dangerous tool '{tool_name}' but no approver configured \
+             (set `pretooluse_approver` / WEAVE_PRETOOLUSE_APPROVER); DENYING"
+        );
+        return (
+            "deny",
+            format!(
+                "weave: '{tool_name}' requires approval but no approver is configured \
+                 (deny-by-default)"
+            ),
+        );
+    };
+    if model::is_broadcast(approver) {
+        // A tracked ask is point-to-point; a broadcast approver can never resolve.
+        eprintln!("[weave] pretooluse: approver '{approver}' is the broadcast id; DENYING");
+        return (
+            "deny",
+            "weave: approver must be a single peer, not broadcast (deny-by-default)".to_string(),
+        );
+    }
+
+    // Identify the requesting session (this hook's own identity) as the asker. A
+    // guessed/empty identity is fine here — the ask still resolves; the askee (the
+    // approver) is what matters for the verdict.
+    let cwd = v.get("cwd").and_then(|x| x.as_str());
+    let from = resolve_me(None, cwd, cfg);
+    let from = if from.is_empty() || from == "unknown" {
+        "weave-pretooluse".to_string()
+    } else {
+        from
+    };
+
+    // Summarize the tool input for the human approver, capped so a huge diff/body can
+    // never bloat the ask. `options` carries the structured `tool\nargs` the existing
+    // permission tooling expects (mirrors `tool_ask_permission`).
+    let tool_input = v
+        .get("tool_input")
+        .map(|ti| ti.to_string())
+        .unwrap_or_default();
+    let args_preview: String = tool_input.chars().take(400).collect();
+    let options = format!("{tool_name}\n{args_preview}");
+    let body = format!(
+        "PreToolUse approval: session '{from}' wants to run '{tool_name}'. \
+         Reply `approve` to allow, anything else to deny."
+    );
+
+    let (cid, _qid) = match store.ask(
+        &from,
+        approver,
+        Some("PreToolUse approval"),
+        &body,
+        model::AskKind::ToolPermission,
+        Some(&options),
+        None,
+    ) {
+        Ok(ok) => ok,
+        Err(e) => {
+            // We could not even open the ask → we cannot prove approval → DENY.
+            eprintln!("[weave] pretooluse: failed to open approval ask ({e}); DENYING");
+            return (
+                "deny",
+                "weave: could not raise the approval request (deny-by-default)".to_string(),
+            );
+        }
+    };
+
+    // Fire the caller-side live nudge to the approver (best-effort; no store->inject
+    // edge). If they're not injectable the ask still waits in their inbox — they can
+    // approve on their next turn within our timeout window.
+    let verdict = ask_inject_verdict(store, cfg, &from, approver, &body);
+    eprintln!(
+        "[weave] pretooluse: opened approval ask {cid} ({from} -> {approver}, {verdict}); \
+         waiting up to {}s",
+        cfg.pretooluse_timeout()
+    );
+
+    // Block (with our OWN short timeout) polling the EXISTING read-time verdict until
+    // it leaves Pending. Approve ⇒ allow; deny/timeout ⇒ deny (fail closed).
+    let status = pretooluse_wait_for_verdict(store, &cid, cfg.pretooluse_timeout());
+    match status {
+        model::PermissionStatus::Approved => {
+            eprintln!("[weave] pretooluse: approved (ask {cid}); ALLOWING '{tool_name}'");
+            ("allow", format!("weave: approved by '{approver}'"))
+        }
+        model::PermissionStatus::Denied => {
+            eprintln!("[weave] pretooluse: denied (ask {cid}); DENYING '{tool_name}'");
+            ("deny", format!("weave: denied by '{approver}'"))
+        }
+        model::PermissionStatus::Timeout | model::PermissionStatus::Pending => {
+            // Timeout (or still pending at our deadline) ⇒ DENY-BY-DEFAULT. Claude's
+            // own timeout would have failed OPEN, so we MUST emit deny ourselves.
+            eprintln!(
+                "[weave] pretooluse: no approval within {}s (ask {cid}); DENYING '{tool_name}'",
+                cfg.pretooluse_timeout()
+            );
+            (
+                "deny",
+                format!("weave: no approval from '{approver}' within timeout (deny-by-default)"),
+            )
+        }
+    }
+}
+
+/// Poll the EXISTING `permission_verdict` for ask `cid` until it leaves `Pending` or
+/// `timeout_secs` elapses, then return the final status. The verdict is derived at
+/// read time (`model::permission_status`), so a fresh `weave answer … approve`/`deny`
+/// is observed on the next poll. We pass `timeout_secs` so the store's own
+/// open-age→Timeout transition lines up with our wall-clock deadline. A store error
+/// on a poll is logged and treated as still-pending (fail closed at the deadline).
+fn pretooluse_wait_for_verdict(
+    store: &dyn Store,
+    cid: &str,
+    timeout_secs: i64,
+) -> model::PermissionStatus {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(0) as u64);
+    let poll = std::time::Duration::from_millis(250);
+    loop {
+        match store.permission_verdict(cid, timeout_secs) {
+            Ok((model::PermissionStatus::Pending, _)) => {}
+            Ok((status, _)) => return status, // Approved | Denied | Timeout — terminal here.
+            Err(e) => {
+                eprintln!("[weave] pretooluse: verdict poll error (treating as pending): {e}");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Resolve once more so an answer that landed in the last poll window is
+            // honored; otherwise this is a Timeout (deny).
+            return match store.permission_verdict(cid, timeout_secs) {
+                Ok((status, _)) => status,
+                Err(_) => model::PermissionStatus::Timeout,
+            };
+        }
+        std::thread::sleep(poll);
+    }
 }
 
 /// Best-effort turn_state update for the hook hot path (P5). The setter targets the
@@ -6680,6 +6949,195 @@ mod tests {
         set_turn_state_best_effort(&ro, "a", model::TurnState::Working);
         // The failed write was a no-op (the row is untouched).
         assert_eq!(ro.get_peer("a").unwrap().unwrap().turn_state, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── WL-055: enforcing PreToolUse approval-gate drain logic ────────────────
+
+    #[cfg(feature = "sqlite")]
+    fn pretooluse_test_store(tag: &str) -> (store::SqliteStore, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-pretooluse-{tag}-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        (store::SqliteStore::open(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn pretooluse_native_dangerous_predicate() {
+        // Claude-native mutators are gated; weave's own dangerous MCP tools too.
+        assert!(pretooluse_is_dangerous("Bash"));
+        assert!(pretooluse_is_dangerous("Edit"));
+        assert!(pretooluse_is_dangerous("Write"));
+        assert!(pretooluse_is_dangerous("weave_spawn_peer"));
+        // Read-only / benign tools are NOT gated.
+        assert!(!pretooluse_is_dangerous("Read"));
+        assert!(!pretooluse_is_dangerous("Glob"));
+        assert!(!pretooluse_is_dangerous("weave_inbox"));
+    }
+
+    #[test]
+    fn pretooluse_response_is_pure_decision_json() {
+        let v = pretooluse_response("deny", "nope");
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/hookEventName")
+                .and_then(|x| x.as_str()),
+            Some("PreToolUse")
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|x| x.as_str()),
+            Some("deny")
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecisionReason")
+                .and_then(|x| x.as_str()),
+            Some("nope")
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_malformed_stdin_fails_open() {
+        let (s, dir) = pretooluse_test_store("malformed");
+        let cfg = Config::default();
+        // payload_ok=false ⇒ defer (never break the session).
+        let (decision, _) = pretooluse_decision(&s, &cfg, &serde_json::json!({}), false);
+        assert_eq!(decision, "defer");
+        // missing tool_name ⇒ also defer.
+        let (decision, _) = pretooluse_decision(&s, &cfg, &serde_json::json!({"cwd": "/x"}), true);
+        assert_eq!(decision, "defer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_safe_tool_defers() {
+        let (s, dir) = pretooluse_test_store("safe");
+        // even WITH an approver configured…
+        let cfg = Config {
+            pretooluse_approver: Some("approver".to_string()),
+            ..Config::default()
+        };
+        let v = serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}});
+        let (decision, _) = pretooluse_decision(&s, &cfg, &v, true);
+        assert_eq!(decision, "defer"); // …a non-dangerous tool is never blocked.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_dangerous_no_approver_denies() {
+        let (s, dir) = pretooluse_test_store("noapprover");
+        let cfg = Config::default(); // no approver configured.
+        let v = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}});
+        let (decision, reason) = pretooluse_decision(&s, &cfg, &v, true);
+        assert_eq!(decision, "deny", "deny-by-default with no approver");
+        assert!(reason.contains("no approver"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_dangerous_denies_on_timeout() {
+        let (s, dir) = pretooluse_test_store("timeout");
+        let cfg = Config {
+            pretooluse_approver: Some("approver".to_string()),
+            pretooluse_timeout_secs: Some(1), // clamps to the 1s floor.
+            ..Config::default()
+        };
+        let v = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "id"}});
+        // No one answers ⇒ the drain's own short timeout fires ⇒ DENY (fail closed),
+        // never relying on Claude's fail-open 600s.
+        let (decision, reason) = pretooluse_decision(&s, &cfg, &v, true);
+        assert_eq!(decision, "deny");
+        assert!(reason.contains("within timeout"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_dangerous_allows_on_approve() {
+        let (s, dir) = pretooluse_test_store("approve");
+        let path = dir.join("t.db");
+        let cfg = Config {
+            pretooluse_approver: Some("approver".to_string()),
+            pretooluse_timeout_secs: Some(5), // ample room for the approver thread.
+            ..Config::default()
+        };
+
+        // A background "approver": poll for the freshly-opened ask and answer it
+        // `approve` (a real second-session response over the same store).
+        let approver_path = path.clone();
+        let h = std::thread::spawn(move || {
+            let approver = store::SqliteStore::open(&approver_path).unwrap();
+            for _ in 0..200 {
+                let asks = approver
+                    .list_asks("approver", model::AskRole::Askee, 10)
+                    .unwrap_or_default();
+                if let Some(a) = asks
+                    .iter()
+                    .find(|a| a.kind == model::AskKind::ToolPermission)
+                {
+                    approver.answer("approver", &a.id, "approve").unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("approver never saw the PreToolUse ask");
+        });
+
+        let v = serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "/tmp/x"}});
+        let (decision, reason) = pretooluse_decision(&s, &cfg, &v, true);
+        h.join().unwrap();
+        assert_eq!(
+            decision, "allow",
+            "an approve verdict ⇒ allow (reason: {reason})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pretooluse_dangerous_denies_on_explicit_deny() {
+        let (s, dir) = pretooluse_test_store("explicit-deny");
+        let path = dir.join("t.db");
+        let cfg = Config {
+            pretooluse_approver: Some("approver".to_string()),
+            pretooluse_timeout_secs: Some(5),
+            ..Config::default()
+        };
+
+        let approver_path = path.clone();
+        let h = std::thread::spawn(move || {
+            let approver = store::SqliteStore::open(&approver_path).unwrap();
+            for _ in 0..200 {
+                let asks = approver
+                    .list_asks("approver", model::AskRole::Askee, 10)
+                    .unwrap_or_default();
+                if let Some(a) = asks
+                    .iter()
+                    .find(|a| a.kind == model::AskKind::ToolPermission)
+                {
+                    // Anything other than "approve" ⇒ a Denied verdict.
+                    approver.answer("approver", &a.id, "no").unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("approver never saw the PreToolUse ask");
+        });
+
+        let v = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "id"}});
+        let (decision, _) = pretooluse_decision(&s, &cfg, &v, true);
+        h.join().unwrap();
+        assert_eq!(decision, "deny", "an explicit non-approve answer ⇒ deny");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -67,7 +67,7 @@ tracked.
 | `broadcast` (fan-out to circle) | `weave_send --to all`, `weave_broadcast_notify`, `weave_broadcast_ask` | 🟢 SUPERSET | broadcast **ask** too (WL-027), not just notify |
 | `ask_many` / `ask_many_result` | `weave_ask_many` / `weave_ask_many_result` | ✅ HAVE | `ask_groups` parent-id correlation |
 | Reminder injection (unacked asks resurface) | prompt-hook reminder nudge | ✅ HAVE | WL-014 |
-| Structured tool-approval questions | `weave_ask_permission` + `weave_permission_*` | ✅ HAVE | WL-021 (advisory approval primitive: ask + deny-on-timeout; NO PreToolUse hook event installed — not an enforcing gate. Tracked: WL-055) |
+| Structured tool-approval questions | `weave_ask_permission` + `weave_permission_*` | ✅ HAVE | WL-021 + **WL-055** (enforcing PreToolUse hook, opt-in via `weave setup --pretooluse`) |
 | Message supersede / successor chains (atm-core) | `weave send --supersedes <id>` / `weave_send {supersedes}` | ✅ HAVE | **WL-037**; additive `messages.superseded_by` (both backends); hide-from-unread, flag-in-history; sender-only authz |
 | Idle notification dedup (atm-core) | `weave notify --dedup-idle` / `weave_notify {dedupIdle}` | ✅ HAVE | **WL-039**; reuses `messages.superseded_by`; eligible only on `kind='idle'` rows + same (sender,recipient) + unread; sender-scoped; additive nullable `messages.kind` (both backends); never dedups a real message or another sender's pings |
 | Ephemeral messages / TTL auto-sweep (atm-core) | `weave send --ttl <secs>` / `weave_send {ttl}` | ✅ HAVE | **WL-038**; additive nullable `messages.expires_at` (both backends); delete-on-sweep via `gc()` fold-in + opportunistic `sweep_expired_messages`; TTL-capped (`MAX_MSG_TTL_SECS = 86400`); cross-store via `outbox.ttl` |
@@ -124,7 +124,7 @@ tracked.
 |---|---|---|---|
 | Bearer token auth (HTTP/WS/hooks) | bearer-auth HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
 | Spawn allowlists (`daemon.spawn.allowed_paths`) | `spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS` + `trusted_dirs()` (two-layer gate) | ✅ HAVE | **WL-047**; cwd allowlist (deny-by-default, MCP hard-deny) + trusted child `argv[0]` |
-| PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` | 🔶 PARTIAL | approval primitive present + tested, but weave installs only SessionStart/UserPromptSubmit/Stop/SubagentStop hooks — there is NO PreToolUse hook, so nothing BLOCKS a tool call (repowire's was enforcing). Enforcing gate tracked: WL-055 |
+| PreToolUse tool approval | `weave_ask_permission` / `weave_permission_*` **+ an enforcing PreToolUse hook** (`weave hook pretooluse`) | ✅ HAVE (enforcing, opt-in via `weave setup --pretooluse`) | WL-021 (primitive) + **WL-055** — the CLI drain raises a blocking approval on the existing ToolPermission machinery; **deny-by-default** (no approver / deny / its own short timeout ⇒ `permissionDecision:"deny"`), fail-CLOSED with weave's own short timeout (never relies on Claude's fail-open 600s). Claude-only, matcher `Bash|Edit|Write`; default OFF so it never surprise-blocks. `main.rs::handle_pretooluse_hook`, `setup.rs::merge_pretooluse_hook_at`, config `pretooluse_approver`/`pretooluse_timeout_secs`. No new standing MCP tool. |
 | Post-send hooks (atm-core `[[post_send_hook]]`) | config `[[post_send_hook]]` (CLI/MCP send/notify/ack) | ✅ HAVE | **WL-036**; argv-only/no-shell, `argv[0]` trusted-dir, message fields env-only (body never exported), bounded/fault-isolated; no new standing tool |
 | CORS restricted to localhost | localhost-only HTTP surface | ✅ HAVE | WL-022 |
 | **No E2E encryption on relay (acknowledged gap)** | no relay at all; ed25519 signed identity + owner-only cross-store pull | 🟢 SUPERSET | `sign.rs`; closes repowire's own acknowledged weakness |
@@ -182,6 +182,7 @@ capability repowire's hosted relay never provided, and one weave delivers
 | Wire repowire's remaining agent-runtimes | *(candidate WL)* | Antigravity, OpenCode, Pi (weave currently wires Claude/Codex/Gemini/Aider) |
 | ~~Governed web reach (beyond repowire)~~ | **WL-049** ✅ done | ADR-0002 (accepted) — obscura-as-capability via spawn-and-speak MCP client, `weave_web`/`weave web`, deny-by-default + SSRF-guarded, no V8/tokio in core (§7, §9) |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
+| ~~Enforcing PreToolUse approval gate~~ | **WL-055** ✅ done | the approval *primitive* (WL-021) now has a real PreToolUse hook that BLOCKS dangerous tools: `weave hook pretooluse` drain (deny-by-default, fail-closed, own short timeout) + opt-in `weave setup --pretooluse` wiring (matcher `Bash\|Edit\|Write`, never-clobber-foreign, read-back-verified). No new standing tool (§7) |
 
 **Net:** with agent spawn/kill shipped (WL-047), weave supersets repowire on every
 dimension except the human surfaces, which are tracked and in scope. The audit
