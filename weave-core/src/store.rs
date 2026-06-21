@@ -1975,6 +1975,23 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(exists)
 }
 
+/// True if `e`'s chain is a transient SQLite "database is locked" (SQLITE_BUSY).
+///
+/// Even with `busy_timeout` set, concurrent multi-process open — every starting
+/// `weave` runs the idempotent open-time SCHEMA + `migrate()` writes — can still
+/// surface an immediate lock instead of waiting, so we retry the whole open at the
+/// app layer (see [`SqliteStore::open`]).
+#[cfg(feature = "sqlite")]
+fn is_db_locked(e: &anyhow::Error) -> bool {
+    let mut s = String::new();
+    for cause in e.chain() {
+        s.push_str(&cause.to_string());
+        s.push('\n');
+    }
+    let s = s.to_ascii_lowercase();
+    s.contains("database is locked") || s.contains("database table is locked")
+}
+
 /// Apply additive, backward-compatible migrations to an already-open DB so that
 /// databases created by an older weave gain new columns in place. Each step is
 /// guarded by an existence check, so running this repeatedly is a no-op.
@@ -2416,6 +2433,33 @@ impl SqliteStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // The open-time SCHEMA + migrate() writes are idempotent but RACE under
+        // concurrent multi-process open: every starting `weave` runs them against
+        // the same file, and busy_timeout alone does not reliably prevent an
+        // immediate "database is locked" during the open-time migration. Retry the
+        // whole connect+migrate as a unit on that transient error — bounded, and
+        // safe to re-run because every open-time statement is idempotent.
+        let mut attempt: u32 = 0;
+        let conn = loop {
+            match Self::open_conn(path) {
+                Err(e) if is_db_locked(&e) && attempt < 200 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis((attempt as u64).min(20)));
+                }
+                other => break other?,
+            }
+        };
+        // Restrict the on-disk DB (which holds message bodies) to the owner.
+        // Done after the file is guaranteed to exist (post-open) and is
+        // best-effort so it never breaks startup on odd filesystems.
+        harden_permissions(path);
+        Ok(Self { conn })
+    }
+
+    /// Connect + apply the idempotent open-time SCHEMA and migrations. Factored out
+    /// of [`SqliteStore::open`] so the whole unit can be retried on a transient
+    /// "database is locked" from a concurrent opener.
+    fn open_conn(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(30))?;
         // journal_mode returns a row, so query rather than execute.
@@ -2423,11 +2467,7 @@ impl SqliteStore {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
-        // Restrict the on-disk DB (which holds message bodies) to the owner.
-        // Done after the file is guaranteed to exist (post-open) and is
-        // best-effort so it never breaks startup on odd filesystems.
-        harden_permissions(path);
-        Ok(Self { conn })
+        Ok(conn)
     }
 
     /// Open an EXISTING store **read-only** for Tier-1 federation. The connection
