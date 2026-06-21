@@ -58,6 +58,23 @@ use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
 use tokio::runtime::Runtime;
 
+/// True if `e`'s chain is a transient SQLite "database is locked" (SQLITE_BUSY).
+///
+/// libsql 0.9's `busy_timeout()` API (and even `PRAGMA busy_timeout`) is not
+/// reliably honored for a *local* file, so under concurrent multi-process open —
+/// every starting `weave` runs the idempotent open-time migrations — a writer can
+/// still see an immediate lock instead of waiting. We retry such writes at the app
+/// layer (mirrors the rusqlite backend's busy_timeout semantics).
+fn is_db_locked(e: &anyhow::Error) -> bool {
+    let mut s = String::new();
+    for cause in e.chain() {
+        s.push_str(&cause.to_string());
+        s.push('\n');
+    }
+    let s = s.to_ascii_lowercase();
+    s.contains("database is locked") || s.contains("database table is locked")
+}
+
 /// Same schema as `SqliteStore`. Executed statement-by-statement because the
 /// libsql remote/HTTP path runs one statement per round-trip; `execute_batch`
 /// works for local but splitting keeps both backends identical.
@@ -511,8 +528,6 @@ impl LibsqlStore {
             .build()
             .context("building tokio runtime for libsql backend")?;
 
-        let url = cfg.libsql_url.clone();
-        let token = cfg.libsql_auth_token.clone();
         let path = cfg.db_path();
         // WL-035: a local-file backend (no remote URL) snapshots from this path;
         // a remote backend has no local file (`None`).
@@ -522,7 +537,19 @@ impl LibsqlStore {
             None
         };
 
-        let (db, conn) = rt.block_on(async move {
+        // The open-time schema + migration writes are idempotent (CREATE TABLE IF
+        // NOT EXISTS / INSERT OR IGNORE / pragma-guarded ALTER), but they RACE under
+        // concurrent multi-process open: every starting `weave` process runs them
+        // against the same file, and libsql's local busy_timeout is not honored, so
+        // a concurrent opener can see an immediate "database is locked". Retry the
+        // whole connect+migrate as a unit on that transient error — bounded, and
+        // safe to re-run because every statement is idempotent.
+        let mut open_attempt: u32 = 0;
+        let (db, conn) = loop {
+            let url = cfg.libsql_url.clone();
+            let token = cfg.libsql_auth_token.clone();
+            let path = path.clone();
+            let attempt_res: Result<(Database, Connection)> = rt.block_on(async move {
             let is_remote = url.is_some();
             let db = if let Some(url) = url {
                 Builder::new_remote(url, token.unwrap_or_default())
@@ -546,6 +573,16 @@ impl LibsqlStore {
             // journal (readers and writers block each other).
             conn.busy_timeout(std::time::Duration::from_secs(30))
                 .context("setting libsql busy_timeout")?;
+            // libsql 0.9's `busy_timeout()` API does NOT reliably install a busy
+            // handler for a local-file connection: under concurrent multi-process
+            // open (each process runs the idempotent open-time migrations) the
+            // INSERT in migration #7 still fails *immediately* with "database is
+            // locked" well inside the 30s window. Setting it at the SQL layer makes
+            // the SQLite core honor it. `PRAGMA busy_timeout=N` RETURNS the applied
+            // value, so it must go through `query`, not `execute`.
+            conn.query("PRAGMA busy_timeout=30000", ())
+                .await
+                .context("setting libsql busy_timeout pragma")?;
             if !is_remote {
                 // WAL + NORMAL are only meaningful for a local file; skip them on
                 // the remote (hrana) path where they don't apply. `PRAGMA
@@ -1110,7 +1147,17 @@ impl LibsqlStore {
                 }
             }
             Ok::<_, anyhow::Error>((db, conn))
-        })?;
+            });
+            match attempt_res {
+                Err(e) if is_db_locked(&e) && open_attempt < 200 => {
+                    open_attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (open_attempt as u64).min(20),
+                    ));
+                }
+                other => break other?,
+            }
+        };
 
         Ok(Self {
             rt,
