@@ -1410,7 +1410,8 @@ keep what worked and drop the operational weight.
 | Rich presence (turn_state + description) | ❌ | ✅ (daemon registry) | ✅ **daemon-free, hook-auto + read-time TTL** |
 | Autonomous dispatch / agent-spawn | ❌ | ✅ (JobRunner daemon) | ⏳ deferred (later runner epic) |
 | Storage | libSQL DB | service state | libSQL-compatible SQLite file |
-| Cross-machine / Telegram | ❌ | ✅ | ❌ (non-goal for now) |
+| Cross-machine push | ❌ | ✅ (hosted-relay daemon) | ✅ **consent-based push (opt-in, daemon-free)** — ADR-0005 / §10 |
+| Telegram / chat bridges | ❌ | ✅ | ✅ (`--features surfaces`, poll-only) |
 
 - **mcp-broker** (`broker_send/inbox/history/sessions/clear`, libSQL, runs under
   a uv-managed CPython) proved the broker semantics weave adopts — per-reader
@@ -1835,3 +1836,58 @@ revocations` lists the log read-only.
 verify-on-commit; `main`/`mcp` depend down on both. `VerifyPolicy` lives in `store`
 in every build (inert without `sign`) so both backends' free-fn signatures are
 identical. No upward edge.
+
+### Cross-machine push (ADR-0005) — the A-initiated dual of the Tier-2 pull
+
+Tier-2 above is **pull-initiated**: A deposits a signed `Intent` in **A's own**
+`outbox`, and B's pane lights up only when **B next polls** (`prompt`/`stop` hook,
+`weave watch`, `weave pull`). WL-056 adds the missing capability — **latency-free
+remote delivery**: a sender A on machine 1 delivers to B on machine 2 and **B's pane
+lights up without B polling first** — *without* breaking any non-negotiable.
+
+The key insight: **push is the A-initiated dual of the same pull-commit pipeline**,
+not a second delivery path. The receive side is exactly a Tier-2 pull-commit, just
+*triggered by A's HTTP request instead of B's poll*:
+
+- **Receive = `weave_push`, a write action on the existing `--features surfaces`
+  HTTP surface.** The WL-052a `POST /api` action set (the same bearer-gated surface
+  that routes mutating ops through the shared `dispatch_request`) gains a `weave_push`
+  op carrying the wire form of an `Intent` (`{from, to, body, sig?, to_host?,
+  subject?, idempotency_key?, trace_id?, priority?, ttl?}`). No new socket, no new
+  listener, no always-on process. B has a receive path **iff** B runs `weave
+  dashboard --write` (opt-in, `--features surfaces`-gated, default OFF).
+- **The handler is the Tier-2 commit, verbatim.** `tool_push` parses the body into
+  an `Intent`, builds the receiver's `VerifyPolicy` from `Config` exactly as the pull
+  path does, and commits via the **existing** `store::commit_pulled(store, me,
+  "push:<from>", &policy, vec![intent])` — re-validation, signature verification
+  (`verify_pulled_intent` → `sign::verify_intent`), `Store::send` (B assigns id/ts),
+  and `idempotency_key` dedup are all inherited unchanged. On `committed == 1` it
+  fires the existing caller-side consent nudge (the `nudge_pulled` seam) into **B's
+  own** pane. **A never writes B's store; A never touches B's pane** — only *who
+  triggers* the commit changes (A's request vs B's poll), never *who performs* it.
+- **Send = `weave push --to <name> --host <url:port> [--token …]`**, a CLI verb (plus
+  the `weave_push` catalog op reachable through the meta-tool's `call` mode) — **not**
+  a standing MCP tool (ADR-0003: zero added standing tokens). It signs the canonical
+  `(from,to,body)` if A is keyed (`sign_intent_if_keyed`) and POSTs the Intent to B's
+  `/api` with `Authorization: Bearer <token>`, reusing the existing blocking+rustls
+  `reqwest` client (no new HTTP dep). `--host` is **EXPLICIT-ONLY** — never
+  auto-resolved from message content (SSRF avoidance).
+- **Idempotency without a cursor.** Push has no per-source `pull_cursor` high-water
+  mark, so dedup rests entirely on the `idempotency_key`. The send path **always**
+  populates it (synthesizing `push:<from>:<fnv1a(body)>` when A omits one), so a
+  retried POST never double-commits.
+- **Bind posture is an explicit operator opt-in.** `serve`/`dashboard` default to
+  `--bind 127.0.0.1` (posture unchanged). Cross-machine requires a deliberate routable
+  `--bind` (e.g. `0.0.0.0` or a Tailscale address); a non-loopback bind with an
+  **empty** bearer token is **refused before the socket opens** (fail-closed — no open
+  listener on a routable address). Recommended deployment is a private overlay
+  (Tailscale / WireGuard / SSH tunnel).
+
+How each non-negotiable survives: **owner-only-writes** (B's own handler does every
+write); **no-daemon-by-default** (no relay/listener on the default path — the default
+`cargo build` is byte-identical, `cargo tree` unchanged, zero new deps); **verify-on-
+commit** (a forged/unsigned-from-trusted Intent is rejected via the unchanged policy
+before any write — bearer gates transport, the ed25519 signature gates identity,
+defense in depth); **token-light** (no new standing MCP tool — the standing budget
+test is unaffected); **dual-backend + no new crate** (the handler calls only existing
+`Store` methods through `commit_pulled`). See `.handoff/decisions/ADR-0005`.

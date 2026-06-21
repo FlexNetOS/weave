@@ -293,6 +293,11 @@ fn ident(args: &Value, key: &str, def: &Option<String>) -> Result<String, String
 /// Dangerous/mutating tools that are disabled by default in HTTP transport mode.
 const DANGEROUS_TOOLS: &[&str] = &[
     "weave_send",
+    // WL-056 / ADR-0005: cross-machine PUSH receive handler. It WRITES B's inbox
+    // (the Tier-2 commit pipeline, A-initiated), so it is a mutating op — gated in
+    // safe HTTP mode exactly like `weave_send`. It is reachable only when the
+    // operator runs `weave serve --write` (which dispatches with `dangerous=true`).
+    "weave_push",
     "weave_notify",
     "weave_reply",
     "weave_ask",
@@ -449,6 +454,9 @@ fn call_tool(
             dangerous,
         ),
         "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
+        // WL-056 / ADR-0005: cross-machine PUSH receive handler (the A-initiated dual
+        // of the Tier-2 pull-commit). Reached over the bearer-gated `POST /api` surface.
+        "weave_push" => tool_push(store, me_default, pull, args, injector),
         "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
         "weave_broadcast_notify" => {
             tool_broadcast_notify(store, me_default, nudge_template, args, injector)
@@ -782,6 +790,207 @@ fn tool_send(
         mid,
     );
     Ok(out)
+}
+
+/// WL-056 / ADR-0005: cross-machine PUSH **receive** handler — the A-initiated DUAL
+/// of the Tier-2 pull-commit, reached over the bearer-gated `POST /api` surface
+/// (`--features surfaces` + `weave serve --write`). A sender A on machine 1 POSTs a
+/// signed `Intent` here; B (this handler, on machine 2) commits it into **B's OWN**
+/// inbox and lights B's OWN pane — **without B polling**.
+///
+/// This REUSES the pull machinery verbatim — it does NOT reinvent verification or
+/// commit:
+///   1. Parse the args into a `model::Intent` (the push wire form).
+///   2. Build the receiver `VerifyPolicy` from `Config` exactly as the pull path
+///      (`main::verify_policy`) does — trust set, revocation list, strict override.
+///   3. Commit via the EXISTING `store::commit_pulled(store, me, "push:<from>",
+///      &policy, vec![intent])` — re-validation, signature verification
+///      (`verify_pulled_intent` → `sign::verify_intent`), `Store::send` (B assigns
+///      id/ts), and `Intent.idempotency_key` dedup are all inherited unchanged.
+///   4. On `committed == 1`, fire the EXISTING caller-side `nudge_pulled(...)` into
+///      B's own pane (gated by the same `inject_pulled` + `inject_allowed_from`
+///      consent as a pull).
+///
+/// Owner-only-writes: A never writes B's store — B's own handler does every write.
+/// Idempotency: push has no per-source `pull_cursor`, so dedup rests entirely on the
+/// Intent's `idempotency_key`; the SEND path always populates it (synthesizing one
+/// when A omits it), so a retried POST never double-commits.
+fn tool_push(
+    store: &dyn Store,
+    _def: &Option<String>,
+    pull: &PullConsent,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    // `from`/`to`/`body` are required; the rest are optional (serde defaults).
+    let from = args
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or("'from' is required (the sender's session name).")?;
+    let from = bound_ident("from", from)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the recipient session name on THIS machine).")?;
+    let to = bound_ident("to", to_raw)?;
+    if model::is_broadcast(&to) {
+        return Err("cross-machine push is directed-only; push to a named recipient.".to_string());
+    }
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("'body' is required.")?
+        .to_string();
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let to_host = args
+        .get("to_host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let sig = args
+        .get("sig")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(model::default_priority);
+    let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
+        Some(t) if !model::ttl_valid(t) => {
+            return Err(format!(
+                "'ttl' must be between 1 and {} seconds.",
+                model::MAX_MSG_TTL_SECS
+            ));
+        }
+        other => other.unwrap_or(0),
+    };
+    let trace_id = args
+        .get("trace_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| Some(model::mint_trace_id()));
+    // Idempotency: push has no `pull_cursor`, so dedup rests on the key. The send
+    // path ALWAYS populates it, but defend in depth here too — synthesize a stable
+    // key from `(from, body)` if a keyless push somehow arrives, so a retried POST
+    // never double-commits.
+    let idempotency_key = args
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| synth_push_idempotency_key(&from, &body));
+
+    // The push wire form is an Intent. `id`/`ts` are advisory on the wire — B
+    // re-stamps them on commit via `Store::send` (id/ts B-local).
+    let intent = model::Intent {
+        id: 0,
+        ts: model::now(),
+        to: to.clone(),
+        to_host,
+        from: from.clone(),
+        subject,
+        body,
+        sig,
+        idempotency_key: Some(idempotency_key),
+        trace_id,
+        priority,
+        ttl,
+    };
+
+    // Build the receiver VerifyPolicy from Config exactly as the pull path does
+    // (`main::verify_policy`). The dashboard `POST /api` route hands us
+    // `PullConsent::empty()` (advisory), so we do NOT rely on `pull.policy` for the
+    // verification decision — we load it fresh, like every other Config-driven MCP
+    // tool (the `Config::load()` precedent). This keeps verify-on-commit honest even
+    // when the surface itself carries no pull config.
+    let cfg = weave_core::config::Config::load();
+    let policy = store::VerifyPolicy {
+        strict_override: cfg.strict_verify_override(),
+        trust: cfg.trust_set(),
+        revoked: cfg.revoked_set(),
+    };
+
+    // Commit via the EXISTING pull-commit pipeline (no new Store method, no schema
+    // change). `commit_pulled` re-validates, verifies the signature under `policy`,
+    // commits into B's OWN inbox via `Store::send` (B assigns id/ts), and dedups on
+    // the idempotency key. A forged/unsigned-from-trusted intent is rejected (0
+    // committed) before any write.
+    let source = format!("push:{from}");
+    let committed = store::commit_pulled(store, &to, &source, &policy, vec![intent]).map_err(e)?;
+
+    if committed == 0 {
+        return Err(format!(
+            "push from '{from}' to '{to}' rejected at commit (verification/validation failed) \
+             or already delivered (idempotent)."
+        ));
+    }
+
+    // Caller-side consent nudge into B's OWN pane (mirrors the EXISTING `nudge_pulled`
+    // seam) — so a push lights B's pane exactly as a pull does, WITHOUT B polling.
+    // Consent gating mirrors a pull: the `inject_pulled` master toggle must be on (the
+    // surface's wired value if any, else the freshly-loaded Config), AND no finer
+    // `allow_inject_from` gate may be set — the push source is synthetic (`push:<from>`)
+    // and so cannot appear in an allow-list, so a configured finer gate keeps a push
+    // delivery advisory (queue-only), exactly as it would for a non-allow-listed pull.
+    // Best-effort: a nudge failure never sinks the (already committed) push.
+    let inject_pulled = pull.inject_pulled || cfg.inject_pulled();
+    let finer_gate = if pull.inject_pulled {
+        pull.allow_inject_from.is_some()
+    } else {
+        cfg.allow_inject_from_sources().is_some()
+    };
+    if inject_pulled && !finer_gate {
+        nudge_pulled_push(store, &to, injector);
+    }
+
+    Ok(format!(
+        "Pushed intent from '{from}' delivered to '{to}' (#committed=1, id assigned locally)."
+    ))
+}
+
+/// Synthesize a stable idempotency key for a keyless push: `push:<from>:<ts>:<hash>`
+/// where `<hash>` is an FNV-1a digest of the body (no `rand`/hash crate — weave is
+/// dependency-light). Two identical-body pushes from the same sender in the same
+/// second collapse to one row; the send path normally supplies an explicit key, so
+/// this is a defense-in-depth fallback for a keyless retried POST.
+fn synth_push_idempotency_key(from: &str, body: &str) -> String {
+    // FNV-1a 64-bit over the body bytes.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in body.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("push:{from}:{:x}", h)
+}
+
+/// Caller-side consent nudge for a committed push (mirrors `nudge_pulled` but for the
+/// synthetic push source). After a push commits into B's own inbox, fire the EXISTING
+/// paste-safe content-free [`Nudge::Nudge`] into B's OWN registered pane — never a
+/// foreign pane, never the body. Best-effort: any failure is logged to STDERR (never
+/// stdout) and never breaks the push.
+fn nudge_pulled_push(store: &dyn Store, me: &str, injector: &dyn Injector) {
+    let peer = match store.get_peer(me) {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(err) => {
+            log(&format!("push-nudge skipped (non-fatal): {err}"));
+            return;
+        }
+    };
+    let target = Target::from_peer(&peer);
+    if !target.injectable() || !injector.target_alive(&target) {
+        return;
+    }
+    match injector.inject_mode(&target, "", Nudge::Nudge) {
+        Ok(_) => {}
+        Err(err) => log(&format!("push-nudge inject failed (non-fatal): {err}")),
+    }
 }
 
 /// Best-effort delivery-trace write: append one metadata-only stage row, swallowing
@@ -3292,6 +3501,22 @@ fn tool_catalog() -> Vec<Value> {
                 "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."},
                 "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400). The message is auto-deleted (delete-on-sweep) after this many seconds and excluded from every read surface; omit for a permanent message."}
             },"required":["to","body"]}
+        },
+        {
+            "name": "weave_push",
+            "description": "Cross-machine PUSH RECEIVE handler (WL-056 / ADR-0005): accept a signed Intent delivered over the bearer-gated `weave serve --write` POST /api surface and commit it into THIS machine's inbox via the SAME Tier-2 pull-commit pipeline (re-validate, verify signature, Store::send assigns id/ts locally), then light this pane without polling. This is the RECEIVE side (no host) — the A-initiated dual of a Tier-2 pull. To SEND a push to another machine, use the `weave push --to <name> --host <url:port>` CLI verb. Owner-only-writes: the recipient commits its own row; dedup is by idempotency_key.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"The sender's session name."},
+                "to":{"type":"string","description":"Recipient session name on THIS machine (directed-only; no broadcast)."},
+                "subject":{"type":"string"},
+                "body":{"type":"string"},
+                "sig":{"type":"string","description":"Optional ed25519 signature over the canonical (from,to,body); verified under this receiver's trust policy on commit."},
+                "to_host":{"type":"string","description":"Optional host hint (advisory)."},
+                "idempotency_key":{"type":"string","description":"Idempotency key; a retried POST with the same key never double-commits. Synthesized from (from,body) if omitted."},
+                "trace_id":{"type":"string","description":"Optional end-to-end trace id."},
+                "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
+                "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400)."}
+            },"required":["from","to","body"]}
         },
         {
             "name": "weave_notify",

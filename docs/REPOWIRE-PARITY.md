@@ -135,8 +135,8 @@ tracked.
 |---|---|---|---|
 | stdio MCP server | `weave mcp` (stdio) | ✅ HAVE | `mcp.rs` |
 | Streamable HTTP MCP (localhost, bearer) | HTTP MCP surface | ✅ HAVE | WL-022; `http.rs` |
-| Hosted relay (`repowire.io`, outbound WSS) | cross-store federation (Tier-1) + Tier-2 cross-machine pull | ⏳ GAP (non-goal) | repowire's relay was PUSH cross-machine (A→B with B idle). weave delivers PULL-only (B must pull) + needs non-default `--features libsql` + a Turso remote; default sqlite build rejects remote sources. weave's own ARCHITECTURE.md marks cross-machine a non-goal. Push reach tracked: WL-056 |
-| Self-hosted relay | Tier-2 pull from remote sources | ⏳ GAP (non-goal) | pull-only (Tier-2), not push; WL-056 |
+| Hosted relay (`repowire.io`, outbound WSS) | consent-based cross-machine **PUSH** (ADR-0005) + cross-store federation (Tier-1) + Tier-2 pull | ✅ HAVE (daemon-free push, owner-only-writes) | WL-056: `weave push --to <name> --host <url:port>` POSTs a signed Intent to B's bearer-gated `weave dashboard --write` endpoint; B commits into its OWN inbox via the SAME `commit_pulled` pipeline and lights its OWN pane WITHOUT polling. Daemon-free (no relay process — receive exists only while B opts into `serve`/`dashboard --write`), owner-only-writes (B commits its own row), verify-on-commit (signature gates identity), default build byte-identical. `mcp::tool_push`, `http.rs` `--bind` fail-closed, `main.rs` `Cmd::Push` |
+| Self-hosted relay | cross-machine PUSH (ADR-0005) + Tier-2 pull from remote sources | ✅ HAVE (daemon-free push) | WL-056 push (A→B, B idle) + Tier-2 pull; no hosted relay process required |
 | API-key scoped relay isolation | per-source token/timeout parity on federated pull | 🧭 SUPERSEDED | ARCHITECTURE §10 |
 
 ---
@@ -178,7 +178,7 @@ capability repowire's hosted relay never provided, and one weave delivers
 | `agents create` folder scaffolding | *(candidate WL)* | minor convenience; `weave config init` already scaffolds config |
 | `SOUL.md` persona-file precedence | *(candidate WL)* | persona memory **scope** already exists; only the file convention is missing |
 | PreToolUse **enforcing** hook | **WL-055** | the approval primitive exists (ask + deny-on-timeout) but no PreToolUse hook event is wired, so nothing blocks a tool call |
-| Cross-machine **PUSH** delivery | **WL-056** | revisit the non-goal via ADR; deliver push (A→B without B polling) without a default daemon |
+| ~~Cross-machine **PUSH** delivery~~ | **WL-056** ✅ done | ADR-0005 (accepted) — consent-based push (A→B, B idle) over the bearer-gated `dashboard --write` POST /api receive seam: `tool_push` commits via the SAME `commit_pulled` pipeline (owner-only-writes, verify-on-commit), `weave push` CLI sender, `--bind` fail-closed; no default daemon, default build byte-identical (§8, §10) |
 | Wire repowire's remaining agent-runtimes | *(candidate WL)* | Antigravity, OpenCode, Pi (weave currently wires Claude/Codex/Gemini/Aider) |
 | ~~Governed web reach (beyond repowire)~~ | **WL-049** ✅ done | ADR-0002 (accepted) — obscura-as-capability via spawn-and-speak MCP client, `weave_web`/`weave web`, deny-by-default + SSRF-guarded, no V8/tokio in core (§7, §9) |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
