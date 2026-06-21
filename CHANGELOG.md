@@ -1,5 +1,16 @@
 # Changelog
 
+
+## [Unreleased] — test: fix free_port TOCTOU dashboard-spawn flake (WL-058)
+
+> **fix(test): race-robust dashboard spawner.** `spawn_dashboard`/`spawn_dashboard_write`
+> picked a port via `free_port()` (bind `:0` → read → drop) then a readiness check that
+> only proved *something* listened — so under parallel `cargo test` a port-collision loser
+> child could exit while the helper connected to the *other* test's server, returning a port
+> it didn't own (the `dashboard_readonly_rejects_post` CI flake). Now a shared
+> `spawn_dashboard_inner` treats child-exit-before-listening as the collision signal and
+> retries on a fresh port (≤8), requiring our child alive AND the port accepting. Test-only.
+
 ## [Unreleased]
 
 ### Fixed (WL-057 — `weave setup` no longer persists an ephemeral exe path, fixes #107)
