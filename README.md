@@ -48,7 +48,9 @@ apply those providers without launching the Tauri app:
 ```bash
 weave provider-switch list --app claude
 weave provider-switch current --app codex
+weave provider-switch models --app codex          # includes local Ollama if reachable
 weave provider-switch switch --app codex deepseek
+weave provider-switch switch-model --app codex deepseek qwen2.5-coder:7b
 ```
 
 The bridge is available in the default sqlite build and reads `~/.cc-switch/cc-switch.db` (override with `--db`), supports
@@ -56,8 +58,12 @@ The bridge is available in the default sqlite build and reads `~/.cc-switch/cc-s
 writes the corresponding live host config. Unlike a plain settings overwrite, it
 preserves existing weave lifecycle wiring where present: Claude `hooks`/
 `mcpServers`, Codex `notify = ["…", "hook", "wake"]`, and Gemini settings
-keys outside the provider's own config block. Use `--dry-run` on `switch` to
-validate a provider id without writing.
+keys outside the provider's own config block. `models` auto-loads model names
+from each provider's current config / model catalog and, when reachable, local
+Ollama's `GET /api/tags` (`OLLAMA_HOST` or `http://127.0.0.1:11434`).
+`switch-model` updates Claude's `model`, Codex's top-level `model = "…"`, or
+Gemini's `GEMINI_MODEL`, refreshing live config when the provider is current.
+Use `--dry-run` on write commands to validate without writing.
 
 The Claude flow registers the MCP server (per user, all projects) and wires the
 lifecycle hooks so sessions auto-register and auto-receive. The resulting

@@ -9,10 +9,13 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProviderSwitchApp {
@@ -42,6 +45,16 @@ pub struct ProviderRow {
     pub category: Option<String>,
     pub is_current: bool,
     pub settings_config: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    pub app: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+    pub source: String,
+    pub current: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -131,6 +144,10 @@ fn connect(db_path: Option<PathBuf>) -> Result<Connection> {
 
 pub fn list(db_path: Option<PathBuf>, app: ProviderSwitchApp) -> Result<Vec<ProviderRow>> {
     let conn = connect(db_path)?;
+    list_from_conn(&conn, app)
+}
+
+fn list_from_conn(conn: &Connection, app: ProviderSwitchApp) -> Result<Vec<ProviderRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, settings_config, category, is_current FROM providers \
          WHERE app_type = ?1 ORDER BY is_current DESC, COALESCE(sort_index, 999999), name, id",
@@ -165,6 +182,89 @@ pub fn list(db_path: Option<PathBuf>, app: ProviderSwitchApp) -> Result<Vec<Prov
 
 pub fn current(db_path: Option<PathBuf>, app: ProviderSwitchApp) -> Result<Option<ProviderRow>> {
     Ok(list(db_path, app)?.into_iter().find(|p| p.is_current))
+}
+
+pub fn models(
+    db_path: Option<PathBuf>,
+    app: ProviderSwitchApp,
+    include_ollama: bool,
+) -> Result<Vec<ModelRow>> {
+    let conn = connect(db_path)?;
+    let mut out = Vec::new();
+    for provider in list_from_conn(&conn, app)? {
+        for (model, source) in provider_models(app, &provider) {
+            out.push(ModelRow {
+                app: app.as_cc_switch().to_string(),
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                current: provider.is_current && model == current_model(app, &provider),
+                model,
+                source,
+            });
+        }
+    }
+
+    if include_ollama {
+        match ollama_models() {
+            Ok(models) => {
+                for model in models {
+                    out.push(ModelRow {
+                        app: app.as_cc_switch().to_string(),
+                        provider_id: "ollama-local".to_string(),
+                        provider_name: "Ollama Local".to_string(),
+                        model,
+                        source: "ollama".to_string(),
+                        current: false,
+                    });
+                }
+            }
+            Err(err) => eprintln!("[weave] provider-switch: Ollama model probe skipped: {err}"),
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then(a.source.cmp(&b.source))
+            .then(a.model.cmp(&b.model))
+    });
+    out.dedup_by(|a, b| {
+        a.provider_id == b.provider_id && a.source == b.source && a.model == b.model
+    });
+    Ok(out)
+}
+
+pub fn switch_model(
+    db_path: Option<PathBuf>,
+    app: ProviderSwitchApp,
+    provider_id: &str,
+    model: &str,
+    dry_run: bool,
+) -> Result<ProviderRow> {
+    let path = db_path.unwrap_or_else(default_db_path);
+    let conn = Connection::open(&path)
+        .with_context(|| format!("opening CC Switch DB {}", path.display()))?;
+    let app_name = app.as_cc_switch();
+    let mut provider = load_provider(&conn, app, provider_id)?;
+    set_model(app, &mut provider.settings_config, model)
+        .with_context(|| format!("setting {app_name} model for provider `{provider_id}`"))?;
+
+    if dry_run {
+        return Ok(provider);
+    }
+
+    let settings_text = serde_json::to_string(&provider.settings_config)?;
+    let changed = conn.execute(
+        "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
+        params![settings_text, provider_id, app_name],
+    )?;
+    if changed != 1 {
+        bail!("provider {provider_id} disappeared while switching model for {app_name}");
+    }
+    if provider.is_current {
+        apply_live(app, &provider)?;
+    }
+    Ok(provider)
 }
 
 pub fn switch(
@@ -289,6 +389,290 @@ fn apply_common_config_if_enabled(settings: &Value, common: Option<&str>) -> Res
     Ok(out)
 }
 
+fn provider_models(app: ProviderSwitchApp, provider: &ProviderRow) -> Vec<(String, String)> {
+    let mut out = BTreeSet::<(String, String)>::new();
+    if let Some(model) = current_model_opt(app, provider) {
+        out.insert((model, "current".to_string()));
+    }
+    collect_catalog_models(&provider.settings_config, &mut out);
+    out.into_iter().collect()
+}
+
+fn current_model(app: ProviderSwitchApp, provider: &ProviderRow) -> String {
+    current_model_opt(app, provider).unwrap_or_default()
+}
+
+fn current_model_opt(app: ProviderSwitchApp, provider: &ProviderRow) -> Option<String> {
+    match app {
+        ProviderSwitchApp::Claude => provider
+            .settings_config
+            .get("model")
+            .or_else(|| provider.settings_config.pointer("/env/ANTHROPIC_MODEL"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        ProviderSwitchApp::Codex => provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .and_then(extract_codex_model),
+        ProviderSwitchApp::Gemini => provider
+            .settings_config
+            .pointer("/env/GEMINI_MODEL")
+            .or_else(|| provider.settings_config.pointer("/env/GOOGLE_GEMINI_MODEL"))
+            .or_else(|| provider.settings_config.pointer("/config/model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }
+}
+
+fn set_model(app: ProviderSwitchApp, settings: &mut Value, model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        bail!("model must not be empty");
+    }
+    let obj = settings
+        .as_object_mut()
+        .with_context(|| format!("{} provider settings must be a JSON object", app.display()))?;
+    match app {
+        ProviderSwitchApp::Claude => {
+            obj.insert("model".to_string(), Value::String(model.to_string()));
+        }
+        ProviderSwitchApp::Codex => {
+            let config = obj
+                .get("config")
+                .and_then(Value::as_str)
+                .context("Codex provider settings missing string `config`")?;
+            obj.insert(
+                "config".to_string(),
+                Value::String(set_codex_model(config, model)),
+            );
+        }
+        ProviderSwitchApp::Gemini => {
+            let env = obj.entry("env").or_insert_with(|| json!({}));
+            let env_obj = env
+                .as_object_mut()
+                .context("Gemini provider settings `env` must be an object")?;
+            env_obj.insert("GEMINI_MODEL".to_string(), Value::String(model.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn collect_catalog_models(value: &Value, out: &mut BTreeSet<(String, String)>) {
+    fn visit(value: &Value, source: &str, out: &mut BTreeSet<(String, String)>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let next_source = if key.eq_ignore_ascii_case("modelCatalog")
+                        || key.eq_ignore_ascii_case("models")
+                    {
+                        key.as_str()
+                    } else {
+                        source
+                    };
+                    if matches!(key.as_str(), "model" | "id" | "name") {
+                        if let Some(model) = value.as_str().map(str::trim).filter(|s| !s.is_empty())
+                        {
+                            out.insert((model.to_string(), next_source.to_string()));
+                        }
+                    }
+                    visit(value, next_source, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(model) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        out.insert((model.to_string(), source.to_string()));
+                    } else {
+                        visit(item, source, out);
+                    }
+                }
+            }
+            Value::String(model) if source != "settings" => {
+                let model = model.trim();
+                if !model.is_empty() && !model.contains('\n') && model.len() < 128 {
+                    out.insert((model.to_string(), source.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(catalog) = value.get("modelCatalog") {
+        visit(catalog, "modelCatalog", out);
+    }
+    if let Some(models) = value.get("models") {
+        visit(models, "models", out);
+    }
+}
+
+fn extract_codex_model(config: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') || !trimmed.starts_with("model") {
+            return None;
+        }
+        let (key, value) = trimmed.split_once('=')?;
+        if key.trim() != "model" {
+            return None;
+        }
+        Some(unquote_toml_string(value.trim()))
+    })
+}
+
+fn set_codex_model(config: &str, model: &str) -> String {
+    let replacement = format!("model = {}", toml_quote(model));
+    let mut replaced = false;
+    let mut out = Vec::new();
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == "model" {
+                    out.push(replacement.clone());
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        if !replaced && trimmed.starts_with('[') {
+            out.push(replacement.clone());
+            replaced = true;
+        }
+        out.push(line.to_string());
+    }
+    if !replaced {
+        out.push(replacement);
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    text
+}
+
+fn unquote_toml_string(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        value.to_string()
+    }
+}
+
+fn toml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn ollama_models() -> Result<Vec<String>> {
+    let host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let (host_header, addr, path) = parse_http_url(&host, "/api/tags")?;
+    let mut stream =
+        TcpStream::connect(&addr).with_context(|| format!("connecting to Ollama at {addr}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    if let Err(err) = stream.read_to_string(&mut response) {
+        if response.is_empty() {
+            return Err(err.into());
+        }
+    }
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("invalid Ollama HTTP response")?;
+    let body = if headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("Transfer-Encoding: chunked"))
+    {
+        decode_http_chunked(body).context("decoding Ollama chunked response")?
+    } else {
+        body.to_string()
+    };
+    let json: Value = serde_json::from_str(&body).context("parsing Ollama /api/tags response")?;
+    let mut out = Vec::new();
+    if let Some(models) = json.get("models").and_then(Value::as_array) {
+        for item in models {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                if !name.trim().is_empty() {
+                    out.push(name.trim().to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_http_chunked(mut body: &str) -> Result<String> {
+    let mut out = String::new();
+    loop {
+        let (len_hex, rest) = body
+            .split_once("\r\n")
+            .context("chunk missing length terminator")?;
+        let len_hex = len_hex.split(';').next().unwrap_or(len_hex).trim();
+        let len = usize::from_str_radix(len_hex, 16)
+            .with_context(|| format!("invalid chunk length `{len_hex}`"))?;
+        body = rest;
+        if len == 0 {
+            break;
+        }
+        if body.len() < len + 2 {
+            bail!("chunk body shorter than declared length");
+        }
+        out.push_str(&body[..len]);
+        body = &body[len..];
+        body = body
+            .strip_prefix("\r\n")
+            .context("chunk missing trailing CRLF")?;
+    }
+    Ok(out)
+}
+
+fn parse_http_url(base: &str, default_path: &str) -> Result<(String, String, String)> {
+    let rest = base
+        .strip_prefix("http://")
+        .context("OLLAMA_HOST must be an http:// URL for this local smoke")?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, suffix)) => (authority, format!("/{suffix}")),
+        None => (rest, default_path.to_string()),
+    };
+    let authority = authority.trim();
+    if authority.is_empty() {
+        bail!("OLLAMA_HOST has an empty host");
+    }
+    let addr = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    Ok((authority.to_string(), addr, path))
+}
+
+fn merge_json_objects(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(target_map), Value::Object(source_map)) => {
+            for (key, source_value) in source_map {
+                match target_map.get_mut(key) {
+                    Some(target_value) => merge_json_objects(target_value, source_value),
+                    None => {
+                        target_map.insert(key.clone(), source_value.clone());
+                    }
+                }
+            }
+        }
+        (target_value, source_value) => {
+            *target_value = source_value.clone();
+        }
+    }
+}
+
 fn apply_live(app: ProviderSwitchApp, provider: &ProviderRow) -> Result<()> {
     match app {
         ProviderSwitchApp::Claude => apply_claude(provider),
@@ -396,12 +780,10 @@ fn apply_gemini(provider: &ProviderRow) -> Result<()> {
         let mut merged = read_text_if_exists(&path)?
             .and_then(|_| read_json(&path).ok())
             .unwrap_or_else(|| json!({}));
-        let merged_obj = merged
+        merged
             .as_object_mut()
             .context("existing Gemini settings must be a JSON object")?;
-        for (k, v) in config.as_object().unwrap() {
-            merged_obj.insert(k.clone(), v.clone());
-        }
+        merge_json_objects(&mut merged, config);
         write_json(&path, &merged)?;
     }
     Ok(())

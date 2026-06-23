@@ -1482,6 +1482,34 @@ enum ProviderSwitchCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List models discovered from CC Switch providers and local Ollama.
+    Models {
+        /// App namespace to inspect.
+        #[arg(long, value_enum)]
+        app: provider_switch::ProviderSwitchApp,
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Skip probing local Ollama (`OLLAMA_HOST` or localhost:11434).
+        #[arg(long)]
+        no_ollama: bool,
+    },
+    /// Change a provider's selected model and refresh live config if it is current.
+    SwitchModel {
+        /// App namespace to update.
+        #[arg(long, value_enum)]
+        app: provider_switch::ProviderSwitchApp,
+        /// Provider id from CC Switch's providers table.
+        provider_id: String,
+        /// Model id/name to select.
+        model: String,
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Validate and show the target without writing host config or DB state.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Shells we can emit completion scripts for. Kept as a local enum (rather than
@@ -3271,6 +3299,51 @@ fn main() -> Result<()> {
                         row.name
                     );
                     println!("weave lifecycle hooks were preserved where present");
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::Models { app, db, no_ollama } => {
+                let rows = provider_switch::models(db.clone(), *app, !*no_ollama)?;
+                for row in rows {
+                    println!(
+                        "{}	{}	{}	{}	{}",
+                        if row.current { "*" } else { " " },
+                        row.provider_id,
+                        row.provider_name,
+                        row.source,
+                        row.model
+                    );
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::SwitchModel {
+                app,
+                provider_id,
+                model,
+                db,
+                dry_run,
+            } => {
+                let row =
+                    provider_switch::switch_model(db.clone(), *app, provider_id, model, *dry_run)?;
+                if *dry_run {
+                    println!(
+                        "dry-run: {} provider '{}' ({}) can switch to model '{}'",
+                        app.as_cc_switch(),
+                        row.id,
+                        row.name,
+                        model
+                    );
+                } else {
+                    println!(
+                        "switched {} provider '{}' ({}) to model '{}'",
+                        app.as_cc_switch(),
+                        row.id,
+                        row.name,
+                        model
+                    );
+                    if row.is_current {
+                        println!("live config refreshed for current provider");
+                    }
                 }
                 return Ok(());
             }
@@ -7114,23 +7187,38 @@ mod tests {
     /// WL-057 (#107): `weave setup --exe <path>` parses into `Cmd::Setup{ exe: Some }`.
     #[test]
     fn setup_exe_flag_parses() {
-        let cli = Cli::try_parse_from(["weave", "setup", "--exe", "/tmp/x"])
-            .expect("`weave setup --exe /tmp/x` should parse");
-        match cli.cmd {
-            Cmd::Setup { exe, .. } => assert_eq!(exe.as_deref(), Some("/tmp/x")),
-            _ => panic!("expected Cmd::Setup"),
-        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["weave", "setup", "--exe", "/tmp/x"])
+                    .expect("`weave setup --exe /tmp/x` should parse");
+                match cli.cmd {
+                    Cmd::Setup { exe, .. } => assert_eq!(exe.as_deref(), Some("/tmp/x")),
+                    _ => panic!("expected Cmd::Setup"),
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test should not panic");
     }
 
     /// Default `weave setup` (no `--exe`) parses with `exe: None` — the byte-identical
     /// default path is preserved.
     #[test]
     fn setup_without_exe_flag_parses_none() {
-        let cli = Cli::try_parse_from(["weave", "setup"]).expect("`weave setup` should parse");
-        match cli.cmd {
-            Cmd::Setup { exe, .. } => assert!(exe.is_none()),
-            _ => panic!("expected Cmd::Setup"),
-        }
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["weave", "setup"]).expect("`weave setup` should parse");
+                match cli.cmd {
+                    Cmd::Setup { exe, .. } => assert!(exe.is_none()),
+                    _ => panic!("expected Cmd::Setup"),
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test should not panic");
     }
 
     /// Empty snapshot ⇒ a stable header + `no sessions` body, zeroed counts.

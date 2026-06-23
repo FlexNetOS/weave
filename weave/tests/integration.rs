@@ -20,9 +20,13 @@ use common::{
 #[cfg(feature = "surfaces")]
 use common::{scrub_env, weave_bin};
 use std::io::Write;
+#[cfg(feature = "sqlite")]
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(feature = "sqlite")]
+use std::thread;
 
 #[cfg(feature = "sqlite")]
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -61,7 +65,8 @@ fn seed_cc_switch_db(path: &std::path::Path) {
             "Anthropic Alt",
             serde_json::json!({
                 "env": {"ANTHROPIC_BASE_URL": "https://api.example.test", "ANTHROPIC_AUTH_TOKEN": "sk-test"},
-                "model": "claude-test"
+                "model": "claude-test",
+                "modelCatalog": ["claude-test", "claude-haiku-test"]
             }).to_string()
         ],
     ).expect("insert claude");
@@ -72,10 +77,44 @@ fn seed_cc_switch_db(path: &std::path::Path) {
             "DeepSeek",
             serde_json::json!({
                 "auth": {"OPENAI_API_KEY": "sk-codex"},
-                "config": "model_provider = \"custom\"\nmodel = \"deepseek-chat\"\n[model_providers.custom]\nname = \"DeepSeek\"\nbase_url = \"https://api.deepseek.example/v1\"\nwire_api = \"chat\"\n"
+                "config": "model_provider = \"custom\"\nmodel = \"deepseek-chat\"\n[model_providers.custom]\nname = \"DeepSeek\"\nbase_url = \"https://api.deepseek.example/v1\"\nwire_api = \"chat\"\n",
+                "modelCatalog": {"models": [{"id": "deepseek-chat"}, {"id": "deepseek-coder"}]}
             }).to_string()
         ],
     ).expect("insert codex");
+
+    conn.execute(
+        "INSERT INTO providers(id, app_type, name, settings_config, category, is_current, sort_index) VALUES(?1, 'gemini', ?2, ?3, 'custom', 0, 1)",
+        rusqlite::params![
+            "google-alt",
+            "Google Alt",
+            serde_json::json!({
+                "env": {"GEMINI_API_KEY": "sk-gemini", "GEMINI_MODEL": "gemini-test"},
+                "config": {"mcpServers": {"foreign": {"command": "foreign"}}},
+                "modelCatalog": ["gemini-test", "gemini-flash-test"]
+            }).to_string()
+        ],
+    ).expect("insert gemini");
+}
+
+#[cfg(feature = "sqlite")]
+fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"models":[{"name":"llama3.2:latest"},{"name":"qwen2.5-coder:7b"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}"), handle)
 }
 
 #[test]
@@ -231,6 +270,181 @@ fn provider_switch_codex_applies_config_auth_and_preserves_notify_hook() {
     assert_eq!(
         auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()),
         Some("sk-codex")
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_gemini_applies_env_and_preserves_settings() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-gemini-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+
+    let gemini_dir = home.join(".gemini");
+    std::fs::create_dir_all(&gemini_dir).unwrap();
+    std::fs::write(
+        gemini_dir.join("settings.json"),
+        r#"{"mcpServers":{"weave":{"command":"weave"}},"theme":"dark"}"#,
+    )
+    .unwrap();
+
+    run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "switch",
+            "--app",
+            "gemini",
+            "google-alt",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let env = std::fs::read_to_string(gemini_dir.join(".env")).unwrap();
+    assert!(env.contains("GEMINI_API_KEY=sk-gemini"), "{env}");
+    assert!(env.contains("GEMINI_MODEL=gemini-test"), "{env}");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gemini_dir.join("settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        settings.pointer("/mcpServers/weave").is_some(),
+        "existing settings preserved: {settings}"
+    );
+    assert!(
+        settings.pointer("/mcpServers/foreign").is_some(),
+        "provider config merged: {settings}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_models_auto_loads_cc_switch_and_ollama() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-models-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+    let (ollama_host, handle) = fake_ollama_server();
+
+    let (ok, out, err) = run_env(
+        &db,
+        &[
+            "provider-switch",
+            "models",
+            "--app",
+            "codex",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("OLLAMA_HOST", &ollama_host),
+        ],
+    );
+    assert!(
+        ok,
+        "provider-switch models failed
+stdout:
+{out}
+stderr:
+{err}"
+    );
+    handle.join().unwrap();
+    assert!(err.trim().is_empty(), "unexpected stderr: {err}");
+    assert!(
+        out.contains("deepseek\tDeepSeek\tcurrent\tdeepseek-chat"),
+        "{out}"
+    );
+    assert!(
+        out.contains("deepseek\tDeepSeek\tmodels\tdeepseek-coder"),
+        "{out}"
+    );
+    assert!(
+        out.contains("ollama-local\tOllama Local\tollama\tllama3.2:latest"),
+        "{out}"
+    );
+    assert!(
+        out.contains("ollama-local\tOllama Local\tollama\tqwen2.5-coder:7b"),
+        "{out}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_switch_model_updates_claude_codex_and_gemini_live_configs() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-model-switch-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+    let conn = rusqlite::Connection::open(&cc_db).unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'claude' AND id = 'anthropic-alt'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'codex' AND id = 'deepseek'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'gemini' AND id = 'google-alt'",
+        [],
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "notify = [\"/usr/bin/weave\", \"hook\", \"wake\"]\n",
+    )
+    .unwrap();
+
+    for (app, provider, model) in [
+        ("claude", "anthropic-alt", "claude-haiku-test"),
+        ("codex", "deepseek", "deepseek-coder"),
+        ("gemini", "google-alt", "gemini-flash-test"),
+    ] {
+        run_ok_env(
+            &db,
+            &[
+                "provider-switch",
+                "switch-model",
+                "--app",
+                app,
+                provider,
+                model,
+                "--db",
+                cc_db.to_str().unwrap(),
+            ],
+            &[("HOME", home.to_str().unwrap())],
+        );
+    }
+
+    let claude: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        claude.get("model").and_then(|v| v.as_str()),
+        Some("claude-haiku-test")
+    );
+    let codex = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert!(codex.contains("model = \"deepseek-coder\""), "{codex}");
+    assert!(
+        codex.contains("notify = [\"/usr/bin/weave\", \"hook\", \"wake\"]"),
+        "{codex}"
+    );
+    let gemini_env = std::fs::read_to_string(home.join(".gemini/.env")).unwrap();
+    assert!(
+        gemini_env.contains("GEMINI_MODEL=gemini-flash-test"),
+        "{gemini_env}"
     );
 }
 
