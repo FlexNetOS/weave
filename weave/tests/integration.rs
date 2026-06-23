@@ -8048,6 +8048,97 @@ fn cli_ask_status_reports_delivery_receipts_and_answer() {
     );
 }
 
+/// `weave responder` is the non-disruptive immediate-ACK path: it scans open asks
+/// addressed to a session, sends one status reply without marking the question
+/// read or answering the ask, and `ask-status` surfaces that ACK immediately.
+#[test]
+fn cli_responder_auto_ack_is_idempotent_and_non_closing() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "ack status q",
+        ],
+    );
+    let cid = extract_cid(&opened);
+
+    let sweep = run_ok(
+        &db,
+        &[
+            "responder",
+            "--me",
+            "bob",
+            "--status",
+            "busy-queued",
+            "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&sweep).expect("responder json");
+    assert_eq!(v["me"].as_str(), Some("bob"), "sweep: {v}");
+    assert_eq!(v["acknowledged"].as_u64(), Some(1), "sweep: {v}");
+    assert_eq!(
+        v["asks"][0]["id"].as_str(),
+        Some(cid.as_str()),
+        "sweep: {v}"
+    );
+    let ack_mid = v["asks"][0]["ack_message_id"]
+        .as_i64()
+        .expect("ack message id");
+
+    // The ask is still open (ACK is not answer/close), and ask-status reflects
+    // the status before the askee has drained/marked the original question read.
+    let status = run_ok(&db, &["ask-status", "--id", &cid, "--json"]);
+    let st: serde_json::Value = serde_json::from_str(&status).expect("ask-status json");
+    assert_eq!(st["state"].as_str(), Some("open"), "status: {st}");
+    assert_eq!(
+        st["routing_status"].as_str(),
+        Some("busy-queued"),
+        "status: {st}"
+    );
+    assert_eq!(
+        st["auto_ack"]["message_id"].as_i64(),
+        Some(ack_mid),
+        "status: {st}"
+    );
+    assert!(
+        st["question_receipts"].as_array().unwrap().is_empty(),
+        "responder must not mark the question read: {st}"
+    );
+
+    // A second sweep is idempotent: no duplicate ACK replies.
+    let again = run_ok(&db, &["responder", "--me", "bob", "--json"]);
+    let av: serde_json::Value = serde_json::from_str(&again).expect("responder json");
+    assert_eq!(av["acknowledged"].as_u64(), Some(0), "again: {av}");
+
+    // The ACK itself is visible to the asker as a normal threaded reply.
+    let alice = run_ok(&db, &["inbox", "--me", "alice"]);
+    assert!(
+        alice.contains("[weave-ack] busy-queued"),
+        "alice inbox: {alice}"
+    );
+
+    // Bob can still provide the real answer later.
+    let answered = run_ok(
+        &db,
+        &[
+            "answer",
+            "--from",
+            "bob",
+            "--id",
+            &cid,
+            "--body",
+            "real answer",
+        ],
+    );
+    assert!(answered.contains("answered ask"), "answered: {answered}");
+}
+
 /// CLI failure paths are clean non-zero exits (never a panic): answering/acking an
 /// unknown correlation id, double-ack, a wrong-owner answer, and a metachar id.
 #[test]
