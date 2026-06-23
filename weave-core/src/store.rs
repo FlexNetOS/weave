@@ -10093,6 +10093,92 @@ mod tests {
         assert_eq!(p.description_ts, ts_before, "description_ts preserved");
     }
 
+    /// The `hook session` idempotency contract: a SessionStart re-fire carries no
+    /// `WEAVE_BIRTH_CERT` (the common, non-spawned case), so passing `None` MUST
+    /// reject — but the hook recovers the peer's own cert via `get_birth_cert` and
+    /// re-registers with it, which MUST succeed. This is the store-level guarantee
+    /// the `hook session` fix relies on (mirrors the `attach` self-cert fallback).
+    #[test]
+    fn session_hook_self_cert_fallback_is_idempotent() {
+        let s = mem();
+        // First SessionStart: brand-new peer mints its cert.
+        let minted = s
+            .register_peer("envctl", "zellij", "%1", "", Some("/x"))
+            .unwrap();
+        assert!(!minted.is_empty(), "first registration mints a cert");
+
+        // A naive re-fire with `None` (no env cert, no fallback) is rejected —
+        // this is the exact failure the fix removes.
+        let bare = s.register_peer_full(
+            "envctl",
+            "zellij",
+            "%2",
+            "",
+            Some("/x"),
+            Some(1234),
+            "host",
+            "repo",
+            "br",
+            "wt",
+            "default",
+            None,
+        );
+        assert!(
+            bare.is_err(),
+            "re-register with no cert must still be rejected (takeover guard intact)"
+        );
+
+        // The hook's fix: recover our own stored cert, then re-register with it.
+        let stored = s.get_birth_cert("envctl").unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some(minted.as_str()),
+            "stored cert round-trips"
+        );
+        let returned = s
+            .register_peer_full(
+                "envctl",
+                "zellij",
+                "%2",
+                "",
+                Some("/x"),
+                Some(1234),
+                "host",
+                "repo",
+                "br",
+                "wt",
+                "default",
+                stored.as_deref(),
+            )
+            .expect("self-cert fallback re-registration is idempotent");
+        assert_eq!(returned, minted, "re-register preserves the existing cert");
+        assert_eq!(
+            s.get_peer("envctl").unwrap().unwrap().target,
+            "%2",
+            "idempotent re-register updated the live pane"
+        );
+
+        // A *different* cert is still a hard takeover rejection — security intact.
+        let takeover = s.register_peer_full(
+            "envctl",
+            "zellij",
+            "%3",
+            "",
+            Some("/x"),
+            Some(1234),
+            "host",
+            "repo",
+            "br",
+            "wt",
+            "default",
+            Some("deadbeef"),
+        );
+        assert!(
+            takeover.is_err(),
+            "mismatched cert must still bail (no takeover)"
+        );
+    }
+
     /// A legacy peers DB (pre-P5: no turn_state/description/description_ts columns)
     /// upgrades in place on open — columns added with the correct defaults, the old
     /// row survives reading Unknown/empty/0, and a re-open is an idempotent no-op.
