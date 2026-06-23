@@ -1390,6 +1390,30 @@ enum JobCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Create a job assigned to a worker and send that worker a live delegation
+    /// notice. This is the orchestration-first bridge: the main session records
+    /// durable work, nudges a background/executor session, then stays available.
+    Delegate {
+        #[arg(long)]
+        title: String,
+        /// worker/executor peer to assign and notify
+        #[arg(long)]
+        to: String,
+        #[arg(long, allow_hyphen_values = true)]
+        desc: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// optional deadline (epoch seconds)
+        #[arg(long)]
+        deadline: Option<i64>,
+        /// orchestrator/session creating the delegation
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// List board jobs filtered by state/owner/creator/assignee/circle.
     List {
         #[arg(long)]
@@ -6608,6 +6632,77 @@ fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
                     job.state.as_str(),
                     job.title,
                     job.creator
+                );
+            }
+        }
+        JobCmd::Delegate {
+            title,
+            to,
+            desc,
+            kind,
+            prompt,
+            deadline,
+            from,
+            json,
+        } => {
+            if model::is_broadcast(&to) {
+                anyhow::bail!("job delegation is point-to-point; choose one worker peer");
+            }
+            let (creator, explicit) = resolve_me_explicit(from, None, cfg);
+            refresh_presence(store, &creator, explicit);
+            let spec = model::JobSpec {
+                title: title.clone(),
+                description: desc.clone(),
+                kind,
+                owner: Some(creator.clone()),
+                assignee: Some(to.clone()),
+                prompt: prompt.clone(),
+                deadline_at: deadline,
+                ..Default::default()
+            };
+            let job = store.create_job(&creator, spec)?;
+            let body = format!(
+                "JOB_DELEGATED {}\nfrom: {}\nassignee: {}\ntitle: {}\n\n{}",
+                job.id,
+                creator,
+                to,
+                job.title,
+                job.prompt
+                    .as_deref()
+                    .or_else(|| (!job.description.is_empty()).then_some(job.description.as_str()))
+                    .unwrap_or("Claim or inspect this job with weave job show/status/result.")
+            );
+            let trace_id = model::mint_trace_id();
+            let mid = store.send(
+                &creator,
+                &to,
+                Some(&format!("Job: {}", job.title)),
+                &body,
+                None,
+                Some(&trace_id),
+            )?;
+            let verdict = inject_and_trace(
+                store,
+                cfg,
+                mid,
+                model::DeliveryRefKind::Message,
+                &creator,
+                &to,
+                &body,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "job": job,
+                        "delegation_message_id": mid,
+                        "verdict": verdict,
+                    }))?
+                );
+            } else {
+                println!(
+                    "delegated job {} to {} via message #{} ({})",
+                    job.id, to, mid, verdict
                 );
             }
         }

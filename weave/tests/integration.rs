@@ -8747,6 +8747,60 @@ fn cli_job_board_roundtrip() {
     assert_eq!(v["job"]["cancel_requested"].as_bool(), Some(true));
 }
 
+/// Orchestration-first worker support: an orchestrator can record durable work and
+/// notify a worker in one command, then the worker claims/updates the job with the
+/// existing fenced job lifecycle.
+#[test]
+fn cli_job_delegate_creates_assigned_job_and_notifies_worker() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "job",
+            "delegate",
+            "--from",
+            "orchestrator",
+            "--to",
+            "worker",
+            "--title",
+            "run tests",
+            "--prompt",
+            "run cargo test and report back",
+            "--json",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("job delegate --json parses");
+    let job = &v["job"];
+    let id = job["id"].as_str().expect("job id").to_string();
+    assert_eq!(job["creator"].as_str(), Some("orchestrator"));
+    assert_eq!(job["owner"].as_str(), Some("orchestrator"));
+    assert_eq!(job["assignee"].as_str(), Some("worker"));
+    assert_eq!(job["state"].as_str(), Some("queued"));
+    assert!(
+        v["delegation_message_id"].as_i64().unwrap_or(0) > 0,
+        "delegation message id present: {v}"
+    );
+    assert!(
+        v["verdict"].as_str().is_some(),
+        "delegation transport verdict present: {v}"
+    );
+
+    let worker_inbox = run_ok(&db, &["inbox", "--me", "worker"]);
+    assert!(
+        worker_inbox.contains(&format!("JOB_DELEGATED {id}")),
+        "worker receives job delegation: {worker_inbox}"
+    );
+    assert!(
+        worker_inbox.contains("run cargo test and report back"),
+        "worker receives prompt: {worker_inbox}"
+    );
+
+    let claimed = run_ok(&db, &["job", "claim", &id, "--as", "worker", "--json"]);
+    let cv: serde_json::Value = serde_json::from_str(&claimed).expect("job claim --json parses");
+    assert_eq!(cv["job"]["state"].as_str(), Some("running"));
+    assert_eq!(cv["job"]["assignee"].as_str(), Some("worker"));
+}
+
 /// MCP happy path + every documented failure path for the job tools.
 #[test]
 fn mcp_job_tools_happy_and_failure_paths() {
