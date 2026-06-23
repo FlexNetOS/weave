@@ -123,12 +123,13 @@ weave ask-many --from desktop --to envctl --to ci --body "ready to ship?" --subj
 weave ask-many-result --parent-id askm_7_31   # aggregate: per-child state + pending list + complete|partial|pending; --json
 weave ask-many-result --parent-id askm_7_31 --age 600   # treat still-open children past 600s as partial
 
-# Job board (poll-only, daemon-free durable work queue)
+# Job board and worker dispatch (daemon-free durable work queue)
 weave job create --title "build the release" --desc "cut v0.2" --assignee ci --kind build
 weave job list --state queued --owner desktop --limit 20   # filter by state/owner/creator/assignee/circle; --json
 weave job show <job_id>              # full row (status is the canonical; show is an alias)
 weave job status <job_id>            # same as show
 weave job claim <job_id> --as ci     # mint a fresh attempt_id (the fencing token) + assign; prints it
+weave job dispatch --as ci --runner flexnetos_runner --agent codex  # claim + run + record result
 weave job update <job_id> --attempt <att_id> --state running --note "compiling"  # fenced by attempt_id
 weave job update <job_id> --attempt <att_id> --state completed --result '{"ok":true}'  # JSON result/error/artifacts
 weave job result <job_id>            # terminal payload (summary/result/error/artifacts) or not_ready
@@ -452,15 +453,15 @@ Children answer and ack through the **unchanged** `weave answer` / `weave ack` p
 machinery. Local-mesh only (each child must be an explicit, valid, non-broadcast peer in
 your own store); cross-store fan-out is future work.
 
-## Job board (poll-only, daemon-free)
+## Job board and worker dispatch (daemon-free)
 
 A **durable work queue** on top of the same store — the third step toward
 repowire capability parity. A job is a persistent row with a lifecycle; workers
-**poll and claim** jobs and report progress/results back. It is **poll-only**:
-there is **no autonomous dispatch or agent-spawn** in this release (a worker is
-whatever process polls the board — a runner that *acquires and runs* a job by
-spawning an agent is deferred to a later epic). Still **daemon-free**, **no new
-dependency**, and **local-mesh** only.
+**poll and claim** jobs and report progress/results back. `weave job dispatch`
+is the first worker lifecycle tick: it claims one queued job for a worker, runs
+an external runner as argv-only, streams progress checkpoints into the job row,
+and writes the terminal result. Still **daemon-free**, **no new dependency**,
+and **local-mesh** only.
 
 **The board model.**
 
@@ -478,6 +479,15 @@ dependency**, and **local-mesh** only.
 - **Claim** (`weave job claim` / `weave_job_claim`) is how a worker takes a job:
   it **mints a fresh `attempt_id`** (the fencing token), assigns the job to the
   worker, and moves it to `running`. The worker captures the printed `attempt_id`.
+- **Dispatch** (`weave job dispatch --as <worker> --runner flexnetos_runner`) is
+  the CLI worker loop unit. It auto-selects an assigned queued job (or an
+  unassigned queued job), claims it, passes `WEAVE_JOB_ID`, `WEAVE_ATTEMPT_ID`,
+  `WEAVE_JOB_PROMPT`, `WEAVE_POLICY_OWNER=weave`, and optional
+  `WEAVE_FXRUN_AGENT` to the external runner. It also passes
+  `WEAVE_LEASES_JSON` so the execution plane can honor the current advisory
+  lease snapshot, then records completed/failed result JSON and progress notes
+  with the matching `attempt_id`. Weave coordinates and records;
+  `flexnetos_runner` or another trusted runner executes.
 - **Update** (`weave job update` / `weave_job_update`) drives the lifecycle
   forward — state, phase, an append-only progress note, and the terminal
   `result` / `error` / `artifacts` (all **TEXT JSON**). Once a job is claimed,
@@ -502,9 +512,10 @@ job creates a new one (terminal states — `completed` / `failed` / `cancelled` 
 
 The job board adds only an additive `jobs` table (both backends, guarded
 idempotent migration — a legacy DB upgrades in place) and routes every CLI and
-MCP path through one set of store methods. There is **no `store → inject` edge**
-(jobs don't nudge in this release) and the autonomous JobRunner / scheduler /
-spawn machinery is explicitly out of scope here.
+MCP path through one set of store methods. Dispatch intentionally stays a CLI
+runner seam for now to avoid standing MCP-token cost: Weave owns identity,
+policy, claim fencing, cancellation checks, and result recording; the external
+runner owns execution-plane mechanics.
 
 ## Circles + orchestrator role
 
