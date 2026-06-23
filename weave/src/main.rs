@@ -6489,6 +6489,16 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             let env_cert = std::env::var("WEAVE_BIRTH_CERT")
                 .ok()
                 .filter(|s| !s.is_empty());
+            // SessionStart re-fires on every restart, so an already-registered
+            // peer holds a minted cert. Mirror `attach`: fall back to our OWN
+            // stored cert so re-registration is idempotent for the peer owner
+            // instead of failing the hook with "already registered; provide
+            // --cert". The spawn-threaded WEAVE_BIRTH_CERT still takes
+            // precedence; identity-takeover protection is unchanged — a
+            // *mismatched* supplied cert still hard-bails inside
+            // register_peer_full, and a brand-new peer still mints fresh.
+            let stored_cert = store.get_birth_cert(&me)?;
+            let cert = env_cert.as_deref().or(stored_cert.as_deref());
             let cert = store.register_peer_full(
                 &me,
                 t.mux.as_str(),
@@ -6501,7 +6511,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
-                env_cert.as_deref(),
+                cert,
             )?;
             eprintln!(
                 "[weave] registered peer '{me}' [{}] (birth-cert: {cert})",
