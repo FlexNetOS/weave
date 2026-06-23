@@ -2875,6 +2875,52 @@ fn tool_ask(
     ))
 }
 
+fn routing_anomaly_body(ask_id: &str, expected: &str, actual: &str) -> String {
+    format!("ROUTING_ANOMALY: ask for {expected} delivered to {actual} (ask {ask_id})")
+}
+
+fn report_routing_anomaly(
+    store: &dyn Store,
+    nudge_template: Option<&str>,
+    injector: &dyn Injector,
+    ask: &model::Ask,
+    actual: &str,
+) -> Result<Option<i64>, String> {
+    if actual == ask.askee {
+        return Ok(None);
+    }
+    let body = routing_anomaly_body(&ask.id, &ask.askee, actual);
+    let mid = store
+        .send(
+            actual,
+            &ask.asker,
+            Some("ROUTING_ANOMALY"),
+            &body,
+            None,
+            None,
+        )
+        .map_err(e)?;
+    record_delivery_best_effort(
+        store,
+        mid,
+        model::DeliveryRefKind::Message,
+        &ask.asker,
+        model::DeliveryStage::Queued,
+        model::DeliveryOutcome::Ok,
+    );
+    let verdict = ask_delivery_verdict(store, nudge_template, actual, &ask.asker, &body, injector);
+    let (stage, outcome) = verdict_to_stage(verdict);
+    record_delivery_best_effort(
+        store,
+        mid,
+        model::DeliveryRefKind::Message,
+        &ask.asker,
+        stage,
+        outcome,
+    );
+    Ok(Some(mid))
+}
+
 /// `weave_answer`: reply along a tracked thread back to the asker. Accepts either
 /// `correlation_id` or an `in_reply_to` message id (resolved to its owning ask).
 fn tool_answer(
@@ -2901,11 +2947,23 @@ fn tool_answer(
         .map_err(e)?
         .ok_or_else(|| format!("No tracked ask '{cid}'."))?;
     let asker = ask.asker.clone();
+    if from != ask.askee {
+        let anomaly_mid = report_routing_anomaly(store, nudge_template, injector, &ask, &from)
+            .ok()
+            .flatten();
+        let suffix = anomaly_mid
+            .map(|mid| format!("; routing anomaly reported as #{mid}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "ROUTING_ANOMALY: ask for {} delivered to {} (ask {}){}",
+            ask.askee, from, cid, suffix
+        ));
+    }
     let ans_id = store.answer(&from, &cid, &body).map_err(e)?;
     record_delivery_best_effort(
         store,
         ans_id,
-        model::DeliveryRefKind::Ask,
+        model::DeliveryRefKind::Answer,
         &asker,
         model::DeliveryStage::Queued,
         model::DeliveryOutcome::Ok,
@@ -2915,7 +2973,7 @@ fn tool_answer(
     record_delivery_best_effort(
         store,
         ans_id,
-        model::DeliveryRefKind::Ask,
+        model::DeliveryRefKind::Answer,
         &asker,
         stage,
         outcome,
