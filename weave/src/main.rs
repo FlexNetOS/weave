@@ -2253,6 +2253,40 @@ fn inject_and_trace(
     Ok(verdict)
 }
 
+fn routing_anomaly_body(ask_id: &str, expected: &str, actual: &str) -> String {
+    format!("ROUTING_ANOMALY: ask for {expected} delivered to {actual} (ask {ask_id})")
+}
+
+fn report_routing_anomaly(
+    store: &dyn Store,
+    cfg: &Config,
+    ask: &model::Ask,
+    actual: &str,
+) -> Result<Option<i64>> {
+    if actual == ask.askee {
+        return Ok(None);
+    }
+    let body = routing_anomaly_body(&ask.id, &ask.askee, actual);
+    let mid = store.send(
+        actual,
+        &ask.asker,
+        Some("ROUTING_ANOMALY"),
+        &body,
+        None,
+        None,
+    )?;
+    let _ = inject_and_trace(
+        store,
+        cfg,
+        mid,
+        model::DeliveryRefKind::Message,
+        actual,
+        &ask.asker,
+        &body,
+    );
+    Ok(Some(mid))
+}
+
 fn ask_status_token(
     ask: &model::Ask,
     question_trace: &[model::DeliveryTrace],
@@ -4179,6 +4213,21 @@ fn main() -> Result<()> {
                 .get_ask(&cid)?
                 .ok_or_else(|| anyhow::anyhow!("no tracked ask '{cid}'"))?;
             let asker = ask.asker.clone();
+            if from != ask.askee {
+                let anomaly_mid = report_routing_anomaly(store, &cfg, &ask, &from)
+                    .ok()
+                    .flatten();
+                let suffix = anomaly_mid
+                    .map(|mid| format!("; routing anomaly reported as #{mid}"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "ROUTING_ANOMALY: ask for {} delivered to {} (ask {}){}",
+                    ask.askee,
+                    from,
+                    cid,
+                    suffix
+                );
+            }
             let answer_msg_id = store.answer(&from, &cid, &body)?;
             let verdict = inject_and_trace(
                 store,

@@ -8078,12 +8078,22 @@ fn cli_ask_failure_paths_are_clean() {
         "must be a clean error, not a panic: {err:?}"
     );
 
-    // Wrong owner: the asker cannot answer its own ask.
-    let (ok, _o, _e) = run(
+    // Wrong recipient: a non-askee cannot answer. The failed answer now records
+    // an explicit routing anomaly message so misdelivery is visible to the asker.
+    let (ok, _o, err) = run(
         &db,
-        &["answer", "--from", "alice", "--id", &cid, "--body", "x"],
+        &["answer", "--from", "carol", "--id", &cid, "--body", "x"],
     );
     assert!(!ok, "only the askee may answer");
+    assert!(
+        err.contains("ROUTING_ANOMALY"),
+        "wrong-recipient answer reports routing anomaly: {err:?}"
+    );
+    let anomaly = run_ok(&db, &["inbox", "--me", "alice", "--peek"]);
+    assert!(
+        anomaly.contains("ROUTING_ANOMALY: ask for bob delivered to carol"),
+        "routing anomaly message is visible to asker: {anomaly}"
+    );
 
     // Double-ack: ack once, then again.
     run_ok(&db, &["ack", "--from", "bob", "--id", &cid]);
@@ -8227,6 +8237,39 @@ fn mcp_ask_lifecycle_and_failures() {
     let (is_err, got) = mcp.call_tool("weave_ask_get", serde_json::json!({"id": cid}));
     assert!(!is_err, "ask_get: {got}");
     assert!(got.contains("[acked]"), "ask_get shows acked: {got:?}");
+
+    mcp.shutdown();
+}
+
+/// MCP wrong-recipient answers are reported as routing anomalies and leave an
+/// auditable message for the original asker.
+#[test]
+fn mcp_wrong_recipient_answer_reports_routing_anomaly() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+
+    let (is_err, ask_text) = mcp.call_tool(
+        "weave_ask",
+        serde_json::json!({"from": "alice", "to": "bob", "body": "q?"}),
+    );
+    assert!(!is_err, "ask succeeds: {ask_text}");
+    let cid = extract_cid(&ask_text);
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_answer",
+        serde_json::json!({"from": "carol", "correlation_id": cid, "body": "not mine"}),
+    );
+    assert!(is_err, "wrong recipient answer is an error: {text}");
+    assert!(
+        text.contains("ROUTING_ANOMALY: ask for bob delivered to carol"),
+        "error reports anomaly: {text}"
+    );
+
+    let inbox = run_ok(&db, &["inbox", "--me", "alice", "--peek"]);
+    assert!(
+        inbox.contains("ROUTING_ANOMALY: ask for bob delivered to carol"),
+        "anomaly message persisted for asker: {inbox}"
+    );
 
     mcp.shutdown();
 }
