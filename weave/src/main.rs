@@ -3163,6 +3163,38 @@ fn peer_session_id_basis(p: &model::Peer) -> &'static str {
     }
 }
 
+/// Resolve a point-to-point recipient token into the human peer alias that the
+/// store addresses. Plain aliases pass through unchanged. Stable session handles
+/// (`sess_<16-hex>`, as shown by `peers`/`scan`/`sessions`) resolve to exactly one
+/// registered peer row, giving orchestrators a precise routing handle when aliases
+/// or mux targets are visually ambiguous.
+fn resolve_point_recipient(store: &dyn Store, to: &str) -> Result<String> {
+    if !to.starts_with("sess_") {
+        return Ok(to.to_string());
+    }
+    if to.len() != "sess_".len() + 16 || !to["sess_".len()..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        anyhow::bail!("invalid session id '{to}' (expected sess_<16-hex>)");
+    }
+    let mut matches = store
+        .list_peers()?
+        .into_iter()
+        .filter(|p| peer_session_id(p) == to)
+        .map(|p| p.name)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [name] => Ok(name.clone()),
+        [] => anyhow::bail!("no registered peer has session id '{to}'"),
+        many => anyhow::bail!(
+            "session id '{to}' is ambiguous across {} peers: {}",
+            many.len(),
+            many.join(", ")
+        ),
+    }
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in bytes {
@@ -4050,6 +4082,7 @@ fn main() -> Result<()> {
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
                 None => {
+                    let to = resolve_point_recipient(store, &to)?;
                     let mid = store.send(
                         &from,
                         &to,
@@ -4120,6 +4153,7 @@ fn main() -> Result<()> {
                      (broadcast notify is deferred)."
                 );
             }
+            let to = resolve_point_recipient(store, &to)?;
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
             let trace_id = model::mint_trace_id();
@@ -4440,6 +4474,7 @@ fn main() -> Result<()> {
                     "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
                 );
             }
+            let to = resolve_point_recipient(store, &to)?;
             let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             let ask_kind = kind
                 .as_deref()
@@ -6648,6 +6683,7 @@ fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
             if model::is_broadcast(&to) {
                 anyhow::bail!("job delegation is point-to-point; choose one worker peer");
             }
+            let to = resolve_point_recipient(store, &to)?;
             let (creator, explicit) = resolve_me_explicit(from, None, cfg);
             refresh_presence(store, &creator, explicit);
             let spec = model::JobSpec {

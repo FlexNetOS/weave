@@ -186,6 +186,14 @@ basename is a *guess* and never marks mail read (so it can't consume another
 session's inbox). `--to all` (or `*`, `everyone`, `broadcast`) fans out to every
 reader; read state is tracked per reader.
 
+Point-to-point recipient resolution also accepts the stable `session_id` shown by
+`weave peers --json`, `weave scan --json`, and `weave sessions --json`
+(`sess_<16-hex>`). For `send`, `notify`, `ask`, and `job delegate`, Weave resolves
+that handle back to exactly one registered peer before writing. Unknown or
+ambiguous session ids are rejected instead of silently falling back to a peer
+alias, so orchestrators can route by exact live session when human names or mux
+targets are ambiguous.
+
 `--subject`, `--body`, and `--text` accept leading hyphens (`allow_hyphen_values`),
 so a body like `--body "-n flag broke it"` is taken literally, not parsed as a
 flag.
