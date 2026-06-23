@@ -429,6 +429,24 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    /// Non-disruptive ask ACK worker: scan open asks addressed to this session and
+    /// send one lightweight status reply per ask without answering/closing it.
+    Responder {
+        #[arg(long)]
+        me: Option<String>,
+        /// ACK status: received|wrong-recipient|busy-queued|delegated-to-worker|cannot-answer|will-answer-later.
+        #[arg(long, default_value = "received")]
+        status: String,
+        /// poll interval in seconds for multi-iteration/daemon mode
+        #[arg(long, default_value_t = 1)]
+        interval: u64,
+        /// number of sweeps to run; 0 means run forever
+        #[arg(long, default_value_t = 1)]
+        iterations: u64,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Read your inbox.
     Inbox {
         #[arg(long)]
@@ -2291,12 +2309,15 @@ fn ask_status_token(
     ask: &model::Ask,
     question_trace: &[model::DeliveryTrace],
     question_receipts: &[(String, i64)],
+    auto_ack: Option<&AskAutoAck>,
 ) -> &'static str {
     match ask.state {
         model::AskState::Acked => "acked",
         model::AskState::Answered => "answered",
         model::AskState::Open => {
-            if !question_receipts.is_empty()
+            if let Some(ack) = auto_ack {
+                ack.status
+            } else if !question_receipts.is_empty()
                 || question_trace
                     .iter()
                     .any(|t| t.stage == model::DeliveryStage::Drained.as_str())
@@ -2319,6 +2340,55 @@ fn ask_status_token(
     }
 }
 
+const AUTO_ACK_PREFIX: &str = "[weave-ack]";
+
+#[derive(Debug, Clone)]
+struct AskAutoAck {
+    message_id: i64,
+    status: &'static str,
+    body: String,
+    ts: i64,
+}
+
+fn parse_auto_ack_status(body: &str) -> Option<&'static str> {
+    let rest = body.strip_prefix(AUTO_ACK_PREFIX)?.trim_start();
+    let token = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("received")
+        .trim_end_matches(':');
+    match token {
+        "received" => Some("received"),
+        "wrong-recipient" => Some("wrong-recipient"),
+        "busy-queued" => Some("busy-queued"),
+        "delegated-to-worker" => Some("delegated-to-worker"),
+        "cannot-answer" => Some("cannot-answer"),
+        "will-answer-later" => Some("will-answer-later"),
+        _ => Some("received"),
+    }
+}
+
+fn auto_ack_for_ask(store: &dyn Store, ask: &model::Ask) -> Option<AskAutoAck> {
+    let thread = store.thread(ask.question_msg_id, MAX_THREAD).ok()?;
+    thread
+        .into_iter()
+        .rev()
+        .filter(|m| {
+            m.sender == ask.askee
+                && m.recipient == ask.asker
+                && m.in_reply_to == Some(ask.question_msg_id)
+        })
+        .filter_map(|m| {
+            parse_auto_ack_status(&m.body).map(|status| AskAutoAck {
+                message_id: m.id,
+                status,
+                body: m.body,
+                ts: m.ts,
+            })
+        })
+        .next()
+}
+
 fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
     if !model::ask_id_valid(id) {
         anyhow::bail!("invalid ask correlation id");
@@ -2336,7 +2406,13 @@ fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
         Some(mid) => store.receipts(mid)?,
         None => Vec::new(),
     };
-    let routing_status = ask_status_token(&ask, &question_delivery, &question_receipts);
+    let auto_ack = auto_ack_for_ask(store, &ask);
+    let routing_status = ask_status_token(
+        &ask,
+        &question_delivery,
+        &question_receipts,
+        auto_ack.as_ref(),
+    );
     if json {
         println!(
             "{}",
@@ -2348,6 +2424,12 @@ fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
                 "askee": ask.askee,
                 "question_msg_id": ask.question_msg_id,
                 "answer_msg_id": ask.answer_msg_id,
+                "auto_ack": auto_ack.as_ref().map(|ack| serde_json::json!({
+                    "message_id": ack.message_id,
+                    "status": ack.status,
+                    "body": ack.body,
+                    "ts": ack.ts,
+                })),
                 "question_delivery": question_delivery,
                 "question_receipts": question_receipts.iter().map(|(reader, ts)| {
                     serde_json::json!({"reader": reader, "ts": ts})
@@ -2367,6 +2449,14 @@ fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
             ask.askee
         );
         println!("  question: #{}", ask.question_msg_id);
+        if let Some(ack) = &auto_ack {
+            println!(
+                "  auto-ack: #{} {} at {}",
+                ack.message_id,
+                ack.status,
+                model::fmt_ts(ack.ts)
+            );
+        }
         if question_delivery.is_empty() {
             println!("    delivery: no trace");
         } else {
@@ -2414,6 +2504,82 @@ fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn responder_status_body(status: &str) -> Result<(&'static str, &'static str)> {
+    match status {
+        "received" => Ok(("received", "ask received; queued for this session")),
+        "wrong-recipient" => Ok(("wrong-recipient", "ask appears to be routed to the wrong session")),
+        "busy-queued" => Ok(("busy-queued", "session is busy; ask is queued for a later answer")),
+        "delegated-to-worker" => Ok(("delegated-to-worker", "ask was delegated to a background worker")),
+        "cannot-answer" => Ok(("cannot-answer", "session cannot answer this ask")),
+        "will-answer-later" => Ok(("will-answer-later", "session will answer later")),
+        _ => anyhow::bail!(
+            "invalid responder status '{status}' (expected received|wrong-recipient|busy-queued|delegated-to-worker|cannot-answer|will-answer-later)"
+        ),
+    }
+}
+
+fn responder_sweep(
+    store: &dyn Store,
+    cfg: &Config,
+    me: &str,
+    status: &str,
+    json: bool,
+) -> Result<usize> {
+    let (status, text) = responder_status_body(status)?;
+    let asks = store.list_asks(me, model::AskRole::Askee, 200)?;
+    let mut acked = 0usize;
+    let mut rows = Vec::new();
+    for ask in asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+    {
+        if auto_ack_for_ask(store, &ask).is_some() {
+            continue;
+        }
+        let body = format!("{AUTO_ACK_PREFIX} {status}: {text}");
+        let mid = store.reply(me, ask.question_msg_id, &body)?;
+        let verdict = inject_and_trace(
+            store,
+            cfg,
+            mid,
+            model::DeliveryRefKind::Message,
+            me,
+            &ask.asker,
+            &body,
+        )
+        .unwrap_or("queued_next_turn");
+        acked += 1;
+        if json {
+            rows.push(serde_json::json!({
+                "id": ask.id,
+                "asker": ask.asker,
+                "askee": ask.askee,
+                "ack_message_id": mid,
+                "ack_status": status,
+                "verdict": verdict,
+            }));
+        } else {
+            println!(
+                "acknowledged ask {} -> {} as {status} (#{mid}, {verdict})",
+                ask.id, ask.asker
+            );
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "me": me,
+                "acknowledged": acked,
+                "asks": rows,
+            }))?
+        );
+    } else if acked == 0 {
+        println!("responder: no unacknowledged open asks for {me}");
+    }
+    Ok(acked)
 }
 
 const MAX_DIAGNOSTIC_ANOMALIES: i64 = 500;
@@ -4679,6 +4845,29 @@ fn main() -> Result<()> {
             let (me, explicit) = resolve_me_explicit(me, None, &cfg);
             refresh_presence(store, &me, explicit);
             watch(store, &cfg, &me, explicit, interval, all, limit)?;
+        }
+
+        Cmd::Responder {
+            me,
+            status,
+            interval,
+            iterations,
+            json,
+        } => {
+            // Validate once before a daemon-style loop so a typo fails immediately
+            // without printing partial JSON frames.
+            let _ = responder_status_body(&status)?;
+            let (me, explicit) = resolve_me_explicit(me, None, &cfg);
+            refresh_presence(store, &me, explicit);
+            let mut done = 0u64;
+            loop {
+                responder_sweep(store, &cfg, &me, &status, json)?;
+                done = done.saturating_add(1);
+                if iterations != 0 && done >= iterations {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval.clamp(1, 60)));
+            }
         }
 
         Cmd::Inbox {
