@@ -305,45 +305,194 @@ Why this shape:
 
 ## 7. CC Switch provider/vendor flow
 
+Source evidence for this map: the restored upstream archive at
+`cc-switch-main.zip` (`package.json` says `cc-switch` v3.16.3) plus Weave's
+bridge in `weave/src/provider_switch.rs`. CC Switch is not a tiny provider DB;
+it is a Tauri desktop control plane with UI, local DB, live config
+writers, MCP/prompt/skill sync, a local proxy, failover, health, usage accounting,
+DeepLink import, and per-app providers.
+
+### 7.1 Upstream CC Switch shape, as dropped in the archive
+
 ```text
-CC Switch DB
+cc-switch-main.zip
+└─ cc-switch-main/                         All-in-One Assistant for Claude Code,
+   ├─ package.json                         Codex & Gemini CLI (v3.16.3)
+   ├─ src/                                 React/Vite frontend
+   │  ├─ App.tsx                           app tabs: providers, proxy, MCP,
+   │  ├─ components/providers/*            prompts, skills, sessions, settings
+   │  ├─ hooks/useProviderActions.tsx
+   │  └─ config/*ProviderPresets.ts
+   │
+   └─ src-tauri/src/                       Rust/Tauri backend
+      ├─ database/schema.rs                SQLite SSOT schema
+      ├─ database/dao/providers.rs         provider rows/current marker
+      ├─ provider.rs                       Provider + ProviderMeta model
+      ├─ services/provider/live.rs         live config writers
+      ├─ services/proxy.rs                 local route takeover/backup
+      ├─ proxy/provider_router.rs          failover/circuit breaker routing
+      ├─ mcp/*                             MCP sync to host apps
+      ├─ prompt.rs / prompt_files.rs       prompt sync
+      ├─ services/skill.rs                 skill sync
+      ├─ claude_* / codex_config.rs /
+      │  gemini_* / opencode_config.rs /
+      │  openclaw_config.rs / hermes_config.rs
+      └─ deeplink/*                        ccswitch:// import flow
+```
+
+### 7.2 CC Switch internal data/control plane
+
+```text
+                          +------------------------------+
+                          | CC Switch desktop UI         |
+                          | React/Vite tabs + forms      |
+                          +---------------+--------------+
+                                          |
+                                          | Tauri commands
+                                          v
++--------------------------------------------------------------------------------+
+|                              CC Switch Rust backend                             |
+|                                                                                |
+| +-----------------------+    +-----------------------+    +------------------+ |
+| | database/schema.rs    |    | provider.rs           |    | app_config.rs    | |
+| | SQLite SSOT           |    | Provider/ProviderMeta |    | AppType + modes  | |
+| +-----------+-----------+    +-----------+-----------+    +---------+--------+ |
+|             |                            |                          |          |
+|             v                            v                          v          |
+| +-----------------------+    +-----------------------+    +------------------+ |
+| | providers table       |    | settings_config JSON  |    | app capability   | |
+| | app_type, id, name,   |    | auth/config/env/meta  |    | switch/additive  | |
+| | is_current, meta,     |    | modelCatalog/routes   |    | claude/codex/... | |
+| | sort/failover fields  |    +-----------+-----------+    +---------+--------+ |
+| +-----------+-----------+                |                          |          |
+|             |                            v                          |          |
+|             |              +----------------------------+            |          |
+|             |              | services/provider/live.rs  |            |          |
+|             |              | write_live_with_common_*   |            |          |
+|             |              | sync_current_provider_*    |            |          |
+|             |              +-------------+--------------+            |          |
+|             |                            |                           |          |
+|             v                            v                           v          |
+| +----------------------+    +-------------------------+    +------------------+|
+| | proxy_config         |    | MCP / prompt / skills   |    | proxy logs,      ||
+| | provider_health      |    | sync stores             |    | usage rollups    ||
+| | failover queue       |    | mcp_servers/prompts     |    | stream checks    ||
+| +----------+-----------+    +------------+------------+    +------------------+|
+|            |                             |                                      |
+|            v                             v                                      |
+| +-----------------------+   +-----------------------------------------------+  |
+| | proxy/provider_router |   | host app config writers                        |  |
+| | current/failover      |   | Claude, Claude Desktop, Codex, Gemini,         |  |
+| | circuit breakers      |   | OpenCode, OpenClaw, Hermes                    |  |
+| +-----------------------+   +-----------------------------------------------+  |
++--------------------------------------------------------------------------------+
+```
+
+### 7.3 Weave bridge: what is wired today
+
+```text
+READ/SWITCH BRIDGE TODAY
+========================
+
 ~/.cc-switch/cc-switch.db
-providers + settings
+providers(id, app_type, name, settings_config, category, is_current)
+settings(common_config_<app>, current_provider_<app>, ...)
         |
-        | weave provider-switch list/current/models/switch/switch-model
+        | sqlite query/update by `weave provider-switch`
         v
 +------------------------------+
 | weave/src/provider_switch.rs |
-| Rust-native bridge           |
+| small Rust-native bridge     |
 +--------------+---------------+
                |
+               | supports ProviderSwitchApp only:
+               |   claude, codex, gemini
                v
 +------------------------------+
-| provider snapshot transform  |
-| - common config merge        |
-| - app-specific model update  |
-| - hook/MCP preservation      |
-+-------+----------+-----------+
-        |          |           |
-        v          v           v
-   Claude       Codex       Gemini
- settings.json  config.toml .env/settings.json
-        |          |           |
-        v          v           v
- live host model/vendor config updated
+| ProviderRow                  |
+| id/name/category/is_current  |
+| settings_config JSON         |
++--------------+---------------+
+               |
+     +---------+---------+-------------------+
+     |                   |                   |
+     v                   v                   v
++------------+     +-------------+     +-------------+
+| list       |     | current     |     | models      |
+| DB read    |     | DB read     |     | DB + catalog|
++------------+     +-------------+     +------+------+
+                                             |
+                                             | optional additive probe only
+                                             v
+                                      Ollama /api/tags
+                                      (keep until shimmy/ruvllm
+                                       are proven replacements)
+
+WRITE/SWITCH PATH TODAY
+=======================
+
+weave provider-switch switch --app <claude|codex|gemini> <provider_id>
+        |
+        v
+load provider row + optional common_config_<app>
+        |
+        v
+apply_live(app, provider)
+        |
+        +--> Claude: ~/.claude/settings.json
+        |           preserve existing hooks + mcpServers if provider lacks them
+        |
+        +--> Codex: ~/.codex/config.toml
+        |           preserve existing notify hook wake line
+        |           write auth.json only when explicit OPENAI_API_KEY exists
+        |
+        +--> Gemini: ~/.gemini/.env and ~/.gemini/settings.json
+                    merge/preserve settings outside provider-owned keys
+        |
+        v
+update CC Switch DB:
+  providers.is_current = 1 for selected provider
+  settings.current_provider_<app> = provider_id
 ```
 
-Current limits to track:
+### 7.4 What is not wired yet, and why the graph matters
 
-- The bridge supports `claude`, `codex`, and `gemini`, but it is CLI-only and
-  sqlite-build-only.
-- It preserves lifecycle hooks where the target file shape is known, but provider
-  switching is not yet tied into Weave's session/job/runner policy model.
-- `models` can probe local Ollama; owner policy now says Ollama must remain until
-  shimmy/ruvllm replacement is proven, so future model discovery should account
-  for shimmy/ruvllm without prematurely deleting Ollama support.
-- CC Switch provider state is not yet surfaced in `doctor`, `scan`, or worker
-  delegation/runner routing diagnostics.
+```text
+CC SWITCH CAPABILITY               WEAVE STATE NOW             GAP
+--------------------               ---------------             ---
+Claude/Codex/Gemini providers ---> provider-switch CLI ------> no doctor/scan status
+OpenCode/OpenClaw/Hermes --------> not in bridge -----------> no as-is app coverage
+Claude Desktop 3P profiles ------> not in bridge -----------> no proxy route mapping
+local proxy/takeover ------------> not in bridge -----------> no route/failover view
+provider_health/failover --------> not in bridge -----------> no orchestration signal
+MCP/prompt/skill sync -----------> setup has own paths -----> no CC Switch sync map
+usage/proxy logs ----------------> not in bridge -----------> no cost/health feedback
+DeepLink import -----------------> not in bridge -----------> no import/status story
+```
+
+The correct integration boundary is therefore **not** "Weave owns CC Switch" and
+not "copy random provider fields by hand." The boundary is:
+
+```text
+CC Switch owns: provider catalog, app-specific live config semantics, proxy,
+                failover, health, usage, MCP/prompt/skill sync, DeepLink import.
+
+Weave owns:     live agent/session orchestration, jobs, asks, routing, doctor,
+                policy surfaces, and runner delegation.
+
+Bridge owns:    exact, source-truth interop contracts:
+                - read provider/app/proxy/health state from CC Switch DB
+                - request a provider/model policy for a Weave job/session
+                - apply switch only through semantics that preserve Weave hooks
+                - surface drift/mismatch in doctor/scan/status
+                - never silently drop unsupported CC Switch apps/capabilities
+```
+
+Next implementation slice implied by this graph: replace the current
+three-app-only mental model with a CC Switch status contract that reads the actual
+archive schema (`providers`, `provider_health`, `proxy_config`, failover/usage
+state, MCP/prompt/skill tables) and reports which pieces Weave honors, ignores,
+or cannot safely drive yet.
 
 ## 8. CLI/daemon-first vs MCP friction map
 
