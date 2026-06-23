@@ -24,6 +24,216 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(feature = "sqlite")]
+fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("weave-it-{label}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+#[cfg(feature = "sqlite")]
+fn seed_cc_switch_db(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).expect("open cc-switch test db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE providers (
+            id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            settings_config TEXT NOT NULL,
+            category TEXT,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            sort_index INTEGER,
+            PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+        "#,
+    )
+    .expect("schema");
+    conn.execute(
+        "INSERT INTO providers(id, app_type, name, settings_config, category, is_current, sort_index) VALUES(?1, 'claude', ?2, ?3, 'custom', 0, 1)",
+        rusqlite::params![
+            "anthropic-alt",
+            "Anthropic Alt",
+            serde_json::json!({
+                "env": {"ANTHROPIC_BASE_URL": "https://api.example.test", "ANTHROPIC_AUTH_TOKEN": "sk-test"},
+                "model": "claude-test"
+            }).to_string()
+        ],
+    ).expect("insert claude");
+    conn.execute(
+        "INSERT INTO providers(id, app_type, name, settings_config, category, is_current, sort_index) VALUES(?1, 'codex', ?2, ?3, 'custom', 0, 1)",
+        rusqlite::params![
+            "deepseek",
+            "DeepSeek",
+            serde_json::json!({
+                "auth": {"OPENAI_API_KEY": "sk-codex"},
+                "config": "model_provider = \"custom\"\nmodel = \"deepseek-chat\"\n[model_providers.custom]\nname = \"DeepSeek\"\nbase_url = \"https://api.deepseek.example/v1\"\nwire_api = \"chat\"\n"
+            }).to_string()
+        ],
+    ).expect("insert codex");
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_lists_and_reports_current_cc_switch_provider() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-list-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+    let conn = rusqlite::Connection::open(&cc_db).unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'claude' AND id = 'anthropic-alt'",
+        [],
+    )
+    .unwrap();
+
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "list",
+            "--app",
+            "claude",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    assert!(out.contains("*\tanthropic-alt\tAnthropic Alt"), "{out}");
+
+    let current = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "current",
+            "--app",
+            "claude",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    assert!(
+        current.contains("anthropic-alt\tAnthropic Alt"),
+        "{current}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_claude_applies_provider_and_preserves_weave_hooks() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-claude-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/weave hook wake"}]}]},
+            "mcpServers": {"weave": {"command": "/usr/bin/weave", "args": ["mcp"]}}
+        })).unwrap(),
+    ).unwrap();
+
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "switch",
+            "--app",
+            "claude",
+            "anthropic-alt",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    assert!(out.contains("switched claude provider"), "{out}");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        settings
+            .pointer("/env/ANTHROPIC_BASE_URL")
+            .and_then(|v| v.as_str()),
+        Some("https://api.example.test")
+    );
+    assert!(
+        settings.get("hooks").is_some(),
+        "hooks must survive provider switching: {settings}"
+    );
+    assert!(
+        settings.get("mcpServers").is_some(),
+        "MCP servers must survive provider switching: {settings}"
+    );
+    let is_current: i64 = rusqlite::Connection::open(&cc_db)
+        .unwrap()
+        .query_row(
+            "SELECT is_current FROM providers WHERE app_type = 'claude' AND id = 'anthropic-alt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(is_current, 1);
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_codex_applies_config_auth_and_preserves_notify_hook() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-codex-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+
+    let codex_dir = home.join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "notify = [\"/usr/bin/weave\", \"hook\", \"wake\"]\n",
+    )
+    .unwrap();
+
+    run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "switch",
+            "--app",
+            "codex",
+            "deepseek",
+            "--db",
+            cc_db.to_str().unwrap(),
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(config.contains("model_provider = \"custom\""), "{config}");
+    assert!(
+        config.contains("notify = [\"/usr/bin/weave\", \"hook\", \"wake\"]"),
+        "{config}"
+    );
+    let auth: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_dir.join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()),
+        Some("sk-codex")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1. MCP stdio protocol
 // ---------------------------------------------------------------------------

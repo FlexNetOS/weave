@@ -16,7 +16,7 @@ harness = false
 
 [features]
 default = ["sqlite"]
-sqlite = ["weave-core/sqlite"]
+sqlite = ["weave-core/sqlite", "dep:rusqlite"]
 libsql = ["weave-core/libsql", "weave-mcp/libsql"]
 sign = ["weave-core/sign", "weave-mcp/sign"]
 llm = ["weave-core/llm"]
@@ -43,6 +43,7 @@ clap_mangen = "0.2.31"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
+rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
 # FrankenNetworkX graph primitives — extracted for peer/message network analysis.
 # These are workspace-internal crates; we reference them by git + path.
 fnx-classes = { git = "https://github.com/Dicklesworthstone/franken_networkx" }
