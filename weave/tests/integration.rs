@@ -7991,6 +7991,62 @@ fn cli_asks_and_ask_get_json_shapes() {
         .unwrap_or(true));
 }
 
+/// `ask-status` is the read-time near-instant status surface for an ask: it joins
+/// ask state, delivery trace, and receipts without changing the ask lifecycle.
+#[test]
+fn cli_ask_status_reports_delivery_receipts_and_answer() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &[
+            "ask", "--from", "alice", "--to", "bob", "--body", "status q",
+        ],
+    );
+    let cid = extract_cid(&opened);
+
+    let status_json = run_ok(&db, &["ask-status", "--id", &cid, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&status_json).expect("ask-status json");
+    assert_eq!(v["id"].as_str(), Some(cid.as_str()), "status: {v}");
+    assert_eq!(v["state"].as_str(), Some("open"), "status: {v}");
+    assert_eq!(v["routing_status"].as_str(), Some("queued"), "status: {v}");
+    assert!(
+        v["question_delivery"].as_array().unwrap().len() >= 2,
+        "question trace present: {v}"
+    );
+
+    // A normal inbox drain by bob marks the question read; status upgrades to received.
+    let inbox = run_ok(&db, &["inbox", "--me", "bob"]);
+    assert!(inbox.contains("status q"), "bob drains question: {inbox}");
+    let received = run_ok(&db, &["ask-status", "--id", &cid, "--json"]);
+    let rv: serde_json::Value = serde_json::from_str(&received).expect("ask-status json");
+    assert_eq!(
+        rv["routing_status"].as_str(),
+        Some("received"),
+        "received status: {rv}"
+    );
+    assert!(
+        !rv["question_receipts"].as_array().unwrap().is_empty(),
+        "receipt present: {rv}"
+    );
+
+    run_ok(
+        &db,
+        &[
+            "answer", "--from", "bob", "--id", &cid, "--body", "status a",
+        ],
+    );
+    let answered = run_ok(&db, &["ask-status", "--id", &cid]);
+    assert!(
+        answered.contains("status=answered"),
+        "human status: {answered}"
+    );
+    assert!(answered.contains("answer: #"), "answer section: {answered}");
+    assert!(
+        answered.contains("(answer)"),
+        "answer trace kind: {answered}"
+    );
+}
+
 /// CLI failure paths are clean non-zero exits (never a panic): answering/acking an
 /// unknown correlation id, double-ack, a wrong-owner answer, and a metachar id.
 #[test]
@@ -8053,7 +8109,7 @@ fn cli_ask_failure_paths_are_clean() {
     );
 }
 
-/// MCP black-box: tools/list grows by EXACTLY 5 (weave_ask/answer/ack/asks/ask_get),
+/// MCP black-box: tools/list grows by EXACTLY 6 (weave_ask/answer/ack/asks/ask_get/ask_status),
 /// a happy-path ask returns a correlation id + an honest verdict (NOT isError even
 /// when not injectable), and the failure paths come back as clean isError results
 /// (never a panic, never a silent persist). stdout stays pure JSON-RPC (call_tool
@@ -8078,23 +8134,29 @@ fn mcp_ask_lifecycle_and_failures() {
         "weave_ack",
         "weave_asks",
         "weave_ask_get",
+        "weave_ask_status",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
             "tools/list missing {expected}; got {names:?}"
         );
     }
-    // Exactly five tool names start with the ask family prefix set.
+    // Exactly six tool names start with the ask family prefix set.
     let ask_family = names
         .iter()
         .filter(|n| {
             matches!(
                 n.as_str(),
-                "weave_ask" | "weave_answer" | "weave_ack" | "weave_asks" | "weave_ask_get"
+                "weave_ask"
+                    | "weave_answer"
+                    | "weave_ack"
+                    | "weave_asks"
+                    | "weave_ask_get"
+                    | "weave_ask_status"
             )
         })
         .count();
-    assert_eq!(ask_family, 5, "exactly 5 ask-family tools: {names:?}");
+    assert_eq!(ask_family, 6, "exactly 6 ask-family tools: {names:?}");
 
     // Happy path: ask to an unknown peer is HONEST SUCCESS with a verdict, NOT an
     // error (degrade-to-store), exactly like weave_send/weave_connect.
@@ -8115,6 +8177,13 @@ fn mcp_ask_lifecycle_and_failures() {
         "the honest delivery verdict vocabulary must appear: {ask_text:?}"
     );
     let cid = extract_cid(&ask_text);
+
+    let (is_err, st_text) = mcp.call_tool("weave_ask_status", serde_json::json!({"id": cid}));
+    assert!(!is_err, "ask_status happy path: {st_text}");
+    assert!(
+        st_text.contains("status=queued"),
+        "ask_status shows routing status: {st_text}"
+    );
 
     // weave_answer happy path (back to the asker) with a verdict.
     let (is_err, ans_text) = mcp.call_tool(

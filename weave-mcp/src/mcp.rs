@@ -492,6 +492,7 @@ fn call_tool(
         "weave_ack" => tool_ack(store, me_default, args),
         "weave_asks" => tool_asks(store, me_default, args),
         "weave_ask_get" => tool_ask_get(store, args),
+        "weave_ask_status" => tool_ask_status(store, args),
         "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args, injector),
         "weave_ask_many_result" => tool_ask_many_result(store, args),
         "weave_job_create" => tool_job_create(store, me_default, args),
@@ -3030,6 +3031,91 @@ fn tool_ask_get(store: &dyn Store, args: &Value) -> Result<String, String> {
     ))
 }
 
+fn ask_status_token(
+    ask: &model::Ask,
+    question_trace: &[model::DeliveryTrace],
+    question_receipts: &[(String, i64)],
+) -> &'static str {
+    match ask.state {
+        model::AskState::Acked => "acked",
+        model::AskState::Answered => "answered",
+        model::AskState::Open => {
+            if !question_receipts.is_empty()
+                || question_trace
+                    .iter()
+                    .any(|t| t.stage == model::DeliveryStage::Drained.as_str())
+            {
+                "received"
+            } else if question_trace.iter().any(|t| {
+                t.stage == model::DeliveryStage::Injected.as_str()
+                    && t.outcome == model::DeliveryOutcome::Ok.as_str()
+            }) {
+                "injected"
+            } else if question_trace.iter().any(|t| {
+                t.stage == model::DeliveryStage::Queued.as_str()
+                    || t.stage == model::DeliveryStage::NotInjectable.as_str()
+            }) {
+                "queued"
+            } else {
+                "opened"
+            }
+        }
+    }
+}
+
+/// `weave_ask_status`: show read-time delivery/response status for a tracked ask.
+fn tool_ask_status(store: &dyn Store, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'id' is required (the correlation id).")?;
+    if !model::ask_id_valid(id) {
+        return Err("'id' is not a valid correlation id.".to_string());
+    }
+    let ask = store
+        .get_ask(id)
+        .map_err(e)?
+        .ok_or_else(|| format!("No tracked ask '{id}'."))?;
+    let question_delivery = store
+        .list_delivery(ask.question_msg_id, model::MAX_DELIVERY_ROWS)
+        .map_err(e)?;
+    let question_receipts = store.receipts(ask.question_msg_id).map_err(e)?;
+    let answer_delivery = match ask.answer_msg_id {
+        Some(mid) => store
+            .list_delivery(mid, model::MAX_DELIVERY_ROWS)
+            .map_err(e)?,
+        None => Vec::new(),
+    };
+    let answer_receipts = match ask.answer_msg_id {
+        Some(mid) => store.receipts(mid).map_err(e)?,
+        None => Vec::new(),
+    };
+    let routing_status = ask_status_token(&ask, &question_delivery, &question_receipts);
+    let mut out = format!(
+        "Ask {} [{}] {} -> {} status={routing_status}\n",
+        ask.id,
+        ask.state.as_str(),
+        ask.asker,
+        ask.askee
+    );
+    out.push_str(&format!(
+        "Question #{}: {} delivery stage(s), {} receipt(s)\n",
+        ask.question_msg_id,
+        question_delivery.len(),
+        question_receipts.len()
+    ));
+    if let Some(mid) = ask.answer_msg_id {
+        out.push_str(&format!(
+            "Answer #{mid}: {} delivery stage(s), {} receipt(s)\n",
+            answer_delivery.len(),
+            answer_receipts.len()
+        ));
+    }
+    Ok(out)
+}
+
 /// `weave_ask_many`: fan ONE question to N explicit peers. Opens a parent group +
 /// one normal P1 child ask per (de-duped, valid, non-broadcast) peer, then fires the
 /// per-child live nudge CALLER-SIDE for each created child (the `ask_delivery_verdict`
@@ -3776,6 +3862,13 @@ fn tool_catalog() -> Vec<Value> {
         {
             "name": "weave_ask_get",
             "description": "Fetch a single tracked ask by correlation_id (its state, parties, subject, and whether it has been answered). Read-only.",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"The correlation_id."}
+            },"required":["id"]}
+        },
+        {
+            "name": "weave_ask_status",
+            "description": "Show read-time delivery/response status for a tracked ask: ask state, routing_status (opened|queued|injected|received|answered|acked), delivery stage counts, and read receipt counts. Read-only.",
             "inputSchema": {"type":"object","properties":{
                 "id":{"type":"string","description":"The correlation_id."}
             },"required":["id"]}

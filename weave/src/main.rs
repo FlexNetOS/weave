@@ -669,6 +669,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show read-time delivery/response status for a tracked ask.
+    AskStatus {
+        #[arg(long)]
+        id: String,
+        /// machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Fan ONE question to N peers (P2 ask-many). Opens a parent group + one tracked
     /// child ask per --to peer, fires each child's live nudge, and prints the parent
     /// id + per-child verdicts immediately (non-blocking, best-effort).
@@ -2243,6 +2251,135 @@ fn inject_and_trace(
     };
     record_delivery_best_effort(store, ref_id, kind, to, stage, outcome);
     Ok(verdict)
+}
+
+fn ask_status_token(
+    ask: &model::Ask,
+    question_trace: &[model::DeliveryTrace],
+    question_receipts: &[(String, i64)],
+) -> &'static str {
+    match ask.state {
+        model::AskState::Acked => "acked",
+        model::AskState::Answered => "answered",
+        model::AskState::Open => {
+            if !question_receipts.is_empty()
+                || question_trace
+                    .iter()
+                    .any(|t| t.stage == model::DeliveryStage::Drained.as_str())
+            {
+                "received"
+            } else if question_trace.iter().any(|t| {
+                t.stage == model::DeliveryStage::Injected.as_str()
+                    && t.outcome == model::DeliveryOutcome::Ok.as_str()
+            }) {
+                "injected"
+            } else if question_trace.iter().any(|t| {
+                t.stage == model::DeliveryStage::Queued.as_str()
+                    || t.stage == model::DeliveryStage::NotInjectable.as_str()
+            }) {
+                "queued"
+            } else {
+                "opened"
+            }
+        }
+    }
+}
+
+fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
+    if !model::ask_id_valid(id) {
+        anyhow::bail!("invalid ask correlation id");
+    }
+    let ask = store
+        .get_ask(id)?
+        .ok_or_else(|| anyhow::anyhow!("no tracked ask '{id}'"))?;
+    let question_delivery = store.list_delivery(ask.question_msg_id, model::MAX_DELIVERY_ROWS)?;
+    let question_receipts = store.receipts(ask.question_msg_id)?;
+    let answer_delivery = match ask.answer_msg_id {
+        Some(mid) => store.list_delivery(mid, model::MAX_DELIVERY_ROWS)?,
+        None => Vec::new(),
+    };
+    let answer_receipts = match ask.answer_msg_id {
+        Some(mid) => store.receipts(mid)?,
+        None => Vec::new(),
+    };
+    let routing_status = ask_status_token(&ask, &question_delivery, &question_receipts);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": ask.id,
+                "state": ask.state.as_str(),
+                "routing_status": routing_status,
+                "asker": ask.asker,
+                "askee": ask.askee,
+                "question_msg_id": ask.question_msg_id,
+                "answer_msg_id": ask.answer_msg_id,
+                "question_delivery": question_delivery,
+                "question_receipts": question_receipts.iter().map(|(reader, ts)| {
+                    serde_json::json!({"reader": reader, "ts": ts})
+                }).collect::<Vec<_>>(),
+                "answer_delivery": answer_delivery,
+                "answer_receipts": answer_receipts.iter().map(|(reader, ts)| {
+                    serde_json::json!({"reader": reader, "ts": ts})
+                }).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "ask {} [{}] {} -> {} status={routing_status}",
+            ask.id,
+            ask.state.as_str(),
+            ask.asker,
+            ask.askee
+        );
+        println!("  question: #{}", ask.question_msg_id);
+        if question_delivery.is_empty() {
+            println!("    delivery: no trace");
+        } else {
+            for t in &question_delivery {
+                println!(
+                    "    delivery [{}] {}/{} -> {} ({})",
+                    model::fmt_ts(t.ts),
+                    t.stage,
+                    t.outcome,
+                    t.to_peer,
+                    t.ref_kind
+                );
+            }
+        }
+        if question_receipts.is_empty() {
+            println!("    receipts: none");
+        } else {
+            for (reader, ts) in &question_receipts {
+                println!("    receipt: {reader} at {}", model::fmt_ts(*ts));
+            }
+        }
+        if let Some(mid) = ask.answer_msg_id {
+            println!("  answer: #{mid}");
+            if answer_delivery.is_empty() {
+                println!("    delivery: no trace");
+            } else {
+                for t in &answer_delivery {
+                    println!(
+                        "    delivery [{}] {}/{} -> {} ({})",
+                        model::fmt_ts(t.ts),
+                        t.stage,
+                        t.outcome,
+                        t.to_peer,
+                        t.ref_kind
+                    );
+                }
+            }
+            if answer_receipts.is_empty() {
+                println!("    receipts: none");
+            } else {
+                for (reader, ts) in &answer_receipts {
+                    println!("    receipt: {reader} at {}", model::fmt_ts(*ts));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
@@ -4069,6 +4206,8 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        Cmd::AskStatus { id, json } => print_ask_status(store, &id, json)?,
 
         Cmd::AskMany {
             to,
