@@ -1675,6 +1675,29 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn all_messages(&self, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so whole-DB export never surfaces expired rows.
+        let _ = self.sweep_expired_messages();
+        let limit = clamp_limit(limit);
+        let now_cut = now();
+        self.rt.block_on(async {
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                 WHERE (expires_at IS NULL OR expires_at > ?2)
+                 ORDER BY id DESC LIMIT ?1";
+            let mut it = self
+                .conn
+                .query(sql, params(vec![limit.into(), now_cut.into()]))
+                .await?;
+            let mut rows: Vec<Message> = Vec::new();
+            while let Some(r) = it.next().await? {
+                rows.push(row_to_message(&r)?);
+            }
+            drop(it);
+            rows.reverse();
+            Ok(rows)
+        })
+    }
+
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>> {
         // WL-038: opportunistic sweep so search never surfaces an expired row.
         let _ = self.sweep_expired_messages();
@@ -5657,6 +5680,18 @@ mod tests {
         s.send("c", "d", None, "x", None, None).unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn all_messages_crosses_identity_scope_explicitly() {
+        let s = mem();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("c", "d", None, "2", None, None).unwrap();
+        assert_eq!(s.history("a", None, 50).unwrap().len(), 1);
+        let all = s.all_messages(50).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].body, "1");
+        assert_eq!(all[1].body, "2");
     }
 
     #[test]

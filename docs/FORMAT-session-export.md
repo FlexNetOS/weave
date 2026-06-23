@@ -8,7 +8,7 @@ It is one of **three** distinct weave "export" surfaces — do not confuse them:
 
 | Surface | Command | Form | Scope | Portable? |
 |---|---|---|---|---|
-| **WL-034** | `weave export` | HTML | presentation (offline mailbox view) | viewer-only |
+| **WL-034/WL-074** | `weave export` | HTML | presentation (offline mailbox view; per-identity by default, explicit `--all` for whole local store) | viewer-only |
 | **WL-035** | `weave backup` / `restore` | USTAR tar (binary DB snapshot) | byte-exact, **host-local** | no (ids/host identical) |
 | **WL-040** | `weave session export` / `import` | **canonical JSON** | logical session (messages + memory) | **yes** (ids re-minted on import) |
 

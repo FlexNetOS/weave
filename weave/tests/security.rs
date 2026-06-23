@@ -1251,6 +1251,85 @@ fn export_neutralizes_script_breakout_and_event_handler() {
     let _ = std::fs::remove_file(&out_path);
 }
 
+#[test]
+fn export_all_is_explicit_and_preserves_xss_defenses_across_identities() {
+    let db = TestDb::new();
+    let breakout = "</script><script>document.title='all-xss'</script>";
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "attacker",
+            "--to",
+            "victim",
+            &format!("--body={breakout}"),
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "other",
+            "--to",
+            "separate",
+            "--body=separate-private-body",
+        ],
+    );
+
+    let out_path = std::env::temp_dir().join(format!(
+        "weave-sec-export-all-{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let scoped_path = out_path.with_extension("scoped.html");
+
+    run_ok(
+        &db,
+        &[
+            "export",
+            "--for",
+            "victim",
+            "--out",
+            &scoped_path.to_string_lossy(),
+        ],
+    );
+    let scoped = std::fs::read_to_string(&scoped_path)
+        .unwrap_or_else(|e| panic!("scoped export exists: {e}"));
+    assert!(scoped.contains("<\\/script>") || scoped.contains("&lt;/script&gt;"));
+    assert!(
+        !scoped.contains("separate-private-body"),
+        "identity-scoped export must not leak another mailbox"
+    );
+
+    run_ok(
+        &db,
+        &["export", "--all", "--out", &out_path.to_string_lossy()],
+    );
+    let html = std::fs::read_to_string(&out_path)
+        .unwrap_or_else(|e| panic!("whole-db export exists: {e}"));
+    assert!(
+        html.contains("separate-private-body"),
+        "--all is the explicit privacy decision to include every identity"
+    );
+    assert!(
+        !html.contains(breakout),
+        "whole-db export must still neutralize script-breakout bodies"
+    );
+    assert!(
+        !html.contains("<script>document.title='all-xss'</script>"),
+        "whole-db export must not emit injected script markup"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&scoped_path);
+}
+
 // ---------------------------------------------------------------------------
 // Tier-2 phase 2d — signed sender identity (only built with `--features sign`).
 //
