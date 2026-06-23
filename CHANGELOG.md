@@ -13,6 +13,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `scripts/target_smoke.py`, a generated-artifact smoke matrix that builds and executes `target/debug/weave` and `target/release/weave` directly, emits `target/target-smoke/target-smoke.json`, and can expand to feature-gated artifacts with `--full`.
+
 ### Added (CC Switch provider bridge)
 - **`weave provider-switch`** (default sqlite build) reads CC Switch's `~/.cc-switch/cc-switch.db` and
   can `list`, show `current`, or `switch` providers for `claude`, `codex`, and

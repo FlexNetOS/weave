@@ -1119,3 +1119,48 @@ done:
     + `sign`: clippy + test), and `libsql + sign` (clippy + build + test). The
     optional crypto path is therefore gated in CI on **both** backends, not just
     locally, so a `sign`-only regression cannot merge unnoticed.
+
+## Generated target-output smoke matrix (WL-081)
+
+Unit and integration tests prove source behavior, but operators also need proof
+that the **generated binaries in `target/`** were produced by Cargo and work when
+executed directly. Use the stdlib-only smoke runner:
+
+```bash
+python3 scripts/target_smoke.py
+```
+
+What it proves:
+
+- `cargo metadata.target_directory`, `target/CACHEDIR.TAG`, `.rustc_info.json`,
+  debug/release directories, and binary metadata are recorded in a JSON report.
+- `target/debug/weave` and `target/release/weave` are executed directly, not via
+  `cargo test`.
+- Each artifact runs a temp-store E2E sweep: `--version`, `doctor --json`,
+  registration, `send`/`inbox`, `delivery`, `ask`/`responder`/`answer`, jobs,
+  graph, session export/import dry-run, backup, MCP stdio meta-tool, readonly-DB
+  negative, unknown-peer negative, and CC Switch missing-DB diagnostic when the
+  sqlite-only provider-switch command is compiled in.
+- The report is machine-readable at `target/target-smoke/target-smoke.json` by
+  default and the generated report stays out of git with the rest of `target/`.
+
+For the larger feature-gated artifact sweep, run:
+
+```bash
+python3 scripts/target_smoke.py --full
+```
+
+`--full` builds feature-specific artifacts in isolated target dirs under
+`target/target-smoke/build/` so sqlite/libsql/sign/surfaces/obscura combinations
+cannot overwrite the root debug/release artifacts. The script records skipped
+feature artifacts when run without `--full`.
+
+To prove Cargo recreates the generated cache from a no-`target` state:
+
+```bash
+python3 scripts/target_smoke.py --clean-target
+```
+
+`--clean-target` refuses to delete a non-empty `target/` unless Cargo's
+`CACHEDIR.TAG` marker is present. Never commit files from `target/`; commit only
+script, docs, or source changes.

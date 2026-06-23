@@ -53,6 +53,27 @@ jobs:
       - name: cargo test --all-targets
         run: cargo test --all-targets
 
+  target-smoke:
+    # WL-081: generated-artifact smoke. This executes the compiled binaries
+    # directly from target/debug and target/release and writes a machine-readable
+    # target/target-smoke/target-smoke.json report. The full feature matrix is
+    # available locally with `python3 scripts/target_smoke.py --full`; CI keeps
+    # the always-on root debug/release artifact proof.
+    name: target artifact smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: smoke generated target artifacts
+        run: python3 scripts/target_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: target-smoke-report
+          path: target/target-smoke/target-smoke.json
+          if-no-files-found: ignore
+
   libsql:
     # The libSQL backend is a SEPARATE binary build: rusqlite and libsql each
     # bundle their own SQLite, so they are mutually-exclusive features. Build it
