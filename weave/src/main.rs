@@ -6,6 +6,7 @@
 //!                        --provider <claude|codex|gemini|aider> (default claude);
 //!                        --pretooluse also installs the enforcing PreToolUse gate (Claude)
 //!   weave uninstall      remove weave's host wiring (--provider <…>, default claude)
+//!   weave provider-switch list|current|switch  bridge CC Switch providers into host configs
 //!   weave send           send a message (CLI; --to-store deposits a cross-store intent)
 //!   weave outbox         list pending cross-store intents (Tier-2)
 //!   weave pull           pull cross-store intents from pull_from sources into your inbox
@@ -44,6 +45,8 @@ compile_error!("no storage backend selected: enable `sqlite` (default) or `libsq
 mod backup;
 mod git;
 mod harness;
+#[cfg(feature = "sqlite")]
+mod provider_switch;
 mod session;
 mod setup;
 #[cfg(feature = "surfaces")]
@@ -215,6 +218,12 @@ enum Cmd {
         /// Which coding-agent host to unwire (default: claude).
         #[arg(long, value_enum, default_value_t = SetupProvider::Claude)]
         provider: SetupProvider,
+    },
+    /// Bridge CC Switch providers into Claude/Codex/Gemini live configs while preserving weave hooks.
+    #[cfg(feature = "sqlite")]
+    ProviderSwitch {
+        #[command(subcommand)]
+        cmd: ProviderSwitchCmd,
     },
     /// Autonomous orchestration harnesses (Codex seven-layer ide-merge-ide).
     Harness {
@@ -1435,6 +1444,43 @@ enum JobCmd {
         from: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Subcommand)]
+enum ProviderSwitchCmd {
+    /// List providers from the CC Switch SQLite store.
+    List {
+        /// App namespace to list.
+        #[arg(long, value_enum)]
+        app: provider_switch::ProviderSwitchApp,
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Print the current provider from the CC Switch SQLite store.
+    Current {
+        /// App namespace to inspect.
+        #[arg(long, value_enum)]
+        app: provider_switch::ProviderSwitchApp,
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Switch to a CC Switch provider and apply its live host config.
+    Switch {
+        /// App namespace to switch.
+        #[arg(long, value_enum)]
+        app: provider_switch::ProviderSwitchApp,
+        /// Provider id from CC Switch's providers table.
+        provider_id: String,
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Validate and show the target without writing host config or DB state.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -3181,6 +3227,54 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Cmd::Uninstall { provider } => return setup::uninstall_provider((*provider).into()),
+        #[cfg(feature = "sqlite")]
+        Cmd::ProviderSwitch { cmd } => match cmd {
+            ProviderSwitchCmd::List { app, db } => {
+                let rows = provider_switch::list(db.clone(), *app)?;
+                for row in rows {
+                    println!(
+                        "{}	{}	{}	{}",
+                        if row.is_current { "*" } else { " " },
+                        row.id,
+                        row.name,
+                        row.category.as_deref().unwrap_or("")
+                    );
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::Current { app, db } => {
+                match provider_switch::current(db.clone(), *app)? {
+                    Some(row) => println!("{}	{}", row.id, row.name),
+                    None => println!("no current {} provider", app.as_cc_switch()),
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::Switch {
+                app,
+                provider_id,
+                db,
+                dry_run,
+            } => {
+                let row = provider_switch::switch(db.clone(), *app, provider_id, *dry_run)?;
+                if *dry_run {
+                    println!(
+                        "dry-run: {} provider '{}' ({}) is valid",
+                        app.as_cc_switch(),
+                        row.id,
+                        row.name
+                    );
+                } else {
+                    println!(
+                        "switched {} provider to '{}' ({})",
+                        app.as_cc_switch(),
+                        row.id,
+                        row.name
+                    );
+                    println!("weave lifecycle hooks were preserved where present");
+                }
+                return Ok(());
+            }
+        },
         Cmd::Config {
             cmd: ConfigCmd::Init,
         } => {
@@ -3216,6 +3310,11 @@ fn main() -> Result<()> {
     let store = store.as_ref();
 
     match cli.cmd {
+        #[cfg(feature = "sqlite")]
+        Cmd::ProviderSwitch { .. } => {
+            unreachable!("handled above")
+        }
+
         Cmd::Setup { .. }
         | Cmd::Uninstall { .. }
         | Cmd::Config { .. }

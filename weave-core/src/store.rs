@@ -18,7 +18,7 @@ use anyhow::Result;
 // `main`/`mcp` consumers can call `store::federated_peers` / `federated_sessions`
 // regardless of which (mutually-exclusive) backend is compiled in. The sqlite
 // backend defines these free functions inline below.
-#[cfg(feature = "libsql")]
+#[cfg(all(feature = "libsql", not(feature = "sqlite")))]
 pub use crate::store_libsql::{
     federated_peers, federated_sessions, federation_status, pull_from_store,
 };

@@ -13,6 +13,16 @@
 
 ## [Unreleased]
 
+### Added (CC Switch provider bridge)
+- **`weave provider-switch`** (default sqlite build) reads CC Switch's `~/.cc-switch/cc-switch.db` and
+  can `list`, show `current`, or `switch` providers for `claude`, `codex`, and
+  `gemini` without launching the Tauri app. The switch path applies the provider
+  snapshot to the host's live config, updates CC Switch's current-provider marker,
+  and preserves weave lifecycle wiring already present (Claude `hooks`/
+  `mcpServers`, Codex `notify = ["…", "hook", "wake"]`, Gemini settings
+  merged with existing JSON). Includes `--db` for tests/alternate profiles and
+  `--dry-run` for validation-only checks.
+
 ### Fixed (WL-057 — `weave setup` no longer persists an ephemeral exe path, fixes #107)
 - **`weave setup` stopped writing a transient build/worktree binary path into the
   GLOBAL host config.** It used `std::env::current_exe()` verbatim, so when run from

@@ -40,6 +40,25 @@ a non-NotFound read error aborts without writing). Reverse with
 | `gemini` | `~/.gemini/settings.json` | Merges the same Claude-shaped `hooks.{event}` block. | ⚠ **UNCONFIRMED** — Gemini CLI uses a Claude-style JSON settings file, but its exact lifecycle-hook key is not confirmed. weave scaffolds the documented best-known (Claude-compatible) shape; update if Gemini confirms a different key. |
 | `aider` | `~/.aider.conf.yml` | Appends a minimal `weave-hook:` stanza (hand-templated YAML, no YAML dependency). | ⚠ **LIMITED** — Aider has no rich lifecycle-hook surface; this is a best-effort scaffold and may be ignored until Aider grows hook support. |
 
+### CC Switch provider bridge
+
+If you already manage model providers in CC Switch, `weave provider-switch` can
+apply those providers without launching the Tauri app:
+
+```bash
+weave provider-switch list --app claude
+weave provider-switch current --app codex
+weave provider-switch switch --app codex deepseek
+```
+
+The bridge is available in the default sqlite build and reads `~/.cc-switch/cc-switch.db` (override with `--db`), supports
+`claude`, `codex`, and `gemini`, updates CC Switch's current-provider marker, and
+writes the corresponding live host config. Unlike a plain settings overwrite, it
+preserves existing weave lifecycle wiring where present: Claude `hooks`/
+`mcpServers`, Codex `notify = ["…", "hook", "wake"]`, and Gemini settings
+keys outside the provider's own config block. Use `--dry-run` on `switch` to
+validate a provider id without writing.
+
 The Claude flow registers the MCP server (per user, all projects) and wires the
 lifecycle hooks so sessions auto-register and auto-receive. The resulting
 `~/.claude/settings.json` looks like:
