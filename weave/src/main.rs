@@ -2120,37 +2120,6 @@ fn try_inject(store: &dyn Store, cfg: &Config, from: &str, to: &str, body: &str)
     Ok(())
 }
 
-/// Fire the caller-side live nudge for an ask/answer and return the HONEST delivery
-/// verdict string, reusing the EXISTING injector return (no new spawn path, no
-/// `store → inject` edge — exactly the `try_inject` seam). A broadcast/queued/
-/// not-injectable recipient is never an error; the message is safely in the store.
-///   * `inject` returned `Ok(true)` ⇒ `transport_delivered`;
-///   * registered-but-not-alive / `Ok(false)` / `Err` ⇒ `queued_next_turn`;
-///   * `mux=none` / no peer row ⇒ `recipient_not_injectable`.
-fn ask_inject_verdict(
-    store: &dyn Store,
-    cfg: &Config,
-    from: &str,
-    to: &str,
-    body: &str,
-) -> &'static str {
-    let Ok(Some(peer)) = store.get_peer(to) else {
-        return "recipient_not_injectable";
-    };
-    let t = inject::Target::from_peer(&peer);
-    match inject::capability(&t) {
-        inject::Capability::NotInjectable => "recipient_not_injectable",
-        _ => match inject_text(&t, &cfg.nudge(from, body)) {
-            Ok(true) => "transport_delivered",
-            Ok(false) => "queued_next_turn",
-            Err(err) => {
-                eprintln!("inject failed ({err}); will arrive on next turn");
-                "queued_next_turn"
-            }
-        },
-    }
-}
-
 /// Best-effort delivery-trace write (CLI side): append one metadata-only stage row,
 /// swallowing (and logging to STDERR) any store error so a trace failure can NEVER
 /// sink the delivery path. Mirrors the gc/git-tag best-effort precedent. The store
@@ -2168,6 +2137,42 @@ fn record_delivery_best_effort(
     {
         eprintln!("delivery-trace write failed (non-fatal): {err}");
     }
+}
+
+/// Resolve the trace kind for a message row. Tracked ask questions and answers are
+/// still stored in `messages`, but their delivery trace should identify them as
+/// ask/answer artifacts instead of collapsing every hook drain into `message`.
+fn delivery_kind_for_message(store: &dyn Store, message_id: i64) -> model::DeliveryRefKind {
+    let Ok(Some(cid)) = store.ask_for_message(message_id) else {
+        return model::DeliveryRefKind::Message;
+    };
+    match store.get_ask(&cid) {
+        Ok(Some(ask)) if ask.answer_msg_id == Some(message_id) => model::DeliveryRefKind::Answer,
+        Ok(Some(_)) => model::DeliveryRefKind::Ask,
+        _ => model::DeliveryRefKind::Ask,
+    }
+}
+
+fn ambiguous_peer_names<'a>(views: &'a [store::PeerView]) -> std::collections::BTreeSet<&'a str> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_target: BTreeMap<(String, String, String), Vec<&'a str>> = BTreeMap::new();
+    for v in views {
+        let p = &v.peer;
+        if p.mux.is_empty() || p.mux == "none" || p.target.is_empty() {
+            continue;
+        }
+        by_target
+            .entry((p.mux.clone(), p.target.clone(), p.socket.clone()))
+            .or_default()
+            .push(p.name.as_str());
+    }
+    let mut out = BTreeSet::new();
+    for (_target, names) in by_target {
+        if names.len() > 1 {
+            out.extend(names);
+        }
+    }
+    out
 }
 
 /// Inject a freshly-persisted point-to-point message AND record its delivery trace
@@ -2250,6 +2255,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let views = store::federated_peers(store, &extra)?;
     let total_peers = views.len();
     let online = views.iter().filter(|v| is_alive(&v.peer)).count();
+    let ambiguous = ambiguous_peer_names(&views);
+    let peers_misregistered = ambiguous.len();
     // Session-scan observability: how many peers carry a git repo/worktree tag (a
     // self-describing, scan-able session). A 0 here on a populated mesh hints the
     // sessions predate the scan feature or run in non-git cwds.
@@ -2345,6 +2352,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "peers_alive_local": peers_alive_local,
             "peers_alive_remote": peers_alive_remote,
             "peers_stale": peers_stale,
+            "peers_misregistered": peers_misregistered,
+            "current_socket": target.socket,
             "claude_on_path": claude,
             "federation_stores": extra.len(),
             "federation_stores_ok": fed_ok,
@@ -2485,14 +2494,20 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         println!("  backend:        {}", store.backend());
         println!("  db:             {}", db.display());
         println!("  config:         {}", config::config_path().display());
+        let sock = if target.socket.is_empty() {
+            "-"
+        } else {
+            &target.socket
+        };
         println!(
-            "  this session:   mux={} target={} injectable={}",
+            "  this session:   mux={} target={} socket={} injectable={}",
             target.mux.as_str(),
             tgt,
+            sock,
             target.injectable()
         );
         println!("  messages:       {total}");
-        println!("  peers:          {total_peers} ({online} online, {tagged} tagged)");
+        println!("  peers:          {total_peers} ({online} online, {tagged} tagged, {peers_misregistered} misregistered)");
         println!(
             "  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
         );
@@ -3752,7 +3767,23 @@ fn main() -> Result<()> {
                     match res {
                         Ok(cid) => {
                             created += 1;
-                            let verdict = ask_inject_verdict(store, &cfg, &from, peer, &body);
+                            let verdict = store
+                                .get_ask(cid)
+                                .ok()
+                                .flatten()
+                                .map(|a| {
+                                    inject_and_trace(
+                                        store,
+                                        &cfg,
+                                        a.question_msg_id,
+                                        model::DeliveryRefKind::Ask,
+                                        &from,
+                                        peer,
+                                        &body,
+                                    )
+                                    .unwrap_or("queued_next_turn")
+                                })
+                                .unwrap_or("queued_next_turn");
                             if json {
                                 child_json.push(serde_json::json!({
                                     "peer": peer, "correlation_id": cid, "verdict": verdict
@@ -3904,8 +3935,19 @@ fn main() -> Result<()> {
                 options.as_deref(),
                 reply_to.as_deref(),
             )?;
-            // Honest delivery verdict via the caller-side nudge (no store->inject edge).
-            let verdict = ask_inject_verdict(store, &cfg, &from, &to, &body);
+            // Trace + honest delivery verdict for the ask question. The printed
+            // `transport_delivered` token is now derived from the same trace-writing
+            // path as `weave delivery --id <question_msg_id>`, so the CLI can no
+            // longer claim delivery while the trace is empty.
+            let verdict = inject_and_trace(
+                store,
+                &cfg,
+                _qid,
+                model::DeliveryRefKind::Ask,
+                &from,
+                &to,
+                &body,
+            )?;
             println!("opened ask {cid}: {from} -> {to} ({verdict})");
         }
 
@@ -3929,8 +3971,16 @@ fn main() -> Result<()> {
                 .get_ask(&cid)?
                 .ok_or_else(|| anyhow::anyhow!("no tracked ask '{cid}'"))?;
             let asker = ask.asker.clone();
-            store.answer(&from, &cid, &body)?;
-            let verdict = ask_inject_verdict(store, &cfg, &from, &asker, &body);
+            let answer_msg_id = store.answer(&from, &cid, &body)?;
+            let verdict = inject_and_trace(
+                store,
+                &cfg,
+                answer_msg_id,
+                model::DeliveryRefKind::Answer,
+                &from,
+                &asker,
+                &body,
+            )?;
             println!("answered ask {cid} -> {asker} ({verdict})");
         }
 
@@ -4039,7 +4089,23 @@ fn main() -> Result<()> {
                 match res {
                     Ok(cid) => {
                         created += 1;
-                        let verdict = ask_inject_verdict(store, &cfg, &from, peer, &body);
+                        let verdict = store
+                            .get_ask(cid)
+                            .ok()
+                            .flatten()
+                            .map(|a| {
+                                inject_and_trace(
+                                    store,
+                                    &cfg,
+                                    a.question_msg_id,
+                                    model::DeliveryRefKind::Ask,
+                                    &from,
+                                    peer,
+                                    &body,
+                                )
+                                .unwrap_or("queued_next_turn")
+                            })
+                            .unwrap_or("queued_next_turn");
                         if json {
                             child_json.push(serde_json::json!({
                                 "peer": peer, "correlation_id": cid, "verdict": verdict
@@ -4458,6 +4524,7 @@ fn main() -> Result<()> {
             // Host-aware liveness reason per peer (A2 vocabulary, display-only):
             // reinterpret the already-pulled read-only rows; never a cross-machine
             // probe. Deterministic given the captured this_host/now.
+            let ambiguous = ambiguous_peer_names(&views);
             let this_host = config::this_host();
             let now_ts = model::now();
             if json {
@@ -4484,6 +4551,7 @@ fn main() -> Result<()> {
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
                             "injectable": inject::Target::from_peer(p).injectable(),
+                            "misregistered": ambiguous.contains(p.name.as_str()),
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -4503,7 +4571,10 @@ fn main() -> Result<()> {
                     };
                     let presence = if is_alive(p) { "online" } else { "offline" };
                     let liveness = store::liveness_for(p, &this_host, now_ts);
-                    let reason = scan_liveness_reason(p, liveness);
+                    let mut reason = scan_liveness_reason(p, liveness);
+                    if ambiguous.contains(p.name.as_str()) {
+                        reason.push_str(", misregistered(shared-target)");
+                    }
                     let remote_marker = if p.host != this_host { " <remote>" } else { "" };
                     let tgt = if p.target.is_empty() { "-" } else { &p.target };
                     let via = if v.origin.is_foreign() {
@@ -4773,6 +4844,7 @@ fn main() -> Result<()> {
             }
             // Host-aware liveness reason per row (pure A2 reinterpretation of the
             // already-pulled read-only rows; never a cross-machine probe).
+            let ambiguous = ambiguous_peer_names(&views);
             let this_host = config::this_host();
             let now_ts = model::now();
             if json {
@@ -4799,6 +4871,7 @@ fn main() -> Result<()> {
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
                             "remote": p.host != this_host,
+                            "misregistered": ambiguous.contains(p.name.as_str()),
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -4815,7 +4888,10 @@ fn main() -> Result<()> {
                 for v in &views {
                     let p = &v.peer;
                     let liveness = store::liveness_for(p, &this_host, now_ts);
-                    let reason = scan_liveness_reason(p, liveness);
+                    let mut reason = scan_liveness_reason(p, liveness);
+                    if ambiguous.contains(p.name.as_str()) {
+                        reason.push_str(", misregistered(shared-target)");
+                    }
                     match liveness {
                         store::Liveness::AliveLocal => local_alive += 1,
                         store::Liveness::AliveRemote => remote_alive += 1,
@@ -6790,7 +6866,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                         record_delivery_best_effort(
                             store,
                             m.id,
-                            model::DeliveryRefKind::Message,
+                            delivery_kind_for_message(store, m.id),
                             &me,
                             model::DeliveryStage::Drained,
                             model::DeliveryOutcome::Ok,
@@ -7029,7 +7105,7 @@ fn pretooluse_decision(
          Reply `approve` to allow, anything else to deny."
     );
 
-    let (cid, _qid) = match store.ask(
+    let (cid, qid) = match store.ask(
         &from,
         approver,
         Some("PreToolUse approval"),
@@ -7049,10 +7125,19 @@ fn pretooluse_decision(
         }
     };
 
-    // Fire the caller-side live nudge to the approver (best-effort; no store->inject
-    // edge). If they're not injectable the ask still waits in their inbox — they can
-    // approve on their next turn within our timeout window.
-    let verdict = ask_inject_verdict(store, cfg, &from, approver, &body);
+    // Fire the caller-side live nudge to the approver and trace it. If they're not
+    // injectable the ask still waits in their inbox — they can approve on their next
+    // turn within our timeout window.
+    let verdict = inject_and_trace(
+        store,
+        cfg,
+        qid,
+        model::DeliveryRefKind::Ask,
+        &from,
+        approver,
+        &body,
+    )
+    .unwrap_or("queued_next_turn");
     eprintln!(
         "[weave] pretooluse: opened approval ask {cid} ({from} -> {approver}, {verdict}); \
          waiting up to {}s",
