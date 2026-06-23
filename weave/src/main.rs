@@ -3106,6 +3106,48 @@ fn local_peer_tag_map(store: &dyn Store) -> std::collections::HashMap<String, mo
         .collect()
 }
 
+/// Stable, non-secret live-session id for display/routing surfaces. Prefer the
+/// birth certificate when present (hashed before display), then fall back through
+/// PID/host and exact mux target. This does not replace the human peer alias; it
+/// gives orchestrators a unique session handle when aliases/repos/mux sessions are
+/// ambiguous.
+fn peer_session_id(p: &model::Peer) -> String {
+    let seed = if let Some(cert) = p.birth_cert.as_deref().filter(|s| !s.is_empty()) {
+        format!("cert:{cert}")
+    } else if let Some(pid) = p.pid {
+        format!("pid:{}:{pid}:{}:{}:{}", p.host, p.mux, p.target, p.name)
+    } else {
+        format!(
+            "target:{}:{}:{}:{}:{}",
+            p.host,
+            p.mux,
+            p.target,
+            p.socket,
+            p.cwd.as_deref().unwrap_or("")
+        )
+    };
+    format!("sess_{:016x}", fnv1a64(seed.as_bytes()))
+}
+
+fn peer_session_id_basis(p: &model::Peer) -> &'static str {
+    if p.birth_cert.as_deref().is_some_and(|s| !s.is_empty()) {
+        "birth_cert"
+    } else if p.pid.is_some() {
+        "host_pid_target"
+    } else {
+        "mux_target"
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Render a peer's git session tags for a human listing, e.g.
 /// ` {weave@feat/x #my-wt}`, omitting any empty field and the whole group when all
 /// three are empty (a non-git session prints nothing extra). Pure formatting.
@@ -3181,6 +3223,8 @@ const ANSI_CLEAR_HOME: &str = "\x1b[2J\x1b[H";
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRow {
     name: String,
+    session_id: String,
+    session_id_basis: &'static str,
     repo: String,
     branch: String,
     worktree: String,
@@ -3233,6 +3277,8 @@ fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
             let p = &v.peer;
             SessionRow {
                 name: p.name.clone(),
+                session_id: peer_session_id(p),
+                session_id_basis: peer_session_id_basis(p),
                 repo: p.repo.clone(),
                 branch: p.branch.clone(),
                 worktree: p.worktree_id.clone(),
@@ -5028,6 +5074,8 @@ fn main() -> Result<()> {
                         let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
+                            "session_id": peer_session_id(p),
+                            "session_id_basis": peer_session_id_basis(p),
                             "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
                             "pid": p.pid, "host": p.host,
@@ -5082,13 +5130,14 @@ fn main() -> Result<()> {
                     let tags = fmt_peer_tags(p);
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
+                    let sid = peer_session_id(p);
                     let anomaly_marker = routing_anomaly_counts
                         .get(&p.name)
                         .filter(|&&n| n > 0)
                         .map(|n| format!(" [routing_anomalies={n}]"))
                         .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{presence}] [{reason}] [status={status}]{anomaly_marker}{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -5171,7 +5220,10 @@ fn main() -> Result<()> {
                     .map(|r| {
                         let liveness = row_liveness(r, &this_host, now_ts);
                         serde_json::json!({
-                            "name": r.name, "repo": r.repo, "branch": r.branch,
+                            "name": r.name,
+                            "session_id": r.session_id,
+                            "session_id_basis": r.session_id_basis,
+                            "repo": r.repo, "branch": r.branch,
                             "worktree": r.worktree, "mux": r.mux, "host": r.host,
                             "alive": !matches!(liveness, store::Liveness::Stale),
                             "liveness": liveness.token(),
@@ -5260,8 +5312,14 @@ fn main() -> Result<()> {
                                 )
                             })
                             .unwrap_or_else(|| (model::DEFAULT_CIRCLE.to_string(), String::new()));
+                        let (session_id, session_id_basis) = local_peers
+                            .get(&v.name)
+                            .map(|p| (peer_session_id(p), peer_session_id_basis(p)))
+                            .unwrap_or_else(|| (String::new(), ""));
                         serde_json::json!({
                             "name": v.name, "unread": v.unread, "last_activity": v.last_activity,
+                            "session_id": session_id,
+                            "session_id_basis": session_id_basis,
                             "repo": repo, "branch": branch, "worktree": worktree,
                             "circle": circle, "role": role,
                             "origin": v.origin.label(), "foreign": v.origin.is_foreign(),
@@ -5283,8 +5341,12 @@ fn main() -> Result<()> {
                         .get(&v.name)
                         .map(fmt_peer_tags)
                         .unwrap_or_default();
+                    let sid = local_peers
+                        .get(&v.name)
+                        .map(|p| format!(" [session={}]", peer_session_id(p)))
+                        .unwrap_or_default();
                     println!(
-                        "{}: {} unread (last {}){tags}{via}",
+                        "{}: {} unread (last {}){sid}{tags}{via}",
                         v.name,
                         v.unread,
                         model::fmt_ts(v.last_activity)
@@ -5362,6 +5424,8 @@ fn main() -> Result<()> {
                         let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                         serde_json::json!({
                             "name": p.name,
+                            "session_id": peer_session_id(p),
+                            "session_id_basis": peer_session_id_basis(p),
                             "repo": p.repo,
                             "branch": p.branch,
                             "worktree": p.worktree_id,
@@ -5425,13 +5489,14 @@ fn main() -> Result<()> {
                     };
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
+                    let sid = peer_session_id(p);
                     let anomaly_marker = routing_anomaly_counts
                         .get(&p.name)
                         .filter(|&&n| n > 0)
                         .map(|n| format!(" [routing_anomalies={n}]"))
                         .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{reason}] [status={status}]{anomaly_marker}{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
+                        "{}{remote_marker} [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
                         p.name, p.mux
                     );
                 }
@@ -7768,6 +7833,8 @@ mod tests {
     fn row(name: &str, repo: &str, branch: &str, alive: bool) -> SessionRow {
         SessionRow {
             name: name.to_string(),
+            session_id: format!("sess_test_{name}"),
+            session_id_basis: "test",
             repo: repo.to_string(),
             branch: branch.to_string(),
             worktree: "(main)".to_string(),
