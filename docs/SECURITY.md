@@ -336,6 +336,20 @@ database — a gate that did not exist before WL-044. The **default shippable
 binary is advisory-clean**: `cargo tree -i rustls-webpki` on default features
 matches nothing.
 
+To reproduce the CI advisory posture locally, use the repo-local helper:
+
+```bash
+python3 scripts/supply_chain_audit.py
+```
+
+It validates `deny.toml`, proves the default graph is free of `rustls-webpki`,
+confirms the residual `rustls-webpki 0.102.x` tree is confined to optional
+`libsql` TLS, and then runs the same advisory command as CI:
+`cargo-deny check advisories`. If `cargo-deny` is not installed, install it with
+`cargo install cargo-deny --locked`, or run
+`python3 scripts/supply_chain_audit.py --allow-missing-cargo-deny` to check the
+repo-local policy/tree invariants while treating the missing binary as a warning.
+
 **Surface reduced (WL-044b):** `libsql` is pulled with
 `default-features = false, features = ["core", "remote", "tls"]` — only what
 weave uses (`Builder::new_local` for a local file; `Builder::new_remote` for
