@@ -1751,12 +1751,15 @@ impl DeliveryStage {
 /// Coarse pass/fail of a delivery stage. `Ok` = the stage completed as intended
 /// (queued, injected, not-injectable-but-persisted, drained); `Fail` = the stage's
 /// operation errored (an inject that returned `Err`). Stored as TEXT
-/// (`delivery_log.outcome`); validated through this enum. Pure value type.
+/// (`delivery_log.outcome`); validated through this enum. `AmbiguousTarget` is a
+/// safe-degrade verdict: Weave deliberately avoided live injection because more
+/// than one peer shares the same mux target. Pure value type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliveryOutcome {
     Ok,
     Fail,
+    AmbiguousTarget,
 }
 
 impl DeliveryOutcome {
@@ -1765,6 +1768,7 @@ impl DeliveryOutcome {
         match self {
             DeliveryOutcome::Ok => "ok",
             DeliveryOutcome::Fail => "fail",
+            DeliveryOutcome::AmbiguousTarget => "ambiguous_target",
         }
     }
 
@@ -1775,6 +1779,7 @@ impl DeliveryOutcome {
         match s {
             "ok" => Ok(DeliveryOutcome::Ok),
             "fail" => Ok(DeliveryOutcome::Fail),
+            "ambiguous_target" => Ok(DeliveryOutcome::AmbiguousTarget),
             other => Err(format!("unknown delivery outcome '{other}'")),
         }
     }
@@ -2084,7 +2089,11 @@ mod tests {
     /// `DeliveryOutcome` round-trips; unknown is a clean error.
     #[test]
     fn delivery_outcome_str_roundtrips() {
-        for s in [DeliveryOutcome::Ok, DeliveryOutcome::Fail] {
+        for s in [
+            DeliveryOutcome::Ok,
+            DeliveryOutcome::Fail,
+            DeliveryOutcome::AmbiguousTarget,
+        ] {
             assert_eq!(DeliveryOutcome::from_str(s.as_str()), Ok(s));
         }
         assert!(DeliveryOutcome::from_str("bogus").is_err());

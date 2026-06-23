@@ -726,10 +726,22 @@ fn tool_send(
         );
         // Native push: nudge the recipient's pane if it's a registered injectable peer.
         if let Ok(Some(peer)) = store.get_peer(to) {
+            let ambiguous = mcp_peer_ambiguous_target_names(store, to);
             let target = Target::from_peer(&peer);
             // Record the post-inject stage AFTER the inject attempt (no store→inject
-            // edge — the store records the outcome we pass it).
-            let (stage, outcome) = if target.injectable() {
+            // edge — the store records the outcome we pass it). Ambiguous shared
+            // mux targets are deliberately not injected: the message remains queued
+            // and the trace records the safety downgrade.
+            let (stage, outcome) = if !ambiguous.is_empty() {
+                out.push_str(&format!(
+                    " Live injection avoided: ambiguous mux target shared by {} (ambiguous_target_queued).",
+                    ambiguous.join(", ")
+                ));
+                (
+                    model::DeliveryStage::NotInjectable,
+                    model::DeliveryOutcome::AmbiguousTarget,
+                )
+            } else if target.injectable() {
                 let (nudge, mode) = build_nudge(nudge_template, &from, &body);
                 match injector.inject_mode(&target, &nudge, mode) {
                     Ok(true) => {
@@ -1029,6 +1041,10 @@ fn verdict_to_stage(verdict: &str) -> (model::DeliveryStage, model::DeliveryOutc
         "recipient_not_injectable" => (
             model::DeliveryStage::NotInjectable,
             model::DeliveryOutcome::Ok,
+        ),
+        "ambiguous_target_queued" => (
+            model::DeliveryStage::NotInjectable,
+            model::DeliveryOutcome::AmbiguousTarget,
         ),
         _ => (model::DeliveryStage::Queued, model::DeliveryOutcome::Ok),
     }
@@ -2890,6 +2906,34 @@ fn tool_connect(
     Ok(msg)
 }
 
+fn mcp_peer_ambiguous_target_names(store: &dyn Store, to: &str) -> Vec<String> {
+    let Ok(Some(peer)) = store.get_peer(to) else {
+        return Vec::new();
+    };
+    if peer.mux.is_empty() || peer.mux == "none" || peer.target.is_empty() {
+        return Vec::new();
+    }
+    let Ok(peers) = store.list_peers() else {
+        return Vec::new();
+    };
+    let mut names = peers
+        .into_iter()
+        .filter(|p| p.mux == peer.mux && p.target == peer.target && p.socket == peer.socket)
+        .map(|p| p.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.len() > 1 {
+        names
+    } else {
+        Vec::new()
+    }
+}
+
+fn mcp_target_is_ambiguous(store: &dyn Store, to: &str) -> bool {
+    !mcp_peer_ambiguous_target_names(store, to).is_empty()
+}
+
 /// Fire the caller-side live nudge for an ask/answer and compute the HONEST
 /// delivery verdict, reusing the EXISTING injector return (no new spawn path, no
 /// `store → inject` edge). This is the exact seam `tool_send` uses, lifted into a
@@ -2898,9 +2942,11 @@ fn tool_connect(
 ///     `transport_delivered`;
 ///   * a registered-but-not-alive / `Ok(false)` / `Err` peer ⇒ `queued_next_turn`
 ///     (still succeeds; arrives on the recipient's next drain);
-///   * `mux=none` / no peer row ⇒ `recipient_not_injectable`.
+///   * `mux=none` / no peer row ⇒ `recipient_not_injectable`;
+///   * shared mux target with another peer ⇒ `ambiguous_target_queued` and no live
+///     injection attempt.
 ///
-/// Advisory only: a queued / not-injectable delivery is NEVER an error.
+/// Advisory only: a queued / not-injectable / ambiguous delivery is NEVER an error.
 fn ask_delivery_verdict(
     store: &dyn Store,
     nudge_template: Option<&str>,
@@ -2912,6 +2958,9 @@ fn ask_delivery_verdict(
     let Ok(Some(peer)) = store.get_peer(to) else {
         return "recipient_not_injectable";
     };
+    if mcp_target_is_ambiguous(store, to) {
+        return "ambiguous_target_queued";
+    }
     let target = Target::from_peer(&peer);
     match injector.capability(&target) {
         Capability::NotInjectable => "recipient_not_injectable",
@@ -2937,6 +2986,9 @@ fn verdict_sentence(verdict: &str, to: &str) -> String {
         "queued_next_turn" => {
             format!("Queued for '{to}'; arrives on their next turn (queued_next_turn).")
         }
+        "ambiguous_target_queued" => format!(
+            "Live injection avoided for '{to}' because its mux target is ambiguous; arrives on their next drain (ambiguous_target_queued)."
+        ),
         _ => format!(
             "'{to}' is not injectable; arrives on their next drain (recipient_not_injectable)."
         ),
@@ -3811,7 +3863,7 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_notify",
-            "description": "Fire-and-forget notification to a peer (no reply expected). Persists the message and pushes a live nudge if the recipient is injectable, then returns the HONEST delivery verdict: transport_delivered (nudge landed live) / queued_next_turn (registered or not alive — arrives on next drain) / recipient_not_injectable. An unknown peer is NOT an error — the message still waits in the store. Point-to-point only; use weave_send for broadcast.",
+            "description": "Fire-and-forget notification to a peer (no reply expected). Persists the message and pushes a live nudge if the recipient is injectable, then returns the HONEST delivery verdict: transport_delivered (nudge landed live) / queued_next_turn (registered or not alive — arrives on next drain) / recipient_not_injectable / ambiguous_target_queued. An unknown peer is NOT an error — the message still waits in the store. Point-to-point only; use weave_send for broadcast.",
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"Recipient session name (point-to-point; broadcast is not supported)."},
@@ -4025,7 +4077,7 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_ask",
-            "description": "Open a correlation-TRACKED request to a peer and return its correlation_id immediately (NON-blocking — not a synchronous RPC). The question is delivered like a normal message (live nudge if injectable, else next-turn) and the result reports the honest delivery verdict (transport_delivered / queued_next_turn / recipient_not_injectable). Point-to-point only (no broadcast). Optional reply_to chains a new ask off a prior one, closing the prior thread.",
+            "description": "Open a correlation-TRACKED request to a peer and return its correlation_id immediately (NON-blocking — not a synchronous RPC). The question is delivered like a normal message (live nudge if injectable, else next-turn) and the result reports the honest delivery verdict (transport_delivered / queued_next_turn / recipient_not_injectable / ambiguous_target_queued). Point-to-point only (no broadcast). Optional reply_to chains a new ask off a prior one, closing the prior thread.",
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"The peer session name to ask."},
@@ -6513,6 +6565,13 @@ mod tests {
         assert_eq!(
             verdict_to_stage("queued_next_turn"),
             (DeliveryStage::Queued, DeliveryOutcome::Ok)
+        );
+        assert_eq!(
+            verdict_to_stage("ambiguous_target_queued"),
+            (
+                DeliveryStage::NotInjectable,
+                DeliveryOutcome::AmbiguousTarget
+            )
         );
         // Unknown token degrades safely to queued (the message is in the store).
         assert_eq!(

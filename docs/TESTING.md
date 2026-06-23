@@ -1177,3 +1177,13 @@ accurately described as, for example, "registered but process-dead" or
 "reachable but heartbeat-stale" without doctor/scan hiding the dimensions. MCP
 `weave_peers`, `weave_scan`, and `weave_doctor` mirror the same dimension summary
 in their text surfaces.
+
+### Unsafe shared-target delivery avoidance (WL-069)
+
+Diagnostics alone are not enough for shared mux targets. When more than one peer
+shares the same `(mux, target, socket)` tuple, point-to-point live injection now
+degrades to queue-only and records a delivery trace row with stage
+`not_injectable` and outcome `ambiguous_target`. The CLI/MCP verdict token is
+`ambiguous_target_queued`. Integration coverage registers two peers on the same
+fake tmux pane, sends a notification, and proves no `injected` or
+`inject_failed` trace row is produced.
