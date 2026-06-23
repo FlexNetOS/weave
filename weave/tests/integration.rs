@@ -9400,6 +9400,50 @@ fn scan_and_doctor_surface_shared_target_misregistration() {
     );
 }
 
+/// WL-069: a shared mux target is not merely diagnosed; live injection is avoided
+/// and the delivery trace records an explicit ambiguous-target downgrade.
+#[test]
+fn ambiguous_shared_target_degrades_to_queue_only_trace() {
+    let db = TestDb::new();
+    run_ok_env(
+        &db,
+        &["register", "--name", "dup_a"],
+        &[("TMUX_PANE", "%69")],
+    );
+    run_ok_env(
+        &db,
+        &["register", "--name", "dup_b"],
+        &[("TMUX_PANE", "%69")],
+    );
+
+    let out = run_ok(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "sender",
+            "--to",
+            "dup_a",
+            "--body",
+            "avoid live leak",
+        ],
+    );
+    assert!(
+        out.contains("ambiguous_target_queued"),
+        "notify avoids ambiguous target: {out}"
+    );
+    let id = extract_mid(&out);
+    let trace = run_ok(&db, &["delivery", "--id", &id.to_string(), "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&trace).expect("delivery json");
+    let text = rows.to_string();
+    assert!(text.contains("not_injectable"), "trace stage: {trace}");
+    assert!(text.contains("ambiguous_target"), "trace outcome: {trace}");
+    assert!(
+        !text.contains("injected") && !text.contains("inject_failed"),
+        "ambiguous target must not attempt live injection: {trace}"
+    );
+}
+
 /// A peer that recently answered a tracked ask is classified as responsive even if
 /// its original one-shot registration process has already exited. This is the
 /// read-time status layer doctor/scan use to avoid stale-only summaries.

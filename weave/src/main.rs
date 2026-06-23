@@ -274,7 +274,7 @@ enum Cmd {
     },
     /// Fire-and-forget notification to a peer (no reply expected). Persists +
     /// pushes a live nudge if injectable, then prints the HONEST delivery verdict
-    /// (transport_delivered / queued_next_turn / recipient_not_injectable).
+    /// (transport_delivered / queued_next_turn / recipient_not_injectable / ambiguous_target_queued).
     /// Point-to-point only; use `weave send` for broadcast.
     Notify {
         #[arg(long)]
@@ -2225,6 +2225,32 @@ fn ambiguous_peer_names<'a>(views: &'a [store::PeerView]) -> std::collections::B
     out
 }
 
+fn peer_ambiguous_target_names(store: &dyn Store, to: &str) -> Result<Vec<String>> {
+    let Some(peer) = store.get_peer(to)? else {
+        return Ok(Vec::new());
+    };
+    if peer.mux.is_empty() || peer.mux == "none" || peer.target.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names = store
+        .list_peers()?
+        .into_iter()
+        .filter(|p| p.mux == peer.mux && p.target == peer.target && p.socket == peer.socket)
+        .map(|p| p.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.len() > 1 {
+        Ok(names)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn ambiguous_target_verdict() -> &'static str {
+    "ambiguous_target_queued"
+}
+
 /// Inject a freshly-persisted point-to-point message AND record its delivery trace
 /// (queued + the post-inject stage), returning the normalized HONEST verdict token so
 /// the caller can print it WITHOUT a second inject. Caller-side, best-effort trace —
@@ -2252,37 +2278,50 @@ fn inject_and_trace(
         model::DeliveryOutcome::Ok,
     );
     let (stage, outcome, verdict) = if let Some(peer) = store.get_peer(to)? {
-        let t = inject::Target::from_peer(&peer);
-        if t.injectable() {
-            match inject_text(&t, &cfg.nudge(from, body)) {
-                Ok(true) => {
-                    println!("injected into {} '{}'", t.mux.as_str(), t.id);
-                    (
-                        model::DeliveryStage::Injected,
-                        model::DeliveryOutcome::Ok,
-                        "transport_delivered",
-                    )
-                }
-                Ok(false) => (
-                    model::DeliveryStage::Queued,
-                    model::DeliveryOutcome::Ok,
-                    "queued_next_turn",
-                ),
-                Err(err) => {
-                    eprintln!("inject failed ({err}); will arrive on next turn");
-                    (
-                        model::DeliveryStage::InjectFailed,
-                        model::DeliveryOutcome::Fail,
-                        "queued_next_turn",
-                    )
-                }
-            }
-        } else {
+        let ambiguous = peer_ambiguous_target_names(store, to)?;
+        if !ambiguous.is_empty() {
+            eprintln!(
+                "live injection avoided for '{to}': ambiguous mux target shared by {}",
+                ambiguous.join(", ")
+            );
             (
                 model::DeliveryStage::NotInjectable,
-                model::DeliveryOutcome::Ok,
-                "recipient_not_injectable",
+                model::DeliveryOutcome::AmbiguousTarget,
+                ambiguous_target_verdict(),
             )
+        } else {
+            let t = inject::Target::from_peer(&peer);
+            if t.injectable() {
+                match inject_text(&t, &cfg.nudge(from, body)) {
+                    Ok(true) => {
+                        println!("injected into {} '{}'", t.mux.as_str(), t.id);
+                        (
+                            model::DeliveryStage::Injected,
+                            model::DeliveryOutcome::Ok,
+                            "transport_delivered",
+                        )
+                    }
+                    Ok(false) => (
+                        model::DeliveryStage::Queued,
+                        model::DeliveryOutcome::Ok,
+                        "queued_next_turn",
+                    ),
+                    Err(err) => {
+                        eprintln!("inject failed ({err}); will arrive on next turn");
+                        (
+                            model::DeliveryStage::InjectFailed,
+                            model::DeliveryOutcome::Fail,
+                            "queued_next_turn",
+                        )
+                    }
+                }
+            } else {
+                (
+                    model::DeliveryStage::NotInjectable,
+                    model::DeliveryOutcome::Ok,
+                    "recipient_not_injectable",
+                )
+            }
         }
     } else {
         (
