@@ -15,6 +15,10 @@
 
 ### Added
 
+- Added WL-071 MCP parity for exact session-id recipients and job delegation:
+  `weave_send`, `weave_notify`, and `weave_ask` now accept `sess_<16-hex>` targets
+  through the same shared resolver as CLI paths, and new `weave_job_delegate`
+  creates an assigned queued job plus durable `JOB_DELEGATED` worker nudge.
 - Added WL-069 unsafe-target avoidance: live injection is skipped when multiple peers share the same mux target, with delivery traces recording `not_injectable/ambiguous_target` and verdicts returning `ambiguous_target_queued`.
 - Added WL-068 dimensional liveness diagnostics across `peers --json`, `scan --json`, and `doctor --json`: registered/process/pane/reachable/responsive dimensions, last heartbeat/transport/response timestamps, stale reasons, and per-peer diagnostic rows.
 - Added `scripts/target_smoke.py`, a generated-artifact smoke matrix that builds and executes `target/debug/weave` and `target/release/weave` directly, emits `target/target-smoke/target-smoke.json`, and can expand to feature-gated artifacts with `--full`.

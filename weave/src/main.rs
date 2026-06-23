@@ -2765,8 +2765,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             let diag = peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
             serde_json::json!({
                 "name": p.name,
-                "session_id": peer_session_id(p),
-                "session_id_basis": peer_session_id_basis(p),
+                "session_id": model::peer_session_id(p),
+                "session_id_basis": model::peer_session_id_basis(p),
                 "mux": p.mux,
                 "target": p.target,
                 "host": p.host,
@@ -3451,80 +3451,6 @@ fn local_peer_tag_map(store: &dyn Store) -> std::collections::HashMap<String, mo
         .collect()
 }
 
-/// Stable, non-secret live-session id for display/routing surfaces. Prefer the
-/// birth certificate when present (hashed before display), then fall back through
-/// PID/host and exact mux target. This does not replace the human peer alias; it
-/// gives orchestrators a unique session handle when aliases/repos/mux sessions are
-/// ambiguous.
-fn peer_session_id(p: &model::Peer) -> String {
-    let seed = if let Some(cert) = p.birth_cert.as_deref().filter(|s| !s.is_empty()) {
-        format!("cert:{cert}")
-    } else if let Some(pid) = p.pid {
-        format!("pid:{}:{pid}:{}:{}:{}", p.host, p.mux, p.target, p.name)
-    } else {
-        format!(
-            "target:{}:{}:{}:{}:{}",
-            p.host,
-            p.mux,
-            p.target,
-            p.socket,
-            p.cwd.as_deref().unwrap_or("")
-        )
-    };
-    format!("sess_{:016x}", fnv1a64(seed.as_bytes()))
-}
-
-fn peer_session_id_basis(p: &model::Peer) -> &'static str {
-    if p.birth_cert.as_deref().is_some_and(|s| !s.is_empty()) {
-        "birth_cert"
-    } else if p.pid.is_some() {
-        "host_pid_target"
-    } else {
-        "mux_target"
-    }
-}
-
-/// Resolve a point-to-point recipient token into the human peer alias that the
-/// store addresses. Plain aliases pass through unchanged. Stable session handles
-/// (`sess_<16-hex>`, as shown by `peers`/`scan`/`sessions`) resolve to exactly one
-/// registered peer row, giving orchestrators a precise routing handle when aliases
-/// or mux targets are visually ambiguous.
-fn resolve_point_recipient(store: &dyn Store, to: &str) -> Result<String> {
-    if !to.starts_with("sess_") {
-        return Ok(to.to_string());
-    }
-    if to.len() != "sess_".len() + 16 || !to["sess_".len()..].bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        anyhow::bail!("invalid session id '{to}' (expected sess_<16-hex>)");
-    }
-    let mut matches = store
-        .list_peers()?
-        .into_iter()
-        .filter(|p| peer_session_id(p) == to)
-        .map(|p| p.name)
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [name] => Ok(name.clone()),
-        [] => anyhow::bail!("no registered peer has session id '{to}'"),
-        many => anyhow::bail!(
-            "session id '{to}' is ambiguous across {} peers: {}",
-            many.len(),
-            many.join(", ")
-        ),
-    }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 /// Render a peer's git session tags for a human listing, e.g.
 /// ` {weave@feat/x #my-wt}`, omitting any empty field and the whole group when all
 /// three are empty (a non-git session prints nothing extra). Pure formatting.
@@ -3654,8 +3580,8 @@ fn dashboard_rows(views: &[store::PeerView]) -> Vec<SessionRow> {
             let p = &v.peer;
             SessionRow {
                 name: p.name.clone(),
-                session_id: peer_session_id(p),
-                session_id_basis: peer_session_id_basis(p),
+                session_id: model::peer_session_id(p),
+                session_id_basis: model::peer_session_id_basis(p),
                 repo: p.repo.clone(),
                 branch: p.branch.clone(),
                 worktree: p.worktree_id.clone(),
@@ -4403,7 +4329,7 @@ fn main() -> Result<()> {
                     println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
                 }
                 None => {
-                    let to = resolve_point_recipient(store, &to)?;
+                    let to = store::resolve_point_recipient(store, &to)?;
                     let mid = store.send(
                         &from,
                         &to,
@@ -4474,7 +4400,7 @@ fn main() -> Result<()> {
                      (broadcast notify is deferred)."
                 );
             }
-            let to = resolve_point_recipient(store, &to)?;
+            let to = store::resolve_point_recipient(store, &to)?;
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
             let trace_id = model::mint_trace_id();
@@ -4795,7 +4721,7 @@ fn main() -> Result<()> {
                     "tracked ask is point-to-point; use `weave send` for broadcast (broadcast ask is P2)."
                 );
             }
-            let to = resolve_point_recipient(store, &to)?;
+            let to = store::resolve_point_recipient(store, &to)?;
             let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
             let ask_kind = kind
                 .as_deref()
@@ -5482,8 +5408,8 @@ fn main() -> Result<()> {
                         let status = diag.status;
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
-                            "session_id": peer_session_id(p),
-                            "session_id_basis": peer_session_id_basis(p),
+                            "session_id": model::peer_session_id(p),
+                            "session_id_basis": model::peer_session_id_basis(p),
                             "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
                             "pid": p.pid, "host": p.host,
@@ -5552,7 +5478,7 @@ fn main() -> Result<()> {
                     let tags = fmt_peer_tags(p);
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
-                    let sid = peer_session_id(p);
+                    let sid = model::peer_session_id(p);
                     let anomaly_marker = routing_anomaly_counts
                         .get(&p.name)
                         .filter(|&&n| n > 0)
@@ -5740,7 +5666,7 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|| (model::DEFAULT_CIRCLE.to_string(), String::new()));
                         let (session_id, session_id_basis) = local_peers
                             .get(&v.name)
-                            .map(|p| (peer_session_id(p), peer_session_id_basis(p)))
+                            .map(|p| (model::peer_session_id(p), model::peer_session_id_basis(p)))
                             .unwrap_or_else(|| (String::new(), ""));
                         serde_json::json!({
                             "name": v.name, "unread": v.unread, "last_activity": v.last_activity,
@@ -5769,7 +5695,7 @@ fn main() -> Result<()> {
                         .unwrap_or_default();
                     let sid = local_peers
                         .get(&v.name)
-                        .map(|p| format!(" [session={}]", peer_session_id(p)))
+                        .map(|p| format!(" [session={}]", model::peer_session_id(p)))
                         .unwrap_or_default();
                     println!(
                         "{}: {} unread (last {}){sid}{tags}{via}",
@@ -5852,8 +5778,8 @@ fn main() -> Result<()> {
                         let status = diag.status;
                         serde_json::json!({
                             "name": p.name,
-                            "session_id": peer_session_id(p),
-                            "session_id_basis": peer_session_id_basis(p),
+                            "session_id": model::peer_session_id(p),
+                            "session_id_basis": model::peer_session_id_basis(p),
                             "repo": p.repo,
                             "branch": p.branch,
                             "worktree": p.worktree_id,
@@ -5932,7 +5858,7 @@ fn main() -> Result<()> {
                     };
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
-                    let sid = peer_session_id(p);
+                    let sid = model::peer_session_id(p);
                     let anomaly_marker = routing_anomaly_counts
                         .get(&p.name)
                         .filter(|&&n| n > 0)
@@ -7072,7 +6998,7 @@ fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
             if model::is_broadcast(&to) {
                 anyhow::bail!("job delegation is point-to-point; choose one worker peer");
             }
-            let to = resolve_point_recipient(store, &to)?;
+            let to = store::resolve_point_recipient(store, &to)?;
             let (creator, explicit) = resolve_me_explicit(from, None, cfg);
             refresh_presence(store, &creator, explicit);
             let spec = model::JobSpec {

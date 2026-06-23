@@ -41,6 +41,58 @@ pub fn is_broadcast(name: &str) -> bool {
     BROADCAST.contains(&name)
 }
 
+/// Does `token` have the stable session-id shape used by `peer_session_id`?
+pub fn session_id_valid(token: &str) -> bool {
+    token.len() == "sess_".len() + 16
+        && token.starts_with("sess_")
+        && token["sess_".len()..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Stable, non-secret live-session id for display/routing surfaces.
+///
+/// Prefer the birth certificate when present (hashed before display), then fall
+/// back through PID/host and exact mux target. This does not replace the human
+/// peer alias; it gives orchestrators a unique session handle when aliases/repos/
+/// mux sessions are ambiguous.
+pub fn peer_session_id(p: &Peer) -> String {
+    let seed = if let Some(cert) = p.birth_cert.as_deref().filter(|s| !s.is_empty()) {
+        format!("cert:{cert}")
+    } else if let Some(pid) = p.pid {
+        format!("pid:{}:{pid}:{}:{}:{}", p.host, p.mux, p.target, p.name)
+    } else {
+        format!(
+            "target:{}:{}:{}:{}:{}",
+            p.host,
+            p.mux,
+            p.target,
+            p.socket,
+            p.cwd.as_deref().unwrap_or("")
+        )
+    };
+    format!("sess_{:016x}", fnv1a64(seed.as_bytes()))
+}
+
+pub fn peer_session_id_basis(p: &Peer) -> &'static str {
+    if p.birth_cert.as_deref().is_some_and(|s| !s.is_empty()) {
+        "birth_cert"
+    } else if p.pid.is_some() {
+        "host_pid_target"
+    } else {
+        "mux_target"
+    }
+}
+
 /// Current UNIX time in seconds. Stored as an integer so we need no date crate;
 /// formatted for humans only at display time.
 pub fn now() -> i64 {
