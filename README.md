@@ -193,7 +193,7 @@ TTL-presumed-remote vs stale). `--repo <name>` / `--branch <name>` narrow the se
 by exact tag match.
 
 `--json` emits an array of
-`{name, repo, branch, worktree, mux, pane, host, alive, liveness, remote, origin, foreign}`.
+`{name, session_id, session_id_basis, repo, branch, worktree, mux, pane, host, alive, liveness, remote, origin, foreign}`.
 The two new keys are additive:
 
 - **`liveness`** — a stable machine token, one of `"alive_local"` (same host,
@@ -202,6 +202,12 @@ The two new keys are additive:
   or a same-host known-dead pid).
 - **`remote`** — a bool, `true` when the row's `host` differs from this machine's
   host.
+- **`session_id`** — a stable, non-secret live-session handle (`sess_<16-hex>`)
+  derived from the peer birth certificate when possible. Point-to-point `send`,
+  `notify`, `ask`, and `job delegate` accept either a peer alias or this exact
+  session id, resolving the id back to one registered peer before writing. This
+  gives orchestrators a precise recipient handle when aliases, repos, or mux
+  session names are ambiguous.
 
 The human (non-`--json`) output marks a remote row with a ` <remote>` tag and
 prints the reason in brackets per row:

@@ -1579,6 +1579,98 @@ fn cli_register_then_peers_lists_peer() {
     );
 }
 
+#[test]
+fn cli_point_to_point_commands_accept_session_id_recipient() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "worker"]);
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers --json parses");
+    let session_id = peers
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("worker")))
+        .and_then(|p| p["session_id"].as_str())
+        .unwrap_or_else(|| panic!("worker session_id in peers --json: {peers_json}"))
+        .to_string();
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "orchestrator",
+            "--to",
+            &session_id,
+            "--body",
+            "session-routed send",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "orchestrator",
+            "--to",
+            &session_id,
+            "--body",
+            "session-routed ask",
+        ],
+    );
+    let delegated = run_ok(
+        &db,
+        &[
+            "job",
+            "delegate",
+            "--from",
+            "orchestrator",
+            "--to",
+            &session_id,
+            "--title",
+            "session-routed job",
+            "--json",
+        ],
+    );
+    let dv: serde_json::Value =
+        serde_json::from_str(&delegated).expect("job delegate --json parses");
+    assert_eq!(dv["job"]["assignee"].as_str(), Some("worker"));
+
+    let inbox = run_ok(&db, &["inbox", "--me", "worker", "--peek"]);
+    assert!(
+        inbox.contains("session-routed send"),
+        "send resolves session id to worker inbox: {inbox}"
+    );
+    assert!(
+        inbox.contains("session-routed ask"),
+        "ask resolves session id to worker inbox: {inbox}"
+    );
+    assert!(
+        inbox.contains("JOB_DELEGATED"),
+        "job delegate resolves session id to worker inbox: {inbox}"
+    );
+}
+
+#[test]
+fn cli_unknown_session_id_recipient_is_rejected() {
+    let db = TestDb::new();
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "notify",
+            "--from",
+            "orchestrator",
+            "--to",
+            "sess_0123456789abcdef",
+            "--body",
+            "lost",
+        ],
+    );
+    assert!(!ok, "unknown session id should fail");
+    assert!(
+        err.contains("no registered peer has session id"),
+        "clear unknown-session diagnostic: {err}"
+    );
+}
+
 // ─────────────────────── P5: rich presence (turn_state + description) ───────────
 
 /// The full hook turn_state lifecycle surfaces in `weave peers` (human): session ⇒
