@@ -8241,6 +8241,61 @@ fn mcp_ask_lifecycle_and_failures() {
     mcp.shutdown();
 }
 
+/// Routing anomaly reports are aggregated into doctor and attributed to involved
+/// peers in scan, so misdelivery is visible outside the recipient inbox.
+#[test]
+fn doctor_and_scan_surface_routing_anomaly_counts() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "alice"]);
+    run_ok(&db, &["register", "--name", "carol"]);
+
+    let opened = run_ok(
+        &db,
+        &["ask", "--from", "alice", "--to", "bob", "--body", "q"],
+    );
+    let cid = extract_cid(&opened);
+    let (ok, _out, err) = run(
+        &db,
+        &["answer", "--from", "carol", "--id", &cid, "--body", "wrong"],
+    );
+    assert!(!ok, "wrong recipient answer fails");
+    assert!(err.contains("ROUTING_ANOMALY"), "anomaly error: {err}");
+
+    let doctor = run_ok(&db, &["doctor", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&doctor).expect("doctor json");
+    assert_eq!(
+        doc["routing_anomalies"].as_i64(),
+        Some(1),
+        "doctor anomaly count: {doc}"
+    );
+    assert!(
+        doc["routing_anomaly_last_ts"].as_i64().unwrap_or_default() > 0,
+        "doctor anomaly last ts: {doc}"
+    );
+
+    let scan_json = run_ok(&db, &["scan", "--json"]);
+    let scan: serde_json::Value = serde_json::from_str(&scan_json).expect("scan json");
+    for name in ["alice", "carol"] {
+        let row = scan
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {scan_json}"));
+        assert_eq!(
+            row["routing_anomalies"].as_i64(),
+            Some(1),
+            "scan anomaly count for {name}: {row}"
+        );
+    }
+
+    let scan_human = run_ok(&db, &["scan"]);
+    assert!(
+        scan_human.contains("routing-anomalies"),
+        "scan summary includes anomaly count: {scan_human}"
+    );
+}
+
 /// MCP wrong-recipient answers are reported as routing anomalies and leave an
 /// auditable message for the original asker.
 #[test]
