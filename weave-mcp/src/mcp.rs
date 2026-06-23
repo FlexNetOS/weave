@@ -1704,6 +1704,7 @@ fn tool_peers(
             store::Liveness::AliveRemote => "alive (remote, ttl)",
             store::Liveness::Stale => "stale",
         };
+        let diag = mcp_peer_diagnostics(store, p, liveness, &this_host, now_ts);
         let remote_marker = if p.host != this_host { " <remote>" } else { "" };
         let via = if v.origin.is_foreign() {
             format!(" (via {})", v.origin.label())
@@ -1714,11 +1715,18 @@ fn tool_peers(
         let ts_marker = fmt_turn_state(p);
         let desc = fmt_description(p);
         out.push_str(&format!(
-            "\n  • {}{remote_marker} [{presence}] [{reason}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
+            "\n  • {}{remote_marker} [{presence}] [{reason}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {} process_alive={} pane_alive={} reachable={} stale_reason={} last_transport_success={} last_response={} inject_probe={}{via}",
             p.name,
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
-            fmt_ts(p.last_seen)
+            fmt_ts(p.last_seen),
+            diag.process_alive,
+            diag.pane_alive,
+            diag.reachable,
+            if diag.stale_reason.is_empty() { "-" } else { diag.stale_reason },
+            diag.last_transport_success,
+            diag.last_response,
+            diag.inject_probe,
         ));
     }
     Ok(out)
@@ -1764,6 +1772,109 @@ fn fmt_description(p: &weave_core::model::Peer) -> String {
         String::new()
     } else {
         format!(" \"{}\"", p.description)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpPeerDiagnostics {
+    process_expected: bool,
+    process_alive: bool,
+    pane_alive: bool,
+    reachable: bool,
+    responsive_recently: bool,
+    last_transport_success: i64,
+    last_response: i64,
+    stale_reason: &'static str,
+    inject_probe: &'static str,
+}
+
+fn mcp_peer_recently_responded(store: &dyn Store, name: &str, now_ts: i64) -> bool {
+    store
+        .list_asks(name, weave_core::model::AskRole::Askee, 50)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|a| {
+            matches!(
+                a.state,
+                weave_core::model::AskState::Answered | weave_core::model::AskState::Acked
+            ) && now_ts.saturating_sub(a.updated_ts) <= 15 * 60
+        })
+}
+
+fn mcp_peer_last_response(store: &dyn Store, name: &str) -> i64 {
+    store
+        .list_asks(name, weave_core::model::AskRole::Askee, 200)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            matches!(
+                a.state,
+                weave_core::model::AskState::Answered | weave_core::model::AskState::Acked
+            )
+        })
+        .map(|a| a.updated_ts)
+        .max()
+        .unwrap_or(0)
+}
+
+fn mcp_peer_last_transport_success(store: &dyn Store, name: &str) -> i64 {
+    store
+        .history(name, None, 200)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|m| {
+            store
+                .list_delivery(m.id, weave_core::model::MAX_DELIVERY_ROWS)
+                .unwrap_or_default()
+        })
+        .filter(|t| {
+            t.to_peer == name
+                && t.outcome == weave_core::model::DeliveryOutcome::Ok.as_str()
+                && (t.stage == weave_core::model::DeliveryStage::Injected.as_str()
+                    || t.stage == weave_core::model::DeliveryStage::Drained.as_str())
+        })
+        .map(|t| t.ts)
+        .max()
+        .unwrap_or(0)
+}
+
+fn mcp_peer_diagnostics(
+    store: &dyn Store,
+    p: &weave_core::model::Peer,
+    liveness: store::Liveness,
+    this_host: &str,
+    now_ts: i64,
+) -> McpPeerDiagnostics {
+    let target = Target::from_peer(p);
+    let capability = weave_inject::capability(&target);
+    let process_expected = p.pid.is_some() && p.host == this_host;
+    let process_alive = match p.pid {
+        Some(pid) if process_expected => store::pid_alive(pid),
+        _ => false,
+    };
+    let stale_reason = if !matches!(liveness, store::Liveness::Stale) {
+        ""
+    } else if process_expected && !process_alive {
+        "process_dead"
+    } else if !store::is_online_at(p.last_seen, now_ts) {
+        "heartbeat_stale"
+    } else {
+        "stale"
+    };
+    McpPeerDiagnostics {
+        process_expected,
+        process_alive,
+        pane_alive: matches!(capability, Capability::Live),
+        reachable: matches!(capability, Capability::Live),
+        responsive_recently: mcp_peer_recently_responded(store, &p.name, now_ts),
+        last_transport_success: mcp_peer_last_transport_success(store, &p.name),
+        last_response: mcp_peer_last_response(store, &p.name),
+        stale_reason,
+        inject_probe: match capability {
+            Capability::Live => "live",
+            Capability::RegisteredNotAlive => "absent",
+            Capability::NotInjectable => "not_injectable",
+        },
     }
 }
 
@@ -1848,6 +1959,7 @@ fn tool_scan(
             store::Liveness::AliveRemote => "alive (remote, ttl)",
             store::Liveness::Stale => "stale",
         };
+        let diag = mcp_peer_diagnostics(store, p, liveness, &this_host, now_ts);
         match liveness {
             store::Liveness::AliveLocal => local_alive += 1,
             store::Liveness::AliveRemote => remote_alive += 1,
@@ -1862,7 +1974,7 @@ fn tool_scan(
         let ts_marker = fmt_turn_state(p);
         let desc = fmt_description(p);
         out.push_str(&format!(
-            "\n  • {}{remote_marker} [{reason}]{ts_marker} repo={} branch={} worktree={} mux={} pane={} host={}{desc}{via}",
+            "\n  • {}{remote_marker} [{reason}]{ts_marker} repo={} branch={} worktree={} mux={} pane={} host={}{desc} process_alive={} pane_alive={} reachable={} responsive={} stale_reason={} last_transport_success={} last_response={} inject_probe={}{via}",
             p.name,
             if p.repo.is_empty() { "-" } else { &p.repo },
             if p.branch.is_empty() { "-" } else { &p.branch },
@@ -1874,6 +1986,14 @@ fn tool_scan(
             p.mux,
             if p.target.is_empty() { "-" } else { &p.target },
             if p.host.is_empty() { "-" } else { &p.host },
+            diag.process_alive,
+            diag.pane_alive,
+            diag.reachable,
+            diag.responsive_recently,
+            if diag.stale_reason.is_empty() { "-" } else { diag.stale_reason },
+            diag.last_transport_success,
+            diag.last_response,
+            diag.inject_probe,
         ));
     }
     out.push_str(&format!(
@@ -2096,12 +2216,28 @@ fn tool_doctor(
     let mut peers_alive_local = 0usize;
     let mut peers_alive_remote = 0usize;
     let mut peers_stale = 0usize;
+    let mut process_expected = 0usize;
+    let mut process_alive = 0usize;
+    let mut pane_alive = 0usize;
+    let mut reachable = 0usize;
+    let mut responsive = 0usize;
+    let mut transport_seen = 0usize;
+    let mut response_seen = 0usize;
     for v in &views {
-        match store::liveness_for(&v.peer, &this_host, now_ts) {
+        let liveness = store::liveness_for(&v.peer, &this_host, now_ts);
+        match liveness {
             store::Liveness::AliveLocal => peers_alive_local += 1,
             store::Liveness::AliveRemote => peers_alive_remote += 1,
             store::Liveness::Stale => peers_stale += 1,
         }
+        let diag = mcp_peer_diagnostics(store, &v.peer, liveness, &this_host, now_ts);
+        process_expected += usize::from(diag.process_expected);
+        process_alive += usize::from(diag.process_alive);
+        pane_alive += usize::from(diag.pane_alive);
+        reachable += usize::from(diag.reachable);
+        responsive += usize::from(diag.responsive_recently);
+        transport_seen += usize::from(diag.last_transport_success > 0);
+        response_seen += usize::from(diag.last_response > 0);
     }
     let (fed_ok, fed_skipped) = store::federation_status(extra_dbs);
     let total = store.total_messages().map_err(e)?;
@@ -2129,6 +2265,17 @@ fn tool_doctor(
     ));
     out.push_str(&format!(
         "\n  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
+    ));
+    out.push_str(&format!(
+        "\n  dimensions:     registered={}, process_alive={}/{}, pane_alive={}, reachable={}, responsive={}, transport_seen={}, response_seen={}",
+        total_peers,
+        process_alive,
+        process_expected,
+        pane_alive,
+        reachable,
+        responsive,
+        transport_seen,
+        response_seen,
     ));
     out.push_str(&format!(
         "\n  claude on PATH: {}",

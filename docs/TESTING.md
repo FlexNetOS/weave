@@ -1164,3 +1164,16 @@ python3 scripts/target_smoke.py --clean-target
 `--clean-target` refuses to delete a non-empty `target/` unless Cargo's
 `CACHEDIR.TAG` marker is present. Never commit files from `target/`; commit only
 script, docs, or source changes.
+
+### Dimensional doctor/scan liveness diagnostics (WL-068)
+
+`peers --json`, `scan --json`, and `doctor --json` now expose orthogonal
+dimensions instead of relying only on a folded status token: `registered`,
+`process_expected`, `process_alive`, `pane_alive`, `injectable`, `reachable`,
+`responsive_recently`, `last_heartbeat`, `last_transport_success`,
+`last_response`, `stale_reason`, and `inject_probe`. The integration suite pins
+misregistration, responsive-answer, and registered-stale cases so a peer can be
+accurately described as, for example, "registered but process-dead" or
+"reachable but heartbeat-stale" without doctor/scan hiding the dimensions. MCP
+`weave_peers`, `weave_scan`, and `weave_doctor` mirror the same dimension summary
+in their text surfaces.
