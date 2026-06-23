@@ -1664,7 +1664,7 @@ pub const MAX_DELIVERY_ROWS: i64 = 500;
 
 /// Which kind of artifact a `delivery_log` row traces. `Message` = a plain
 /// `weave_send`; `Notify` = a fire-and-forget `weave_notify`; `Ask` = a tracked
-/// `weave_ask` question. Stored as TEXT (see the `delivery_log` table) and validated
+/// `weave_ask` question; `Answer` = a tracked ask answer. Stored as TEXT (see the `delivery_log` table) and validated
 /// through this enum so the store never binds raw garbage; mirrors the `AskState`
 /// as_str/from_str pattern. Pure value type — DAG layer `model` (no I/O).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1673,6 +1673,7 @@ pub enum DeliveryRefKind {
     Message,
     Notify,
     Ask,
+    Answer,
 }
 
 impl DeliveryRefKind {
@@ -1684,6 +1685,7 @@ impl DeliveryRefKind {
             DeliveryRefKind::Message => "message",
             DeliveryRefKind::Notify => "notify",
             DeliveryRefKind::Ask => "ask",
+            DeliveryRefKind::Answer => "answer",
         }
     }
 
@@ -1697,6 +1699,7 @@ impl DeliveryRefKind {
             "message" => Ok(DeliveryRefKind::Message),
             "notify" => Ok(DeliveryRefKind::Notify),
             "ask" => Ok(DeliveryRefKind::Ask),
+            "answer" => Ok(DeliveryRefKind::Answer),
             other => Err(format!("unknown delivery ref kind '{other}'")),
         }
     }
@@ -2094,6 +2097,7 @@ mod tests {
             DeliveryRefKind::Message,
             DeliveryRefKind::Notify,
             DeliveryRefKind::Ask,
+            DeliveryRefKind::Answer,
         ] {
             assert_eq!(DeliveryRefKind::from_str(s.as_str()), Ok(s));
         }

@@ -100,18 +100,40 @@ fn seed_cc_switch_db(path: &std::path::Path) {
 #[cfg(feature = "sqlite")]
 fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+    listener.set_nonblocking(true).ok();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1024];
+        // Reqwest may retry or open a second connection while probing. Serve a small
+        // bounded handful of identical `/api/tags` responses so the hermetic test is
+        // not sensitive to client connection reuse behavior.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut served = 0usize;
+        while served < 4 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            served += 1;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            let mut buf = [0u8; 2048];
             let _ = std::io::Read::read(&mut stream, &mut buf);
             let body = r#"{"models":[{"name":"llama3.2:latest"},{"name":"qwen2.5-coder:7b"}]}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
         }
     });
     (format!("http://{addr}"), handle)
@@ -8830,6 +8852,99 @@ fn extract_mid(text: &str) -> i64 {
             w.parse::<i64>().ok()
         })
         .unwrap_or_else(|| panic!("no message id in: {text:?}"))
+}
+
+/// REGRESSION: point-to-point ask and answer use the traced injection path, so any
+/// printed transport verdict has matching `weave delivery --id <message-id>` rows.
+#[test]
+fn cli_ask_and_answer_have_delivery_traces() {
+    let db = TestDb::new();
+
+    let opened = run_ok(
+        &db,
+        &["ask", "--from", "alice", "--to", "bob", "--body", "trace q"],
+    );
+    assert!(opened.contains("opened ask"), "ask line: {opened}");
+    let cid = extract_cid(&opened);
+
+    let get_json = run_ok(&db, &["ask-get", "--id", &cid, "--json"]);
+    let ask_v: serde_json::Value = serde_json::from_str(&get_json).expect("ask json");
+    let qid = ask_v["ask"]["question_msg_id"]
+        .as_i64()
+        .expect("question message id");
+    let qtrace = run_ok(&db, &["delivery", "--id", &qid.to_string()]);
+    assert!(qtrace.contains("queued"), "ask queued trace: {qtrace}");
+    assert!(
+        qtrace.contains("not_injectable")
+            || qtrace.contains("inject_failed")
+            || qtrace.contains("injected"),
+        "ask terminal trace: {qtrace}"
+    );
+    assert!(qtrace.contains("(ask)"), "ask ref kind: {qtrace}");
+
+    let answered = run_ok(
+        &db,
+        &["answer", "--from", "bob", "--id", &cid, "--body", "trace a"],
+    );
+    assert!(answered.contains("answered ask"), "answer line: {answered}");
+
+    let get_json = run_ok(&db, &["ask-get", "--id", &cid, "--json"]);
+    let ask_v: serde_json::Value = serde_json::from_str(&get_json).expect("ask json");
+    let aid = ask_v["ask"]["answer_msg_id"]
+        .as_i64()
+        .expect("answer message id");
+    let atrace = run_ok(&db, &["delivery", "--id", &aid.to_string()]);
+    assert!(atrace.contains("queued"), "answer queued trace: {atrace}");
+    assert!(
+        atrace.contains("not_injectable")
+            || atrace.contains("inject_failed")
+            || atrace.contains("injected"),
+        "answer terminal trace: {atrace}"
+    );
+    assert!(atrace.contains("(answer)"), "answer ref kind: {atrace}");
+}
+
+/// Ambiguous registrations that share the exact same mux target are surfaced as
+/// misregistered instead of being hidden behind a generic stale/online count.
+#[test]
+fn scan_and_doctor_surface_shared_target_misregistration() {
+    let db = TestDb::new();
+    run_ok_env(
+        &db,
+        &["register", "--name", "dup_a"],
+        &[("TMUX_PANE", "%42")],
+    );
+    run_ok_env(
+        &db,
+        &["register", "--name", "dup_b"],
+        &[("TMUX_PANE", "%42")],
+    );
+
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers json");
+    for name in ["dup_a", "dup_b"] {
+        let row = peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {peers_json}"));
+        assert_eq!(row["misregistered"].as_bool(), Some(true), "row: {row}");
+    }
+
+    let scan = run_ok(&db, &["scan"]);
+    assert!(
+        scan.contains("misregistered(shared-target)"),
+        "scan flags duplicate target: {scan}"
+    );
+
+    let doctor = run_ok(&db, &["doctor", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&doctor).expect("doctor json");
+    assert_eq!(
+        doc["peers_misregistered"].as_i64(),
+        Some(2),
+        "doctor: {doc}"
+    );
 }
 
 /// CLI end-to-end: `weave notify` returns the honest verdict, persists a normal
