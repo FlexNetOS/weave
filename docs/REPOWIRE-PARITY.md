@@ -115,8 +115,8 @@ tracked.
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
 | Browser dashboard (Next.js) | read-only web dashboard (`weave dashboard`), server-rendered HTML + SSE; `weave sessions --watch` TUI also | ✅ **HAVE** | **WL-048** — `weave-mcp/src/dashboard.rs` + `http.rs::serve_dashboard`, Rust-native HTTP/SSE over `http.rs`, no Next.js, `--features surfaces` |
-| Telegram bot | Telegram bridge (`weave telegram`), poll-only | ✅ **HAVE** | **WL-048** — `weave/src/telegram.rs`, shared `reqwest` blocking client, `--features surfaces` |
-| Slack bot | Slack bridge (`weave slack`), poll-only | ✅ **HAVE** | **WL-048** — `weave/src/slack.rs`, `--features surfaces` |
+| Telegram bot | Telegram bridge (`weave telegram`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/telegram.rs`, `/inbox`/`/peers`/`/sessions` plus gated `/send`/`/ask`/`/answer`/`/reply` through shared dispatcher |
+| Slack bot | Slack bridge (`weave slack`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/slack.rs`, same shared command grammar as Telegram, `--features surfaces` |
 
 ## 7. Security
 

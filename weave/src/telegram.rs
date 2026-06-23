@@ -137,13 +137,17 @@ pub fn redact_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 /// WL-052b: a structured bot command parsed from an inbound `/…` message. Read-only
-/// in v1 (mutating commands are intentionally not exposed to chat by default).
+/// reads are always enabled; writes require the explicit bot-write gate.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BotCommand {
     Help,
     Inbox,
     Peers,
     Sessions,
+    Send { to: String, body: String },
+    Ask { to: String, body: String },
+    Answer { id: String, body: String },
+    Reply { message_id: i64, body: String },
 }
 
 /// Parse an inbound message into a [`BotCommand`]. Returns `None` for ordinary text
@@ -157,25 +161,111 @@ pub fn parse_bot_command(text: &str) -> Option<BotCommand> {
         "inbox" => BotCommand::Inbox,
         "peers" => BotCommand::Peers,
         "sessions" => BotCommand::Sessions,
+        "send" => {
+            let Some((to, body)) = parse_two_arg_command(text) else {
+                return Some(BotCommand::Help);
+            };
+            BotCommand::Send { to, body }
+        }
+        "ask" => {
+            let Some((to, body)) = parse_two_arg_command(text) else {
+                return Some(BotCommand::Help);
+            };
+            BotCommand::Ask { to, body }
+        }
+        "answer" => {
+            let Some((id, body)) = parse_two_arg_command(text) else {
+                return Some(BotCommand::Help);
+            };
+            BotCommand::Answer { id, body }
+        }
+        "reply" => {
+            let Some((id, body)) = parse_two_arg_command(text) else {
+                return Some(BotCommand::Help);
+            };
+            let Ok(message_id) = id.parse::<i64>() else {
+                return Some(BotCommand::Help);
+            };
+            BotCommand::Reply { message_id, body }
+        }
         _ => BotCommand::Help,
     })
 }
 
+fn parse_two_arg_command(text: &str) -> Option<(String, String)> {
+    let mut parts = text.splitn(3, char::is_whitespace);
+    let _cmd = parts.next()?;
+    let first = parts.next()?.trim();
+    let rest = parts.next()?.trim();
+    if first.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((first.to_string(), rest.to_string()))
+}
+
+/// Bot write commands are explicit opt-in. Human chat writes route through the
+/// dangerous-tool gate (`dispatch_request(..., dangerous=true)`) only when this
+/// returns true.
+pub fn bot_write_commands_enabled(_config: &Config) -> bool {
+    matches!(
+        std::env::var("WEAVE_BOT_WRITES")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Map a command to the JSON-RPC `tools/call` it dispatches through — the SAME
 /// `dispatch_request` → `call_tool` handler the MCP and CLI surfaces use (the WL-052
-/// one-handler-many-surfaces law). `Help` has no RPC (handled locally). All mapped
-/// ops are read-only, so they pass the safe (`dangerous=false`) gate.
-pub fn bot_command_rpc(cmd: &BotCommand, me: &str) -> Option<Value> {
+/// one-handler-many-surfaces law). `Help` has no RPC (handled locally). Write ops
+/// return an error until the explicit bot-write gate is enabled.
+pub fn bot_command_rpc(
+    cmd: &BotCommand,
+    me: &str,
+    allow_writes: bool,
+) -> std::result::Result<Option<Value>, String> {
     let (name, args) = match cmd {
-        BotCommand::Help => return None,
+        BotCommand::Help => return Ok(None),
         BotCommand::Inbox => ("weave_inbox", json!({"me": me, "include_read": false})),
         BotCommand::Peers => ("weave_peers", json!({"circle": "*"})),
         BotCommand::Sessions => ("weave_sessions", json!({"circle": "*"})),
+        BotCommand::Send { to, body } => {
+            if !allow_writes {
+                return Err(bot_writes_disabled_text());
+            }
+            ("weave_send", json!({"from": me, "to": to, "body": body}))
+        }
+        BotCommand::Ask { to, body } => {
+            if !allow_writes {
+                return Err(bot_writes_disabled_text());
+            }
+            ("weave_ask", json!({"from": me, "to": to, "body": body}))
+        }
+        BotCommand::Answer { id, body } => {
+            if !allow_writes {
+                return Err(bot_writes_disabled_text());
+            }
+            ("weave_answer", json!({"from": me, "id": id, "body": body}))
+        }
+        BotCommand::Reply { message_id, body } => {
+            if !allow_writes {
+                return Err(bot_writes_disabled_text());
+            }
+            (
+                "weave_reply",
+                json!({"from": me, "message_id": message_id, "body": body}),
+            )
+        }
     };
-    Some(json!({
+    Ok(Some(json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": name, "arguments": args}
-    }))
+    })))
+}
+
+fn bot_writes_disabled_text() -> String {
+    "bot write commands are disabled; set WEAVE_BOT_WRITES=1 to enable /send, /ask, /answer, and /reply".to_string()
 }
 
 /// The `/help` listing.
@@ -184,6 +274,10 @@ pub fn bot_help_text() -> String {
      /inbox — unread messages for this bridge\n\
      /peers — registered peers + presence\n\
      /sessions — known sessions + unread counts\n\
+     /send <to> <body> — send a message (requires WEAVE_BOT_WRITES=1)\n\
+     /ask <to> <body> — open a tracked ask (requires WEAVE_BOT_WRITES=1)\n\
+     /answer <ask_id> <body> — answer an ask (requires WEAVE_BOT_WRITES=1)\n\
+     /reply <message_id> <body> — reply to a message (requires WEAVE_BOT_WRITES=1)\n\
      /help — this list"
         .to_string()
 }
@@ -206,6 +300,33 @@ pub fn format_bot_reply(resp: Option<&str>) -> String {
         return format!("error: {e}");
     }
     raw.to_string()
+}
+
+pub fn dispatch_bot_command(
+    store: &dyn Store,
+    config: &Config,
+    identity: &str,
+    cmd: &BotCommand,
+    injector: &dyn weave_inject::Injector,
+) -> String {
+    let allow_writes = bot_write_commands_enabled(config);
+    match bot_command_rpc(cmd, identity, allow_writes) {
+        Ok(None) => bot_help_text(),
+        Err(e) => e,
+        Ok(Some(rpc)) => {
+            let resp = weave_mcp::mcp::dispatch_request(
+                store,
+                &Some(identity.to_string()),
+                None,
+                &[],
+                &weave_mcp::PullConsent::empty(),
+                &rpc,
+                injector,
+                allow_writes,
+            );
+            format_bot_reply(resp.as_deref())
+        }
+    }
 }
 
 /// Run the Telegram bridge blocking loop on the calling thread (like `Cmd::Serve`).
@@ -259,22 +380,9 @@ pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
                                 // WL-052b: a `/command` is answered structurally via the
                                 // shared handler; ordinary text falls through to the relay.
                                 if let Some(cmd) = parse_bot_command(&text) {
-                                    let reply = match bot_command_rpc(&cmd, &identity) {
-                                        None => bot_help_text(),
-                                        Some(rpc) => {
-                                            let resp = weave_mcp::mcp::dispatch_request(
-                                                store,
-                                                &Some(identity.clone()),
-                                                None,
-                                                &[],
-                                                &weave_mcp::PullConsent::empty(),
-                                                &rpc,
-                                                &injector,
-                                                false,
-                                            );
-                                            format_bot_reply(resp.as_deref())
-                                        }
-                                    };
+                                    let reply = dispatch_bot_command(
+                                        store, config, &identity, &cmd, &injector,
+                                    );
                                     if let Some(chat) = &chat_id {
                                         let payload = telegram_send_payload(chat, &reply);
                                         if let Err(e) = client
@@ -376,6 +484,35 @@ mod tests {
         assert_eq!(parse_bot_command("/inbox"), Some(BotCommand::Inbox));
         assert_eq!(parse_bot_command("/peers"), Some(BotCommand::Peers));
         assert_eq!(parse_bot_command("/sessions"), Some(BotCommand::Sessions));
+        assert_eq!(
+            parse_bot_command("/send worker hello there"),
+            Some(BotCommand::Send {
+                to: "worker".into(),
+                body: "hello there".into()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/ask worker ready?"),
+            Some(BotCommand::Ask {
+                to: "worker".into(),
+                body: "ready?".into()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/answer ask_1_2 yes"),
+            Some(BotCommand::Answer {
+                id: "ask_1_2".into(),
+                body: "yes".into()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/reply 42 got it"),
+            Some(BotCommand::Reply {
+                message_id: 42,
+                body: "got it".into()
+            })
+        );
+        assert_eq!(parse_bot_command("/send worker"), Some(BotCommand::Help));
         // group-suffix form + unknown -> Help.
         assert_eq!(
             parse_bot_command("/inbox@weavebot"),
@@ -390,16 +527,36 @@ mod tests {
 
     #[test]
     fn bot_command_rpc_maps_to_read_ops() {
-        let rpc = bot_command_rpc(&BotCommand::Inbox, "bridge").unwrap();
+        let rpc = bot_command_rpc(&BotCommand::Inbox, "bridge", false)
+            .unwrap()
+            .unwrap();
         assert_eq!(rpc["method"], "tools/call");
         assert_eq!(rpc["params"]["name"], "weave_inbox");
         assert_eq!(rpc["params"]["arguments"]["me"], "bridge");
         assert_eq!(
-            bot_command_rpc(&BotCommand::Peers, "x").unwrap()["params"]["name"],
+            bot_command_rpc(&BotCommand::Peers, "x", false)
+                .unwrap()
+                .unwrap()["params"]["name"],
             "weave_peers"
         );
         // Help has no RPC (answered locally).
-        assert!(bot_command_rpc(&BotCommand::Help, "x").is_none());
+        assert!(bot_command_rpc(&BotCommand::Help, "x", false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bot_command_rpc_gates_write_ops() {
+        let send = BotCommand::Send {
+            to: "worker".into(),
+            body: "hello".into(),
+        };
+        assert!(bot_command_rpc(&send, "bridge", false).is_err());
+        let rpc = bot_command_rpc(&send, "bridge", true).unwrap().unwrap();
+        assert_eq!(rpc["params"]["name"], "weave_send");
+        assert_eq!(rpc["params"]["arguments"]["from"], "bridge");
+        assert_eq!(rpc["params"]["arguments"]["to"], "worker");
+        assert_eq!(rpc["params"]["arguments"]["body"], "hello");
     }
 
     #[test]
