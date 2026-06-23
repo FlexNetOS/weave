@@ -2669,6 +2669,30 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         }
     }
     let peer_statuses = peer_status_counts(store, &views, &ambiguous, &this_host, now_ts);
+    let peer_diagnostics_summary =
+        peer_diagnostic_summary(store, &views, &ambiguous, &this_host, now_ts);
+    let peer_diagnostics_rows: Vec<_> = views
+        .iter()
+        .map(|v| {
+            let p = &v.peer;
+            let liveness = store::liveness_for(p, &this_host, now_ts);
+            let misregistered = ambiguous.contains(p.name.as_str());
+            let diag = peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
+            serde_json::json!({
+                "name": p.name,
+                "session_id": peer_session_id(p),
+                "session_id_basis": peer_session_id_basis(p),
+                "mux": p.mux,
+                "target": p.target,
+                "host": p.host,
+                "liveness": liveness.token(),
+                "misregistered": misregistered,
+                "origin": v.origin.label(),
+                "foreign": v.origin.is_foreign(),
+                "diagnostics": diag.to_json(),
+            })
+        })
+        .collect::<Vec<_>>();
     let (fed_ok, fed_skipped) = store::federation_status(&extra);
     // On the default sqlite build a remote source cannot be opened — surface how
     // many were skipped purely for lack of the libsql feature so the user is told.
@@ -2749,6 +2773,16 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "peers_stale": peers_stale,
             "peers_misregistered": peers_misregistered,
             "peer_statuses": peer_statuses,
+            "peer_diagnostics": peer_diagnostics_rows,
+            "peers_registered": peer_diagnostics_summary.registered,
+            "peers_process_expected": peer_diagnostics_summary.process_expected,
+            "peers_process_alive": peer_diagnostics_summary.process_alive,
+            "peers_pane_alive": peer_diagnostics_summary.pane_alive,
+            "peers_injectable": peer_diagnostics_summary.injectable,
+            "peers_reachable": peer_diagnostics_summary.reachable,
+            "peers_responsive_recently": peer_diagnostics_summary.responsive_recently,
+            "peers_last_transport_success": peer_diagnostics_summary.transport_success,
+            "peers_last_response": peer_diagnostics_summary.response_seen,
             "current_socket": target.socket,
             "claude_on_path": claude,
             "federation_stores": extra.len(),
@@ -2915,6 +2949,17 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         println!(
             "  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
         );
+        println!(
+            "  dimensions:     registered={}, process_alive={}/{}, pane_alive={}, reachable={}, responsive={}, transport_seen={}, response_seen={}",
+            peer_diagnostics_summary.registered,
+            peer_diagnostics_summary.process_alive,
+            peer_diagnostics_summary.process_expected,
+            peer_diagnostics_summary.pane_alive,
+            peer_diagnostics_summary.reachable,
+            peer_diagnostics_summary.responsive_recently,
+            peer_diagnostics_summary.transport_success,
+            peer_diagnostics_summary.response_seen,
+        );
         let status_summary = peer_statuses
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -3066,21 +3111,194 @@ fn peer_recently_responded(store: &dyn Store, name: &str, now_ts: i64) -> bool {
         })
 }
 
-fn peer_status_token(
+#[derive(Debug, Clone)]
+struct PeerDiagnostics {
+    registered: bool,
+    process_expected: bool,
+    process_alive: bool,
+    pane_alive: bool,
+    injectable: bool,
+    reachable: bool,
+    responsive_recently: bool,
+    last_heartbeat: i64,
+    last_transport_success: i64,
+    last_response: i64,
+    stale_reason: &'static str,
+    inject_probe: &'static str,
+    status: &'static str,
+}
+
+impl PeerDiagnostics {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "registered": self.registered,
+            "process_expected": self.process_expected,
+            "process_alive": self.process_alive,
+            "pane_alive": self.pane_alive,
+            "injectable": self.injectable,
+            "reachable": self.reachable,
+            "responsive_recently": self.responsive_recently,
+            "last_heartbeat": self.last_heartbeat,
+            "last_transport_success": self.last_transport_success,
+            "last_response": self.last_response,
+            "stale_reason": self.stale_reason,
+            "inject_probe": self.inject_probe,
+            "status": self.status,
+        })
+    }
+}
+
+fn peer_last_response(store: &dyn Store, name: &str) -> i64 {
+    store
+        .list_asks(name, model::AskRole::Askee, 200)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| matches!(a.state, model::AskState::Answered | model::AskState::Acked))
+        .map(|a| a.updated_ts)
+        .max()
+        .unwrap_or(0)
+}
+
+fn peer_last_transport_success(store: &dyn Store, name: &str) -> i64 {
+    store
+        .history(name, None, 200)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|m| {
+            store
+                .list_delivery(m.id, model::MAX_DELIVERY_ROWS)
+                .unwrap_or_default()
+        })
+        .filter(|t| {
+            t.to_peer == name
+                && t.outcome == model::DeliveryOutcome::Ok.as_str()
+                && matches!(
+                    t.stage.as_str(),
+                    s if s == model::DeliveryStage::Injected.as_str()
+                        || s == model::DeliveryStage::Drained.as_str()
+                )
+        })
+        .map(|t| t.ts)
+        .max()
+        .unwrap_or(0)
+}
+
+fn peer_stale_reason(
+    p: &model::Peer,
+    liveness: store::Liveness,
+    process_expected: bool,
+    process_alive: bool,
+    now_ts: i64,
+) -> &'static str {
+    if !matches!(liveness, store::Liveness::Stale) {
+        return "";
+    }
+    if process_expected && !process_alive {
+        return "process_dead";
+    }
+    if !store::is_online_at(p.last_seen, now_ts) {
+        return "heartbeat_stale";
+    }
+    "stale"
+}
+
+fn peer_diagnostics(
     store: &dyn Store,
     p: &model::Peer,
     liveness: store::Liveness,
     misregistered: bool,
+    this_host: &str,
     now_ts: i64,
+) -> PeerDiagnostics {
+    let target = inject::Target::from_peer(p);
+    let capability = inject::capability(&target);
+    let process_expected = p.pid.is_some() && p.host == this_host;
+    let process_alive = match p.pid {
+        Some(pid) if process_expected => store::pid_alive(pid),
+        _ => false,
+    };
+    let responsive_recently = peer_recently_responded(store, &p.name, now_ts);
+    let status =
+        peer_status_token_from_dimensions(liveness, misregistered, responsive_recently, capability);
+    PeerDiagnostics {
+        registered: true,
+        process_expected,
+        process_alive,
+        pane_alive: matches!(capability, inject::Capability::Live),
+        injectable: target.injectable(),
+        reachable: matches!(capability, inject::Capability::Live),
+        responsive_recently,
+        last_heartbeat: p.last_seen,
+        last_transport_success: peer_last_transport_success(store, &p.name),
+        last_response: peer_last_response(store, &p.name),
+        stale_reason: peer_stale_reason(p, liveness, process_expected, process_alive, now_ts),
+        inject_probe: match capability {
+            inject::Capability::Live => "live",
+            inject::Capability::RegisteredNotAlive => "absent",
+            inject::Capability::NotInjectable => "not_injectable",
+        },
+        status,
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerDiagnosticSummary {
+    registered: usize,
+    process_expected: usize,
+    process_alive: usize,
+    pane_alive: usize,
+    injectable: usize,
+    reachable: usize,
+    responsive_recently: usize,
+    transport_success: usize,
+    response_seen: usize,
+}
+
+fn peer_diagnostic_summary(
+    store: &dyn Store,
+    views: &[store::PeerView],
+    ambiguous: &std::collections::BTreeSet<&str>,
+    this_host: &str,
+    now_ts: i64,
+) -> PeerDiagnosticSummary {
+    let mut out = PeerDiagnosticSummary::default();
+    for v in views {
+        let p = &v.peer;
+        let liveness = store::liveness_for(p, this_host, now_ts);
+        let d = peer_diagnostics(
+            store,
+            p,
+            liveness,
+            ambiguous.contains(p.name.as_str()),
+            this_host,
+            now_ts,
+        );
+        out.registered += usize::from(d.registered);
+        out.process_expected += usize::from(d.process_expected);
+        out.process_alive += usize::from(d.process_alive);
+        out.pane_alive += usize::from(d.pane_alive);
+        out.injectable += usize::from(d.injectable);
+        out.reachable += usize::from(d.reachable);
+        out.responsive_recently += usize::from(d.responsive_recently);
+        out.transport_success += usize::from(d.last_transport_success > 0);
+        out.response_seen += usize::from(d.last_response > 0);
+    }
+    out
+}
+
+fn peer_status_token_from_dimensions(
+    liveness: store::Liveness,
+    misregistered: bool,
+    responsive_recently: bool,
+    capability: inject::Capability,
 ) -> &'static str {
     if misregistered {
         return "misregistered";
     }
-    if peer_recently_responded(store, &p.name, now_ts) {
+    if responsive_recently {
         return "responsive";
     }
-    let target = inject::Target::from_peer(p);
-    match inject::capability(&target) {
+    match capability {
         inject::Capability::Live => "reachable",
         inject::Capability::RegisteredNotAlive => "dead",
         inject::Capability::NotInjectable => {
@@ -3091,6 +3309,24 @@ fn peer_status_token(
             }
         }
     }
+}
+
+fn peer_status_token(
+    store: &dyn Store,
+    p: &model::Peer,
+    liveness: store::Liveness,
+    misregistered: bool,
+    now_ts: i64,
+) -> &'static str {
+    peer_diagnostics(
+        store,
+        p,
+        liveness,
+        misregistered,
+        &config::this_host(),
+        now_ts,
+    )
+    .status
 }
 
 fn peer_status_counts(
@@ -5130,7 +5366,9 @@ fn main() -> Result<()> {
                         let p = &v.peer;
                         let liveness = store::liveness_for(p, &this_host, now_ts);
                         let misregistered = ambiguous.contains(p.name.as_str());
-                        let status = peer_status_token(store, p, liveness, misregistered, now_ts);
+                        let diag =
+                            peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
+                        let status = diag.status;
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "session_id": peer_session_id(p),
@@ -5151,7 +5389,19 @@ fn main() -> Result<()> {
                             "liveness": liveness.token(),
                             "status": status,
                             "remote": p.host != this_host,
-                            "injectable": inject::Target::from_peer(p).injectable(),
+                            "registered": diag.registered,
+                            "process_expected": diag.process_expected,
+                            "process_alive": diag.process_alive,
+                            "pane_alive": diag.pane_alive,
+                            "injectable": diag.injectable,
+                            "reachable": diag.reachable,
+                            "responsive_recently": diag.responsive_recently,
+                            "last_heartbeat": diag.last_heartbeat,
+                            "last_transport_success": diag.last_transport_success,
+                            "last_response": diag.last_response,
+                            "stale_reason": diag.stale_reason,
+                            "inject_probe": diag.inject_probe,
+                            "diagnostics": diag.to_json(),
                             "misregistered": misregistered,
                             "routing_anomalies": *routing_anomaly_counts.get(&p.name).unwrap_or(&0),
                             "origin": v.origin.label(),
@@ -5174,7 +5424,9 @@ fn main() -> Result<()> {
                     let presence = if is_alive(p) { "online" } else { "offline" };
                     let liveness = store::liveness_for(p, &this_host, now_ts);
                     let misregistered = ambiguous.contains(p.name.as_str());
-                    let status = peer_status_token(store, p, liveness, misregistered, now_ts);
+                    let diag =
+                        peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
+                    let status = diag.status;
                     let mut reason = scan_liveness_reason(p, liveness);
                     if misregistered {
                         reason.push_str(", misregistered(shared-target)");
@@ -5196,11 +5448,15 @@ fn main() -> Result<()> {
                         .map(|n| format!(" [routing_anomalies={n}]"))
                         .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{presence}] [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} [{}] {} ({inj}){tags}{desc} seen {} process_alive={} pane_alive={} reachable={} stale_reason={}{via}",
                         p.name,
                         p.mux,
                         tgt,
-                        model::fmt_ts(p.last_seen)
+                        model::fmt_ts(p.last_seen),
+                        diag.process_alive,
+                        diag.pane_alive,
+                        diag.reachable,
+                        if diag.stale_reason.is_empty() { "-" } else { diag.stale_reason }
                     );
                 }
             }
@@ -5480,7 +5736,9 @@ fn main() -> Result<()> {
                         let p = &v.peer;
                         let liveness = store::liveness_for(p, &this_host, now_ts);
                         let misregistered = ambiguous.contains(p.name.as_str());
-                        let status = peer_status_token(store, p, liveness, misregistered, now_ts);
+                        let diag =
+                            peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
+                        let status = diag.status;
                         serde_json::json!({
                             "name": p.name,
                             "session_id": peer_session_id(p),
@@ -5502,6 +5760,19 @@ fn main() -> Result<()> {
                             "liveness": liveness.token(),
                             "status": status,
                             "remote": p.host != this_host,
+                            "registered": diag.registered,
+                            "process_expected": diag.process_expected,
+                            "process_alive": diag.process_alive,
+                            "pane_alive": diag.pane_alive,
+                            "injectable": diag.injectable,
+                            "reachable": diag.reachable,
+                            "responsive_recently": diag.responsive_recently,
+                            "last_heartbeat": diag.last_heartbeat,
+                            "last_transport_success": diag.last_transport_success,
+                            "last_response": diag.last_response,
+                            "stale_reason": diag.stale_reason,
+                            "inject_probe": diag.inject_probe,
+                            "diagnostics": diag.to_json(),
                             "misregistered": misregistered,
                             "routing_anomalies": *routing_anomaly_counts.get(&p.name).unwrap_or(&0),
                             "origin": v.origin.label(),
@@ -5521,7 +5792,9 @@ fn main() -> Result<()> {
                     let p = &v.peer;
                     let liveness = store::liveness_for(p, &this_host, now_ts);
                     let misregistered = ambiguous.contains(p.name.as_str());
-                    let status = peer_status_token(store, p, liveness, misregistered, now_ts);
+                    let diag =
+                        peer_diagnostics(store, p, liveness, misregistered, &this_host, now_ts);
+                    let status = diag.status;
                     let mut reason = scan_liveness_reason(p, liveness);
                     if misregistered {
                         reason.push_str(", misregistered(shared-target)");
@@ -5555,8 +5828,13 @@ fn main() -> Result<()> {
                         .map(|n| format!(" [routing_anomalies={n}]"))
                         .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
-                        p.name, p.mux
+                        "{}{remote_marker} [{reason}] [status={status}] [session={sid}]{anomaly_marker}{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc} process_alive={} pane_alive={} reachable={} stale_reason={}{via}",
+                        p.name,
+                        p.mux,
+                        diag.process_alive,
+                        diag.pane_alive,
+                        diag.reachable,
+                        if diag.stale_reason.is_empty() { "-" } else { diag.stale_reason }
                     );
                 }
                 if !views.is_empty() {

@@ -9358,6 +9358,15 @@ fn scan_and_doctor_surface_shared_target_misregistration() {
             .unwrap_or_else(|| panic!("missing {name}: {peers_json}"));
         assert_eq!(row["misregistered"].as_bool(), Some(true), "row: {row}");
         assert_eq!(row["status"].as_str(), Some("misregistered"), "row: {row}");
+        assert_eq!(row["registered"].as_bool(), Some(true), "row: {row}");
+        assert!(row["process_alive"].is_boolean(), "row: {row}");
+        assert!(row["pane_alive"].is_boolean(), "row: {row}");
+        assert!(row["reachable"].is_boolean(), "row: {row}");
+        assert!(
+            row["last_heartbeat"].as_i64().unwrap_or(0) > 0,
+            "row: {row}"
+        );
+        assert!(row["diagnostics"].is_object(), "row: {row}");
     }
 
     let scan = run_ok(&db, &["scan"]);
@@ -9377,6 +9386,17 @@ fn scan_and_doctor_surface_shared_target_misregistration() {
         doc["peer_statuses"]["misregistered"].as_i64(),
         Some(2),
         "doctor status counts: {doc}"
+    );
+    assert_eq!(doc["peers_registered"].as_i64(), Some(2), "doctor: {doc}");
+    assert!(doc["peers_process_alive"].is_i64(), "doctor: {doc}");
+    assert!(doc["peers_pane_alive"].is_i64(), "doctor: {doc}");
+    assert!(doc["peers_reachable"].is_i64(), "doctor: {doc}");
+    let rows = doc["peer_diagnostics"].as_array().expect("diagnostic rows");
+    assert_eq!(rows.len(), 2, "doctor diagnostics: {doc}");
+    assert!(
+        rows.iter()
+            .all(|r| r["diagnostics"]["registered"].as_bool() == Some(true)),
+        "doctor diagnostics: {doc}"
     );
 }
 
@@ -9406,6 +9426,12 @@ fn peers_scan_and_doctor_surface_responsive_status() {
         .find(|r| r["name"] == "resp")
         .unwrap_or_else(|| panic!("missing resp: {peers_json}"));
     assert_eq!(row["status"].as_str(), Some("responsive"), "row: {row}");
+    assert_eq!(
+        row["responsive_recently"].as_bool(),
+        Some(true),
+        "row: {row}"
+    );
+    assert!(row["last_response"].as_i64().unwrap_or(0) > 0, "row: {row}");
 
     let scan_json = run_ok(&db, &["scan", "--json"]);
     let scan: serde_json::Value = serde_json::from_str(&scan_json).expect("scan json");
@@ -9416,6 +9442,12 @@ fn peers_scan_and_doctor_surface_responsive_status() {
         .find(|r| r["name"] == "resp")
         .unwrap_or_else(|| panic!("missing resp: {scan_json}"));
     assert_eq!(row["status"].as_str(), Some("responsive"), "row: {row}");
+    assert_eq!(
+        row["responsive_recently"].as_bool(),
+        Some(true),
+        "row: {row}"
+    );
+    assert!(row["last_response"].as_i64().unwrap_or(0) > 0, "row: {row}");
 
     let doctor = run_ok(&db, &["doctor", "--json"]);
     let doc: serde_json::Value = serde_json::from_str(&doctor).expect("doctor json");
@@ -9446,6 +9478,15 @@ fn peers_scan_and_doctor_surface_registered_stale_status() {
         Some("registered-stale"),
         "row: {row}"
     );
+    assert_eq!(row["registered"].as_bool(), Some(true), "row: {row}");
+    assert_eq!(row["process_expected"].as_bool(), Some(true), "row: {row}");
+    assert_eq!(row["process_alive"].as_bool(), Some(false), "row: {row}");
+    assert_eq!(row["pane_alive"].as_bool(), Some(false), "row: {row}");
+    assert_eq!(
+        row["stale_reason"].as_str(),
+        Some("process_dead"),
+        "row: {row}"
+    );
 
     let scan_json = run_ok(&db, &["scan", "--json"]);
     let scan: serde_json::Value = serde_json::from_str(&scan_json).expect("scan json");
@@ -9458,6 +9499,11 @@ fn peers_scan_and_doctor_surface_registered_stale_status() {
     assert_eq!(
         row["status"].as_str(),
         Some("registered-stale"),
+        "row: {row}"
+    );
+    assert_eq!(
+        row["diagnostics"]["stale_reason"].as_str(),
+        Some("process_dead"),
         "row: {row}"
     );
 
