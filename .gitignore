@@ -5,3 +5,5 @@ target/
 # Guard against a local `hf claim/checkpoint` writing the ephemeral member ledger.
 .handoff/ledger.db
 .handoff/**/ledger.db
+# Local upstream archives supplied for audit/integration evidence. Do not delete.
+cc-switch-main.zip
