@@ -493,6 +493,7 @@ fn call_tool(
         "weave_asks" => tool_asks(store, me_default, args),
         "weave_ask_get" => tool_ask_get(store, args),
         "weave_ask_status" => tool_ask_status(store, args),
+        "weave_responder" => tool_responder(store, me_default, nudge_template, args, injector),
         "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args, injector),
         "weave_ask_many_result" => tool_ask_many_result(store, args),
         "weave_job_create" => tool_job_create(store, me_default, args),
@@ -3288,16 +3289,68 @@ fn tool_ask_get(store: &dyn Store, args: &Value) -> Result<String, String> {
     ))
 }
 
+const AUTO_ACK_PREFIX: &str = "[weave-ack]";
+
+#[derive(Debug, Clone)]
+struct AskAutoAck {
+    message_id: i64,
+    status: &'static str,
+    body: String,
+    ts: i64,
+}
+
+fn parse_auto_ack_status(body: &str) -> Option<&'static str> {
+    let rest = body.strip_prefix(AUTO_ACK_PREFIX)?.trim_start();
+    let token = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("received")
+        .trim_end_matches(':');
+    match token {
+        "received" => Some("received"),
+        "wrong-recipient" => Some("wrong-recipient"),
+        "busy-queued" => Some("busy-queued"),
+        "delegated-to-worker" => Some("delegated-to-worker"),
+        "cannot-answer" => Some("cannot-answer"),
+        "will-answer-later" => Some("will-answer-later"),
+        _ => Some("received"),
+    }
+}
+
+fn auto_ack_for_ask(store: &dyn Store, ask: &model::Ask) -> Option<AskAutoAck> {
+    let thread = store.thread(ask.question_msg_id, 1_000).ok()?;
+    thread
+        .into_iter()
+        .rev()
+        .filter(|m| {
+            m.sender == ask.askee
+                && m.recipient == ask.asker
+                && m.in_reply_to == Some(ask.question_msg_id)
+        })
+        .filter_map(|m| {
+            parse_auto_ack_status(&m.body).map(|status| AskAutoAck {
+                message_id: m.id,
+                status,
+                body: m.body,
+                ts: m.ts,
+            })
+        })
+        .next()
+}
+
 fn ask_status_token(
     ask: &model::Ask,
     question_trace: &[model::DeliveryTrace],
     question_receipts: &[(String, i64)],
+    auto_ack: Option<&AskAutoAck>,
 ) -> &'static str {
     match ask.state {
         model::AskState::Acked => "acked",
         model::AskState::Answered => "answered",
         model::AskState::Open => {
-            if !question_receipts.is_empty()
+            if let Some(ack) = auto_ack {
+                ack.status
+            } else if !question_receipts.is_empty()
                 || question_trace
                     .iter()
                     .any(|t| t.stage == model::DeliveryStage::Drained.as_str())
@@ -3318,6 +3371,111 @@ fn ask_status_token(
             }
         }
     }
+}
+
+fn responder_status_body(status: &str) -> Result<(&'static str, &'static str), String> {
+    match status {
+        "received" => Ok(("received", "ask received; queued for this session")),
+        "wrong-recipient" => Ok(("wrong-recipient", "ask appears to be routed to the wrong session")),
+        "busy-queued" => Ok(("busy-queued", "session is busy; ask is queued for a later answer")),
+        "delegated-to-worker" => Ok(("delegated-to-worker", "ask was delegated to a background worker")),
+        "cannot-answer" => Ok(("cannot-answer", "session cannot answer this ask")),
+        "will-answer-later" => Ok(("will-answer-later", "session will answer later")),
+        _ => Err(format!(
+            "invalid responder status '{status}' (expected received|wrong-recipient|busy-queued|delegated-to-worker|cannot-answer|will-answer-later)"
+        )),
+    }
+}
+
+fn responder_health(store: &dyn Store, me: &str) -> Result<(usize, usize), String> {
+    let asks = store.list_asks(me, model::AskRole::Askee, 200).map_err(e)?;
+    let mut open = 0usize;
+    let mut unacknowledged = 0usize;
+    for ask in asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+    {
+        open += 1;
+        if auto_ack_for_ask(store, &ask).is_none() {
+            unacknowledged += 1;
+        }
+    }
+    Ok((open, unacknowledged))
+}
+
+fn tool_responder(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let me = ident(args, "me", def)?;
+    if args
+        .get("health")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let (open, unacknowledged) = responder_health(store, &me)?;
+        return serde_json::to_string_pretty(&json!({
+            "me": me,
+            "running": false,
+            "open": open,
+            "unacknowledged": unacknowledged,
+        }))
+        .map_err(e);
+    }
+    let status_arg = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("received");
+    let (status, text) = responder_status_body(status_arg)?;
+    let asks = store
+        .list_asks(&me, model::AskRole::Askee, 200)
+        .map_err(e)?;
+    let mut rows = Vec::new();
+    for ask in asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+    {
+        if auto_ack_for_ask(store, &ask).is_some() {
+            continue;
+        }
+        let body = format!("{AUTO_ACK_PREFIX} {status}: {text}");
+        let mid = store.reply(&me, ask.question_msg_id, &body).map_err(e)?;
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Message,
+            &ask.asker,
+            model::DeliveryStage::Queued,
+            model::DeliveryOutcome::Ok,
+        );
+        let verdict = ask_delivery_verdict(store, nudge_template, &me, &ask.asker, &body, injector);
+        let (stage, outcome) = verdict_to_stage(verdict);
+        record_delivery_best_effort(
+            store,
+            mid,
+            model::DeliveryRefKind::Message,
+            &ask.asker,
+            stage,
+            outcome,
+        );
+        rows.push(json!({
+            "id": ask.id,
+            "asker": ask.asker,
+            "askee": ask.askee,
+            "ack_message_id": mid,
+            "ack_status": status,
+            "verdict": verdict,
+        }));
+    }
+    serde_json::to_string_pretty(&json!({
+        "me": me,
+        "acknowledged": rows.len(),
+        "asks": rows,
+    }))
+    .map_err(e)
 }
 
 /// `weave_ask_status`: show read-time delivery/response status for a tracked ask.
@@ -3349,7 +3507,13 @@ fn tool_ask_status(store: &dyn Store, args: &Value) -> Result<String, String> {
         Some(mid) => store.receipts(mid).map_err(e)?,
         None => Vec::new(),
     };
-    let routing_status = ask_status_token(&ask, &question_delivery, &question_receipts);
+    let auto_ack = auto_ack_for_ask(store, &ask);
+    let routing_status = ask_status_token(
+        &ask,
+        &question_delivery,
+        &question_receipts,
+        auto_ack.as_ref(),
+    );
     let mut out = format!(
         "Ask {} [{}] {} -> {} status={routing_status}\n",
         ask.id,
@@ -3363,6 +3527,15 @@ fn tool_ask_status(store: &dyn Store, args: &Value) -> Result<String, String> {
         question_delivery.len(),
         question_receipts.len()
     ));
+    if let Some(ack) = &auto_ack {
+        out.push_str(&format!(
+            "Auto-ACK #{}: {} at {}\n",
+            ack.message_id,
+            ack.status,
+            fmt_ts(ack.ts)
+        ));
+        out.push_str(&format!("Auto-ACK body: {}\n", ack.body));
+    }
     if let Some(mid) = ask.answer_msg_id {
         out.push_str(&format!(
             "Answer #{mid}: {} delivery stage(s), {} receipt(s)\n",
@@ -4125,10 +4298,19 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_ask_status",
-            "description": "Show read-time delivery/response status for a tracked ask: ask state, routing_status (opened|queued|injected|received|answered|acked), delivery stage counts, and read receipt counts. Read-only.",
+            "description": "Show read-time delivery/response status for a tracked ask: ask state, routing_status (opened|queued|injected|received|answered|acked), delivery stage counts, read receipt counts, and any non-closing [weave-ack] auto-ACK. Read-only.",
             "inputSchema": {"type":"object","properties":{
                 "id":{"type":"string","description":"The correlation_id."}
             },"required":["id"]}
+        },
+        {
+            "name": "weave_responder",
+            "description": "Run one non-disruptive responder sweep for YOUR session: send one idempotent [weave-ack] status reply for each open ask addressed to you, without marking the question read and without answering/closing the ask. Returns JSON with acknowledged count and per-ask ack ids.",
+            "inputSchema": {"type":"object","properties":{
+                "me":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
+                "status":{"type":"string","enum":["received","wrong-recipient","busy-queued","delegated-to-worker","cannot-answer","will-answer-later"],"description":"ACK status token (default received)."},
+                "health":{"type":"boolean","description":"Report open/unacknowledged ask counts without sending ACKs."}
+            },"required":[]}
         },
         {
             "name": "weave_ask_many",

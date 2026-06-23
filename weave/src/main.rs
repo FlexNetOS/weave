@@ -446,6 +446,9 @@ enum Cmd {
         /// machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Report responder health/status without sending ACKs.
+        #[arg(long)]
+        health: bool,
     },
     /// Read your inbox.
     Inbox {
@@ -2581,6 +2584,49 @@ fn responder_status_body(status: &str) -> Result<(&'static str, &'static str)> {
             "invalid responder status '{status}' (expected received|wrong-recipient|busy-queued|delegated-to-worker|cannot-answer|will-answer-later)"
         ),
     }
+}
+
+fn responder_health(store: &dyn Store, me: &str) -> Result<(usize, usize)> {
+    let asks = store.list_asks(me, model::AskRole::Askee, 200)?;
+    let mut open = 0usize;
+    let mut unacknowledged = 0usize;
+    for ask in asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+    {
+        open += 1;
+        if auto_ack_for_ask(store, &ask).is_none() {
+            unacknowledged += 1;
+        }
+    }
+    Ok((open, unacknowledged))
+}
+
+fn responder_sweep_quiet(store: &dyn Store, cfg: &Config, me: &str, status: &str) -> Result<usize> {
+    let (status, text) = responder_status_body(status)?;
+    let asks = store.list_asks(me, model::AskRole::Askee, 200)?;
+    let mut acked = 0usize;
+    for ask in asks
+        .into_iter()
+        .filter(|a| a.state == model::AskState::Open)
+    {
+        if auto_ack_for_ask(store, &ask).is_some() {
+            continue;
+        }
+        let body = format!("{AUTO_ACK_PREFIX} {status}: {text}");
+        let mid = store.reply(me, ask.question_msg_id, &body)?;
+        let _ = inject_and_trace(
+            store,
+            cfg,
+            mid,
+            model::DeliveryRefKind::Message,
+            me,
+            &ask.asker,
+            &body,
+        );
+        acked += 1;
+    }
+    Ok(acked)
 }
 
 fn responder_sweep(
@@ -5233,12 +5279,38 @@ fn main() -> Result<()> {
             interval,
             iterations,
             json,
+            health,
         } => {
             // Validate once before a daemon-style loop so a typo fails immediately
             // without printing partial JSON frames.
             let _ = responder_status_body(&status)?;
             let (me, explicit) = resolve_me_explicit(me, None, &cfg);
             refresh_presence(store, &me, explicit);
+            if health {
+                let (open, unacknowledged) = responder_health(store, &me)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "me": me,
+                            "running": iterations == 0,
+                            "interval": interval,
+                            "open": open,
+                            "unacknowledged": unacknowledged,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "responder {me}: open={open} unacknowledged={unacknowledged} mode={}",
+                        if iterations == 0 {
+                            "worker"
+                        } else {
+                            "one-shot"
+                        }
+                    );
+                }
+                return Ok(());
+            }
             let mut done = 0u64;
             loop {
                 responder_sweep(store, &cfg, &me, &status, json)?;
@@ -7724,6 +7796,29 @@ fn execute_tick(store: &dyn Store, me: &str, all: bool) -> Result<()> {
     Ok(())
 }
 
+fn responder_hook_enabled() -> bool {
+    std::env::var("WEAVE_RESPONDER_ON_HOOK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+fn responder_hook_status() -> String {
+    std::env::var("WEAVE_RESPONDER_STATUS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "received".to_string())
+}
+
+fn run_hook_responder_best_effort(store: &dyn Store, cfg: &Config, me: &str, event: &str) {
+    if !responder_hook_enabled() {
+        return;
+    }
+    let status = responder_hook_status();
+    if let Err(err) = responder_sweep_quiet(store, cfg, me, &status) {
+        eprintln!("[weave] hook responder skipped on {event} (non-fatal): {err}");
+    }
+}
+
 fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -7836,6 +7931,9 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // inbox BEFORE draining, so a freshly-pulled message is delivered in
             // this same turn. Best-effort: a pull failure never sinks the drain.
             try_pull(store, cfg, &me);
+            if event == "prompt" && explicit_identity {
+                run_hook_responder_best_effort(store, cfg, &me, event);
+            }
             let is_wake_stop = event == "stop"
                 && (wake_flag || std::env::var("WEAVE_STOP_WAKE").ok().as_deref() == Some("1"));
             let mut mark_read = event == "prompt" || is_wake_stop;
@@ -7934,6 +8032,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                 );
             } else {
                 try_pull(store, cfg, &me);
+                run_hook_responder_best_effort(store, cfg, &me, event);
                 match store.peek_oldest_unread(&me) {
                     Ok(Some(msg)) => match store.wake_last_acked(&me) {
                         Ok(acked) if msg.id > acked => {
@@ -7960,6 +8059,9 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
         // Notification: the agent's prompt is live + unconsumed (awaiting input).
         // This arm has no drain — just the best-effort turn_state setter.
         "notification" => {
+            if explicit_identity {
+                run_hook_responder_best_effort(store, cfg, &me, event);
+            }
             set_turn_state_best_effort(store, &me, model::TurnState::AwaitingInput);
         }
         // WL-055: PreToolUse approval gate. Distinct codepath (`handle_pretooluse_hook`)

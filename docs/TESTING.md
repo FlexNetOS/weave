@@ -262,6 +262,15 @@ Coverage:
   stops re-surface the same message); a *guessed* identity (empty stdin) peeks
   only and warns; and garbage / unknown events are tolerated (exit 0 with a
   stderr warning, not a crash).
+  The optional hook responder path is also covered: with
+  `WEAVE_RESPONDER_ON_HOOK=1`, `hook notification` performs a quiet one-shot ACK sweep,
+  surfaces through `ask-status`, remains idempotent, and never marks the original
+  question read or closes the ask.
+
+- **Responder/ACK parity.** CLI `responder` sends idempotent non-closing
+  `[weave-ack]` replies, `responder --health --json` reports open/unacknowledged
+  counts, MCP `weave_responder` mirrors the one-shot ACK surface, and MCP
+  `weave_ask_status` parses and displays auto-ACK status/body just like the CLI.
 
 - **New CLI surface.** `--json` output for `inbox`/`peers`/`sessions` parses and
   carries the right shape; `doctor --json` reports the compiled-in backend and db

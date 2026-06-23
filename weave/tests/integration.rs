@@ -8237,6 +8237,11 @@ fn cli_responder_auto_ack_is_idempotent_and_non_closing() {
         "alice inbox: {alice}"
     );
 
+    let health = run_ok(&db, &["responder", "--me", "bob", "--health", "--json"]);
+    let hv: serde_json::Value = serde_json::from_str(&health).expect("responder health json");
+    assert_eq!(hv["open"].as_u64(), Some(1), "health: {hv}");
+    assert_eq!(hv["unacknowledged"].as_u64(), Some(0), "health: {hv}");
+
     // Bob can still provide the real answer later.
     let answered = run_ok(
         &db,
@@ -8251,6 +8256,66 @@ fn cli_responder_auto_ack_is_idempotent_and_non_closing() {
         ],
     );
     assert!(answered.contains("answered ask"), "answered: {answered}");
+}
+
+#[test]
+fn hook_notification_responder_ack_is_idempotent_and_non_disruptive() {
+    let db = TestDb::new();
+    let opened = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "hook ack q",
+        ],
+    );
+    let cid = extract_cid(&opened);
+
+    let (ok, out, err) = run_hook_env(
+        &db,
+        "notification",
+        r#"{"cwd":"/proj/bob"}"#,
+        &[
+            ("WEAVE_RESPONDER_ON_HOOK", "1"),
+            ("WEAVE_RESPONDER_STATUS", "will-answer-later"),
+        ],
+    );
+    assert!(ok, "hook notification responder: stdout={out} stderr={err}");
+    assert!(
+        out.trim().is_empty(),
+        "notification responder must not add disruptive hook stdout: {out}"
+    );
+
+    let status = run_ok(&db, &["ask-status", "--id", &cid, "--json"]);
+    let st: serde_json::Value = serde_json::from_str(&status).expect("ask-status json");
+    assert_eq!(st["state"].as_str(), Some("open"), "status: {st}");
+    assert_eq!(
+        st["routing_status"].as_str(),
+        Some("will-answer-later"),
+        "status: {st}"
+    );
+    assert!(
+        st["question_receipts"].as_array().unwrap().is_empty(),
+        "hook responder must not mark original question read: {st}"
+    );
+
+    let (ok2, _out2, err2) = run_hook_env(
+        &db,
+        "notification",
+        r#"{"cwd":"/proj/bob"}"#,
+        &[("WEAVE_RESPONDER_ON_HOOK", "1")],
+    );
+    assert!(ok2, "second hook notification responder: {err2}");
+    let alice = run_ok(&db, &["inbox", "--me", "alice", "--all"]);
+    assert_eq!(
+        alice.matches("[weave-ack]").count(),
+        1,
+        "hook responder must be idempotent: {alice}"
+    );
 }
 
 /// CLI failure paths are clean non-zero exits (never a panic): answering/acking an
@@ -8325,7 +8390,7 @@ fn cli_ask_failure_paths_are_clean() {
     );
 }
 
-/// MCP black-box: tools/list grows by EXACTLY 6 (weave_ask/answer/ack/asks/ask_get/ask_status),
+/// MCP black-box: tools/list exposes the ask family plus responder parity,
 /// a happy-path ask returns a correlation id + an honest verdict (NOT isError even
 /// when not injectable), and the failure paths come back as clean isError results
 /// (never a panic, never a silent persist). stdout stays pure JSON-RPC (call_tool
@@ -8351,13 +8416,14 @@ fn mcp_ask_lifecycle_and_failures() {
         "weave_asks",
         "weave_ask_get",
         "weave_ask_status",
+        "weave_responder",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
             "tools/list missing {expected}; got {names:?}"
         );
     }
-    // Exactly six tool names start with the ask family prefix set.
+    // Exactly seven ask/responder parity tool names are present.
     let ask_family = names
         .iter()
         .filter(|n| {
@@ -8369,10 +8435,11 @@ fn mcp_ask_lifecycle_and_failures() {
                     | "weave_asks"
                     | "weave_ask_get"
                     | "weave_ask_status"
+                    | "weave_responder"
             )
         })
         .count();
-    assert_eq!(ask_family, 6, "exactly 6 ask-family tools: {names:?}");
+    assert_eq!(ask_family, 7, "exactly 7 ask/responder tools: {names:?}");
 
     // Happy path: ask to an unknown peer is HONEST SUCCESS with a verdict, NOT an
     // error (degrade-to-store), exactly like weave_send/weave_connect.
@@ -8399,6 +8466,24 @@ fn mcp_ask_lifecycle_and_failures() {
     assert!(
         st_text.contains("status=queued"),
         "ask_status shows routing status: {st_text}"
+    );
+
+    let (is_err, responder_text) = mcp.call_tool(
+        "weave_responder",
+        serde_json::json!({"me": "bob", "status": "busy-queued"}),
+    );
+    assert!(!is_err, "responder happy path: {responder_text}");
+    let rv: serde_json::Value = serde_json::from_str(&responder_text).expect("responder json");
+    assert_eq!(rv["acknowledged"].as_u64(), Some(1), "responder: {rv}");
+
+    let (is_err, ack_status_text) =
+        mcp.call_tool("weave_ask_status", serde_json::json!({"id": cid}));
+    assert!(!is_err, "ask_status after responder: {ack_status_text}");
+    assert!(
+        ack_status_text.contains("status=busy-queued")
+            && ack_status_text.contains("Auto-ACK")
+            && ack_status_text.contains("[weave-ack] busy-queued"),
+        "MCP ask_status surfaces auto-ACK parity: {ack_status_text}"
     );
 
     // weave_answer happy path (back to the asker) with a verdict.

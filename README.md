@@ -397,6 +397,15 @@ whether a request was answered and close the loop.
 - **`weave asks` / `weave_asks`** `{ me?, role? }` (role `asker|askee|any`, default `any`)
   and **`weave ask-get` / `weave_ask_get`** `{ id }` — list / inspect tracked asks
   (read-only).
+- **`weave ask-status` / `weave_ask_status`** `{ id }` — read-time routing status
+  (`opened|queued|injected|received|answered|acked`) plus delivery/receipt counts and any
+  non-closing `[weave-ack]` auto-ACK.
+- **`weave responder` / `weave_responder`** `{ me?, status? }` — a non-disruptive
+  ACK worker: sends one idempotent `[weave-ack]` status reply for each open ask addressed
+  to you, without marking the question read and without answering/closing the ask. CLI
+  `--iterations 0` is the optional long-running worker; `--health --json` reports open vs
+  unacknowledged counts. Hook one-shots are opt-in via `WEAVE_RESPONDER_ON_HOOK=1` on
+  `prompt`/`notification`/`wake`; set `WEAVE_RESPONDER_STATUS` to choose the ACK token.
 
 The lifecycle is **monotonic** — `open → answered → acked`, never backward — so a
 double-ack, an answer to an already-acked thread, or an unknown correlation_id is a clean
