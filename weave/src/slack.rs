@@ -18,7 +18,7 @@ use std::time::Duration;
 use weave_core::config::Config;
 use weave_core::store::{check_body, check_ident, Store, MAX_BODY};
 
-use crate::telegram::sanitize_inbound_ident;
+use crate::telegram::{dispatch_bot_command, parse_bot_command, sanitize_inbound_ident};
 
 const DEFAULT_BRIDGE_IDENTITY: &str = "slack";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -112,6 +112,13 @@ pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
 
     eprintln!("[weave-slack] bridge started as identity '{identity}'");
 
+    // WL-073: Slack command replies dispatch through the SAME handler as
+    // MCP/CLI/Telegram. Read commands are safe; write commands require
+    // WEAVE_BOT_WRITES=1 and then pass the dangerous-tool gate explicitly.
+    let injector = crate::RealInjector {
+        preferred_mux: crate::parse_mux_preference(config),
+    };
+
     // Start the cursor at "now-ish": skip channel history on first run by reading
     // the latest ts and using it as the initial watermark.
     let mut oldest = String::from("0");
@@ -140,7 +147,25 @@ pub fn run(store: &dyn Store, config: &Config) -> Result<()> {
                         if !first_pass {
                             for m in arr {
                                 if let Some((from, text)) = parse_slack_message(m) {
-                                    relay_inbound(store, &from, &recipient, &text, &identity);
+                                    if let Some(cmd) = parse_bot_command(&text) {
+                                        let reply = dispatch_bot_command(
+                                            store, config, &identity, &cmd, &injector,
+                                        );
+                                        let payload = slack_post_payload(&channel, &reply);
+                                        if let Err(e) = client
+                                            .post("https://slack.com/api/chat.postMessage")
+                                            .header("Authorization", format!("Bearer {token}"))
+                                            .json(&payload)
+                                            .send()
+                                        {
+                                            eprintln!(
+                                                "[weave-slack] command reply error: {}",
+                                                crate::telegram::redact_reqwest_error(&e)
+                                            );
+                                        }
+                                    } else {
+                                        relay_inbound(store, &from, &recipient, &text, &identity);
+                                    }
                                 }
                             }
                         }
@@ -252,5 +277,67 @@ mod tests {
         ];
         assert_eq!(latest_ts(&msgs).as_deref(), Some("1700000005.000100"));
         assert_eq!(latest_ts(&[]), None);
+    }
+
+    #[test]
+    fn slack_reuses_bot_command_grammar_for_reads_and_writes() {
+        use crate::telegram::{bot_command_rpc, parse_bot_command, BotCommand};
+
+        assert_eq!(parse_bot_command("/inbox"), Some(BotCommand::Inbox));
+        assert_eq!(parse_bot_command("/peers"), Some(BotCommand::Peers));
+        assert_eq!(parse_bot_command("/sessions"), Some(BotCommand::Sessions));
+        assert_eq!(
+            parse_bot_command("/send worker run the check"),
+            Some(BotCommand::Send {
+                to: "worker".to_string(),
+                body: "run the check".to_string()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/ask worker ship it?"),
+            Some(BotCommand::Ask {
+                to: "worker".to_string(),
+                body: "ship it?".to_string()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/answer ask_1_2 done"),
+            Some(BotCommand::Answer {
+                id: "ask_1_2".to_string(),
+                body: "done".to_string()
+            })
+        );
+        assert_eq!(
+            parse_bot_command("/reply 42 ack"),
+            Some(BotCommand::Reply {
+                message_id: 42,
+                body: "ack".to_string()
+            })
+        );
+
+        let gated = bot_command_rpc(
+            &BotCommand::Send {
+                to: "worker".to_string(),
+                body: "run".to_string(),
+            },
+            "slack",
+            false,
+        );
+        assert!(gated.is_err(), "write commands must be explicitly gated");
+
+        let rpc = bot_command_rpc(
+            &BotCommand::Send {
+                to: "worker".to_string(),
+                body: "run".to_string(),
+            },
+            "slack",
+            true,
+        )
+        .expect("writes enabled")
+        .expect("send rpc");
+        assert_eq!(rpc["params"]["name"], "weave_send");
+        assert_eq!(rpc["params"]["arguments"]["from"], "slack");
+        assert_eq!(rpc["params"]["arguments"]["to"], "worker");
+        assert_eq!(rpc["params"]["arguments"]["body"], "run");
     }
 }

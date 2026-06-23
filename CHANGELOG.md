@@ -15,6 +15,10 @@
 
 ### Added
 
+- Added WL-073 bot command parity for human surfaces: Slack now reuses the
+  structured bot command grammar and shared `dispatch_request` path, and both
+  Telegram and Slack support `/send`, `/ask`, `/answer`, and `/reply` behind the
+  explicit `WEAVE_BOT_WRITES=1` gate while keeping read commands always available.
 - Added WL-072 worker dispatch integration: `weave job dispatch` now auto-claims
   a queued job for a worker, runs a trusted external runner (default
   `flexnetos_runner`) as argv-only, passes `WEAVE_JOB_*` plus optional
@@ -309,14 +313,15 @@
   (never `innerHTML`). `--for <id>` scopes the export to another identity; `--limit N` caps
   the rows. The pure renderer (`render_mailbox_html`) lives in `weave-core/src/export.rs`,
   which also now owns the single `html_escape` source of truth the dashboard reuses.
-- **Bot command grammar (WL-052b), `--features surfaces`:** the Telegram bridge now
-  answers structured `/`-commands — `/inbox`, `/peers`, `/sessions`, `/help` — by
-  dispatching through the **same** `dispatch_request` → `call_tool` handler as MCP/CLI
-  (the one-handler-many-surfaces law), formatting the result back to the chat. Ordinary
-  (non-`/`) text still relays into the mesh as before. Read-only in v1 (mutating commands
-  are not exposed to chat by default; they hit the safe `dangerous=false` gate). The
-  parser, RPC mapping, and reply formatter are pure + unit-tested; the Slack bridge reuses
-  the same grammar (wiring is a follow).
+- **Bot command grammar (WL-052b/WL-073), `--features surfaces`:** the Telegram and
+  Slack bridges answer structured `/`-commands — `/inbox`, `/peers`, `/sessions`,
+  `/help`, plus gated `/send`, `/ask`, `/answer`, and `/reply` — by dispatching
+  through the **same** `dispatch_request` → `call_tool` handler as MCP/CLI (the
+  one-handler-many-surfaces law), formatting the result back to the chat. Ordinary
+  (non-`/`) text still relays into the mesh as before. Read commands are always
+  available; write commands require explicit `WEAVE_BOT_WRITES=1`, then pass the
+  same dangerous-tool gate as HTTP write mode. The parser, RPC mapping, and reply
+  formatter are pure + unit-tested and shared by both bot bridges.
 - **Dashboard write surface (WL-052a), behind `weave dashboard --write` (default
   read-only):** a bearer-gated `POST /api` action route that accepts a JSON-RPC body
   and dispatches through the **same** `dispatch_request` → `call_tool` handler the MCP

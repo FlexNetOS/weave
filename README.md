@@ -648,6 +648,8 @@ weave dashboard --port 9000 --token mysecret
 # Telegram / Slack bridges (poll-only): relay between a chat and the mesh.
 WEAVE_TELEGRAM_TOKEN=… WEAVE_TELEGRAM_CHAT_ID=… weave telegram
 WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=…        weave slack
+# Optional, explicit human-chat write gate for /send, /ask, /answer, /reply:
+WEAVE_BOT_WRITES=1 WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=… weave slack
 ```
 
 The dashboard is **read-only** (`GET /` HTML, `GET /events` SSE — never mutates) and
@@ -655,7 +657,12 @@ HTML-escapes every stored string. Bot tokens are **secrets** — supply them via
 config (`telegram_token` / `slack_token`) or the env vars above (envctl can inject
 them); they are Debug-redacted and never logged. The bridge posts inbound human
 replies into the mesh as the configured `bridge_identity` (`WEAVE_BRIDGE_IDENTITY`,
-default `telegram`/`slack`). See ADR-0004 for the locked stack decision.
+default `telegram`/`slack`). Both bot bridges answer `/inbox`, `/peers`,
+`/sessions`, and `/help` through the same JSON-RPC dispatcher as MCP/CLI. Mutating
+chat commands (`/send <to> <body>`, `/ask <to> <body>`, `/answer <ask_id> <body>`,
+`/reply <message_id> <body>`) are disabled unless `WEAVE_BOT_WRITES=1` is set; once
+enabled, they still route through the same dangerous-tool gate instead of a
+bot-specific write path. See ADR-0004 for the locked stack decision.
 
 ## Governed web access (`--features obscura`)
 
