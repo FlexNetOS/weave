@@ -1,3 +1,8 @@
+---
+name: weave
+description: Repo-specific development patterns, invariants, and verification gates for the Weave Rust codebase. Use when working in /home/drdave/Desktop/meta/weave or editing Weave source, tests, docs, hooks, skills, or release/CI behavior.
+---
+
 # weave Development Patterns
 
 Repo-specific conventions for the **weave** codebase — a single dependency-light **Rust** binary (agent-to-agent session mesh + native multi-mux terminal injector). The authoritative source of truth is `CLAUDE.md` and the `.claude/skills/weave-*` harness skills; this file mirrors the essentials for the Codex/OpenAI-agents bundle.

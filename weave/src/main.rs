@@ -2416,6 +2416,34 @@ fn print_ask_status(store: &dyn Store, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+const MAX_DIAGNOSTIC_ANOMALIES: i64 = 500;
+
+fn routing_anomaly_messages(store: &dyn Store) -> Vec<model::Message> {
+    store
+        .search("ROUTING_ANOMALY", MAX_DIAGNOSTIC_ANOMALIES)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            m.subject.as_deref() == Some("ROUTING_ANOMALY") || m.body.contains("ROUTING_ANOMALY:")
+        })
+        .collect()
+}
+
+fn routing_anomaly_counts_by_peer(
+    anomalies: &[model::Message],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for m in anomalies {
+        *out.entry(m.sender.clone()).or_insert(0) += 1;
+        *out.entry(m.recipient.clone()).or_insert(0) += 1;
+    }
+    out
+}
+
+fn routing_anomaly_last_ts(anomalies: &[model::Message]) -> i64 {
+    anomalies.iter().map(|m| m.ts).max().unwrap_or(0)
+}
+
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let target = inject::detect_target_with_preference(parse_mux_preference(cfg));
@@ -2500,6 +2528,9 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     // peer_db set is the already-computed fed_ok/fed_skipped above).
     let fed_health = cfg.federation_health();
     let total = store.total_messages()?;
+    let routing_anomalies = routing_anomaly_messages(store);
+    let routing_anomalies_total = routing_anomalies.len();
+    let routing_anomaly_last_ts = routing_anomaly_last_ts(&routing_anomalies);
     let claude = inject::have("claude");
     let db = cfg.db_path();
     // FR6: warn when the resolved store is NOT the well-known XDG default. The most
@@ -2518,6 +2549,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "current_target": target.id,
             "injectable_here": target.injectable(),
             "total_messages": total,
+            "routing_anomalies": routing_anomalies_total,
+            "routing_anomaly_last_ts": routing_anomaly_last_ts,
             "peers": total_peers,
             "peers_online": online,
             "peers_tagged": tagged,
@@ -2680,6 +2713,14 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             target.injectable()
         );
         println!("  messages:       {total}");
+        if routing_anomalies_total > 0 {
+            println!(
+                "  anomalies:      {routing_anomalies_total} routing (last {})",
+                model::fmt_ts(routing_anomaly_last_ts)
+            );
+        } else {
+            println!("  anomalies:      0 routing");
+        }
         println!("  peers:          {total_peers} ({online} online, {tagged} tagged, {peers_misregistered} misregistered)");
         println!(
             "  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
@@ -4784,6 +4825,8 @@ fn main() -> Result<()> {
             // reinterpret the already-pulled read-only rows; never a cross-machine
             // probe. Deterministic given the captured this_host/now.
             let ambiguous = ambiguous_peer_names(&views);
+            let routing_anomalies = routing_anomaly_messages(store);
+            let routing_anomaly_counts = routing_anomaly_counts_by_peer(&routing_anomalies);
             let this_host = config::this_host();
             let now_ts = model::now();
             if json {
@@ -4814,6 +4857,7 @@ fn main() -> Result<()> {
                             "remote": p.host != this_host,
                             "injectable": inject::Target::from_peer(p).injectable(),
                             "misregistered": misregistered,
+                            "routing_anomalies": *routing_anomaly_counts.get(&p.name).unwrap_or(&0),
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -4849,8 +4893,13 @@ fn main() -> Result<()> {
                     let tags = fmt_peer_tags(p);
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
+                    let anomaly_marker = routing_anomaly_counts
+                        .get(&p.name)
+                        .filter(|&&n| n > 0)
+                        .map(|n| format!(" [routing_anomalies={n}]"))
+                        .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{presence}] [{reason}] [status={status}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}] [status={status}]{anomaly_marker}{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -5109,6 +5158,9 @@ fn main() -> Result<()> {
             // Host-aware liveness reason per row (pure A2 reinterpretation of the
             // already-pulled read-only rows; never a cross-machine probe).
             let ambiguous = ambiguous_peer_names(&views);
+            let routing_anomalies = routing_anomaly_messages(store);
+            let routing_anomaly_counts = routing_anomaly_counts_by_peer(&routing_anomalies);
+            let routing_anomalies_total = routing_anomalies.len();
             let this_host = config::this_host();
             let now_ts = model::now();
             if json {
@@ -5139,6 +5191,7 @@ fn main() -> Result<()> {
                             "status": status,
                             "remote": p.host != this_host,
                             "misregistered": misregistered,
+                            "routing_anomalies": *routing_anomaly_counts.get(&p.name).unwrap_or(&0),
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -5183,14 +5236,19 @@ fn main() -> Result<()> {
                     };
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
+                    let anomaly_marker = routing_anomaly_counts
+                        .get(&p.name)
+                        .filter(|&&n| n > 0)
+                        .map(|n| format!(" [routing_anomalies={n}]"))
+                        .unwrap_or_default();
                     println!(
-                        "{}{remote_marker} [{reason}] [status={status}]{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
+                        "{}{remote_marker} [{reason}] [status={status}]{anomaly_marker}{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
                         p.name, p.mux
                     );
                 }
                 if !views.is_empty() {
                     println!(
-                        "summary: {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale"
+                        "summary: {local_alive} local-alive, {remote_alive} remote-alive, {stale} stale, {routing_anomalies_total} routing-anomalies"
                     );
                 }
             }
