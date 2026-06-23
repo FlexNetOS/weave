@@ -1129,6 +1129,32 @@ done:
     optional crypto path is therefore gated in CI on **both** backends, not just
     locally, so a `sign`-only regression cannot merge unnoticed.
 
+### Supply-chain advisory gate (WL-075)
+
+CI's `audit` job uses `cargo-deny check advisories` plus `deny.toml`'s explicit,
+scoped ignores for the optional libsql remote-TLS advisory surface. Reproduce the
+same posture locally with:
+
+```bash
+python3 scripts/supply_chain_audit.py
+```
+
+The helper checks three repo-local invariants before running cargo-deny:
+
+- `deny.toml` still has `[graph] all-features = true` and exactly the tracked
+  advisory ids (the removed bincode id must not reappear).
+- The default sqlite dependency graph remains advisory-clean for
+  `rustls-webpki` (`cargo tree -i rustls-webpki --locked` must find nothing).
+- The residual `rustls-webpki` tree is still confined to the optional libsql TLS
+  graph (`--no-default-features --features libsql`).
+
+If `cargo-deny` is not installed, install it with
+`cargo install cargo-deny --locked`. For environments that cannot install tools,
+`python3 scripts/supply_chain_audit.py --allow-missing-cargo-deny` still verifies
+the local policy/tree invariants and reports the missing deny binary as a warning.
+`python3 scripts/supply_chain_audit.py --self-test` is stdlib-only and pins the
+script parser/formatter behavior.
+
 ## Generated target-output smoke matrix (WL-081)
 
 Unit and integration tests prove source behavior, but operators also need proof

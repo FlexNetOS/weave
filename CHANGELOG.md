@@ -15,6 +15,11 @@
 
 ### Added
 
+- Added WL-075 supply-chain audit reproducibility: `scripts/supply_chain_audit.py`
+  validates the local `deny.toml` advisory policy, proves the default dependency
+  graph has no `rustls-webpki`, confirms the residual advisory tree is confined
+  to optional libsql TLS, and runs (or gives install guidance for) the same
+  `cargo-deny check advisories` command used by CI.
 - Added WL-074 whole-store mailbox export: `weave export --all` is now the
   explicit privacy boundary for cross-identity HTML export, backed by a bounded
   dual-backend `Store::all_messages()` API while the default/`--for` path remains
