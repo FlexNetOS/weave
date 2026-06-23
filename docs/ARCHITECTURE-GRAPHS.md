@@ -161,9 +161,11 @@ HUMAN-FACING NAME                    STABLE LIVE INSTANCE
 Current state:
 
 - `peers`, `scan`, and `sessions` expose `session_id`.
-- CLI `send`, `notify`, `ask`, and `job delegate` accept `sess_<16-hex>`.
-- MCP session-id recipient resolution and MCP job delegation are tracked backlog
-  work, because MCP still validates `to` as a peer alias in several paths.
+- CLI and MCP `send`, `notify`, and `ask` accept `sess_<16-hex>` through the
+  shared core resolver.
+- CLI `job delegate` and MCP `weave_job_delegate` accept a peer alias or exact
+  session id, create a queued assigned job, and notify the worker with
+  `JOB_DELEGATED <job_id>`.
 
 ## 4. Doctor and scan diagnostics
 

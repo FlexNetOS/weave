@@ -25,6 +25,7 @@ TARGET = ROOT / "target"
 REPORT_DIR = TARGET / "target-smoke"
 DEFAULT_REPORT = REPORT_DIR / "target-smoke.json"
 TIMEOUT = 30
+ALLOWED_RUSTUP_TOOLCHAIN_CHANNELS = ("stable", "nightly")
 
 
 @dataclass
@@ -93,6 +94,98 @@ def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None,
             stderr=((exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "") + "\nTIMEOUT",
             duration_ms=now_ms() - start,
         )
+
+
+def parse_rustup_toolchain_names(stdout: str) -> list[str]:
+    """Return rustup toolchain names from `rustup toolchain list` output."""
+    names: list[str] = []
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        name = line.split()[0]
+        if name:
+            names.append(name)
+    return names
+
+
+def stale_rustup_toolchains(names: list[str]) -> list[str]:
+    """Toolchains that are not the current channel aliases we expect operators to keep.
+
+    The target-smoke contract is intentionally about generated artifacts from the
+    latest channel aliases. Date-pinned nightlies and version-pinned stable
+    duplicates are useful temporarily during bisects, but should not remain in the
+    normal operator toolchain cache after a refresh/prune pass.
+    """
+    stale: list[str] = []
+    for name in names:
+        channel = name.split("-", 1)[0]
+        if channel not in ALLOWED_RUSTUP_TOOLCHAIN_CHANNELS:
+            stale.append(name)
+            continue
+        if channel == "nightly" and re.match(r"^nightly-\d{4}-\d{2}-\d{2}(?:-|$)", name):
+            stale.append(name)
+    return stale
+
+
+def rustup_toolchain_hygiene(*, enforce: bool) -> Step:
+    if not shutil.which("rustup"):
+        status = "skip" if enforce else "warn"
+        return Step(name="rustup toolchain hygiene", status=status, details={"reason": "rustup not on PATH"})
+    listed = run(["rustup", "toolchain", "list"], timeout=30)
+    names = parse_rustup_toolchain_names(listed.stdout)
+    stale = stale_rustup_toolchains(names)
+    status = "pass"
+    if listed.status != "pass":
+        status = "fail" if enforce else "warn"
+    elif stale:
+        status = "fail" if enforce else "warn"
+    return Step(
+        name="rustup toolchain hygiene",
+        status=status,
+        command=listed.command,
+        cwd=listed.cwd,
+        exit_code=listed.exit_code,
+        stdout=listed.stdout,
+        stderr=listed.stderr,
+        duration_ms=listed.duration_ms,
+        details={
+            "enforced": enforce,
+            "installed": names,
+            "allowed_channels": list(ALLOWED_RUSTUP_TOOLCHAIN_CHANNELS),
+            "stale": stale,
+        },
+    )
+
+
+def self_test() -> int:
+    sample = """\
+stable-x86_64-unknown-linux-gnu (active, default)
+nightly-x86_64-unknown-linux-gnu
+nightly-2026-04-29-x86_64-unknown-linux-gnu
+1.96.0-x86_64-unknown-linux-gnu
+"""
+    names = parse_rustup_toolchain_names(sample)
+    expected_names = [
+        "stable-x86_64-unknown-linux-gnu",
+        "nightly-x86_64-unknown-linux-gnu",
+        "nightly-2026-04-29-x86_64-unknown-linux-gnu",
+        "1.96.0-x86_64-unknown-linux-gnu",
+    ]
+    if names != expected_names:
+        print(f"parse_rustup_toolchain_names failed: {names!r}", file=sys.stderr)
+        return 1
+    stale = stale_rustup_toolchains(names)
+    expected_stale = ["nightly-2026-04-29-x86_64-unknown-linux-gnu", "1.96.0-x86_64-unknown-linux-gnu"]
+    if stale != expected_stale:
+        print(f"stale_rustup_toolchains failed: {stale!r}", file=sys.stderr)
+        return 1
+    clean = ["stable-x86_64-unknown-linux-gnu", "nightly-x86_64-unknown-linux-gnu"]
+    if stale_rustup_toolchains(clean):
+        print("stale_rustup_toolchains rejected clean stable/nightly aliases", file=sys.stderr)
+        return 1
+    print("target_smoke self-test: pass")
+    return 0
 
 
 def require(condition: bool, name: str, details: dict[str, Any] | None = None) -> Step:
@@ -390,8 +483,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build and smoke Weave target artifacts")
     parser.add_argument("--full", action="store_true", help="build and smoke feature-gated artifact matrix too")
     parser.add_argument("--clean-target", action="store_true", help="delete ./target first to prove Cargo recreates generated output")
+    parser.add_argument("--check-rustup-hygiene", action="store_true", help="fail if rustup has stale date/version-pinned toolchains beside stable/nightly aliases")
+    parser.add_argument("--self-test", action="store_true", help="run pure tests for this smoke runner and exit")
     parser.add_argument("--output", type=Path, default=DEFAULT_REPORT, help="JSON report path")
     args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     if args.clean_target and TARGET.exists():
         cachedir = TARGET / "CACHEDIR.TAG"
@@ -415,9 +513,11 @@ def main() -> int:
         },
         "artifacts": [],
     }
+    rustup_hygiene = rustup_toolchain_hygiene(enforce=args.check_rustup_hygiene)
+    report["environment"]["rustup_toolchain_hygiene"] = asdict(rustup_hygiene)
 
     artifacts = artifact_matrix(args.full)
-    any_fail = False
+    any_fail = rustup_hygiene.status == "fail"
     for artifact in artifacts:
         build = run(artifact.command, timeout=1800)
         artifact.build = build

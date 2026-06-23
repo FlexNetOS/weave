@@ -1671,6 +1671,110 @@ fn cli_unknown_session_id_recipient_is_rejected() {
     );
 }
 
+#[test]
+fn mcp_point_to_point_tools_accept_session_id_recipient_and_delegate_jobs() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "worker"]);
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers --json parses");
+    let session_id = peers
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("worker")))
+        .and_then(|p| p["session_id"].as_str())
+        .unwrap_or_else(|| panic!("worker session_id in peers --json: {peers_json}"))
+        .to_string();
+
+    let mut mcp = McpServer::spawn(&db);
+    let listed = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<String> = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "weave_job_delegate"),
+        "tools/list missing weave_job_delegate: {names:?}"
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({
+            "from": "orchestrator",
+            "to": session_id,
+            "body": "mcp session-routed send"
+        }),
+    );
+    assert!(
+        !is_err,
+        "MCP weave_send should resolve session id recipients: {text}"
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_notify",
+        serde_json::json!({
+            "from": "orchestrator",
+            "to": session_id,
+            "body": "mcp session-routed notify"
+        }),
+    );
+    assert!(
+        !is_err,
+        "MCP weave_notify should resolve session id recipients: {text}"
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_ask",
+        serde_json::json!({
+            "from": "orchestrator",
+            "to": session_id,
+            "body": "mcp session-routed ask"
+        }),
+    );
+    assert!(
+        !is_err,
+        "MCP weave_ask should resolve session id recipients: {text}"
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_job_delegate",
+        serde_json::json!({
+            "from": "orchestrator",
+            "to": session_id,
+            "title": "mcp session-routed job",
+            "prompt": "claim this from MCP"
+        }),
+    );
+    assert!(
+        !is_err,
+        "MCP weave_job_delegate should create and notify: {text}"
+    );
+    assert!(
+        text.contains("assignee=worker") && text.contains("delegation_message_id="),
+        "delegate output includes resolved assignee + message id: {text}"
+    );
+
+    mcp.shutdown();
+
+    let inbox = run_ok(&db, &["inbox", "--me", "worker", "--peek"]);
+    assert!(
+        inbox.contains("mcp session-routed send"),
+        "send resolves session id to worker inbox: {inbox}"
+    );
+    assert!(
+        inbox.contains("mcp session-routed notify"),
+        "notify resolves session id to worker inbox: {inbox}"
+    );
+    assert!(
+        inbox.contains("mcp session-routed ask"),
+        "ask resolves session id to worker inbox: {inbox}"
+    );
+    assert!(
+        inbox.contains("JOB_DELEGATED") && inbox.contains("claim this from MCP"),
+        "job delegate resolves session id to worker inbox: {inbox}"
+    );
+}
+
 // ─────────────────────── P5: rich presence (turn_state + description) ───────────
 
 /// The full hook turn_state lifecycle surfaces in `weave peers` (human): session ⇒
@@ -8984,7 +9088,7 @@ fn mcp_job_tools_happy_and_failure_paths() {
     let db = TestDb::new();
     let mut mcp = McpServer::spawn(&db);
 
-    // tools/list advertises all 8 job tool names.
+    // tools/list advertises all 9 job tool names.
     let listed = mcp.request("tools/list", serde_json::json!({}));
     let names: Vec<String> = listed["tools"]
         .as_array()
@@ -8994,6 +9098,7 @@ fn mcp_job_tools_happy_and_failure_paths() {
         .collect();
     for n in [
         "weave_job_create",
+        "weave_job_delegate",
         "weave_job_list",
         "weave_job_show",
         "weave_job_status",

@@ -1174,6 +1174,21 @@ python3 scripts/target_smoke.py --clean-target
 `CACHEDIR.TAG` marker is present. Never commit files from `target/`; commit only
 script, docs, or source changes.
 
+For operator machines that use rustup, the smoke runner can also enforce the
+toolchain-cache hygiene expected after a refresh/prune pass:
+
+```bash
+python3 scripts/target_smoke.py --check-rustup-hygiene
+```
+
+This fails when stale date-pinned nightlies or version-pinned stable duplicates
+remain beside the current `stable-*` and `nightly-*` aliases. The pure parser
+coverage for that check is available without building artifacts:
+
+```bash
+python3 scripts/target_smoke.py --self-test
+```
+
 ### Dimensional doctor/scan liveness diagnostics (WL-068)
 
 `peers --json`, `scan --json`, and `doctor --json` now expose orthogonal

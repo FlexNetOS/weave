@@ -308,6 +308,7 @@ const DANGEROUS_TOOLS: &[&str] = &[
     "weave_schedules",
     "weave_tick",
     "weave_job_create",
+    "weave_job_delegate",
     "weave_job_claim",
     "weave_job_update",
     "weave_job_cancel",
@@ -497,6 +498,9 @@ fn call_tool(
         "weave_ask_many" => tool_ask_many(store, me_default, nudge_template, args, injector),
         "weave_ask_many_result" => tool_ask_many_result(store, args),
         "weave_job_create" => tool_job_create(store, me_default, args),
+        "weave_job_delegate" => {
+            tool_job_delegate(store, me_default, nudge_template, args, injector)
+        }
         "weave_job_list" => tool_job_list(store, args),
         // `show` is the canonical detail view; `status` is its alias (repowire parity).
         "weave_job_show" | "weave_job_status" => tool_job_status(store, args),
@@ -580,7 +584,12 @@ fn tool_send(
         .get("to")
         .and_then(|v| v.as_str())
         .ok_or("'to' is required (session name, or 'all' to broadcast).")?;
-    let to = bound_ident("to", to_raw)?;
+    let to_bound = bound_ident("to", to_raw)?;
+    let to = if model::is_broadcast(&to_bound) {
+        to_bound
+    } else {
+        store::resolve_point_recipient(store, &to_bound).map_err(e)?
+    };
     let to = to.as_str();
     let no_memory = args
         .get("no_memory")
@@ -1080,6 +1089,7 @@ fn tool_notify(
                 .to_string(),
         );
     }
+    let to = store::resolve_point_recipient(store, &to).map_err(e)?;
     let body = args
         .get("body")
         .and_then(|v| v.as_str())
@@ -3018,6 +3028,7 @@ fn tool_ask(
                 .to_string(),
         );
     }
+    let to = store::resolve_point_recipient(store, &to).map_err(e)?;
     let no_memory = args
         .get("no_memory")
         .and_then(|v| v.as_bool())
@@ -3768,6 +3779,102 @@ fn tool_job_create(
     ))
 }
 
+/// `weave_job_delegate`: orchestration-first worker handoff. Creates a queued job
+/// assigned to one worker and sends that worker a durable `JOB_DELEGATED` message.
+fn tool_job_delegate(
+    store: &dyn Store,
+    def: &Option<String>,
+    nudge_template: Option<&str>,
+    args: &Value,
+    injector: &dyn Injector,
+) -> Result<String, String> {
+    let creator = ident(args, "from", def)?;
+    let to_raw = args
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or("'to' is required (the worker peer alias or sess_<16-hex>).")?;
+    let to_bound = bound_ident("to", to_raw)?;
+    if model::is_broadcast(&to_bound) {
+        return Err("job delegation is point-to-point; choose one worker peer.".to_string());
+    }
+    let to = store::resolve_point_recipient(store, &to_bound).map_err(e)?;
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("'title' is required.")?;
+    let str_arg = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let spec = model::JobSpec {
+        title: title.to_string(),
+        description: str_arg("description"),
+        kind: str_arg("kind"),
+        owner: Some(creator.clone()),
+        assignee: Some(to.clone()),
+        circle: str_arg("circle"),
+        prompt: str_arg("prompt"),
+        deadline_at: args.get("deadline_at").and_then(|v| v.as_i64()),
+        ..Default::default()
+    };
+    let job = store.create_job(&creator, spec).map_err(e)?;
+    let body = format!(
+        "JOB_DELEGATED {}\nfrom: {}\nassignee: {}\ntitle: {}\n\n{}",
+        job.id,
+        creator,
+        to,
+        job.title,
+        job.prompt
+            .as_deref()
+            .or_else(|| (!job.description.is_empty()).then_some(job.description.as_str()))
+            .unwrap_or("Claim or inspect this job with weave job show/status/result.")
+    );
+    let trace_id = model::mint_trace_id();
+    let mid = store
+        .send(
+            &creator,
+            &to,
+            Some(&format!("Job: {}", job.title)),
+            &body,
+            None,
+            Some(&trace_id),
+        )
+        .map_err(e)?;
+    record_delivery_best_effort(
+        store,
+        mid,
+        model::DeliveryRefKind::Message,
+        &to,
+        model::DeliveryStage::Queued,
+        model::DeliveryOutcome::Ok,
+    );
+    let verdict = ask_delivery_verdict(store, nudge_template, &creator, &to, &body, injector);
+    let (stage, outcome) = verdict_to_stage(verdict);
+    record_delivery_best_effort(
+        store,
+        mid,
+        model::DeliveryRefKind::Message,
+        &to,
+        stage,
+        outcome,
+    );
+    Ok(format!(
+        "Delegated job {} [{}] '{}' creator={} assignee={} delegation_message_id={} verdict={}.",
+        job.id,
+        job.state.as_str(),
+        job.title,
+        job.creator,
+        to,
+        mid,
+        verdict
+    ))
+}
+
 /// `weave_job_list`: list board jobs filtered by state/owner/creator/assignee/circle.
 /// Read-only, bounded by clamp_limit in the store.
 fn tool_job_list(store: &dyn Store, args: &Value) -> Result<String, String> {
@@ -4346,6 +4453,20 @@ fn tool_catalog() -> Vec<Value> {
                 "expires_at":{"type":"integer","description":"Optional expiry (epoch seconds)."},
                 "visibility":{"type":"string","description":"Visibility label (default 'circle')."}
             },"required":["title"]}
+        },
+        {
+            "name": "weave_job_delegate",
+            "description": "Create a queued board job assigned to one worker AND send that worker a durable JOB_DELEGATED message/nudge. `to` accepts either a peer alias or stable sess_<16-hex> id from peers/scan/sessions. Weave coordinates and records; workers still claim/update/result through the normal job tools.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"Orchestrator/creator session name (or omit to use WEAVE_SESSION)."},
+                "to":{"type":"string","description":"Worker peer alias or sess_<16-hex> session id."},
+                "title":{"type":"string","description":"Short job title (required)."},
+                "description":{"type":"string","description":"The work request / details."},
+                "kind":{"type":"string","description":"Job kind label (default 'general')."},
+                "circle":{"type":"string","description":"Board circle/scope label (optional)."},
+                "prompt":{"type":"string","description":"Prompt text sent in the JOB_DELEGATED message."},
+                "deadline_at":{"type":"integer","description":"Optional deadline (epoch seconds)."}
+            },"required":["to","title"]}
         },
         {
             "name": "weave_job_list",

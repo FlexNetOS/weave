@@ -98,7 +98,7 @@ tracked.
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
 | `schedule_create` / `schedule_self` / `schedule_cron` | `weave_schedule` / `weave_schedules` / `weave_cancel_schedule` / `weave_tick` | ✅ HAVE | WL-016; one-shot + recurring, drift-safe |
-| `job_create` / `run` / `retry` / `cancel` (continuity modes) | `weave_job_create/claim/update/result/show/list/cancel/status` | 🟢 SUPERSET | durable `jobs` table; 8 tools |
+| `job_create` / `run` / `retry` / `cancel` (continuity modes) | `weave_job_create/delegate/claim/update/result/show/list/cancel/status` | 🟢 SUPERSET | durable `jobs` table; MCP/CLI delegation creates an assigned queued job and worker `JOB_DELEGATED` nudge |
 | `agents create` (scaffold `AGENTS.md`/`CLAUDE.md`) | `weave config init` scaffolds config only | 🔶 **PARTIAL** | minor gap: no agent-folder scaffold (candidate WL) |
 
 ## 5. Memory & context

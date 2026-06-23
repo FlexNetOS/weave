@@ -866,6 +866,37 @@ pub trait Store: Send {
     fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>;
 }
 
+/// Resolve a point-to-point recipient token into the human peer alias that the
+/// store addresses. Plain aliases pass through unchanged. Stable session handles
+/// (`sess_<16-hex>`, as shown by `peers`/`scan`/`sessions`) resolve to exactly one
+/// registered peer row, giving orchestrators a precise routing handle when aliases
+/// or mux targets are visually ambiguous.
+pub fn resolve_point_recipient(store: &dyn Store, to: &str) -> Result<String> {
+    if !to.starts_with("sess_") {
+        return Ok(to.to_string());
+    }
+    if !crate::model::session_id_valid(to) {
+        anyhow::bail!("invalid session id '{to}' (expected sess_<16-hex>)");
+    }
+    let mut matches = store
+        .list_peers()?
+        .into_iter()
+        .filter(|p| crate::model::peer_session_id(p) == to)
+        .map(|p| p.name)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [name] => Ok(name.clone()),
+        [] => anyhow::bail!("no registered peer has session id '{to}'"),
+        many => anyhow::bail!(
+            "session id '{to}' is ambiguous across {} peers: {}",
+            many.len(),
+            many.join(", ")
+        ),
+    }
+}
+
 /// Where a federated row came from. `Local` is this session's own store;
 /// `Foreign` carries a short display label (the configured store's basename or
 /// path) so a listing can tell local from federated entries. Backend-agnostic

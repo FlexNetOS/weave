@@ -314,7 +314,7 @@ is pulled in.
 · `weave_attach` · `weave_connect`
 · `weave_ask` · `weave_answer` · `weave_ack` · `weave_asks` · `weave_ask_get`
 · `weave_ask_many` · `weave_ask_many_result`
-· `weave_job_create` · `weave_job_list` · `weave_job_show` · `weave_job_status` · `weave_job_claim`
+· `weave_job_create` · `weave_job_delegate` · `weave_job_list` · `weave_job_show` · `weave_job_status` · `weave_job_claim`
 · `weave_job_update` · `weave_job_result` · `weave_job_cancel`
 · `weave_claim_orchestrator` · `weave_orchestrator_status` (P4 circles)
 · `weave_set_turn_state` · `weave_set_description` (P5 rich presence)
@@ -468,6 +468,10 @@ dependency**, and **local-mesh** only.
   `queued`, the server mints its `job_<…>` id, and the creator becomes the owner.
   Carries title/description/kind plus optional assignee/owner/circle and
   caller-supplied `deadline_at`/`expires_at`.
+- **Delegate** (`weave job delegate` / `weave_job_delegate`) creates a queued job
+  assigned to one worker and sends that worker a durable `JOB_DELEGATED <job_id>`
+  message/nudge. The worker target accepts either a peer alias or an exact
+  `sess_<16-hex>` session id from `peers`/`scan`/`sessions`.
 - **List / show / status** (`weave job list|show|status`) are read-only. `list`
   filters by state/owner/creator/assignee/circle and is bounded; `show` and
   `status` are aliases for the same single-job view.
