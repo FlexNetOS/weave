@@ -20,8 +20,11 @@
   snapshot to the host's live config, updates CC Switch's current-provider marker,
   and preserves weave lifecycle wiring already present (Claude `hooks`/
   `mcpServers`, Codex `notify = ["…", "hook", "wake"]`, Gemini settings
-  merged with existing JSON). Includes `--db` for tests/alternate profiles and
-  `--dry-run` for validation-only checks.
+  merged with existing JSON). `models` auto-loads provider current/model-catalog
+  entries plus reachable local Ollama `/api/tags`; `switch-model` updates Claude,
+  Codex, and Gemini selected models and refreshes live config when the provider is
+  current. Includes `--db` for tests/alternate profiles and `--dry-run` for
+  validation-only checks.
 
 ### Fixed (WL-057 — `weave setup` no longer persists an ephemeral exe path, fixes #107)
 - **`weave setup` stopped writing a transient build/worktree binary path into the
