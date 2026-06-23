@@ -1550,10 +1550,32 @@ fn cli_register_then_peers_lists_peer() {
         peers.contains('z'),
         "peers list should mention 'z': {peers:?}"
     );
+    assert!(
+        peers.contains("[session=sess_"),
+        "peers should surface stable live session id: {peers:?}"
+    );
     // 'z' was registered with no mux env present, so it is a non-injectable peer.
     assert!(
         peers.contains("no-inject"),
         "a peer registered outside any mux should be no-inject: {peers:?}"
+    );
+
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&peers_json).expect("peers --json parses");
+    let row = v
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("z")))
+        .unwrap_or_else(|| panic!("peer z in peers --json: {peers_json}"));
+    assert!(
+        row["session_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("sess_") && s.len() == 21),
+        "session_id shape: {peers_json}"
+    );
+    assert_eq!(
+        row["session_id_basis"].as_str(),
+        Some("birth_cert"),
+        "registered peer should prefer birth-cert-backed instance id: {peers_json}"
     );
 }
 
