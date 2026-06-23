@@ -546,7 +546,8 @@ orchestrator/control plane
 BACKGROUND WORKER
 executor/reviewer/runner
           |
-          | claim/update/result
+          | weave job dispatch
+          | (claim -> runner -> update/result)
           v
 +-----------------------------+
 | job lifecycle               |
@@ -561,6 +562,7 @@ Weave policy                         flexnetos_runner execution
 -------------                        -------------------------
 job/delegation intent  ------------> route/execute
 WEAVE_FXRUN_AGENT -----------------> selected agent
+WEAVE_JOB_ID / ATTEMPT -----------> fenced execution context
 policy_owner=weave                  agent_source=weave
 ```
 

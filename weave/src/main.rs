@@ -1362,10 +1362,9 @@ enum OrchestratorCmd {
     },
 }
 
-/// `weave job` subcommands — the P3 poll-only board: create/list/show/status/claim/
-/// update/result/cancel. NO autonomous dispatch/runner (that is P10/P11): nothing
-/// nudges or spawns. attempt_id fencing + the state machine are enforced in the
-/// store, so both CLI and MCP inherit them.
+/// `weave job` subcommands — the durable board plus the first worker-dispatch
+/// bridge. Most commands are pure board lifecycle operations; `dispatch` is the
+/// WL-072 CLI runner seam: Weave claims/records, an external runner executes.
 #[derive(Subcommand)]
 enum JobCmd {
     /// Create a durable board job (state 'queued') and print its minted job_id.
@@ -1495,6 +1494,31 @@ enum JobCmd {
         reason: Option<String>,
         #[arg(long)]
         from: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Worker dispatch tick: auto-claim one queued job, run an external runner,
+    /// and record the terminal result. Weave coordinates/records; the runner
+    /// executes. Argv-only — no shell.
+    Dispatch {
+        /// worker identity used to claim assigned/unassigned queued jobs
+        #[arg(long = "as")]
+        as_who: Option<String>,
+        /// trusted runner binary (default flexnetos_runner)
+        #[arg(long, default_value = "flexnetos_runner")]
+        runner: String,
+        /// extra argv passed to the runner (repeatable)
+        #[arg(long = "runner-arg", allow_hyphen_values = true)]
+        runner_args: Vec<String>,
+        /// optional Weave-selected execution agent; passed as WEAVE_FXRUN_AGENT
+        #[arg(long)]
+        agent: Option<String>,
+        /// run one dispatch tick and exit (currently the default lifecycle unit)
+        #[arg(long)]
+        once: bool,
+        /// hard timeout for the runner process, in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
         #[arg(long)]
         json: bool,
     },
@@ -7198,6 +7222,33 @@ fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
                 }
             }
         }
+        JobCmd::Dispatch {
+            as_who,
+            runner,
+            runner_args,
+            agent,
+            once: _,
+            timeout,
+            json,
+        } => {
+            let (me, explicit) = resolve_me_explicit(as_who, None, cfg);
+            refresh_presence(store, &me, explicit);
+            let report = dispatch_one_job(store, cfg, &me, &runner, &runner_args, agent, timeout)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.claimed_job_id.is_empty() {
+                println!("no queued job for worker '{me}'");
+            } else {
+                println!(
+                    "dispatched job {} as '{}' via {} (exit={}) -> {}",
+                    report.claimed_job_id,
+                    me,
+                    report.runner,
+                    report.exit_code,
+                    report.job.state.as_str()
+                );
+            }
+        }
         JobCmd::Cancel {
             job_id,
             reason,
@@ -7225,6 +7276,297 @@ fn dispatch_job(store: &dyn Store, cfg: &Config, cmd: JobCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct JobDispatchReport {
+    worker: String,
+    claimed_job_id: String,
+    attempt_id: String,
+    runner: String,
+    exit_code: i32,
+    timed_out: bool,
+    job: model::Job,
+}
+
+fn dispatch_one_job(
+    store: &dyn Store,
+    _cfg: &Config,
+    worker: &str,
+    runner: &str,
+    runner_args: &[String],
+    agent: Option<String>,
+    timeout_secs: u64,
+) -> Result<JobDispatchReport> {
+    store::check_ident("worker", worker)?;
+    let queued_for_worker = store.list_jobs(
+        model::JobFilter {
+            state: Some(model::JobState::Queued),
+            assignee: Some(worker.to_string()),
+            ..Default::default()
+        },
+        1,
+    )?;
+    let candidate = if let Some(job) = queued_for_worker.into_iter().next() {
+        Some(job)
+    } else {
+        store
+            .list_jobs(
+                model::JobFilter {
+                    state: Some(model::JobState::Queued),
+                    ..Default::default()
+                },
+                200,
+            )?
+            .into_iter()
+            .find(|j| j.assignee.is_none())
+    };
+    let Some(candidate) = candidate else {
+        let now = model::now();
+        return Ok(JobDispatchReport {
+            worker: worker.to_string(),
+            claimed_job_id: String::new(),
+            attempt_id: String::new(),
+            runner: runner.to_string(),
+            exit_code: 0,
+            timed_out: false,
+            job: model::Job {
+                id: String::new(),
+                title: String::new(),
+                description: String::new(),
+                kind: String::new(),
+                state: model::JobState::Unavailable,
+                state_reason: Some("no queued job".into()),
+                phase: None,
+                prompt: None,
+                progress_note: None,
+                progress_events_json: "[]".into(),
+                creator: String::new(),
+                owner: None,
+                assignee: None,
+                circle: None,
+                correlation_id: None,
+                source_kind: None,
+                source_id: None,
+                scope: None,
+                visibility: String::new(),
+                attempt_id: None,
+                deadline_at: None,
+                expires_at: None,
+                result_summary: None,
+                result_json: "{}".into(),
+                error_json: "{}".into(),
+                artifacts_json: "[]".into(),
+                cancel_requested: false,
+                cancel_requested_by: None,
+                cancel_requested_ts: None,
+                cancel_reason: None,
+                opened_ts: now,
+                updated_ts: now,
+                completed_ts: None,
+            },
+        });
+    };
+    let claimed = store
+        .claim_job(&candidate.id, worker)?
+        .ok_or_else(|| anyhow::anyhow!("no job '{}'", candidate.id))?;
+    let attempt = claimed
+        .attempt_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("claimed job '{}' did not mint attempt_id", claimed.id))?;
+    let started = store.update_job(
+        &claimed.id,
+        Some(&attempt),
+        model::JobPatch {
+            phase: Some("runner_starting".into()),
+            progress_note: Some(format!("worker {worker} dispatching via {runner}")),
+            ..Default::default()
+        },
+    )?;
+    if started.cancel_requested {
+        let job = store.update_job(
+            &started.id,
+            Some(&attempt),
+            model::JobPatch {
+                state: Some(model::JobState::Cancelled),
+                state_reason: Some("cancel requested before runner start".into()),
+                phase: Some("cancelled".into()),
+                progress_note: Some("worker honored pre-run cancellation".into()),
+                ..Default::default()
+            },
+        )?;
+        return Ok(JobDispatchReport {
+            worker: worker.to_string(),
+            claimed_job_id: job.id.clone(),
+            attempt_id: attempt,
+            runner: runner.to_string(),
+            exit_code: 0,
+            timed_out: false,
+            job,
+        });
+    }
+
+    let leases_json = serde_json::to_string(&store.list_leases(200)?)?;
+    let outcome = run_job_runner(RunnerInvocation {
+        job: &started,
+        attempt: &attempt,
+        worker,
+        runner,
+        runner_args,
+        agent,
+        timeout_secs,
+        leases_json: &leases_json,
+    })?;
+    let terminal_state = if outcome.exit_code == 0 && !outcome.timed_out {
+        model::JobState::Completed
+    } else {
+        model::JobState::Failed
+    };
+    let result_json = serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stdout": truncate_chars(&outcome.stdout, 16_384),
+        "stderr": truncate_chars(&outcome.stderr, 16_384),
+    })
+    .to_string();
+    let error_json = serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stderr": truncate_chars(&outcome.stderr, 16_384),
+    })
+    .to_string();
+    let summary = if outcome.timed_out {
+        format!("runner timed out after {timeout_secs}s")
+    } else {
+        format!("runner exited {}", outcome.exit_code)
+    };
+    let job = store.update_job(
+        &started.id,
+        Some(&attempt),
+        model::JobPatch {
+            state: Some(terminal_state),
+            state_reason: Some(summary.clone()),
+            phase: Some("runner_finished".into()),
+            progress_note: Some(summary.clone()),
+            result_summary: Some(summary),
+            result_json: Some(result_json),
+            error_json: if outcome.exit_code == 0 && !outcome.timed_out {
+                None
+            } else {
+                Some(error_json)
+            },
+            artifacts_json: None,
+        },
+    )?;
+    Ok(JobDispatchReport {
+        worker: worker.to_string(),
+        claimed_job_id: job.id.clone(),
+        attempt_id: attempt,
+        runner: runner.to_string(),
+        exit_code: outcome.exit_code,
+        timed_out: outcome.timed_out,
+        job,
+    })
+}
+
+struct RunnerOutcome {
+    exit_code: i32,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+}
+
+struct RunnerInvocation<'a> {
+    job: &'a model::Job,
+    attempt: &'a str,
+    worker: &'a str,
+    runner: &'a str,
+    runner_args: &'a [String],
+    agent: Option<String>,
+    timeout_secs: u64,
+    leases_json: &'a str,
+}
+
+fn run_job_runner(inv: RunnerInvocation<'_>) -> Result<RunnerOutcome> {
+    let RunnerInvocation {
+        job,
+        attempt,
+        worker,
+        runner,
+        runner_args,
+        agent,
+        timeout_secs,
+        leases_json,
+    } = inv;
+    if !inject::spawn_arg_ok(runner) {
+        anyhow::bail!("runner name is too long or contains control/NUL bytes");
+    }
+    for arg in runner_args {
+        if !inject::spawn_arg_ok(arg) {
+            anyhow::bail!("runner argument is too long or contains control/NUL bytes");
+        }
+    }
+    let runner_path = if std::path::Path::new(runner).is_absolute() {
+        let p = std::path::PathBuf::from(runner);
+        if !p.is_file() {
+            anyhow::bail!("runner {:?} is not an executable file", runner);
+        }
+        p
+    } else {
+        inject::resolve_trusted(runner)
+            .ok_or_else(|| anyhow::anyhow!("runner {runner:?} is not in a trusted directory"))?
+    };
+    let mut cmd = std::process::Command::new(&runner_path);
+    cmd.args(runner_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("WEAVE_JOB_ID", &job.id)
+        .env("WEAVE_ATTEMPT_ID", attempt)
+        .env("WEAVE_WORKER", worker)
+        .env("WEAVE_JOB_TITLE", &job.title)
+        .env("WEAVE_JOB_PROMPT", job.prompt.as_deref().unwrap_or(""))
+        .env("WEAVE_JOB_DESCRIPTION", &job.description)
+        .env("WEAVE_LEASES_JSON", leases_json)
+        .env("WEAVE_POLICY_OWNER", "weave");
+    if let Some(agent) = agent {
+        cmd.env("WEAVE_FXRUN_AGENT", agent);
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn runner {runner:?}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            return Ok(RunnerOutcome {
+                exit_code: output.status.code().unwrap_or(1),
+                timed_out: false,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Ok(RunnerOutcome {
+                exit_code: 124,
+                timed_out: true,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("…[truncated]");
+    out
 }
 
 /// One-line human summary of a [`model::Job`] for the CLI listings/show.

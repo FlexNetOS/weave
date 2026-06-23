@@ -9082,6 +9082,97 @@ fn cli_job_delegate_creates_assigned_job_and_notifies_worker() {
     assert_eq!(cv["job"]["assignee"].as_str(), Some("worker"));
 }
 
+/// WL-072: a worker dispatch tick should auto-claim an assigned queued job, execute
+/// the external runner as argv-only, pass Weave policy/env, and write the terminal
+/// result back through the fenced job lifecycle.
+#[test]
+fn cli_job_dispatch_claims_runs_runner_and_records_result() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("runnerbin");
+    std::fs::create_dir_all(&runner_dir).expect("create fake runner dir");
+    let runner_log = runner_dir.join("runner.log");
+    let runner = runner_dir.join("flexnetos_runner");
+    let body = format!(
+        "#!/bin/sh\nprintf 'job=%s attempt=%s agent=%s prompt=%s args=%s\\n' \"$WEAVE_JOB_ID\" \"$WEAVE_ATTEMPT_ID\" \"$WEAVE_FXRUN_AGENT\" \"$WEAVE_JOB_PROMPT\" \"$*\" >> '{}'\nprintf 'runner completed %s\\n' \"$WEAVE_JOB_ID\"\nexit 0\n",
+        runner_log.display()
+    );
+    std::fs::write(&runner, body).expect("write fake runner");
+    let mut perms = std::fs::metadata(&runner)
+        .expect("stat fake runner")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("chmod fake runner");
+
+    let created = run_ok(
+        &db,
+        &[
+            "job",
+            "create",
+            "--from",
+            "lead",
+            "--assignee",
+            "worker",
+            "--title",
+            "runner smoke",
+            "--prompt",
+            "run from weave",
+            "--json",
+        ],
+    );
+    let cv: serde_json::Value = serde_json::from_str(&created).expect("create json parses");
+    let id = cv["job"]["id"].as_str().expect("job id").to_string();
+
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--agent",
+            "codex-nightly",
+            "--runner",
+            "flexnetos_runner",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let out = dispatch.output().expect("spawn job dispatch");
+    assert!(
+        out.status.success(),
+        "dispatch failed stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dv: serde_json::Value = serde_json::from_slice(&out.stdout).expect("dispatch json parses");
+    assert_eq!(dv["claimed_job_id"].as_str(), Some(id.as_str()));
+    assert_eq!(dv["job"]["state"].as_str(), Some("completed"));
+    assert_eq!(dv["job"]["assignee"].as_str(), Some("worker"));
+    assert_eq!(dv["exit_code"].as_i64(), Some(0));
+
+    let logged = std::fs::read_to_string(&runner_log).expect("runner log");
+    assert!(
+        logged.contains(&format!("job={id}")) && logged.contains("agent=codex-nightly"),
+        "runner receives weave env: {logged}"
+    );
+    assert!(
+        logged.contains("prompt=run from weave"),
+        "runner receives job prompt: {logged}"
+    );
+
+    let result = run_ok(&db, &["job", "result", &id, "--json"]);
+    let rv: serde_json::Value = serde_json::from_str(&result).expect("result json parses");
+    assert_eq!(rv["result"]["state"].as_str(), Some("completed"));
+    assert!(
+        rv["result"]["result_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runner exited 0"),
+        "result summary records runner exit: {rv}"
+    );
+}
+
 /// MCP happy path + every documented failure path for the job tools.
 #[test]
 fn mcp_job_tools_happy_and_failure_paths() {

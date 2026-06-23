@@ -15,6 +15,11 @@
 
 ### Added
 
+- Added WL-072 worker dispatch integration: `weave job dispatch` now auto-claims
+  a queued job for a worker, runs a trusted external runner (default
+  `flexnetos_runner`) as argv-only, passes `WEAVE_JOB_*` plus optional
+  `WEAVE_FXRUN_AGENT`, appends progress, and records completed/failed terminal
+  results through the fenced job lifecycle.
 - Added WL-071 MCP parity for exact session-id recipients and job delegation:
   `weave_send`, `weave_notify`, and `weave_ask` now accept `sess_<16-hex>` targets
   through the same shared resolver as CLI paths, and new `weave_job_delegate`
