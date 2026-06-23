@@ -105,7 +105,7 @@ weave send --from desktop --to envctl --body "apply the rtk fix"
 weave send --to envctl --body "use the v2 schema instead" --supersedes 41   # REPLACE msg #41 (hidden from unread, flagged in history); supersede=replacement, reply=threading
 weave send --to envctl --body "transient status" --ttl 3600   # ephemeral: auto-deleted after N seconds (delete-on-sweep), excluded from every read surface; capped at 24h
 weave inbox --me envctl              # read (marks read); --peek to not mark; --all to include read
-weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id> to scope; --limit N to cap)
+weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id>; --all for explicit whole-store; --limit N)
 weave backup --out mailbox.tar       # no-dep snapshot of DB + config + Claude settings (--force to overwrite)
 weave restore --in mailbox.tar       # restore that snapshot (traversal-guarded; --force to clobber DB/config/settings; remote libSQL unsupported)
 weave session export --out s.json    # portable JSON of a session (messages + mesh memory) for cross-instance resume (--for <id>; --force)

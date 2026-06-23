@@ -12144,6 +12144,64 @@ fn export_for_scopes_to_one_identity() {
 }
 
 #[test]
+fn export_all_requires_explicit_flag_and_includes_cross_identity_messages() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "x", "--body=to-x-only"],
+    );
+    run_ok(
+        &db,
+        &["send", "--from", "b", "--to", "y", "--body=to-y-only"],
+    );
+
+    let out_path = std::env::temp_dir().join(format!(
+        "weave-it-exp-all-{}-{}.html",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+
+    let scoped_path = out_path.with_extension("scoped.html");
+    run_ok(
+        &db,
+        &[
+            "export",
+            "--for",
+            "x",
+            "--out",
+            &scoped_path.to_string_lossy(),
+        ],
+    );
+    let scoped = read_export(&scoped_path);
+    assert!(scoped.contains("to-x-only"));
+    assert!(
+        !scoped.contains("to-y-only"),
+        "default/per-identity export must not leak cross-identity messages"
+    );
+
+    let stdout = run_ok(
+        &db,
+        &["export", "--all", "--out", &out_path.to_string_lossy()],
+    );
+    assert!(
+        stdout.contains("exported 2 message(s) for all identities"),
+        "whole-db export should report explicit all scope: {stdout:?}"
+    );
+    let all_html = read_export(&out_path);
+    assert!(all_html.contains("to-x-only"));
+    assert!(
+        all_html.contains("to-y-only"),
+        "--all is the explicit privacy decision to include cross-identity messages"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&scoped_path);
+}
+
+#[test]
 fn export_limit_caps_message_count() {
     let db = TestDb::new();
     for i in 0..5 {

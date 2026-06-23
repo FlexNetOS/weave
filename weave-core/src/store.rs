@@ -88,6 +88,12 @@ pub trait Store: Send {
         limit: i64,
     ) -> Result<(Vec<Message>, i64)>;
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>>;
+    /// Explicit whole-store message export/listing. Unlike [`Store::history`],
+    /// this is **not identity-scoped**: it returns every non-expired message row
+    /// newest-capped, then oldest-first for display/export stability. Keep this
+    /// behind explicit caller intent (`weave export --all`) because it crosses
+    /// every peer/privacy boundary in the local store.
+    fn all_messages(&self, limit: i64) -> Result<Vec<Message>>;
     /// Full-text search over messages using FTS5. Returns matching messages
     /// newest-first, capped at `limit`. Read-only.
     fn search(&self, query: &str, limit: i64) -> Result<Vec<Message>>;
@@ -3281,6 +3287,23 @@ impl Store for SqliteStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             v
         };
+        rows.reverse();
+        Ok(rows)
+    }
+
+    fn all_messages(&self, limit: i64) -> Result<Vec<Message>> {
+        // WL-038: opportunistic sweep so whole-DB export never surfaces expired rows.
+        let _ = self.sweep_expired_messages();
+        let limit = clamp_limit(limit);
+        let now_cut = now();
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM messages
+             WHERE (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let mut rows: Vec<Message> = stmt
+            .query_map(params![limit, now_cut], row_to_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.reverse();
         Ok(rows)
     }
@@ -6653,6 +6676,18 @@ mod tests {
         s.send("c", "d", None, "x", None, None).unwrap();
         let h = s.history("a", Some("b"), 50).unwrap();
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn all_messages_crosses_identity_scope_explicitly() {
+        let s = mem();
+        s.send("a", "b", None, "1", None, None).unwrap();
+        s.send("c", "d", None, "2", None, None).unwrap();
+        assert_eq!(s.history("a", None, 50).unwrap().len(), 1);
+        let all = s.all_messages(50).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].body, "1");
+        assert_eq!(all[1].body, "2");
     }
 
     #[test]

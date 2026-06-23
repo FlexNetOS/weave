@@ -971,11 +971,16 @@ enum Cmd {
     Slack,
     /// WL-034: export a mailbox to a single self-contained, offline-openable HTML
     /// file with client-side search (no external assets, no CDN). Exports the
-    /// caller's mailbox (sender / recipient / broadcast scope) via `history`.
+    /// caller's mailbox (sender / recipient / broadcast scope) via `history`, or
+    /// the whole local message table only with explicit `--all`.
     Export {
         /// Output path for the `.html` bundle.
         #[arg(long)]
         out: PathBuf,
+        /// Export every non-expired message in the local store. This crosses all
+        /// identities; use deliberately. Mutually exclusive with `--for`.
+        #[arg(long, conflicts_with = "for_id")]
+        all: bool,
         /// Identity whose mailbox to export. Falls back to `resolve_me()`
         /// (`$WEAVE_SESSION` > basename(cwd)) when omitted.
         #[arg(long = "for")]
@@ -5345,19 +5350,28 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Export { out, for_id, limit } => {
-            let (me, explicit) = resolve_me_explicit(for_id, None, &cfg);
-            // Honor the identity cap / control-char rejection on the resolved id
-            // before it reaches the store query.
-            weave_core::store::check_ident("identity", &me)?;
-            refresh_presence(store, &me, explicit);
+        Cmd::Export {
+            out,
+            all,
+            for_id,
+            limit,
+        } => {
             let limit = limit.unwrap_or(10_000) as i64;
-            let rows = store.history(&me, None, limit)?;
+            let (rows, scope) = if all {
+                (store.all_messages(limit)?, "all identities".to_string())
+            } else {
+                let (me, explicit) = resolve_me_explicit(for_id, None, &cfg);
+                // Honor the identity cap / control-char rejection on the resolved id
+                // before it reaches the store query.
+                weave_core::store::check_ident("identity", &me)?;
+                refresh_presence(store, &me, explicit);
+                (store.history(&me, None, limit)?, format!("'{me}'"))
+            };
             let html = weave_core::export::render_mailbox_html(&rows);
             std::fs::write(&out, html)
                 .with_context(|| format!("failed to write export to {}", out.display()))?;
             println!(
-                "exported {} message(s) for '{me}' -> {}",
+                "exported {} message(s) for {scope} -> {}",
                 rows.len(),
                 out.display()
             );
