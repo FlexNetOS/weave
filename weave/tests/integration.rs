@@ -6334,6 +6334,7 @@ fn doctor_json_and_human_surface_liveness_counts() {
         "peers_alive_local",
         "peers_alive_remote",
         "peers_stale",
+        "peer_statuses",
     ] {
         assert!(v.get(k).is_some(), "doctor --json missing key {k}: {out}");
     }
@@ -8999,6 +9000,7 @@ fn scan_and_doctor_surface_shared_target_misregistration() {
             .find(|r| r["name"] == name)
             .unwrap_or_else(|| panic!("missing {name}: {peers_json}"));
         assert_eq!(row["misregistered"].as_bool(), Some(true), "row: {row}");
+        assert_eq!(row["status"].as_str(), Some("misregistered"), "row: {row}");
     }
 
     let scan = run_ok(&db, &["scan"]);
@@ -9013,6 +9015,101 @@ fn scan_and_doctor_surface_shared_target_misregistration() {
         doc["peers_misregistered"].as_i64(),
         Some(2),
         "doctor: {doc}"
+    );
+    assert_eq!(
+        doc["peer_statuses"]["misregistered"].as_i64(),
+        Some(2),
+        "doctor status counts: {doc}"
+    );
+}
+
+/// A peer that recently answered a tracked ask is classified as responsive even if
+/// its original one-shot registration process has already exited. This is the
+/// read-time status layer doctor/scan use to avoid stale-only summaries.
+#[test]
+fn peers_scan_and_doctor_surface_responsive_status() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "resp"]);
+    let opened = run_ok(
+        &db,
+        &["ask", "--from", "alice", "--to", "resp", "--body", "ping"],
+    );
+    let cid = extract_cid(&opened);
+    run_ok(
+        &db,
+        &["answer", "--from", "resp", "--id", &cid, "--body", "pong"],
+    );
+
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers json");
+    let row = peers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "resp")
+        .unwrap_or_else(|| panic!("missing resp: {peers_json}"));
+    assert_eq!(row["status"].as_str(), Some("responsive"), "row: {row}");
+
+    let scan_json = run_ok(&db, &["scan", "--json"]);
+    let scan: serde_json::Value = serde_json::from_str(&scan_json).expect("scan json");
+    let row = scan
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "resp")
+        .unwrap_or_else(|| panic!("missing resp: {scan_json}"));
+    assert_eq!(row["status"].as_str(), Some("responsive"), "row: {row}");
+
+    let doctor = run_ok(&db, &["doctor", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&doctor).expect("doctor json");
+    assert_eq!(
+        doc["peer_statuses"]["responsive"].as_i64(),
+        Some(1),
+        "doctor responsive count: {doc}"
+    );
+}
+
+/// A stale store-only peer gets the explicit registered-stale status rather than
+/// being collapsed into online/offline or the generic non-injectable bucket.
+#[test]
+fn peers_scan_and_doctor_surface_registered_stale_status() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "cold"]);
+
+    let peers_json = run_ok(&db, &["peers", "--json"]);
+    let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers json");
+    let row = peers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "cold")
+        .unwrap_or_else(|| panic!("missing cold: {peers_json}"));
+    assert_eq!(
+        row["status"].as_str(),
+        Some("registered-stale"),
+        "row: {row}"
+    );
+
+    let scan_json = run_ok(&db, &["scan", "--json"]);
+    let scan: serde_json::Value = serde_json::from_str(&scan_json).expect("scan json");
+    let row = scan
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "cold")
+        .unwrap_or_else(|| panic!("missing cold: {scan_json}"));
+    assert_eq!(
+        row["status"].as_str(),
+        Some("registered-stale"),
+        "row: {row}"
+    );
+
+    let doctor = run_ok(&db, &["doctor", "--json"]);
+    let doc: serde_json::Value = serde_json::from_str(&doctor).expect("doctor json");
+    assert_eq!(
+        doc["peer_statuses"]["registered-stale"].as_i64(),
+        Some(1),
+        "doctor registered-stale count: {doc}"
     );
 }
 

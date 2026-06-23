@@ -2416,6 +2416,7 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             store::Liveness::Stale => peers_stale += 1,
         }
     }
+    let peer_statuses = peer_status_counts(store, &views, &ambiguous, &this_host, now_ts);
     let (fed_ok, fed_skipped) = store::federation_status(&extra);
     // On the default sqlite build a remote source cannot be opened — surface how
     // many were skipped purely for lack of the libsql feature so the user is told.
@@ -2490,6 +2491,7 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "peers_alive_remote": peers_alive_remote,
             "peers_stale": peers_stale,
             "peers_misregistered": peers_misregistered,
+            "peer_statuses": peer_statuses,
             "current_socket": target.socket,
             "claude_on_path": claude,
             "federation_stores": extra.len(),
@@ -2648,6 +2650,12 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         println!(
             "  liveness:       {peers_alive_local} local-alive, {peers_alive_remote} remote-alive, {peers_stale} stale"
         );
+        let status_summary = peer_statuses
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  peer status:    {status_summary}");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
         // Signed-identity summary (secret-free): trust/revocation counts, the
         // strict-verify mode, and this session's OWN fingerprint (never the secret).
@@ -2778,6 +2786,69 @@ fn scan_liveness_reason(p: &model::Peer, liveness: store::Liveness) -> String {
         store::Liveness::AliveRemote => "alive (remote, ttl)".to_string(),
         store::Liveness::Stale => "stale".to_string(),
     }
+}
+
+const PEER_RESPONSIVE_SECS: i64 = 15 * 60;
+
+fn peer_recently_responded(store: &dyn Store, name: &str, now_ts: i64) -> bool {
+    store
+        .list_asks(name, model::AskRole::Askee, 50)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|a| {
+            matches!(a.state, model::AskState::Answered | model::AskState::Acked)
+                && now_ts.saturating_sub(a.updated_ts) <= PEER_RESPONSIVE_SECS
+        })
+}
+
+fn peer_status_token(
+    store: &dyn Store,
+    p: &model::Peer,
+    liveness: store::Liveness,
+    misregistered: bool,
+    now_ts: i64,
+) -> &'static str {
+    if misregistered {
+        return "misregistered";
+    }
+    if peer_recently_responded(store, &p.name, now_ts) {
+        return "responsive";
+    }
+    let target = inject::Target::from_peer(p);
+    match inject::capability(&target) {
+        inject::Capability::Live => "reachable",
+        inject::Capability::RegisteredNotAlive => "dead",
+        inject::Capability::NotInjectable => {
+            if matches!(liveness, store::Liveness::Stale) {
+                "registered-stale"
+            } else {
+                "non-injectable"
+            }
+        }
+    }
+}
+
+fn peer_status_counts(
+    store: &dyn Store,
+    views: &[store::PeerView],
+    ambiguous: &std::collections::BTreeSet<&str>,
+    this_host: &str,
+    now_ts: i64,
+) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for v in views {
+        let p = &v.peer;
+        let liveness = store::liveness_for(p, this_host, now_ts);
+        let status = peer_status_token(
+            store,
+            p,
+            liveness,
+            ambiguous.contains(p.name.as_str()),
+            now_ts,
+        );
+        *counts.entry(status).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// Build a `name -> Peer` map of the LOCAL store's peers for a display-layer tag
@@ -4672,6 +4743,8 @@ fn main() -> Result<()> {
                     .map(|v| {
                         let p = &v.peer;
                         let liveness = store::liveness_for(p, &this_host, now_ts);
+                        let misregistered = ambiguous.contains(p.name.as_str());
+                        let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                         serde_json::json!({
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "socket": p.socket, "cwd": p.cwd,
@@ -4688,9 +4761,10 @@ fn main() -> Result<()> {
                             "online": is_alive(p),
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
+                            "status": status,
                             "remote": p.host != this_host,
                             "injectable": inject::Target::from_peer(p).injectable(),
-                            "misregistered": ambiguous.contains(p.name.as_str()),
+                            "misregistered": misregistered,
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -4710,8 +4784,10 @@ fn main() -> Result<()> {
                     };
                     let presence = if is_alive(p) { "online" } else { "offline" };
                     let liveness = store::liveness_for(p, &this_host, now_ts);
+                    let misregistered = ambiguous.contains(p.name.as_str());
+                    let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                     let mut reason = scan_liveness_reason(p, liveness);
-                    if ambiguous.contains(p.name.as_str()) {
+                    if misregistered {
                         reason.push_str(", misregistered(shared-target)");
                     }
                     let remote_marker = if p.host != this_host { " <remote>" } else { "" };
@@ -4725,7 +4801,7 @@ fn main() -> Result<()> {
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
                     println!(
-                        "{}{remote_marker} [{presence}] [{reason}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
+                        "{}{remote_marker} [{presence}] [{reason}] [status={status}]{ts_marker} [{}] {} ({inj}){tags}{desc} seen {}{via}",
                         p.name,
                         p.mux,
                         tgt,
@@ -4992,6 +5068,8 @@ fn main() -> Result<()> {
                     .map(|v| {
                         let p = &v.peer;
                         let liveness = store::liveness_for(p, &this_host, now_ts);
+                        let misregistered = ambiguous.contains(p.name.as_str());
+                        let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                         serde_json::json!({
                             "name": p.name,
                             "repo": p.repo,
@@ -5009,8 +5087,9 @@ fn main() -> Result<()> {
                             "description_ts": p.description_ts,
                             "alive": is_alive(p),
                             "liveness": liveness.token(),
+                            "status": status,
                             "remote": p.host != this_host,
-                            "misregistered": ambiguous.contains(p.name.as_str()),
+                            "misregistered": misregistered,
                             "origin": v.origin.label(),
                             "foreign": v.origin.is_foreign(),
                         })
@@ -5027,8 +5106,10 @@ fn main() -> Result<()> {
                 for v in &views {
                     let p = &v.peer;
                     let liveness = store::liveness_for(p, &this_host, now_ts);
+                    let misregistered = ambiguous.contains(p.name.as_str());
+                    let status = peer_status_token(store, p, liveness, misregistered, now_ts);
                     let mut reason = scan_liveness_reason(p, liveness);
-                    if ambiguous.contains(p.name.as_str()) {
+                    if misregistered {
                         reason.push_str(", misregistered(shared-target)");
                     }
                     match liveness {
@@ -5054,7 +5135,7 @@ fn main() -> Result<()> {
                     let ts_marker = fmt_turn_state(p);
                     let desc = fmt_description(p);
                     println!(
-                        "{}{remote_marker} [{reason}]{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
+                        "{}{remote_marker} [{reason}] [status={status}]{ts_marker} repo={repo} branch={branch} worktree={wt} mux={} pane={pane} host={host}{desc}{via}",
                         p.name, p.mux
                     );
                 }
