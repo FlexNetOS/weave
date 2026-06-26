@@ -13431,8 +13431,25 @@ mod surfaces_dashboard {
 
         let events = http_get(dash.port, "/api/events", Some("secret-tok"));
         assert!(
-            events.starts_with("HTTP/1.1 200") && events.contains("hello-dash"),
+            events.starts_with("HTTP/1.1 200")
+                && events.contains("\"events\"")
+                && events.contains("hello-dash"),
             "events JSON exposes mesh feed: {events}"
+        );
+
+        let recovery = http_get(dash.port, "/events?since=0", Some("secret-tok"));
+        assert!(
+            recovery.starts_with("HTTP/1.1 200")
+                && recovery.contains("application/json")
+                && recovery.contains("hello-dash"),
+            "repowire-style gap recovery returns JSON events: {recovery}"
+        );
+        let caught_up = http_get(dash.port, "/events?since=999999999", Some("secret-tok"));
+        assert!(
+            caught_up.starts_with("HTTP/1.1 200")
+                && caught_up.contains("\"events\": []")
+                && !caught_up.contains("hello-dash"),
+            "since filters already-seen events: {caught_up}"
         );
 
         let asks = http_get(dash.port, "/asks/pending", Some("secret-tok"));
