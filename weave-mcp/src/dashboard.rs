@@ -200,6 +200,10 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
     b.push_str("</div></section><section class=\"panel\"><h2>Pending questions</h2><div class=\"panel-body\">");
     render_pending_questions(&mut b, snap);
     b.push_str(
+        "</div></section><section class=\"panel\"><h2>Selected job</h2><div class=\"panel-body\">",
+    );
+    render_selected_job_detail(&mut b, snap);
+    b.push_str(
         "</div></section><section class=\"panel\"><h2>Actions</h2><div class=\"panel-body\">",
     );
     render_action_forms(&mut b, snap);
@@ -365,6 +369,104 @@ fn detail_item(b: &mut String, label: &str, value: &str) {
     b.push_str(&html_escape(label));
     b.push_str("</span>");
     b.push_str(&html_escape(value));
+    b.push_str("</div>");
+}
+
+fn render_selected_job_detail(b: &mut String, snap: &DashboardSnapshot) {
+    let Some(j) = snap.jobs.first() else {
+        b.push_str("<p class=\"empty\">select a job to inspect state, ownership, progress, result, cancellation, and retry context</p>");
+        return;
+    };
+    b.push_str("<div class=\"detail-grid\">");
+    detail_item(b, "id", &j.id);
+    detail_item(b, "title", &j.title);
+    detail_item(b, "state", j.state.as_str());
+    detail_item(b, "kind", &j.kind);
+    detail_item(b, "creator", &j.creator);
+    detail_item(b, "owner", j.owner.as_deref().unwrap_or("-"));
+    detail_item(b, "assignee", j.assignee.as_deref().unwrap_or("-"));
+    detail_item(b, "phase", j.phase.as_deref().unwrap_or("-"));
+    detail_item(
+        b,
+        "progress note",
+        j.progress_note.as_deref().unwrap_or("-"),
+    );
+    detail_item(
+        b,
+        "result summary",
+        j.result_summary.as_deref().unwrap_or("-"),
+    );
+    detail_item(b, "opened", &fmt_ts(j.opened_ts));
+    detail_item(b, "updated", &fmt_ts(j.updated_ts));
+    detail_item(
+        b,
+        "deadline",
+        &j.deadline_at.map(fmt_ts).unwrap_or_else(|| "-".to_string()),
+    );
+    detail_item(
+        b,
+        "expires",
+        &j.expires_at.map(fmt_ts).unwrap_or_else(|| "-".to_string()),
+    );
+    detail_item(
+        b,
+        "cancel requested",
+        if j.cancel_requested { "yes" } else { "no" },
+    );
+    detail_item(
+        b,
+        "cancel reason",
+        j.cancel_reason.as_deref().unwrap_or("-"),
+    );
+    b.push_str("</div>");
+    if !j.description.is_empty() {
+        b.push_str("<h2>Description</h2><div class=\"event-body\">");
+        b.push_str(&html_escape(&j.description));
+        b.push_str("</div>");
+    }
+    if let Some(prompt) = j.prompt.as_deref().filter(|s| !s.is_empty()) {
+        b.push_str("<h2>Prompt</h2><div class=\"event-body\">");
+        b.push_str(&html_escape(prompt));
+        b.push_str("</div>");
+    }
+    render_job_progress_events(b, j);
+    b.push_str("<p class=\"muted\">Read API: <code>/jobs/");
+    b.push_str(&html_escape(&j.id));
+    b.push_str("/status</code> and <code>/jobs/");
+    b.push_str(&html_escape(&j.id));
+    b.push_str("/result</code>.</p>");
+}
+
+fn render_job_progress_events(b: &mut String, j: &Job) {
+    b.push_str("<h2>Progress timeline</h2>");
+    let events = serde_json::from_str::<serde_json::Value>(&j.progress_events_json)
+        .unwrap_or_else(|_| serde_json::json!([]));
+    let Some(events) = events.as_array() else {
+        b.push_str("<p class=\"empty\">no progress events</p>");
+        return;
+    };
+    if events.is_empty() {
+        b.push_str("<p class=\"empty\">no progress events</p>");
+        return;
+    }
+    b.push_str("<div class=\"feed\">");
+    for ev in events.iter().rev().take(8) {
+        let at = ev.get("at").and_then(|v| v.as_i64()).map(fmt_ts);
+        let state = ev.get("state").and_then(|v| v.as_str()).unwrap_or("-");
+        let phase = ev.get("phase").and_then(|v| v.as_str()).unwrap_or("-");
+        let note = ev.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        b.push_str("<article class=\"event\"><div class=\"event-meta\">");
+        b.push_str(&html_escape(at.as_deref().unwrap_or("-")));
+        b.push_str(" · ");
+        b.push_str(&html_escape(state));
+        if phase != "-" {
+            b.push_str(" · ");
+            b.push_str(&html_escape(phase));
+        }
+        b.push_str("</div><div class=\"event-body\">");
+        b.push_str(&html_escape(note));
+        b.push_str("</div></article>");
+    }
     b.push_str("</div>");
 }
 

@@ -205,6 +205,9 @@ fn handle_dashboard_connection(
         if let Some(job_id) = job_status_id_from_path(&path) {
             return serve_dashboard_job_status_json(stream, store, job_id);
         }
+        if let Some(job_id) = job_result_id_from_path(&path) {
+            return serve_dashboard_job_result_json(stream, store, job_id);
+        }
         return match route(&method, &path) {
             Route::Page => serve_dashboard_page(stream, store),
             Route::Events => serve_dashboard_events(stream, store),
@@ -349,6 +352,9 @@ fn handle_connection(
             }
             if let Some(job_id) = job_status_id_from_path(&path) {
                 return serve_dashboard_job_status_json(stream, store, job_id);
+            }
+            if let Some(job_id) = job_result_id_from_path(&path) {
+                return serve_dashboard_job_result_json(stream, store, job_id);
             }
             match route(&method, &path) {
                 Route::Page => return serve_dashboard_page(stream, store),
@@ -819,6 +825,17 @@ fn job_status_id_from_path(path: &str) -> Option<&str> {
 }
 
 #[cfg(feature = "surfaces")]
+fn job_result_id_from_path(path: &str) -> Option<&str> {
+    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let rest = path.strip_prefix("/jobs/")?;
+    let job_id = rest.strip_suffix("/result")?;
+    if job_id.is_empty() || job_id.contains('/') {
+        return None;
+    }
+    Some(job_id)
+}
+
+#[cfg(feature = "surfaces")]
 fn dashboard_snapshot_json(
     store: &dyn weave_core::store::Store,
 ) -> anyhow::Result<serde_json::Value> {
@@ -985,6 +1002,19 @@ fn serve_dashboard_job_status_json(
 ) -> anyhow::Result<()> {
     match store.get_job(job_id)? {
         Some(job) => write_http_json(stream, &serde_json::json!({"job": job_summary_json(&job)}))?,
+        None => write_http(stream, 404, b"Not Found")?,
+    }
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_job_result_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    match store.job_result(job_id)? {
+        Some(result) => write_http_json(stream, &serde_json::json!({"result": result}))?,
         None => write_http(stream, 404, b"Not Found")?,
     }
     Ok(())

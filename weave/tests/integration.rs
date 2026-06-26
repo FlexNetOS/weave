@@ -13445,6 +13445,102 @@ mod surfaces_dashboard {
         );
     }
 
+    /// The repowire-style browser surface exposes the selected job with full
+    /// detail (phase/progress/result/cancel metadata) and a `/jobs/{id}/result`
+    /// read endpoint, not just the compact job card/list.
+    #[test]
+    fn dashboard_selected_job_detail_and_result_endpoint() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let created = run_ok(
+            &db,
+            &[
+                "job",
+                "create",
+                "--title",
+                "dashboard detail job",
+                "--desc",
+                "rich detail body",
+                "--from",
+                "alice",
+                "--json",
+            ],
+        );
+        let v: serde_json::Value = serde_json::from_str(&created).expect("job create json");
+        let job_id = v["job"]["id"].as_str().expect("job id").to_string();
+        let claimed = run_ok(&db, &["job", "claim", &job_id, "--as", "bob", "--json"]);
+        let v: serde_json::Value = serde_json::from_str(&claimed).expect("job claim json");
+        let attempt = v["job"]["attempt_id"]
+            .as_str()
+            .expect("attempt id")
+            .to_string();
+        run_ok(
+            &db,
+            &[
+                "job",
+                "update",
+                &job_id,
+                "--attempt",
+                &attempt,
+                "--note",
+                "detail halfway",
+                "--json",
+            ],
+        );
+        run_ok(
+            &db,
+            &[
+                "job",
+                "update",
+                &job_id,
+                "--attempt",
+                &attempt,
+                "--state",
+                "completed",
+                "--result-summary",
+                "detail shipped",
+                "--result",
+                r#"{"ok":true,"ui":"dashboard"}"#,
+                "--json",
+            ],
+        );
+
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("Selected job")
+                && page.contains("dashboard detail job")
+                && page.contains("rich detail body")
+                && page.contains("detail halfway")
+                && page.contains("detail shipped")
+                && page.contains(&format!("/jobs/{job_id}/result")),
+            "selected job detail should render lifecycle/result fields: {page}"
+        );
+
+        let status = http_get(
+            dash.port,
+            &format!("/jobs/{job_id}/status"),
+            Some("secret-tok"),
+        );
+        assert!(
+            status.contains("\"result_summary\": \"detail shipped\"")
+                && status.contains("\"progress_events\""),
+            "job status should include progress and summary: {status}"
+        );
+
+        let result = http_get(
+            dash.port,
+            &format!("/jobs/{job_id}/result"),
+            Some("secret-tok"),
+        );
+        assert!(
+            result.contains("\"ready\": true")
+                && result.contains("\"result_summary\": \"detail shipped\"")
+                && result.contains("dashboard"),
+            "job result endpoint should expose terminal payload: {result}"
+        );
+    }
+
     /// A read-only dashboard (no `--write`) refuses the action API with 403 — the
     /// safe default; writes require the explicit opt-in.
     #[test]
