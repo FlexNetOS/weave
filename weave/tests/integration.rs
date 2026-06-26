@@ -12929,6 +12929,7 @@ fn post_send_hook_fires_with_env_and_skips_non_match() {
 #[cfg(feature = "surfaces")]
 mod surfaces_dashboard {
     use super::{run_env, run_ok, scrub_env, weave_bin, TestDb};
+    use crate::common::unique_db;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
@@ -12958,7 +12959,7 @@ mod surfaces_dashboard {
     /// Spawn `weave dashboard --port P --token T` against `db`, then poll the
     /// port until it accepts a connection (or time out).
     fn spawn_dashboard(db: &TestDb, token: &str) -> Dashboard {
-        spawn_dashboard_inner(db, token, false)
+        spawn_dashboard_inner(db, token, false, &[])
     }
 
     /// Shared, race-robust spawner for both the read-only and `--write` dashboards.
@@ -12973,7 +12974,12 @@ mod surfaces_dashboard {
     /// **child-exited-before-listening** as the collision signal and retry with a
     /// fresh port; readiness requires our child to be *alive* AND the port to
     /// accept, which (since only one process can hold a port) means it's ours.
-    fn spawn_dashboard_inner(db: &TestDb, token: &str, write: bool) -> Dashboard {
+    fn spawn_dashboard_inner(
+        db: &TestDb,
+        token: &str,
+        write: bool,
+        extra_env: &[(&str, &str)],
+    ) -> Dashboard {
         for _attempt in 0..8 {
             let port = free_port();
             let mut cmd = Command::new(weave_bin());
@@ -12983,6 +12989,9 @@ mod surfaces_dashboard {
             }
             scrub_env(&mut cmd);
             cmd.env("WEAVE_DB", db.path_str());
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
             let mut child = cmd
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -13046,7 +13055,15 @@ mod surfaces_dashboard {
     /// Spawn `weave dashboard --write` (WL-052a): the read-only server plus the
     /// bearer-gated `POST /api` action surface.
     fn spawn_dashboard_write(db: &TestDb, token: &str) -> Dashboard {
-        spawn_dashboard_inner(db, token, true)
+        spawn_dashboard_inner(db, token, true, &[])
+    }
+
+    fn spawn_dashboard_write_env(
+        db: &TestDb,
+        token: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Dashboard {
+        spawn_dashboard_inner(db, token, true, extra_env)
     }
 
     /// Send a raw `POST <path>` with a JSON body (optionally bearer) and return the
@@ -13316,6 +13333,63 @@ mod surfaces_dashboard {
                 && (spawn.contains("\"isError\":true") || spawn.contains("\"isError\": true"))
                 && spawn.contains("spawn_allowed_dirs"),
             "spawn form should route to canonical tool and deny without allowlist: {spawn}"
+        );
+    }
+
+    /// The repowire-style settings surface shows token-free runtime posture:
+    /// write mode, circle, spawn allowlist, bridge/bot booleans, and safety knobs
+    /// without leaking configured secret values.
+    #[test]
+    fn dashboard_settings_panel_and_json_are_token_free() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let allow = unique_db().with_extension("spawn-allow");
+        std::fs::create_dir_all(&allow).unwrap();
+        let allow = std::fs::canonicalize(&allow).unwrap();
+        let allow_s = allow.to_string_lossy().into_owned();
+        let dash = spawn_dashboard_write_env(
+            &db,
+            "secret-tok",
+            &[
+                ("WEAVE_CIRCLE", "dash-circle"),
+                ("WEAVE_SPAWN_DIRS", &allow_s),
+                ("WEAVE_BRIDGE_IDENTITY", "dash-bridge"),
+                ("WEAVE_TELEGRAM_TOKEN", "telegram-secret-value"),
+                ("WEAVE_PRETOOLUSE_APPROVER", "security-peer"),
+            ],
+        );
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("<h2>Settings</h2>")
+                && page.contains("dash-circle")
+                && page.contains("enabled")
+                && page.contains("dash-bridge")
+                && page.contains(&allow_s),
+            "settings panel should render token-free config posture: {page}"
+        );
+        assert!(
+            !page.contains("telegram-secret-value"),
+            "settings panel must not leak secret tokens: {page}"
+        );
+
+        let settings = http_get(dash.port, "/settings", Some("secret-tok"));
+        assert!(
+            settings.contains("\"write_enabled\": true")
+                && settings.contains("\"circle\": \"dash-circle\"")
+                && settings.contains("\"telegram_configured\": true")
+                && settings.contains("\"pretooluse_approver_configured\": true")
+                && settings.contains(&allow_s),
+            "settings JSON should expose redacted posture: {settings}"
+        );
+        assert!(
+            !settings.contains("telegram-secret-value"),
+            "settings JSON must not leak secret tokens: {settings}"
+        );
+
+        let snapshot = http_get(dash.port, "/api/snapshot", Some("secret-tok"));
+        assert!(
+            snapshot.contains("\"settings\"") && snapshot.contains("\"dash-circle\""),
+            "snapshot should include settings posture: {snapshot}"
         );
     }
 

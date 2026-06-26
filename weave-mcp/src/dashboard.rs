@@ -93,6 +93,8 @@ pub enum Route {
     JobsJson,
     /// `GET /asks/pending` — repowire-dashboard compatibility pending question list.
     AsksPendingJson,
+    /// `GET /settings` / `/api/settings` — token-free dashboard config posture.
+    SettingsJson,
     /// `GET /health` — read-only dashboard API health.
     HealthJson,
     /// `POST /` — the existing MCP JSON-RPC surface (left untouched).
@@ -116,6 +118,8 @@ pub fn route(method: &str, path: &str) -> Route {
         ("GET", "/peers") => Route::PeersJson,
         ("GET", "/jobs") => Route::JobsJson,
         ("GET", "/asks/pending") => Route::AsksPendingJson,
+        ("GET", "/settings") => Route::SettingsJson,
+        ("GET", "/api/settings") => Route::SettingsJson,
         ("GET", "/health") => Route::HealthJson,
         ("POST", "/") => Route::JsonRpc,
         _ => Route::NotFound,
@@ -130,8 +134,8 @@ fn query_has_key(query: &str, wanted: &str) -> bool {
 }
 
 /// A read-only snapshot of mesh state for one dashboard render. Composed by the
-/// caller from existing `Store` reads (`list_peers` / `inbox` / `list_jobs` /
-/// `list_leases` / `list_schedules`) — this module never opens the DB.
+/// caller from existing `Store` reads plus token-free runtime config posture —
+/// this module never opens the DB or reads env/config directly.
 #[derive(Debug, Default, Clone)]
 pub struct DashboardSnapshot {
     pub peers: Vec<Peer>,
@@ -140,6 +144,29 @@ pub struct DashboardSnapshot {
     pub asks: Vec<Ask>,
     pub leases: Vec<Lease>,
     pub schedules: Vec<Schedule>,
+    pub settings: DashboardSettings,
+}
+
+/// Token-free dashboard/runtime posture. Booleans and counts are fine; secret
+/// values (bearer tokens, bot tokens, libSQL auth, pull tokens, proxy credentials)
+/// never appear here.
+#[derive(Debug, Default, Clone)]
+pub struct DashboardSettings {
+    pub circle: String,
+    pub write_enabled: bool,
+    pub spawn_allowed_dirs: Vec<String>,
+    pub peer_db_count: usize,
+    pub pull_from_count: usize,
+    pub inject_pulled: bool,
+    pub allow_inject_from_count: Option<usize>,
+    pub bridge_identity: String,
+    pub telegram_configured: bool,
+    pub slack_configured: bool,
+    pub pretooluse_approver_configured: bool,
+    pub pretooluse_timeout_secs: i64,
+    pub obscura_allow_ops: Vec<String>,
+    pub obscura_allow_domains: Vec<String>,
+    pub obscura_allow_internal: bool,
 }
 
 /// Presence TTL (seconds): a peer last seen within this window of `now` renders as
@@ -211,6 +238,10 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
         "</div></section><section class=\"panel\"><h2>Danger zone</h2><div class=\"panel-body\">",
     );
     render_danger_zone(&mut b, snap);
+    b.push_str(
+        "</div></section><section class=\"panel\"><h2>Settings</h2><div class=\"panel-body\">",
+    );
+    render_settings_panel(&mut b, snap);
     b.push_str(
         "</div></section><section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">",
     );
@@ -680,6 +711,90 @@ fn render_danger_zone(b: &mut String, snap: &DashboardSnapshot) {
     b.push_str("<p class=\"muted\">Preview the peer/mux target first; submitting calls <code>weave_kill_peer</code> through the bearer-gated write API.</p>");
     b.push_str("<button type=\"submit\">Kill selected peer</button></form>");
     b.push_str("</div>");
+}
+
+fn render_settings_panel(b: &mut String, snap: &DashboardSnapshot) {
+    let s = &snap.settings;
+    b.push_str("<div class=\"detail-grid\">");
+    detail_item(b, "circle", &s.circle);
+    detail_item(
+        b,
+        "write API",
+        if s.write_enabled {
+            "enabled"
+        } else {
+            "read-only"
+        },
+    );
+    detail_item(
+        b,
+        "spawn allowlist",
+        &format!("{} dirs", s.spawn_allowed_dirs.len()),
+    );
+    detail_item(b, "peer dbs", &s.peer_db_count.to_string());
+    detail_item(b, "pull from", &s.pull_from_count.to_string());
+    detail_item(
+        b,
+        "inject pulled",
+        if s.inject_pulled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    detail_item(
+        b,
+        "allow inject from",
+        &s.allow_inject_from_count
+            .map(|n| format!("{n} narrowed"))
+            .unwrap_or_else(|| "same as pull_from".to_string()),
+    );
+    detail_item(b, "bridge identity", &s.bridge_identity);
+    detail_item(
+        b,
+        "telegram",
+        if s.telegram_configured {
+            "configured"
+        } else {
+            "not configured"
+        },
+    );
+    detail_item(
+        b,
+        "slack",
+        if s.slack_configured {
+            "configured"
+        } else {
+            "not configured"
+        },
+    );
+    detail_item(
+        b,
+        "pretooluse approver",
+        if s.pretooluse_approver_configured {
+            "configured"
+        } else {
+            "not configured"
+        },
+    );
+    detail_item(
+        b,
+        "pretooluse timeout",
+        &format!("{}s", s.pretooluse_timeout_secs),
+    );
+    b.push_str("</div>");
+    if s.spawn_allowed_dirs.is_empty() {
+        b.push_str("<p class=\"muted\">Spawn allowlist is empty, so dashboard/MCP spawn requests are denied by default.</p>");
+    } else {
+        b.push_str("<h2>Spawn allowed dirs</h2><ul>");
+        for dir in s.spawn_allowed_dirs.iter().take(8) {
+            b.push_str("<li><code>");
+            b.push_str(&html_escape(dir));
+            b.push_str("</code></li>");
+        }
+        b.push_str("</ul>");
+    }
+    b.push_str("<p class=\"muted\">Token-free JSON: <code>/settings</code> or <code>/api/settings</code>. Secrets are reported only as configured/not configured.</p>");
 }
 
 fn input(b: &mut String, name: &str, label: &str, value: &str) {

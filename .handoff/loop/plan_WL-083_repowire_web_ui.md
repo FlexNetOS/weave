@@ -205,3 +205,18 @@ Added the first browser-visible spawn/kill parity surface with explicit safety p
 - Integration coverage proves the panel renders and that spawn form submission
   reaches the canonical tool while preserving deny-by-default allowlist behavior
   before any mux command can run.
+
+## 2026-06-26 settings/config posture slice
+
+Added the first Rust-native settings surface for upstream settings-dialog parity:
+
+- The dashboard now renders a Settings panel with token-free runtime posture:
+  circle, write/read-only mode, spawn allowlist count/paths, federation counts,
+  inject-pulled policy, bridge identity, bot configured booleans, PreToolUse
+  approver/timeout posture, and obscura policy fields.
+- `GET /settings` and `GET /api/settings` expose the same token-free posture as
+  JSON, and `/api/snapshot` now embeds it under `settings`.
+- Secret values remain redacted by construction: tokens are reported only as
+  configured/not configured and never copied into the dashboard snapshot.
+- Integration coverage proves the settings panel/JSON reflect env-overlaid
+  config while not leaking a configured Telegram token.

@@ -209,13 +209,14 @@ fn handle_dashboard_connection(
             return serve_dashboard_job_result_json(stream, store, job_id);
         }
         return match route(&method, &path) {
-            Route::Page => serve_dashboard_page(stream, store),
-            Route::Events => serve_dashboard_events(stream, store),
-            Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store),
+            Route::Page => serve_dashboard_page(stream, store, write),
+            Route::Events => serve_dashboard_events(stream, store, write),
+            Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store, write),
             Route::PeersJson => serve_dashboard_peers_json(stream, store),
             Route::EventsJson => serve_dashboard_events_json(stream, store, &path),
             Route::JobsJson => serve_dashboard_jobs_json(stream, store),
             Route::AsksPendingJson => serve_dashboard_asks_pending_json(stream, store),
+            Route::SettingsJson => serve_dashboard_settings_json(stream, store, write),
             Route::HealthJson => serve_dashboard_health_json(stream),
             _ => {
                 write_http(stream, 404, b"Not Found")?;
@@ -357,13 +358,18 @@ fn handle_connection(
                 return serve_dashboard_job_result_json(stream, store, job_id);
             }
             match route(&method, &path) {
-                Route::Page => return serve_dashboard_page(stream, store),
-                Route::Events => return serve_dashboard_events(stream, store),
-                Route::SnapshotJson => return serve_dashboard_snapshot_json(stream, store),
+                Route::Page => return serve_dashboard_page(stream, store, dangerous),
+                Route::Events => return serve_dashboard_events(stream, store, dangerous),
+                Route::SnapshotJson => {
+                    return serve_dashboard_snapshot_json(stream, store, dangerous)
+                }
                 Route::PeersJson => return serve_dashboard_peers_json(stream, store),
                 Route::EventsJson => return serve_dashboard_events_json(stream, store, &path),
                 Route::JobsJson => return serve_dashboard_jobs_json(stream, store),
                 Route::AsksPendingJson => return serve_dashboard_asks_pending_json(stream, store),
+                Route::SettingsJson => {
+                    return serve_dashboard_settings_json(stream, store, dangerous)
+                }
                 Route::HealthJson => return serve_dashboard_health_json(stream),
                 _ => {
                     write_http(stream, 404, b"Not Found")?;
@@ -671,10 +677,12 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Compose a read-only [`dashboard::DashboardSnapshot`] from existing `Store`
-/// reads. No new SQL, no new trait method — just the existing list/inbox calls.
+/// reads plus token-free runtime settings. No new SQL, no new trait method — just
+/// the existing list/inbox calls.
 #[cfg(feature = "surfaces")]
 fn build_snapshot(
     store: &dyn weave_core::store::Store,
+    write_enabled: bool,
 ) -> anyhow::Result<crate::dashboard::DashboardSnapshot> {
     use weave_core::model::JobFilter;
     let peers = store.list_peers().unwrap_or_default();
@@ -717,7 +725,36 @@ fn build_snapshot(
         asks,
         leases,
         schedules,
+        settings: dashboard_settings(write_enabled),
     })
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_settings(write_enabled: bool) -> crate::dashboard::DashboardSettings {
+    let cfg = weave_core::config::Config::load();
+    crate::dashboard::DashboardSettings {
+        circle: cfg.circle(),
+        write_enabled,
+        spawn_allowed_dirs: cfg.spawn_allowed_dirs.clone().unwrap_or_default(),
+        peer_db_count: cfg.peer_dbs.as_ref().map_or(0, Vec::len),
+        pull_from_count: cfg.pull_from.as_ref().map_or(0, Vec::len),
+        inject_pulled: cfg.inject_pulled(),
+        allow_inject_from_count: cfg.allow_inject_from.as_ref().map(Vec::len),
+        bridge_identity: cfg
+            .bridge_identity
+            .clone()
+            .unwrap_or_else(|| "bridge".to_string()),
+        telegram_configured: cfg.telegram_token.as_deref().is_some_and(|s| !s.is_empty()),
+        slack_configured: cfg.slack_token.as_deref().is_some_and(|s| !s.is_empty()),
+        pretooluse_approver_configured: cfg
+            .pretooluse_approver
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        pretooluse_timeout_secs: cfg.pretooluse_timeout(),
+        obscura_allow_ops: cfg.obscura_allow_ops.clone().unwrap_or_default(),
+        obscura_allow_domains: cfg.obscura_allow_domains.clone().unwrap_or_default(),
+        obscura_allow_internal: cfg.obscura_allow_internal.unwrap_or(false),
+    }
 }
 
 #[cfg(feature = "surfaces")]
@@ -857,8 +894,9 @@ fn job_result_id_from_path(path: &str) -> Option<&str> {
 #[cfg(feature = "surfaces")]
 fn dashboard_snapshot_json(
     store: &dyn weave_core::store::Store,
+    write_enabled: bool,
 ) -> anyhow::Result<serde_json::Value> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, write_enabled)?;
     let now = weave_core::model::now();
     Ok(serde_json::json!({
         "schema": "weave.dashboard.v1",
@@ -875,6 +913,7 @@ fn dashboard_snapshot_json(
         },
         "leases": snap.leases,
         "schedules": snap.schedules,
+        "settings": settings_json(&snap.settings),
     }))
 }
 
@@ -882,8 +921,9 @@ fn dashboard_snapshot_json(
 fn serve_dashboard_snapshot_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
+    write_enabled: bool,
 ) -> anyhow::Result<()> {
-    write_http_json(stream, &dashboard_snapshot_json(store)?)?;
+    write_http_json(stream, &dashboard_snapshot_json(store, write_enabled)?)?;
     Ok(())
 }
 
@@ -892,7 +932,7 @@ fn serve_dashboard_peers_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
 ) -> anyhow::Result<()> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, false)?;
     let now = weave_core::model::now();
     write_http_json(
         stream,
@@ -921,7 +961,7 @@ fn serve_dashboard_events_json(
     store: &dyn weave_core::store::Store,
     path: &str,
 ) -> anyhow::Result<()> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, false)?;
     let since = query_param(path, "since").and_then(parse_event_since);
     let events = snap
         .messages
@@ -944,7 +984,7 @@ fn serve_dashboard_jobs_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
 ) -> anyhow::Result<()> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, false)?;
     write_http_json(
         stream,
         &serde_json::json!({"work": snap.jobs.iter().map(job_summary_json).collect::<Vec<_>>(), "recurring": []}),
@@ -957,7 +997,7 @@ fn serve_dashboard_asks_pending_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
 ) -> anyhow::Result<()> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, false)?;
     write_http_json(
         stream,
         &serde_json::json!({
@@ -1040,6 +1080,41 @@ fn serve_dashboard_job_result_json(
 }
 
 #[cfg(feature = "surfaces")]
+fn settings_json(s: &crate::dashboard::DashboardSettings) -> serde_json::Value {
+    serde_json::json!({
+        "circle": &s.circle,
+        "write_enabled": s.write_enabled,
+        "spawn_allowed_dirs": &s.spawn_allowed_dirs,
+        "peer_db_count": s.peer_db_count,
+        "pull_from_count": s.pull_from_count,
+        "inject_pulled": s.inject_pulled,
+        "allow_inject_from_count": s.allow_inject_from_count,
+        "bridge_identity": &s.bridge_identity,
+        "telegram_configured": s.telegram_configured,
+        "slack_configured": s.slack_configured,
+        "pretooluse_approver_configured": s.pretooluse_approver_configured,
+        "pretooluse_timeout_secs": s.pretooluse_timeout_secs,
+        "obscura_allow_ops": &s.obscura_allow_ops,
+        "obscura_allow_domains": &s.obscura_allow_domains,
+        "obscura_allow_internal": s.obscura_allow_internal,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_settings_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+    write_enabled: bool,
+) -> anyhow::Result<()> {
+    let snap = build_snapshot(store, write_enabled)?;
+    write_http_json(
+        stream,
+        &serde_json::json!({"settings": settings_json(&snap.settings)}),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
 fn serve_dashboard_health_json(stream: &mut TcpStream) -> anyhow::Result<()> {
     write_http_json(
         stream,
@@ -1058,8 +1133,9 @@ fn serve_dashboard_health_json(stream: &mut TcpStream) -> anyhow::Result<()> {
 fn serve_dashboard_page(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
+    write_enabled: bool,
 ) -> anyhow::Result<()> {
-    let snap = build_snapshot(store)?;
+    let snap = build_snapshot(store, write_enabled)?;
     let host = weave_core::config::this_host();
     let html = crate::dashboard::render_dashboard(&snap, weave_core::model::now(), &host);
     write_http_html(stream, &html)?;
@@ -1075,6 +1151,7 @@ fn serve_dashboard_page(
 fn serve_dashboard_events(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
+    write_enabled: bool,
 ) -> anyhow::Result<()> {
     let header = format!(
         "{DEFAULT_PROTOCOL} 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
@@ -1084,7 +1161,7 @@ fn serve_dashboard_events(
     }
     let host = weave_core::config::this_host();
     loop {
-        let snap = build_snapshot(store)?;
+        let snap = build_snapshot(store, write_enabled)?;
         let fragment =
             crate::dashboard::render_events_fragment(&snap, weave_core::model::now(), &host);
         let frame = crate::dashboard::sse_event(&fragment);
