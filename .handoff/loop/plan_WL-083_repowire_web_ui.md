@@ -187,3 +187,21 @@ Expanded the jobs panel toward upstream selected-work detail:
   including `ready`, terminal state, result summary, and terminal payload fields.
 - Integration coverage proves the selected-job HTML renders progress/result
   details and that both status/result endpoints expose the richer job data.
+
+## 2026-06-26 dangerous-control preview slice
+
+Added the first browser-visible spawn/kill parity surface with explicit safety posture:
+
+- The dashboard now renders a Danger zone panel for spawn/kill controls instead
+  of silently omitting the upstream-style session management affordances.
+- Spawn form requires argv JSON and documents the remote-surface gates:
+  dashboard `--write`, injector trusted program policy, and
+  `spawn_allowed_dirs`/`WEAVE_SPAWN_DIRS` cwd allowlist.
+- Kill form is present but explicitly routes through canonical `weave_kill_peer`
+  and warns about coarse zellij/screen behavior.
+- `POST /api/spawn-peer` and `POST /api/kill-peer` are thin form adapters over
+  canonical `weave_spawn_peer`/`weave_kill_peer`; no dashboard-local spawn/kill
+  logic was added.
+- Integration coverage proves the panel renders and that spawn form submission
+  reaches the canonical tool while preserving deny-by-default allowlist behavior
+  before any mux command can run.

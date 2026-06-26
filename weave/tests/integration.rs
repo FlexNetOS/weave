@@ -13286,6 +13286,38 @@ mod surfaces_dashboard {
         );
     }
 
+    /// Dangerous repowire-style session controls are visible but remain explicit:
+    /// forms route through canonical spawn/kill tools, and remote spawn keeps the
+    /// existing allowlist denial before any mux command can run.
+    #[test]
+    fn dashboard_danger_zone_renders_and_spawn_respects_allowlist() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("Danger zone")
+                && page.contains("action=\"/api/spawn-peer\"")
+                && page.contains("action=\"/api/kill-peer\"")
+                && page.contains("argv-only")
+                && page.contains("spawn_allowed_dirs"),
+            "danger zone should render explicit spawn/kill posture: {page}"
+        );
+
+        let spawn = http_post_form(
+            dash.port,
+            "/api/spawn-peer",
+            "secret-tok",
+            "name=dash-kid&cmd=%5B%22echo%22%2C%22hi%22%5D&cwd=/tmp&window=false",
+        );
+        assert!(
+            spawn.starts_with("HTTP/1.1 200")
+                && (spawn.contains("\"isError\":true") || spawn.contains("\"isError\": true"))
+                && spawn.contains("spawn_allowed_dirs"),
+            "spawn form should route to canonical tool and deny without allowlist: {spawn}"
+        );
+    }
+
     /// Structured pending-question controls render choice buttons and tool-permission
     /// approve/deny forms, all still routed through canonical `weave_answer`.
     #[test]
