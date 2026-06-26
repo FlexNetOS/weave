@@ -7,7 +7,7 @@ Status: active after the user challenged the minimal Weave web UI on 2026-06-26.
 - `.handoff/decisions/ADR-0004-rust-native-human-surfaces.md` says the target was repowire's human surfaces: Next.js dashboard plus Telegram/Slack, but locked Weave to Rust-native server-rendered HTML + SSE, no Next.js/Node runtime.
 - `.handoff/loop/WL-052_changes.md` says the read-only dashboard and bots were only a v1 baseline; dashboard write forms and bot command grammar were intentionally decomposed into follow-up work.
 - `.handoff/loop/_done/_workspace_prev/references/features/prassanna-ravishankar--repowire.md` identified the Browser dashboard as a repowire human surface but originally ranked it low-impact and said `sessions --watch` covered most of it. That is now too weak for the owner's expectation.
-- `docs/REPOWIRE-PARITY.md` previously overstated Browser dashboard as HAVE; this slice changes it to PARTIAL.
+- `docs/REPOWIRE-PARITY.md` previously overstated Browser dashboard as HAVE; the initial WL-083 slice temporarily corrected it to PARTIAL while parity work was active. PR #151 superseded that intermediate state and marks the Rust-native browser dashboard as HAVE after runtime smoke.
 
 ## Evidence from upstream repowire
 
