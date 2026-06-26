@@ -163,16 +163,33 @@ Closed the browser-side half of event recovery:
 - Integration coverage asserts the browser page contains the reconnect wiring;
   runtime smoke verifies `/events?since=0` returns the seeded event.
 
-Do not mark repowire dashboard parity complete until these are true and verified:
+Final WL-083 dashboard parity checklist (closed by subsequent slices):
 
-1. Selected peer detail view: non-destructive turn-state/description controls are now present; remaining work is richer timeline/thread rendering and dangerous session controls (kill/spawn) with clear preview/allowlist posture.
-2. Pending questions panel: basic choice/tool-permission/free-text answer controls are now present; remaining work is richer validation/status and tool-args display.
-3. Write forms: richer notify/ask/answer/reply affordances; current notify/ask/answer/reply forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
-4. Jobs panel parity: selected job detail remains; cooperative cancel and retry-by-recreate are now routed through the shared handler.
-5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
-6. Event stream gap recovery: `/events/stream` SSE plus browser-side `/events?since=...` recovery is now present; remaining work is richer event typing.
-7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
-8. Docs parity matrix stays honest: Browser dashboard remains PARTIAL until the above surfaces exist.
+1. Selected peer detail view: present with session controls, transcript preview,
+   reply form, transcript search/pagination endpoint, and explicit spawn/kill
+   Danger zone controls.
+2. Pending questions panel: present with choice buttons, tool-permission
+   approve/deny, and free-text answer forms routed through canonical
+   `weave_answer`.
+3. Write forms: notify/ask/answer/reply/job cancel/job recreate/session
+   controls/spawn/kill all route through the single `dispatch_request` path with
+   no dashboard-local mutation logic; writes remain bearer-gated and require
+   `weave dashboard --write`.
+4. Jobs panel parity: job cards, selected job detail, cooperative cancel,
+   retry-by-recreate, `/jobs/{id}/status`, and `/jobs/{id}/result` are present.
+5. Settings/spawn controls: Settings panel plus `/settings`/`/api/settings` are
+   token-free; spawn remains argv-only with `spawn_allowed_dirs`/trusted-program
+   posture and kill routes through canonical `weave_kill_peer`.
+6. Event stream gap recovery: `/events/stream`, browser-side
+   `/events?since=...` recovery, and typed `/api/events` message/ask/job/peer
+   events are present.
+7. Browser/API smoke: `.handoff/run/repowire-final-smoke/` verified rendered
+   peer roster, mesh feed, selected peer, pending questions, actions, Danger
+   zone, Settings, selected job, control plane, and expected JSON endpoint
+   shapes.
+8. Docs parity matrix is honest as of PR #151: Browser dashboard is Rust-native
+   HAVE for the real upstream dashboard shape; Weave intentionally did not adopt
+   the Next.js runtime.
 
 ## 2026-06-26 selected-job detail slice
 
