@@ -14627,6 +14627,7 @@ fn every_top_level_command_has_documented_help() {
         "mcp",
         "setup",
         "uninstall",
+        #[cfg(feature = "sqlite")]
         "provider-switch",
         "harness",
         "send",
@@ -14646,6 +14647,7 @@ fn every_top_level_command_has_documented_help() {
         "search",
         "peers",
         "sessions",
+        "tui",
         "scan",
         "gc",
         "doctor",
@@ -14707,4 +14709,33 @@ fn every_top_level_command_has_documented_help() {
             "help for `{command}` did not look like clap help:\n{help}"
         );
     }
+}
+
+#[test]
+fn tui_once_and_json_are_default_build_operator_surfaces() {
+    let db = TestDb::new();
+
+    let once = run_ok(&db, &["tui", "--once", "--no-color"]);
+    assert!(once.contains("weave tui"), "{once}");
+    assert!(once.contains("panes:"), "{once}");
+    assert!(
+        once.contains("HTTP `dashboard` is feature-gated"),
+        "default-build TUI should explain the old dashboard-icon failure mode: {once}"
+    );
+
+    let graph = run_ok(&db, &["tui", "--once", "--no-color", "--pane", "graph"]);
+    assert!(graph.contains("graph intelligence"), "{graph}");
+    assert!(graph.contains("nodes="), "{graph}");
+
+    let json = run_ok(&db, &["tui", "--json", "--pane", "commands"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("tui json");
+    assert_eq!(parsed["pane"], "commands");
+    assert!(
+        parsed["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .any(|cmd| cmd["name"] == "tui" && cmd["domain"] == "dashboard"),
+        "command catalog includes tui dashboard entry: {parsed}"
+    );
 }

@@ -86,3 +86,24 @@ Next implementation coverage:
 - Do not replace the HTTP/SSE dashboard.
 - Do not make the default build heavier without a feature-gated ADR.
 - Do not add write actions before read-only panes and deterministic tests are green.
+
+## Dashboard icon trace (2026-06-26)
+
+The user pointed at `/home/drdave/Desktop/weave-x86_64` as the broken dashboard icon/artifact. Evidence:
+
+- `/home/drdave/Desktop/weave-x86_64 --version` reports `weave 0.1.0` / sqlite.
+- `/home/drdave/Desktop/weave-x86_64 --help` exposes only the early seed command set (`mcp`, `setup`, `send`, `inbox`, `peers`, `sessions`, etc.).
+- `/home/drdave/Desktop/weave-x86_64 dashboard --help` fails with `unrecognized subcommand 'dashboard'`.
+- Current default `~/.cargo/bin/weave` reports `weave 0.2.0`, but a default build still does not expose the HTTP `dashboard` subcommand because that surface is behind `--features surfaces`.
+
+Conclusion: a desktop icon/launcher that expects `weave dashboard` is stale in two ways: the Desktop binary is prehistoric, and the HTTP dashboard is not a default-build command. The durable fix is not to revive the old Desktop ELF; it is to add a default-build terminal operator cockpit (`weave tui`) and keep the HTTP dashboard feature-gated.
+
+Implemented first slice:
+
+- `weave tui` in the default binary.
+- `--once` for icon/headless/test launchers.
+- `--json` machine-readable snapshot.
+- `--pane overview|sessions|messages|asks|jobs|graph|leases|commands`.
+- `--filter <text>` and `--no-color`.
+- Graph pane reuses the same graph-intelligence summary as `weave graph`.
+- The overview explicitly states: `HTTP dashboard is feature-gated; this TUI is default-build.`
