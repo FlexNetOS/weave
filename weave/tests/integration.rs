@@ -11265,10 +11265,11 @@ fn cli_lease_path_conflict_parent_child() {
 #[test]
 fn cli_lease_sweep_removes_expired() {
     let db = TestDb::new();
-    // Reserve with 1-second TTL.
+    // Reserve with a TTL long enough that process startup/scheduling jitter in
+    // slower CI feature matrices cannot expire it before the immediate list.
     run_ok(
         &db,
-        &["lease", "reserve", "--resource", "tmp/file", "--ttl", "1"],
+        &["lease", "reserve", "--resource", "tmp/file", "--ttl", "5"],
     );
 
     // List shows it.
@@ -11276,7 +11277,7 @@ fn cli_lease_sweep_removes_expired() {
     assert!(list1.contains("tmp/file"), "list before expiry: {list1}");
 
     // Wait for expiry.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(6));
 
     // Sweep removes it.
     let sweep = run_ok(&db, &["lease", "sweep"]);
