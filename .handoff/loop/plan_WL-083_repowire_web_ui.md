@@ -99,11 +99,25 @@ Closed the first event-stream recovery gap from upstream repowire:
 - Integration coverage proves `/events?since=0` returns JSON with missed events
   and a high-water `since` filters already-seen events.
 
+## 2026-06-26 selected-peer transcript slice
+
+Expanded the selected-peer surface toward upstream `PeerView.tsx`:
+
+- Selected peer transcript preview now renders a Reply form for the latest visible
+  message.
+- `POST /api/reply` adapts form-url-encoded input into canonical `weave_reply`
+  via the existing `dispatch_request` JSON-RPC path.
+- `GET /peers/{name}/transcript` now supports `q=<query>` search and
+  `before=<id>` pagination filters, while keeping the existing transcript JSON
+  shape (`turns`, `next_before`).
+- Integration coverage proves form reply delivery and transcript search/no-match
+  behavior.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
-1. Selected peer detail view: full transcript/history pagination, thread/timeline search, rich selected-peer message rendering, and current active session controls.
+1. Selected peer detail view: current active session controls and richer timeline/thread rendering; basic transcript search, before pagination, and reply are now present.
 2. Pending questions panel: structured choice/tool-permission rendering and answer UX beyond the basic answer form.
-3. Write forms: reply forms and richer notify/ask/answer affordances; current notify/ask/answer forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
+3. Write forms: richer notify/ask/answer/reply affordances; current notify/ask/answer/reply forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
 4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.
 5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
 6. Event stream gap recovery: basic `/events?since=...` JSON recovery is now present; remaining work is browser-side reconnect wiring and richer event typing.

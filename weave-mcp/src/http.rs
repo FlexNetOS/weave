@@ -200,7 +200,7 @@ fn handle_dashboard_connection(
             return Ok(());
         }
         if let Some(peer) = transcript_peer_from_path(&path) {
-            return serve_dashboard_peer_transcript_json(stream, store, peer);
+            return serve_dashboard_peer_transcript_json(stream, store, peer, &path);
         }
         if let Some(job_id) = job_status_id_from_path(&path) {
             return serve_dashboard_job_status_json(stream, store, job_id);
@@ -345,7 +345,7 @@ fn handle_connection(
                 return Ok(());
             }
             if let Some(peer) = transcript_peer_from_path(&path) {
-                return serve_dashboard_peer_transcript_json(stream, store, peer);
+                return serve_dashboard_peer_transcript_json(stream, store, peer, &path);
             }
             if let Some(job_id) = job_status_id_from_path(&path) {
                 return serve_dashboard_job_status_json(stream, store, job_id);
@@ -538,6 +538,7 @@ fn dashboard_action_tool(path: &str) -> Option<&'static str> {
         "/api/notify" => Some("weave_notify"),
         "/api/ask" => Some("weave_ask"),
         "/api/answer" => Some("weave_answer"),
+        "/api/reply" => Some("weave_reply"),
         "/api/job-cancel" => Some("weave_job_cancel"),
         _ => None,
     }
@@ -554,6 +555,7 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "body",
         "correlation_id",
         "reply_to",
+        "in_reply_to",
         "kind",
         "options",
         "priority",
@@ -561,6 +563,12 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "reason",
     ] {
         if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
+            if matches!(key, "in_reply_to" | "ttl" | "supersedes") {
+                if let Ok(n) = value.parse::<i64>() {
+                    args.insert(key.to_string(), Value::Number(n.into()));
+                    continue;
+                }
+            }
             args.insert(key.to_string(), Value::String(value.clone()));
         }
     }
@@ -920,14 +928,37 @@ fn serve_dashboard_peer_transcript_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
     peer: &str,
+    path: &str,
 ) -> anyhow::Result<()> {
+    let before = query_param(path, "before").and_then(parse_event_since);
+    let query = query_param(path, "q")
+        .map(percent_decode_form)
+        .map(|q| q.to_ascii_lowercase());
     let turns = store.history(peer, None, 50).unwrap_or_default();
+    let filtered = turns
+        .iter()
+        .filter(|m| before.is_none_or(|id| m.id < id))
+        .filter(|m| {
+            query.as_ref().is_none_or(|q| {
+                m.body.to_ascii_lowercase().contains(q)
+                    || m.subject
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(q)
+                    || m.sender.to_ascii_lowercase().contains(q)
+                    || m.recipient.to_ascii_lowercase().contains(q)
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_before = filtered.iter().map(|m| m.id).min();
     write_http_json(
         stream,
         &serde_json::json!({
             "peer_id": peer,
-            "turns": turns.iter().map(event_json).collect::<Vec<_>>(),
-            "next_before": serde_json::Value::Null,
+            "turns": filtered.iter().map(|m| event_json(m)).collect::<Vec<_>>(),
+            "next_before": next_before,
+            "query": query,
         }),
     )?;
     Ok(())

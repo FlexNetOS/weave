@@ -13097,6 +13097,18 @@ mod surfaces_dashboard {
             .to_string()
     }
 
+    fn first_transcript_message_id(resp: &str) -> i64 {
+        let body = http_body(resp);
+        let v: serde_json::Value = serde_json::from_str(body).expect("transcript json");
+        v["turns"][0]["id"]
+            .as_str()
+            .expect("message id")
+            .strip_prefix("msg_")
+            .expect("msg_ prefix")
+            .parse()
+            .expect("numeric message id")
+    }
+
     /// WL-052a: `weave dashboard --write` exposes a `POST /api` action surface that
     /// routes through the SAME `dispatch_request` handler as MCP/CLI — proven by
     /// sending a message and reading it back, both via the dashboard API, end-to-end
@@ -13147,7 +13159,8 @@ mod surfaces_dashboard {
         assert!(
             page.contains("action=\"/api/notify\"")
                 && page.contains("action=\"/api/ask\"")
-                && page.contains("action=\"/api/answer\""),
+                && page.contains("action=\"/api/answer\"")
+                && page.contains("action=\"/api/reply\""),
             "dashboard renders form actions: {page}"
         );
 
@@ -13165,6 +13178,22 @@ mod surfaces_dashboard {
         assert!(
             transcript.contains("notify-from-form"),
             "notify form delivered through store: {transcript}"
+        );
+        let parent_id = first_transcript_message_id(&transcript);
+        let reply = http_post_form(
+            dash.port,
+            "/api/reply",
+            "secret-tok",
+            &format!("from=bob&in_reply_to={parent_id}&body=reply+from+form"),
+        );
+        assert!(
+            reply.starts_with("HTTP/1.1 200") && reply.contains("\"isError\":false"),
+            "reply form should route through dispatch_request: {reply}"
+        );
+        let alice_transcript = http_get(dash.port, "/peers/alice/transcript", Some("secret-tok"));
+        assert!(
+            alice_transcript.contains("reply from form"),
+            "reply form delivered through store: {alice_transcript}"
         );
 
         let ask = http_post_form(
@@ -13466,6 +13495,24 @@ mod surfaces_dashboard {
                 && transcript.contains("\"turns\"")
                 && transcript.contains("hello-dash"),
             "peer transcript endpoint exposes turns: {transcript}"
+        );
+        let searched = http_get(
+            dash.port,
+            "/peers/bob/transcript?q=hello-dash&before=999999999",
+            Some("secret-tok"),
+        );
+        assert!(
+            searched.contains("hello-dash") && searched.contains("\"next_before\""),
+            "transcript search/pagination endpoint filters turns: {searched}"
+        );
+        let missed = http_get(
+            dash.port,
+            "/peers/bob/transcript?q=nope",
+            Some("secret-tok"),
+        );
+        assert!(
+            missed.contains("\"turns\": []"),
+            "transcript search can return no matches: {missed}"
         );
 
         let jobs = http_get(dash.port, "/jobs?view=summary", Some("secret-tok"));
