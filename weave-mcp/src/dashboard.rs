@@ -455,6 +455,16 @@ fn render_jobs_cards(b: &mut String, snap: &DashboardSnapshot) {
             b.push_str("\"><input name=\"from\" placeholder=\"from\" value=\"");
             b.push_str(&html_escape(j.owner.as_deref().unwrap_or(&j.creator)));
             b.push_str("\"><input name=\"reason\" placeholder=\"reason\"><button type=\"submit\">Cancel</button></form>");
+        } else {
+            b.push_str("<form method=\"post\" action=\"/api/job-create\" class=\"inline-form\"><input type=\"hidden\" name=\"creator\" value=\"");
+            b.push_str(&html_escape(&j.creator));
+            b.push_str("\"><input type=\"hidden\" name=\"title\" value=\"Retry: ");
+            b.push_str(&html_escape(&j.title));
+            b.push_str("\"><input type=\"hidden\" name=\"description\" value=\"");
+            b.push_str(&html_escape(&j.description));
+            b.push_str("\"><input type=\"hidden\" name=\"kind\" value=\"");
+            b.push_str(&html_escape(&j.kind));
+            b.push_str("\"><button type=\"submit\">Recreate</button></form>");
         }
         b.push_str("</article>");
     }

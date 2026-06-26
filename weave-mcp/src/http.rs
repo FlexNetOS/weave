@@ -540,6 +540,7 @@ fn dashboard_action_tool(path: &str) -> Option<&'static str> {
         "/api/answer" => Some("weave_answer"),
         "/api/reply" => Some("weave_reply"),
         "/api/job-cancel" => Some("weave_job_cancel"),
+        "/api/job-create" => Some("weave_job_create"),
         "/api/turn-state" => Some("weave_set_turn_state"),
         "/api/description" => Some("weave_set_description"),
         _ => None,
@@ -566,6 +567,13 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "me",
         "state",
         "description",
+        "creator",
+        "title",
+        "kind",
+        "owner",
+        "assignee",
+        "circle",
+        "prompt",
     ] {
         if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
             if matches!(key, "in_reply_to" | "ttl" | "supersedes") {
