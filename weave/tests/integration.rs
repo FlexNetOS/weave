@@ -13421,6 +13421,28 @@ mod surfaces_dashboard {
                 && status.contains("\"cancel_requested\": true"),
             "job status reflects form cancel: {status}"
         );
+
+        let terminal_page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            terminal_page.contains("action=\"/api/job-create\"")
+                && terminal_page.contains("Recreate"),
+            "terminal job card should render recreate form: {terminal_page}"
+        );
+        let recreate = http_post_form(
+            dash.port,
+            "/api/job-create",
+            "secret-tok",
+            "creator=alice&title=Retry%3A+dashboard+cancel+me&description=rerun&kind=general",
+        );
+        assert!(
+            recreate.starts_with("HTTP/1.1 200") && recreate.contains("\"isError\":false"),
+            "job recreate form should route through dispatch_request: {recreate}"
+        );
+        let jobs = http_get(dash.port, "/jobs?view=summary", Some("secret-tok"));
+        assert!(
+            jobs.contains("Retry: dashboard cancel me"),
+            "jobs summary should include recreated job: {jobs}"
+        );
     }
 
     /// A read-only dashboard (no `--write`) refuses the action API with 403 — the
@@ -13537,6 +13559,10 @@ mod surfaces_dashboard {
         assert!(
             resp.contains("weave dashboard"),
             "page body missing: {resp}"
+        );
+        assert!(
+            resp.contains("/events/stream") && resp.contains("/events?since="),
+            "browser reconnect wiring missing: {resp}"
         );
 
         let cookie = http_get_with_extra_headers(

@@ -139,13 +139,37 @@ Added the first non-destructive selected-peer session controls:
 - Integration coverage proves the forms update canonical peer fields visible from
   `GET /peers`.
 
+## 2026-06-26 job recreate slice
+
+Extended jobs-panel controls beyond cancellation:
+
+- Terminal job cards now render a Recreate form.
+- `POST /api/job-create` adapts form-url-encoded input into canonical
+  `weave_job_create`.
+- Recreate remains a new queued job (retry-by-recreate) rather than mutating a
+  terminal job, preserving the board lifecycle invariant.
+- Integration coverage proves a cancelled job renders the recreate control and
+  the jobs summary includes the new retry job after submit.
+
+## 2026-06-26 browser reconnect slice
+
+Closed the browser-side half of event recovery:
+
+- The rendered dashboard now opens `EventSource('/events/stream')`.
+- On browser load and EventSource errors, it fetches `/events?since=<lastSeen>`
+  with same-origin credentials for gap recovery.
+- Query-token page loads still set the existing dashboard cookie, so the browser
+  reconnect/recovery calls reuse the same auth path.
+- Integration coverage asserts the browser page contains the reconnect wiring;
+  runtime smoke verifies `/events?since=0` returns the seeded event.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
 1. Selected peer detail view: non-destructive turn-state/description controls are now present; remaining work is richer timeline/thread rendering and dangerous session controls (kill/spawn) with clear preview/allowlist posture.
 2. Pending questions panel: basic choice/tool-permission/free-text answer controls are now present; remaining work is richer validation/status and tool-args display.
 3. Write forms: richer notify/ask/answer/reply affordances; current notify/ask/answer/reply forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
-4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.
+4. Jobs panel parity: selected job detail remains; cooperative cancel and retry-by-recreate are now routed through the shared handler.
 5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
-6. Event stream gap recovery: basic `/events?since=...` JSON recovery is now present; remaining work is browser-side reconnect wiring and richer event typing.
+6. Event stream gap recovery: `/events/stream` SSE plus browser-side `/events?since=...` recovery is now present; remaining work is richer event typing.
 7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
 8. Docs parity matrix stays honest: Browser dashboard remains PARTIAL until the above surfaces exist.
