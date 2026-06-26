@@ -13224,6 +13224,49 @@ mod surfaces_dashboard {
     }
 
     #[test]
+    fn dashboard_exposes_repowire_compat_read_api() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard(&db, "secret-tok");
+
+        let snapshot = http_get(dash.port, "/api/snapshot", Some("secret-tok"));
+        assert!(
+            snapshot.starts_with("HTTP/1.1 200"),
+            "snapshot endpoint should be 200:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("\"repowire_compat\": true"),
+            "snapshot marks compatibility: {snapshot}"
+        );
+        assert!(snapshot.contains("\"peers\""), "snapshot peers: {snapshot}");
+        assert!(
+            snapshot.contains("\"events\""),
+            "snapshot events: {snapshot}"
+        );
+        assert!(snapshot.contains("\"jobs\""), "snapshot jobs: {snapshot}");
+
+        let peers = http_get(dash.port, "/peers", Some("secret-tok"));
+        assert!(
+            peers.contains("\"peer_id\"") && peers.contains("\"display_name\""),
+            "repowire-style peers payload: {peers}"
+        );
+
+        let events = http_get(dash.port, "/api/events", Some("secret-tok"));
+        assert!(
+            events.starts_with("HTTP/1.1 200") && events.contains("hello-dash"),
+            "events JSON exposes mesh feed: {events}"
+        );
+
+        let jobs = http_get(dash.port, "/jobs?view=summary", Some("secret-tok"));
+        assert!(
+            jobs.starts_with("HTTP/1.1 200")
+                && jobs.contains("\"work\"")
+                && jobs.contains("\"recurring\""),
+            "jobs summary envelope matches dashboard clients: {jobs}"
+        );
+    }
+
+    #[test]
     fn dashboard_rejects_without_bearer_token() {
         let db = TestDb::new();
         let dash = spawn_dashboard(&db, "secret-tok");

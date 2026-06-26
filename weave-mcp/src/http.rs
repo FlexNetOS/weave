@@ -202,6 +202,11 @@ fn handle_dashboard_connection(
         return match route(&method, &path) {
             Route::Page => serve_dashboard_page(stream, store),
             Route::Events => serve_dashboard_events(stream, store),
+            Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store),
+            Route::PeersJson => serve_dashboard_peers_json(stream, store),
+            Route::EventsJson => serve_dashboard_events_json(stream, store),
+            Route::JobsJson => serve_dashboard_jobs_json(stream, store),
+            Route::HealthJson => serve_dashboard_health_json(stream),
             _ => {
                 write_http(stream, 404, b"Not Found")?;
                 Ok(())
@@ -326,6 +331,11 @@ fn handle_connection(
             match route(&method, &path) {
                 Route::Page => return serve_dashboard_page(stream, store),
                 Route::Events => return serve_dashboard_events(stream, store),
+                Route::SnapshotJson => return serve_dashboard_snapshot_json(stream, store),
+                Route::PeersJson => return serve_dashboard_peers_json(stream, store),
+                Route::EventsJson => return serve_dashboard_events_json(stream, store),
+                Route::JobsJson => return serve_dashboard_jobs_json(stream, store),
+                Route::HealthJson => return serve_dashboard_health_json(stream),
                 _ => {
                     write_http(stream, 404, b"Not Found")?;
                     return Ok(());
@@ -411,6 +421,18 @@ fn write_http(stream: &mut TcpStream, status: u16, body: &[u8]) -> std::io::Resu
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
+    stream.flush()
+}
+
+#[cfg(feature = "surfaces")]
+fn write_http_json(stream: &mut TcpStream, body: &serde_json::Value) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(body).unwrap_or_else(|_| "{}".to_string());
+    let header = format!(
+        "{DEFAULT_PROTOCOL} 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
     stream.flush()
 }
 
@@ -516,6 +538,169 @@ fn build_snapshot(
         leases,
         schedules,
     })
+}
+
+#[cfg(feature = "surfaces")]
+fn peer_json(p: &weave_core::model::Peer, now: i64) -> serde_json::Value {
+    let live = now - p.last_seen <= 90;
+    serde_json::json!({
+        "peer_id": weave_core::model::peer_session_id(p),
+        "name": p.name,
+        "display_name": if p.description.is_empty() { p.name.as_str() } else { p.description.as_str() },
+        "status": if live { "online" } else { "offline" },
+        "turn_state": if p.turn_state.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(p.turn_state.clone()) },
+        "machine": p.host,
+        "path": p.cwd.as_deref().unwrap_or(""),
+        "tmux_session": if p.mux == "tmux" { Some(p.target.as_str()) } else { None },
+        "backend": p.mux,
+        "model": serde_json::Value::Null,
+        "circle": weave_core::model::circle_or_default(&p.circle),
+        "role": if p.role == "orchestrator" { "orchestrator" } else { "agent" },
+        "last_seen": weave_core::model::fmt_ts(p.last_seen),
+        "description": p.description,
+        "metadata": {
+            "repo": p.repo,
+            "branch": p.branch,
+            "worktree": p.worktree_id,
+            "mux": p.mux,
+            "target": p.target,
+            "session_id_basis": weave_core::model::peer_session_id_basis(p),
+        }
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn event_json(m: &weave_core::model::Message) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("msg_{}", m.id),
+        "type": if m.recipient == "all" { "broadcast" } else { "notification" },
+        "timestamp": weave_core::model::fmt_ts(m.ts),
+        "from": m.sender,
+        "to": m.recipient,
+        "from_peer_id": m.sender,
+        "to_peer_id": m.recipient,
+        "text": m.body,
+        "status": "success",
+        "delivered": true,
+        "has_message": !m.body.is_empty(),
+        "subject": m.subject,
+        "priority": m.priority,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn job_summary_json(j: &weave_core::model::Job) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": j.id,
+        "work_id": j.id,
+        "title": j.title,
+        "kind": j.kind,
+        "state": j.state.as_str(),
+        "state_reason": j.state_reason,
+        "phase": j.phase,
+        "progress_events": serde_json::from_str::<serde_json::Value>(&j.progress_events_json).unwrap_or_else(|_| serde_json::json!([])),
+        "owner_peer_id": j.owner,
+        "assigned_peer_id": j.assignee,
+        "correlation_id": j.correlation_id,
+        "circle": j.circle,
+        "created_by_peer_id": j.creator,
+        "source_kind": j.source_kind,
+        "source_id": j.source_id,
+        "scope": j.scope,
+        "visibility": j.visibility,
+        "created_at": weave_core::model::fmt_ts(j.opened_ts),
+        "updated_at": weave_core::model::fmt_ts(j.updated_ts),
+        "deadline_at": j.deadline_at.map(weave_core::model::fmt_ts),
+        "expires_at": j.expires_at.map(weave_core::model::fmt_ts),
+        "result_summary": j.result_summary,
+        "cancel_requested": j.cancel_requested,
+        "cancellation_reason": j.cancel_reason,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_snapshot_json(
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<serde_json::Value> {
+    let snap = build_snapshot(store)?;
+    let now = weave_core::model::now();
+    Ok(serde_json::json!({
+        "schema": "weave.dashboard.v1",
+        "source": "weave-rust-surfaces",
+        "repowire_compat": true,
+        "generated_at": weave_core::model::fmt_ts(now),
+        "peers": snap.peers.iter().map(|p| peer_json(p, now)).collect::<Vec<_>>(),
+        "events": snap.messages.iter().map(event_json).collect::<Vec<_>>(),
+        "jobs": {
+            "work": snap.jobs.iter().map(job_summary_json).collect::<Vec<_>>(),
+            "recurring": [],
+        },
+        "leases": snap.leases,
+        "schedules": snap.schedules,
+    }))
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_snapshot_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<()> {
+    write_http_json(stream, &dashboard_snapshot_json(store)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_peers_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<()> {
+    let snap = build_snapshot(store)?;
+    let now = weave_core::model::now();
+    write_http_json(
+        stream,
+        &serde_json::json!({"peers": snap.peers.iter().map(|p| peer_json(p, now)).collect::<Vec<_>>()}),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_events_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<()> {
+    let snap = build_snapshot(store)?;
+    write_http_json(
+        stream,
+        &serde_json::Value::Array(snap.messages.iter().map(event_json).collect()),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_jobs_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<()> {
+    let snap = build_snapshot(store)?;
+    write_http_json(
+        stream,
+        &serde_json::json!({"work": snap.jobs.iter().map(job_summary_json).collect::<Vec<_>>(), "recurring": []}),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_health_json(stream: &mut TcpStream) -> anyhow::Result<()> {
+    write_http_json(
+        stream,
+        &serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "surface": "dashboard",
+            "repowire_compat": true,
+        }),
+    )?;
+    Ok(())
 }
 
 /// `GET /` → render the dashboard HTML page once and close.

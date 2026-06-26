@@ -47,6 +47,16 @@ pub enum Route {
     Page,
     /// `GET /events` — the long-lived SSE stream.
     Events,
+    /// `GET /api/snapshot` — browser-friendly JSON snapshot for the dashboard.
+    SnapshotJson,
+    /// `GET /peers` — repowire-dashboard compatibility peer roster JSON.
+    PeersJson,
+    /// `GET /events` when JSON is requested by a fetch client.
+    EventsJson,
+    /// `GET /jobs?view=summary` — repowire-dashboard compatibility job summary.
+    JobsJson,
+    /// `GET /health` — read-only dashboard API health.
+    HealthJson,
     /// `POST /` — the existing MCP JSON-RPC surface (left untouched).
     JsonRpc,
     /// Anything else — `404`.
@@ -61,6 +71,12 @@ pub fn route(method: &str, path: &str) -> Route {
     match (method, path) {
         ("GET", "/") => Route::Page,
         ("GET", "/events") => Route::Events,
+        ("GET", "/events/stream") => Route::Events,
+        ("GET", "/api/events") => Route::EventsJson,
+        ("GET", "/api/snapshot") => Route::SnapshotJson,
+        ("GET", "/peers") => Route::PeersJson,
+        ("GET", "/jobs") => Route::JobsJson,
+        ("GET", "/health") => Route::HealthJson,
         ("POST", "/") => Route::JsonRpc,
         _ => Route::NotFound,
     }
@@ -93,20 +109,47 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
     b.push_str("<title>weave dashboard</title>");
     b.push_str("<style>");
     b.push_str(
-        "body{font-family:system-ui,sans-serif;margin:1.5rem;background:#0d1117;color:#c9d1d9}\
-         h1{font-size:1.3rem}h2{font-size:1rem;margin-top:1.5rem;border-bottom:1px solid #30363d;padding-bottom:.25rem}\
-         table{border-collapse:collapse;width:100%;font-size:.85rem}\
-         td,th{text-align:left;padding:.2rem .5rem;border-bottom:1px solid #21262d;vertical-align:top}\
-         .live{color:#3fb950}.idle{color:#8b949e}.empty{color:#8b949e;font-style:italic}\
-         code{color:#79c0ff}",
+        ":root{color-scheme:dark;--bg:#070b12;--panel:#0d1422;--panel2:#101b2d;--line:#243149;\
+         --text:#d8e5f2;--muted:#8ea0b8;--accent:#62a8ff;--ok:#3fb950;--warn:#d29922;--bad:#ff7b72}\
+         *{box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,sans-serif;margin:0;background:radial-gradient(circle at 10% 0%,#12233a 0,#070b12 36rem);color:var(--text)}\
+         .shell{min-height:100vh;display:grid;grid-template-rows:auto 1fr}.top{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 1rem;border-bottom:1px solid var(--line);background:rgba(7,11,18,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:1}\
+         .brand{font-weight:800;letter-spacing:.02em}.brand code{color:var(--accent)}.pill{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:.25rem .55rem;color:var(--muted);font-size:.8rem}\
+         .grid{display:grid;grid-template-columns:320px minmax(0,1fr) 360px;gap:1rem;padding:1rem}.panel{background:linear-gradient(180deg,var(--panel),#0a101b);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px #0006;overflow:hidden}\
+         .panel h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0;padding:.85rem 1rem;border-bottom:1px solid var(--line)}\
+         .panel-body{padding:.8rem 1rem}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:.8rem}.stat strong{display:block;font-size:1.4rem}.stat span{color:var(--muted);font-size:.78rem}\
+         table{border-collapse:collapse;width:100%;font-size:.82rem}td,th{text-align:left;padding:.35rem .45rem;border-bottom:1px solid #1c2739;vertical-align:top}\
+         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
     );
     b.push_str("</style></head><body>");
-    b.push_str("<h1>weave dashboard <code>");
+    b.push_str(
+        "<div class=\"shell\"><header class=\"top\"><div class=\"brand\">weave dashboard <code>",
+    );
     b.push_str(&html_escape(host));
-    b.push_str("</code></h1>");
-    b.push_str("<p class=\"idle\">read-only · ");
+    b.push_str("</code></div><div class=\"pill\">repowire-grade Rust surface · read-only · ");
     b.push_str(&html_escape(&fmt_ts(now)));
-    b.push_str("</p>");
+    b.push_str("</div></header><main class=\"grid\">");
+
+    let live = snap
+        .peers
+        .iter()
+        .filter(|p| now - p.last_seen <= PRESENCE_TTL_SECS)
+        .count();
+    b.push_str("<section class=\"panel\"><h2>Peer roster</h2><div class=\"panel-body\">");
+    b.push_str(&format!(
+        "<div class=\"stats\"><div class=\"stat\"><strong>{}</strong><span>peers</span></div><div class=\"stat\"><strong>{}</strong><span>live</span></div><div class=\"stat\"><strong>{}</strong><span>jobs</span></div><div class=\"stat\"><strong>{}</strong><span>leases</span></div></div>",
+        snap.peers.len(),
+        live,
+        snap.jobs.len(),
+        snap.leases.len()
+    ));
+    render_peer_cards(&mut b, snap, now);
+    b.push_str("</div></section>");
+
+    b.push_str("<section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">");
+    render_feed_cards(&mut b, snap);
+    b.push_str("</div></section>");
+
+    b.push_str("<aside class=\"panel\"><h2>Control plane</h2><div class=\"panel-body\">");
 
     render_peers(&mut b, snap, now);
     render_messages(&mut b, snap);
@@ -114,8 +157,61 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
     render_leases(&mut b, snap);
     render_schedules(&mut b, snap);
 
-    b.push_str("</body></html>");
+    b.push_str("</div></aside></main></div></body></html>");
     b
+}
+
+fn render_peer_cards(b: &mut String, snap: &DashboardSnapshot, now: i64) {
+    if snap.peers.is_empty() {
+        b.push_str("<p class=\"empty\">no sessions</p>");
+        return;
+    }
+    for p in &snap.peers {
+        let live = now - p.last_seen <= PRESENCE_TTL_SECS;
+        let (cls, label) = if live {
+            ("live", "live")
+        } else {
+            ("idle", "idle")
+        };
+        b.push_str("<div class=\"peer-card\"><div><div class=\"peer-name\">");
+        b.push_str(&html_escape(&p.name));
+        b.push_str("</div><div class=\"peer-sub\">");
+        b.push_str(&html_escape(&format!(
+            "{} · {} · {}",
+            p.mux,
+            if p.repo.is_empty() { "-" } else { &p.repo },
+            fmt_ts(p.last_seen)
+        )));
+        b.push_str("</div></div><div class=\"");
+        b.push_str(cls);
+        b.push_str("\">");
+        b.push_str(label);
+        b.push_str("</div></div>");
+    }
+}
+
+fn render_feed_cards(b: &mut String, snap: &DashboardSnapshot) {
+    if snap.messages.is_empty() {
+        b.push_str("<p class=\"empty\">no messages</p>");
+        return;
+    }
+    b.push_str("<div class=\"feed\">");
+    for m in snap.messages.iter().take(24) {
+        b.push_str("<article class=\"event\"><div class=\"event-meta\">");
+        b.push_str(&html_escape(&fmt_ts(m.ts)));
+        b.push_str(" · ");
+        b.push_str(&html_escape(&m.sender));
+        b.push_str(" → ");
+        b.push_str(&html_escape(&m.recipient));
+        if let Some(subject) = m.subject.as_deref().filter(|s| !s.is_empty()) {
+            b.push_str(" · ");
+            b.push_str(&html_escape(subject));
+        }
+        b.push_str("</div><div class=\"event-body\">");
+        b.push_str(&html_escape(&m.body));
+        b.push_str("</div></article>");
+    }
+    b.push_str("</div>");
 }
 
 fn render_peers(b: &mut String, snap: &DashboardSnapshot, now: i64) {
@@ -365,7 +461,13 @@ mod tests {
         assert_eq!(route("GET", "/"), Route::Page);
         assert_eq!(route("GET", "/?token=browser"), Route::Page);
         assert_eq!(route("GET", "/events"), Route::Events);
+        assert_eq!(route("GET", "/events/stream"), Route::Events);
         assert_eq!(route("GET", "/events?token=browser"), Route::Events);
+        assert_eq!(route("GET", "/api/events"), Route::EventsJson);
+        assert_eq!(route("GET", "/api/snapshot"), Route::SnapshotJson);
+        assert_eq!(route("GET", "/peers"), Route::PeersJson);
+        assert_eq!(route("GET", "/jobs?view=summary"), Route::JobsJson);
+        assert_eq!(route("GET", "/health"), Route::HealthJson);
         assert_eq!(route("POST", "/"), Route::JsonRpc);
         assert_eq!(route("GET", "/nope"), Route::NotFound);
         assert_eq!(route("DELETE", "/"), Route::NotFound);
