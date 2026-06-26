@@ -210,7 +210,7 @@ fn handle_dashboard_connection(
             Route::Events => serve_dashboard_events(stream, store),
             Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store),
             Route::PeersJson => serve_dashboard_peers_json(stream, store),
-            Route::EventsJson => serve_dashboard_events_json(stream, store),
+            Route::EventsJson => serve_dashboard_events_json(stream, store, &path),
             Route::JobsJson => serve_dashboard_jobs_json(stream, store),
             Route::AsksPendingJson => serve_dashboard_asks_pending_json(stream, store),
             Route::HealthJson => serve_dashboard_health_json(stream),
@@ -355,7 +355,7 @@ fn handle_connection(
                 Route::Events => return serve_dashboard_events(stream, store),
                 Route::SnapshotJson => return serve_dashboard_snapshot_json(stream, store),
                 Route::PeersJson => return serve_dashboard_peers_json(stream, store),
-                Route::EventsJson => return serve_dashboard_events_json(stream, store),
+                Route::EventsJson => return serve_dashboard_events_json(stream, store, &path),
                 Route::JobsJson => return serve_dashboard_jobs_json(stream, store),
                 Route::AsksPendingJson => return serve_dashboard_asks_pending_json(stream, store),
                 Route::HealthJson => return serve_dashboard_health_json(stream),
@@ -845,14 +845,39 @@ fn serve_dashboard_peers_json(
 }
 
 #[cfg(feature = "surfaces")]
+fn query_param<'a>(path: &'a str, wanted: &str) -> Option<&'a str> {
+    let query = path.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (k == wanted).then_some(v)
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn parse_event_since(raw: &str) -> Option<i64> {
+    raw.strip_prefix("msg_").unwrap_or(raw).parse().ok()
+}
+
+#[cfg(feature = "surfaces")]
 fn serve_dashboard_events_json(
     stream: &mut TcpStream,
     store: &dyn weave_core::store::Store,
+    path: &str,
 ) -> anyhow::Result<()> {
     let snap = build_snapshot(store)?;
+    let since = query_param(path, "since").and_then(parse_event_since);
+    let events = snap
+        .messages
+        .iter()
+        .filter(|m| since.is_none_or(|id| m.id > id))
+        .map(event_json)
+        .collect::<Vec<_>>();
     write_http_json(
         stream,
-        &serde_json::Value::Array(snap.messages.iter().map(event_json).collect()),
+        &serde_json::json!({
+            "events": events,
+            "next_since": snap.messages.iter().map(|m| m.id).max(),
+        }),
     )?;
     Ok(())
 }

@@ -71,9 +71,10 @@ pub enum Route {
 /// route to the right writer. `POST /` stays [`Route::JsonRpc`] so the surfaces
 /// extension provably does not alter the MCP path.
 pub fn route(method: &str, path: &str) -> Route {
-    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     match (method, path) {
         ("GET", "/") => Route::Page,
+        ("GET", "/events") if query_has_key(query, "since") => Route::EventsJson,
         ("GET", "/events") => Route::Events,
         ("GET", "/events/stream") => Route::Events,
         ("GET", "/api/events") => Route::EventsJson,
@@ -85,6 +86,13 @@ pub fn route(method: &str, path: &str) -> Route {
         ("POST", "/") => Route::JsonRpc,
         _ => Route::NotFound,
     }
+}
+
+fn query_has_key(query: &str, wanted: &str) -> bool {
+    query.split('&').any(|pair| {
+        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+        key == wanted
+    })
 }
 
 /// A read-only snapshot of mesh state for one dashboard render. Composed by the
@@ -686,6 +694,7 @@ mod tests {
         assert_eq!(route("GET", "/events"), Route::Events);
         assert_eq!(route("GET", "/events/stream"), Route::Events);
         assert_eq!(route("GET", "/events?token=browser"), Route::Events);
+        assert_eq!(route("GET", "/events?since=msg_1"), Route::EventsJson);
         assert_eq!(route("GET", "/api/events"), Route::EventsJson);
         assert_eq!(route("GET", "/api/snapshot"), Route::SnapshotJson);
         assert_eq!(route("GET", "/peers"), Route::PeersJson);

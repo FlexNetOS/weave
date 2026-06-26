@@ -87,6 +87,18 @@ Extended the action-form work into the jobs panel:
 - Integration coverage proves a dashboard job-cancel form updates canonical job
   state and that `GET /jobs/{id}/status` reports the cancelled job.
 
+## 2026-06-26 event-gap recovery slice
+
+Closed the first event-stream recovery gap from upstream repowire:
+
+- `GET /events` remains the long-lived SSE route for live browser updates.
+- `GET /events?since=<id>` now returns JSON events for reconnect/gap recovery,
+  matching the upstream dashboard client's `/events?since=...` pattern.
+- `GET /api/events?since=<id>` uses the same filter.
+- Event ids accept both numeric ids and the existing `msg_<id>` JSON id shape.
+- Integration coverage proves `/events?since=0` returns JSON with missed events
+  and a high-water `since` filters already-seen events.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
 1. Selected peer detail view: full transcript/history pagination, thread/timeline search, rich selected-peer message rendering, and current active session controls.
@@ -94,6 +106,6 @@ Do not mark repowire dashboard parity complete until these are true and verified
 3. Write forms: reply forms and richer notify/ask/answer affordances; current notify/ask/answer forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
 4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.
 5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
-6. Event stream gap recovery: `/events/stream` plus `/events?since=...` or an equivalent documented route.
+6. Event stream gap recovery: basic `/events?since=...` JSON recovery is now present; remaining work is browser-side reconnect wiring and richer event typing.
 7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
 8. Docs parity matrix stays honest: Browser dashboard remains PARTIAL until the above surfaces exist.
