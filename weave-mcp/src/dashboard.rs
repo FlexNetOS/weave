@@ -19,6 +19,40 @@ use weave_core::model::{
     fmt_ts, peer_session_id, Ask, AskState, Job, Lease, Message, Peer, Schedule,
 };
 
+const DASHBOARD_SCRIPT: &str = r#"<script>
+(() => {
+  try {
+    const p = new URLSearchParams(location.search);
+    const t = p.get('token') || p.get('access_token');
+    if (t) document.cookie = 'weave_dashboard_token=' + encodeURIComponent(t) + '; SameSite=Lax; path=/';
+  } catch (_) {}
+  let lastSince = 0;
+  const remember = (payload) => {
+    const ids = (payload.events || []).map((e) => String(e.id || '').replace(/^msg_/, '')).map(Number).filter(Number.isFinite);
+    if (ids.length) lastSince = Math.max(lastSince, ...ids);
+    if (typeof payload.next_since === 'number') lastSince = Math.max(lastSince, payload.next_since);
+  };
+  const recover = async () => {
+    try {
+      const r = await fetch('/events?since=' + encodeURIComponent(String(lastSince)), { credentials: 'same-origin' });
+      if (r.ok) remember(await r.json());
+    } catch (_) {}
+  };
+  recover();
+  if ('EventSource' in window) {
+    const es = new EventSource('/events/stream', { withCredentials: true });
+    es.onmessage = (ev) => {
+      if (typeof ev.data === 'string' && ev.data.startsWith('<!doctype html>')) {
+        document.open();
+        document.write(ev.data);
+        document.close();
+      }
+    };
+    es.onerror = () => { recover(); };
+  }
+})();
+</script>"#;
+
 /// Build a single Server-Sent Events frame. Per the SSE spec each line of `data`
 /// is emitted as its own `data:` field and the event is terminated by a blank
 /// line. CR is stripped (the spec treats CR/LF/CRLF as line separators; we emit
@@ -134,7 +168,9 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
          table{border-collapse:collapse;width:100%;font-size:.82rem}td,th{text-align:left;padding:.35rem .45rem;border-bottom:1px solid #1c2739;vertical-align:top}\
          th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.action-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem}.action-form{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.75rem}.action-form label{display:block;color:var(--muted);font-size:.72rem;margin-top:.45rem}.action-form input,.action-form textarea{width:100%;margin-top:.18rem;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.42rem}.action-form textarea{min-height:4rem;resize:vertical}.action-form button,.inline-form button{margin-top:.55rem;border:1px solid #2f81f7;background:#1f6feb;color:white;border-radius:999px;padding:.42rem .75rem;cursor:pointer}.choice-row{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.55rem}.inline-form{display:flex;gap:.35rem;align-items:center;margin-top:.55rem}.inline-form input{min-width:0;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.35rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
     );
-    b.push_str("</style><script>try{const p=new URLSearchParams(location.search);const t=p.get('token')||p.get('access_token');if(t)document.cookie='weave_dashboard_token='+encodeURIComponent(t)+'; SameSite=Lax; path=/';}catch(_){}</script></head><body>");
+    b.push_str("</style>");
+    b.push_str(DASHBOARD_SCRIPT);
+    b.push_str("</head><body>");
     b.push_str(
         "<div class=\"shell\"><header class=\"top\"><div class=\"brand\">weave dashboard <code>",
     );

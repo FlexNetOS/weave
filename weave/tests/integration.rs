@@ -13560,6 +13560,10 @@ mod surfaces_dashboard {
             resp.contains("weave dashboard"),
             "page body missing: {resp}"
         );
+        assert!(
+            resp.contains("/events/stream") && resp.contains("/events?since="),
+            "browser reconnect wiring missing: {resp}"
+        );
 
         let cookie = http_get_with_extra_headers(
             dash.port,
