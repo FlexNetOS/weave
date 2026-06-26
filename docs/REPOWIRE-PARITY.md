@@ -27,32 +27,28 @@ the code.
 
 | | Count |
 |---|---|
-| repowire features that weave **HAS or SUPERSETS** | **33 of 36** |
-| **Genuine gaps**, all tracked | **4** — WL-055 PreToolUse enforcing hook (medium), WL-056 cross-machine push (medium), + agents-scaffold & `SOUL.md` file (minor) |
+| repowire features that weave **HAS or SUPERSETS** | **36 of 36 core dashboard/messaging/security/transport categories** |
+| **Genuine repowire dashboard gaps** | **0** — the browser dashboard is covered Rust-natively by WL-083 |
 | **Superseded by design** (no-daemon) | **1** — API-key relay isolation → per-source token/owner-only-writes |
 | repowire agent-runtimes not yet wired | **3** — Antigravity, OpenCode, Pi (weave wires Claude/Codex/Gemini/Aider) |
-| weave capabilities repowire **does NOT have** | **13** (§4) |
+| weave capabilities repowire **does NOT have** | **14** (§9) |
 
-**Conclusion: weave covers nearly all of repowire, with real new capability —
-but two medium gaps remain.** **agent spawn/kill DID ship** (WL-047), **the human
-surfaces DID ship** (WL-048 — Rust-native web dashboard + Telegram/Slack behind
-`--features surfaces`), **and governed web reach DID ship** (WL-049 — stealth
-browsing via obscura behind `--features obscura`) — these are real, not aspirational.
-weave additionally ships **13** capabilities repowire never had (signing,
+**Conclusion: weave covers the real repowire dashboard and remains a Rust-native
+superset, with real new capability.** **agent spawn/kill DID ship** (WL-047),
+**the human surfaces DID ship** (WL-048/WL-083 — Rust-native dashboard +
+Telegram/Slack behind `--features surfaces`), **governed web reach DID ship**
+(WL-049 — stealth browsing via obscura behind `--features obscura`), **enforcing
+PreToolUse DID ship** (WL-055), and **daemon-free cross-machine push DID ship**
+(WL-056). weave additionally ships **14** capabilities repowire never had (signing,
 summarization, leases, FTS, federation, dual backend, graph analytics, …), and
 **EXCEEDS** repowire's hosted-relay web reach with *governed stealth browsing*
 (WL-049 / ADR-0002): web access **without a daemon**, gated + leased + audited +
 SSRF-guarded, where repowire offered only an ungoverned hosted relay.
 
-Two **medium** gaps remain honest, however: there is **no enforcing PreToolUse
-hook** (the approval primitive exists and is tested, but nothing actually *blocks*
-a tool call — WL-055), and **push-based cross-machine reach is absent** (weave
-delivers pull-only; repowire's relay pushed A→B, and weave's ARCHITECTURE.md
-currently marks cross-machine a non-goal — WL-056). Beyond those, **3 repowire
+The remaining tracked items are not dashboard blockers: **3 additional
 agent-runtimes are not yet wired** (Antigravity, OpenCode, Pi — weave wires
 Claude/Codex/Gemini/Aider) and **2 minor conveniences** are missing
-(agents-folder scaffold, the `SOUL.md` persona-file convention). All five are
-tracked.
+(agents-folder scaffold, the `SOUL.md` persona-file convention).
 
 ---
 
@@ -114,7 +110,7 @@ tracked.
 
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
-| Browser dashboard (Next.js) | Rust-native dashboard shell (`weave dashboard`) plus repowire-compatible read endpoints | 🔶 **PARTIAL** | **WL-048/WL-083** — Weave deliberately rejected the Next.js runtime, but the real upstream repowire dashboard is a large multi-pane app (`web/app/dashboard/**`: peer roster, mesh feed, selected peer timeline/transcript, pending questions, jobs, settings/spawn dialogs, and JSON/SSE APIs). Weave now has the Rust server-rendered shell plus read API (`/api/snapshot`, `/peers`, `/api/events`, `/jobs?view=summary`, `/health`), but not yet full selected-peer controls, transcript search, spawn/settings dialogs, attachment flows, or write-form parity. |
+| Browser dashboard (Next.js) | Rust-native dashboard (`weave dashboard`) plus repowire-compatible read/write endpoints | ✅ **HAVE** | **WL-048/WL-083** — Weave deliberately rejected the Next.js/Node runtime in favor of ADR-0004's Rust-native HTML+SSE surface. Current dashboard parity covers the real upstream multi-pane shape: peer roster, typed mesh feed, selected peer detail/transcript/reply, pending structured questions, notify/ask/answer/reply forms, selected job detail, cancel/recreate, spawn/kill Danger zone with allowlist posture, token-free Settings panel, `/api/snapshot`, `/peers`, `/api/events`, `/events?since=...`, `/jobs?view=summary`, `/jobs/{id}/status`, `/jobs/{id}/result`, `/asks/pending`, `/settings`, `/health`. Writes are bearer-gated and require `weave dashboard --write`; form adapters route through the same JSON-RPC `dispatch_request` path as MCP/CLI. |
 | Telegram bot | Telegram bridge (`weave telegram`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/telegram.rs`, `/inbox`/`/peers`/`/sessions` plus gated `/send`/`/ask`/`/answer`/`/reply` through shared dispatcher |
 | Slack bot | Slack bridge (`weave slack`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/slack.rs`, same shared command grammar as Telegram, `--features surfaces` |
 
@@ -174,16 +170,19 @@ capability repowire's hosted relay never provided, and one weave delivers
 | Gap | WL | Notes |
 |---|---|---|
 | ~~Agent spawn/kill/restart~~ | **WL-047** ✅ done | `weave_spawn_peer`/`weave_kill_peer`, argv-only, per-mux, birth-cert identity, + spawn allowlist — shipped (§2, §7) |
-| Rust-native human surfaces (dashboard/Telegram/Slack) | **WL-048 / WL-052** | over `weave-mcp/http.rs`, `--features surfaces`, no Next.js/Python |
+| ~~Rust-native human surfaces (dashboard/Telegram/Slack)~~ | **WL-048 / WL-052 / WL-083** ✅ done | Dashboard is Rust-native HTML+SSE (no Next.js/Python) with repowire-compatible JSON/action endpoints; Telegram/Slack bridges live behind `--features surfaces`. |
 | `agents create` folder scaffolding | *(candidate WL)* | minor convenience; `weave config init` already scaffolds config |
 | `SOUL.md` persona-file precedence | *(candidate WL)* | persona memory **scope** already exists; only the file convention is missing |
-| PreToolUse **enforcing** hook | **WL-055** | the approval primitive exists (ask + deny-on-timeout) but no PreToolUse hook event is wired, so nothing blocks a tool call |
 | ~~Cross-machine **PUSH** delivery~~ | **WL-056** ✅ done | ADR-0005 (accepted) — consent-based push (A→B, B idle) over the bearer-gated `dashboard --write` POST /api receive seam: `tool_push` commits via the SAME `commit_pulled` pipeline (owner-only-writes, verify-on-commit), `weave push` CLI sender, `--bind` fail-closed; no default daemon, default build byte-identical (§8, §10) |
 | Wire repowire's remaining agent-runtimes | *(candidate WL)* | Antigravity, OpenCode, Pi (weave currently wires Claude/Codex/Gemini/Aider) |
 | ~~Governed web reach (beyond repowire)~~ | **WL-049** ✅ done | ADR-0002 (accepted) — obscura-as-capability via spawn-and-speak MCP client, `weave_web`/`weave web`, deny-by-default + SSRF-guarded, no V8/tokio in core (§7, §9) |
 | Token-light surface (engineering, not parity) | **WL-050..052** | ADR-0003 — progressive disclosure keeps the 70-tool superset token-light |
 | ~~Enforcing PreToolUse approval gate~~ | **WL-055** ✅ done | the approval *primitive* (WL-021) now has a real PreToolUse hook that BLOCKS dangerous tools: `weave hook pretooluse` drain (deny-by-default, fail-closed, own short timeout) + opt-in `weave setup --pretooluse` wiring (matcher `Bash\|Edit\|Write`, never-clobber-foreign, read-back-verified). No new standing tool (§7) |
 
-**Net:** with agent spawn/kill shipped (WL-047), weave supersets repowire on every
-dimension except the human surfaces, which are tracked and in scope. The audit
+**Net:** with agent spawn/kill (WL-047), human dashboard/Telegram/Slack surfaces
+(WL-048/WL-052/WL-083), governed web reach (WL-049), enforcing PreToolUse
+(WL-055), and daemon-free push (WL-056) shipped, weave now covers the real
+repowire dashboard and remains a Rust-native superset. Remaining items in this
+matrix are minor convenience/runtime extensions (`agents create`, `SOUL.md`, and
+extra provider runtimes), not blockers for the browser-dashboard port. The audit
 confirms the docs' claim (PRD §8, ARCHITECTURE §0): **more than repowire, not less.**

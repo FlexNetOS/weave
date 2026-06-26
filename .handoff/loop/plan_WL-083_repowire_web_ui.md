@@ -220,3 +220,33 @@ Added the first Rust-native settings surface for upstream settings-dialog parity
   configured/not configured and never copied into the dashboard snapshot.
 - Integration coverage proves the settings panel/JSON reflect env-overlaid
   config while not leaking a configured Telegram token.
+
+## 2026-06-26 typed mesh events slice
+
+Expanded browser/recovery event semantics toward upstream dashboard event typing:
+
+- `/api/snapshot` and `/api/events` now expose a typed mesh feed composed from
+  messages, asks, jobs, and peer presence instead of message rows only.
+- Message events retain the existing `msg_<id>` ids and compatibility fields,
+  while adding `entity`, `event_type`, and `source_id` for richer browser logic.
+- Ask/job/peer events use stable synthetic ids (`ask_*`, `job_*`, `peer_*`) and
+  include status/type metadata for client-side feed rendering.
+- Gap recovery with `/events?since=<id>` remains message-id based for backwards
+  compatibility and keeps `next_since` behavior unchanged.
+- Integration coverage proves `/api/events` includes typed message/ask/job/peer
+  events while existing gap-recovery filtering still works.
+
+## 2026-06-26 runtime smoke + parity-doc audit slice
+
+Finalized the dashboard audit trail for the real repowire web UI port:
+
+- Runtime smoke starts `weave dashboard --write` against a hermetic DB, opens the
+  browser-auth URL, and checks the rendered page includes peer roster, selected
+  peer, pending questions, actions, Danger zone, Settings, mesh feed, selected
+  job, and control plane sections.
+- Runtime smoke checks JSON endpoint shapes for `/api/snapshot`, `/api/events`,
+  `/events?since=0`, `/jobs?view=summary`, `/asks/pending`, `/settings`, and
+  `/health`.
+- `docs/REPOWIRE-PARITY.md` now records the browser dashboard as a Rust-native
+  HAVE for the real upstream dashboard shape, with explicit caveat that Weave did
+  not adopt the Next.js runtime and all writes stay bearer/`--write` gated.

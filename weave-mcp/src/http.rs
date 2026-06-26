@@ -790,7 +790,10 @@ fn peer_json(p: &weave_core::model::Peer, now: i64) -> serde_json::Value {
 fn event_json(m: &weave_core::model::Message) -> serde_json::Value {
     serde_json::json!({
         "id": format!("msg_{}", m.id),
+        "entity": "message",
         "type": if m.recipient == "all" { "broadcast" } else { "notification" },
+        "event_type": if m.recipient == "all" { "message.broadcast" } else { "message.notification" },
+        "source_id": m.id,
         "timestamp": weave_core::model::fmt_ts(m.ts),
         "from": m.sender,
         "to": m.recipient,
@@ -803,6 +806,84 @@ fn event_json(m: &weave_core::model::Message) -> serde_json::Value {
         "subject": m.subject,
         "priority": m.priority,
     })
+}
+
+#[cfg(feature = "surfaces")]
+fn ask_event_json(a: &weave_core::model::Ask) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("ask_{}", a.id),
+        "entity": "ask",
+        "type": if a.state == weave_core::model::AskState::Open { "ask_open" } else { "ask_closed" },
+        "event_type": format!("ask.{}", a.state.as_str()),
+        "timestamp": weave_core::model::fmt_ts(a.updated_ts),
+        "from": a.asker,
+        "to": a.askee,
+        "ask_id": a.id,
+        "subject": a.subject,
+        "text": a.subject.as_deref().unwrap_or("question"),
+        "status": a.state.as_str(),
+        "kind": a.kind.as_str(),
+        "has_message": true,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn job_event_json(j: &weave_core::model::Job) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("job_{}", j.id),
+        "entity": "job",
+        "type": format!("job_{}", j.state.as_str()),
+        "event_type": format!("job.{}", j.state.as_str()),
+        "timestamp": weave_core::model::fmt_ts(j.updated_ts),
+        "job_id": j.id,
+        "title": j.title,
+        "text": if j.description.is_empty() { j.title.as_str() } else { j.description.as_str() },
+        "status": j.state.as_str(),
+        "phase": j.phase,
+        "from": j.creator,
+        "to": j.assignee.as_deref().unwrap_or(""),
+        "has_message": !j.description.is_empty(),
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn peer_event_json(p: &weave_core::model::Peer, now: i64) -> serde_json::Value {
+    let live = now - p.last_seen <= 90;
+    serde_json::json!({
+        "id": format!("peer_{}", weave_core::model::peer_session_id(p)),
+        "entity": "peer",
+        "type": if live { "peer_online" } else { "peer_offline" },
+        "event_type": if live { "peer.online" } else { "peer.offline" },
+        "timestamp": weave_core::model::fmt_ts(p.last_seen),
+        "peer_id": weave_core::model::peer_session_id(p),
+        "name": p.name,
+        "status": if live { "online" } else { "offline" },
+        "repo": p.repo,
+        "branch": p.branch,
+        "has_message": false,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn mesh_events_json(
+    snap: &crate::dashboard::DashboardSnapshot,
+    now: i64,
+) -> Vec<serde_json::Value> {
+    let mut events: Vec<(i64, serde_json::Value)> = Vec::new();
+    events.extend(snap.messages.iter().map(|m| (m.ts, event_json(m))));
+    events.extend(snap.asks.iter().map(|a| (a.updated_ts, ask_event_json(a))));
+    events.extend(snap.jobs.iter().map(|j| (j.updated_ts, job_event_json(j))));
+    events.extend(
+        snap.peers
+            .iter()
+            .map(|p| (p.last_seen, peer_event_json(p, now))),
+    );
+    events.sort_by_key(|event| std::cmp::Reverse(event.0));
+    events
+        .into_iter()
+        .take(100)
+        .map(|(_, event)| event)
+        .collect()
 }
 
 #[cfg(feature = "surfaces")]
@@ -904,7 +985,7 @@ fn dashboard_snapshot_json(
         "repowire_compat": true,
         "generated_at": weave_core::model::fmt_ts(now),
         "peers": snap.peers.iter().map(|p| peer_json(p, now)).collect::<Vec<_>>(),
-        "events": snap.messages.iter().map(event_json).collect::<Vec<_>>(),
+        "events": mesh_events_json(&snap, now),
         "asks": snap.asks.iter().map(ask_json).collect::<Vec<_>>(),
         "pending_questions": snap.asks.iter().filter(|a| a.state == weave_core::model::AskState::Open).map(ask_json).collect::<Vec<_>>(),
         "jobs": {
@@ -963,12 +1044,15 @@ fn serve_dashboard_events_json(
 ) -> anyhow::Result<()> {
     let snap = build_snapshot(store, false)?;
     let since = query_param(path, "since").and_then(parse_event_since);
-    let events = snap
-        .messages
-        .iter()
-        .filter(|m| since.is_none_or(|id| m.id > id))
-        .map(event_json)
-        .collect::<Vec<_>>();
+    let events = if let Some(since) = since {
+        snap.messages
+            .iter()
+            .filter(|m| m.id > since)
+            .map(event_json)
+            .collect::<Vec<_>>()
+    } else {
+        mesh_events_json(&snap, weave_core::model::now())
+    };
     write_http_json(
         stream,
         &serde_json::json!({

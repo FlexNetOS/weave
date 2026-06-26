@@ -13360,7 +13360,8 @@ mod surfaces_dashboard {
         );
         let page = http_get(dash.port, "/?token=secret-tok", None);
         assert!(
-            page.contains("<h2>Settings</h2>")
+            page.contains("write-enabled")
+                && page.contains("<h2>Settings</h2>")
                 && page.contains("dash-circle")
                 && page.contains("enabled")
                 && page.contains("dash-bridge")
@@ -13801,6 +13802,18 @@ mod surfaces_dashboard {
             ],
             &[("HOSTNAME", "h2")],
         );
+        run_ok(
+            &db,
+            &[
+                "job",
+                "create",
+                "--title",
+                "dashboard-event-job",
+                "--from",
+                "alice",
+                "--json",
+            ],
+        );
 
         let snapshot = http_get(dash.port, "/api/snapshot", Some("secret-tok"));
         assert!(
@@ -13833,8 +13846,13 @@ mod surfaces_dashboard {
         assert!(
             events.starts_with("HTTP/1.1 200")
                 && events.contains("\"events\"")
-                && events.contains("hello-dash"),
-            "events JSON exposes mesh feed: {events}"
+                && events.contains("hello-dash")
+                && events.contains("\"entity\": \"message\"")
+                && events.contains("\"entity\": \"ask\"")
+                && events.contains("\"entity\": \"job\"")
+                && events.contains("\"entity\": \"peer\"")
+                && events.contains("dashboard-event-job"),
+            "events JSON exposes typed mesh feed: {events}"
         );
 
         let recovery = http_get(dash.port, "/events?since=0", Some("secret-tok"));
