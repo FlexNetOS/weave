@@ -275,6 +275,7 @@ fn render_selected_peer_detail(b: &mut String, snap: &DashboardSnapshot) {
     );
     b.push_str("</div><h2>Transcript preview</h2>");
     let mut count = 0usize;
+    let mut latest_message_id = None;
     b.push_str("<div class=\"feed\">");
     for m in snap
         .messages
@@ -282,6 +283,9 @@ fn render_selected_peer_detail(b: &mut String, snap: &DashboardSnapshot) {
         .filter(|m| m.sender == p.name || m.recipient == p.name)
         .take(8)
     {
+        if latest_message_id.is_none() {
+            latest_message_id = Some(m.id);
+        }
         count += 1;
         b.push_str("<article class=\"event\"><div class=\"event-meta\">");
         b.push_str(&html_escape(&fmt_ts(m.ts)));
@@ -296,6 +300,12 @@ fn render_selected_peer_detail(b: &mut String, snap: &DashboardSnapshot) {
     b.push_str("</div>");
     if count == 0 {
         b.push_str("<p class=\"empty\">no transcript messages for selected peer</p>");
+    } else if let Some(mid) = latest_message_id {
+        b.push_str("<form class=\"action-form\" method=\"post\" action=\"/api/reply\"><strong>Reply in transcript</strong>");
+        input(b, "from", "from", &p.name);
+        input(b, "in_reply_to", "message id", &mid.to_string());
+        textarea(b, "body", "reply", "");
+        b.push_str("<button type=\"submit\">Reply</button></form>");
     }
 }
 
