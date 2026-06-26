@@ -114,7 +114,7 @@ tracked.
 
 | repowire | weave equivalent | Verdict | Evidence |
 |---|---|---|---|
-| Browser dashboard (Next.js) | read-only web dashboard (`weave dashboard`), server-rendered HTML + SSE; `weave sessions --watch` TUI also | ✅ **HAVE** | **WL-048** — `weave-mcp/src/dashboard.rs` + `http.rs::serve_dashboard`, Rust-native HTTP/SSE over `http.rs`, no Next.js, `--features surfaces` |
+| Browser dashboard (Next.js) | Rust-native dashboard shell (`weave dashboard`) plus repowire-compatible read endpoints | 🔶 **PARTIAL** | **WL-048/WL-083** — Weave deliberately rejected the Next.js runtime, but the real upstream repowire dashboard is a large multi-pane app (`web/app/dashboard/**`: peer roster, mesh feed, selected peer timeline/transcript, pending questions, jobs, settings/spawn dialogs, and JSON/SSE APIs). Weave now has the Rust server-rendered shell plus read API (`/api/snapshot`, `/peers`, `/api/events`, `/jobs?view=summary`, `/health`), but not yet full selected-peer controls, transcript search, spawn/settings dialogs, attachment flows, or write-form parity. |
 | Telegram bot | Telegram bridge (`weave telegram`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/telegram.rs`, `/inbox`/`/peers`/`/sessions` plus gated `/send`/`/ask`/`/answer`/`/reply` through shared dispatcher |
 | Slack bot | Slack bridge (`weave slack`), poll-only relay + commands | ✅ **HAVE** | **WL-048/WL-073** — `weave/src/slack.rs`, same shared command grammar as Telegram, `--features surfaces` |
 

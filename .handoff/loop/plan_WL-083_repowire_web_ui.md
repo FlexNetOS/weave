@@ -1,0 +1,56 @@
+# WL-083 plan — real repowire dashboard/UI parity for Weave
+
+Status: active after the user challenged the minimal Weave web UI on 2026-06-26.
+
+## Evidence from prior handoff
+
+- `.handoff/decisions/ADR-0004-rust-native-human-surfaces.md` says the target was repowire's human surfaces: Next.js dashboard plus Telegram/Slack, but locked Weave to Rust-native server-rendered HTML + SSE, no Next.js/Node runtime.
+- `.handoff/loop/WL-052_changes.md` says the read-only dashboard and bots were only a v1 baseline; dashboard write forms and bot command grammar were intentionally decomposed into follow-up work.
+- `.handoff/loop/_done/_workspace_prev/references/features/prassanna-ravishankar--repowire.md` identified the Browser dashboard as a repowire human surface but originally ranked it low-impact and said `sessions --watch` covered most of it. That is now too weak for the owner's expectation.
+- `docs/REPOWIRE-PARITY.md` previously overstated Browser dashboard as HAVE; this slice changes it to PARTIAL.
+
+## Evidence from upstream repowire
+
+Fresh clone of `github.com/prassanna-ravishankar/repowire` on 2026-06-26 shows the actual web UI is under `web/app/dashboard/**`, about 7.9k lines of dashboard code/tests:
+
+- `page.tsx`: app shell with peer roster, mesh feed, selected peer view, pending questions, jobs view, mobile tabs, settings dialog, spawn dialog, and event stream wiring.
+- `components/PeerView.tsx`: selected-peer conversation/timeline/transcript/search/MCP/session-control/compose surface; posts `/notify`, `/ask`, `/answer`, `/reply`, session control routes, attachments, and MCP routes.
+- `components/JobsView.tsx`: job summary, selected job detail, retry/cancel actions.
+- `components/DashboardDialogs.tsx`: spawn/settings/orphan-pane control surfaces.
+- `lib/useEventStream.ts`: `/events/stream` plus reconnect gap recovery via `/events?since=...`.
+- Expected read endpoints include `/peers`, `/events`, `/events/stream`, `/jobs?view=summary`, `/jobs/{id}/status`, `/circles/{circle}/orchestrator`, `/health`, plus write/control endpoints.
+
+## Current Weave state before WL-083
+
+- `weave dashboard` was a read-only server-rendered table page: sessions, recent messages, jobs, leases, schedules.
+- It had `GET /` and `GET /events` (HTML/SSE) only, plus optional `POST /api` when launched with `--write`.
+- It did not expose repowire-style JSON read endpoints or the multi-pane app shell.
+
+## This slice
+
+Implemented the first aligned Rust-native slice toward the real repowire UI while preserving ADR-0004's no-Next.js/no-Node constraint:
+
+- Upgraded `render_dashboard` into a repowire-inspired three-column operator shell:
+  - Peer roster with counts and cards.
+  - Mesh feed event cards.
+  - Control plane with the legacy tables retained for compatibility.
+- Added browser/read API endpoints:
+  - `GET /api/snapshot` with `repowire_compat: true`.
+  - `GET /peers` repowire-style peer roster envelope.
+  - `GET /api/events` mesh feed event JSON.
+  - `GET /jobs?view=summary` job summary envelope `{work, recurring}`.
+  - `GET /health` dashboard health.
+- Kept existing `GET /events` SSE behavior for backwards compatibility and added `/events/stream` as the repowire-style SSE path.
+
+## Remaining work to call the dashboard parity complete
+
+Do not mark repowire dashboard parity complete until these are true and verified:
+
+1. Selected peer detail view: transcript/history pagination, thread/timeline search, selected-peer message rendering, and current active session controls.
+2. Pending questions panel: structured choices/text/tool-permission answering via the shared handler.
+3. Write forms: notify/ask/answer/reply forms route through the single `dispatch_request` path; no dashboard-local mutation logic; CSRF/bearer posture documented and tested.
+4. Jobs panel parity: selected job detail plus retry/cancel routed through the job API or shared handler.
+5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
+6. Event stream gap recovery: `/events/stream` plus `/events?since=...` or an equivalent documented route.
+7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
+8. Docs parity matrix stays honest: Browser dashboard remains PARTIAL until the above surfaces exist.
