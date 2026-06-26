@@ -13190,6 +13190,14 @@ mod surfaces_dashboard {
             resp.contains("Sessions / presence"),
             "missing peers section"
         );
+        assert!(
+            resp.contains("Selected peer"),
+            "missing selected peer panel"
+        );
+        assert!(
+            resp.contains("Pending questions"),
+            "missing pending questions panel"
+        );
         assert!(resp.contains("Recent messages"), "missing messages section");
         // Seeded peer + message body show through.
         assert!(resp.contains("alice"), "seeded peer alice missing");
@@ -13229,6 +13237,22 @@ mod surfaces_dashboard {
         seed_peers(&db);
         let dash = spawn_dashboard(&db, "secret-tok");
 
+        run_env(
+            &db,
+            &[
+                "ask",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--subject",
+                "dashboard-question",
+                "--body",
+                "repowire asks panel?",
+            ],
+            &[("HOSTNAME", "h2")],
+        );
+
         let snapshot = http_get(dash.port, "/api/snapshot", Some("secret-tok"));
         assert!(
             snapshot.starts_with("HTTP/1.1 200"),
@@ -13244,6 +13268,11 @@ mod surfaces_dashboard {
             "snapshot events: {snapshot}"
         );
         assert!(snapshot.contains("\"jobs\""), "snapshot jobs: {snapshot}");
+        assert!(snapshot.contains("\"asks\""), "snapshot asks: {snapshot}");
+        assert!(
+            snapshot.contains("dashboard-question"),
+            "snapshot pending question: {snapshot}"
+        );
 
         let peers = http_get(dash.port, "/peers", Some("secret-tok"));
         assert!(
@@ -13255,6 +13284,22 @@ mod surfaces_dashboard {
         assert!(
             events.starts_with("HTTP/1.1 200") && events.contains("hello-dash"),
             "events JSON exposes mesh feed: {events}"
+        );
+
+        let asks = http_get(dash.port, "/asks/pending", Some("secret-tok"));
+        assert!(
+            asks.starts_with("HTTP/1.1 200")
+                && asks.contains("pending_questions")
+                && asks.contains("dashboard-question"),
+            "pending asks endpoint exposes open questions: {asks}"
+        );
+
+        let transcript = http_get(dash.port, "/peers/bob/transcript", Some("secret-tok"));
+        assert!(
+            transcript.starts_with("HTTP/1.1 200")
+                && transcript.contains("\"turns\"")
+                && transcript.contains("hello-dash"),
+            "peer transcript endpoint exposes turns: {transcript}"
         );
 
         let jobs = http_get(dash.port, "/jobs?view=summary", Some("secret-tok"));

@@ -199,6 +199,12 @@ fn handle_dashboard_connection(
             write_http(stream, 401, b"Unauthorized")?;
             return Ok(());
         }
+        if let Some(peer) = transcript_peer_from_path(&path) {
+            return serve_dashboard_peer_transcript_json(stream, store, peer);
+        }
+        if let Some(job_id) = job_status_id_from_path(&path) {
+            return serve_dashboard_job_status_json(stream, store, job_id);
+        }
         return match route(&method, &path) {
             Route::Page => serve_dashboard_page(stream, store),
             Route::Events => serve_dashboard_events(stream, store),
@@ -206,6 +212,7 @@ fn handle_dashboard_connection(
             Route::PeersJson => serve_dashboard_peers_json(stream, store),
             Route::EventsJson => serve_dashboard_events_json(stream, store),
             Route::JobsJson => serve_dashboard_jobs_json(stream, store),
+            Route::AsksPendingJson => serve_dashboard_asks_pending_json(stream, store),
             Route::HealthJson => serve_dashboard_health_json(stream),
             _ => {
                 write_http(stream, 404, b"Not Found")?;
@@ -328,6 +335,12 @@ fn handle_connection(
                 write_http(stream, 401, b"Unauthorized")?;
                 return Ok(());
             }
+            if let Some(peer) = transcript_peer_from_path(&path) {
+                return serve_dashboard_peer_transcript_json(stream, store, peer);
+            }
+            if let Some(job_id) = job_status_id_from_path(&path) {
+                return serve_dashboard_job_status_json(stream, store, job_id);
+            }
             match route(&method, &path) {
                 Route::Page => return serve_dashboard_page(stream, store),
                 Route::Events => return serve_dashboard_events(stream, store),
@@ -335,6 +348,7 @@ fn handle_connection(
                 Route::PeersJson => return serve_dashboard_peers_json(stream, store),
                 Route::EventsJson => return serve_dashboard_events_json(stream, store),
                 Route::JobsJson => return serve_dashboard_jobs_json(stream, store),
+                Route::AsksPendingJson => return serve_dashboard_asks_pending_json(stream, store),
                 Route::HealthJson => return serve_dashboard_health_json(stream),
                 _ => {
                     write_http(stream, 404, b"Not Found")?;
@@ -529,12 +543,26 @@ fn build_snapshot(
     let jobs = store
         .list_jobs(JobFilter::default(), 50)
         .unwrap_or_default();
+    let mut asks_by_id: std::collections::HashMap<String, weave_core::model::Ask> =
+        std::collections::HashMap::new();
+    for p in &peers {
+        for ask in store
+            .list_asks(&p.name, weave_core::model::AskRole::Any, 20)
+            .unwrap_or_default()
+        {
+            asks_by_id.entry(ask.id.clone()).or_insert(ask);
+        }
+    }
+    let mut asks: Vec<weave_core::model::Ask> = asks_by_id.into_values().collect();
+    asks.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts).then(b.id.cmp(&a.id)));
+    asks.truncate(50);
     let leases = store.list_leases(50).unwrap_or_default();
     let schedules = store.list_schedules("", 50).unwrap_or_default();
     Ok(crate::dashboard::DashboardSnapshot {
         peers,
         messages,
         jobs,
+        asks,
         leases,
         schedules,
     })
@@ -619,6 +647,51 @@ fn job_summary_json(j: &weave_core::model::Job) -> serde_json::Value {
 }
 
 #[cfg(feature = "surfaces")]
+fn ask_json(a: &weave_core::model::Ask) -> serde_json::Value {
+    serde_json::json!({
+        "ask_id": a.id,
+        "id": a.id,
+        "question_msg_id": a.question_msg_id,
+        "answer_msg_id": a.answer_msg_id,
+        "asker_peer_id": a.asker,
+        "askee_peer_id": a.askee,
+        "asker": a.asker,
+        "askee": a.askee,
+        "subject": a.subject,
+        "state": a.state.as_str(),
+        "kind": a.kind.as_str(),
+        "options": a.options,
+        "reply_to": a.reply_to,
+        "parent_id": a.parent_id,
+        "opened_at": weave_core::model::fmt_ts(a.opened_ts),
+        "updated_at": weave_core::model::fmt_ts(a.updated_ts),
+        "closed_at": a.closed_ts.map(weave_core::model::fmt_ts),
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn transcript_peer_from_path(path: &str) -> Option<&str> {
+    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let rest = path.strip_prefix("/peers/")?;
+    let peer = rest.strip_suffix("/transcript")?;
+    if peer.is_empty() || peer.contains('/') {
+        return None;
+    }
+    Some(peer)
+}
+
+#[cfg(feature = "surfaces")]
+fn job_status_id_from_path(path: &str) -> Option<&str> {
+    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let rest = path.strip_prefix("/jobs/")?;
+    let job_id = rest.strip_suffix("/status")?;
+    if job_id.is_empty() || job_id.contains('/') {
+        return None;
+    }
+    Some(job_id)
+}
+
+#[cfg(feature = "surfaces")]
 fn dashboard_snapshot_json(
     store: &dyn weave_core::store::Store,
 ) -> anyhow::Result<serde_json::Value> {
@@ -631,6 +704,8 @@ fn dashboard_snapshot_json(
         "generated_at": weave_core::model::fmt_ts(now),
         "peers": snap.peers.iter().map(|p| peer_json(p, now)).collect::<Vec<_>>(),
         "events": snap.messages.iter().map(event_json).collect::<Vec<_>>(),
+        "asks": snap.asks.iter().map(ask_json).collect::<Vec<_>>(),
+        "pending_questions": snap.asks.iter().filter(|a| a.state == weave_core::model::AskState::Open).map(ask_json).collect::<Vec<_>>(),
         "jobs": {
             "work": snap.jobs.iter().map(job_summary_json).collect::<Vec<_>>(),
             "recurring": [],
@@ -686,6 +761,57 @@ fn serve_dashboard_jobs_json(
         stream,
         &serde_json::json!({"work": snap.jobs.iter().map(job_summary_json).collect::<Vec<_>>(), "recurring": []}),
     )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_asks_pending_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+) -> anyhow::Result<()> {
+    let snap = build_snapshot(store)?;
+    write_http_json(
+        stream,
+        &serde_json::json!({
+            "pending_questions": snap
+                .asks
+                .iter()
+                .filter(|a| a.state == weave_core::model::AskState::Open)
+                .map(ask_json)
+                .collect::<Vec<_>>()
+        }),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_peer_transcript_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+    peer: &str,
+) -> anyhow::Result<()> {
+    let turns = store.history(peer, None, 50).unwrap_or_default();
+    write_http_json(
+        stream,
+        &serde_json::json!({
+            "peer_id": peer,
+            "turns": turns.iter().map(event_json).collect::<Vec<_>>(),
+            "next_before": serde_json::Value::Null,
+        }),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "surfaces")]
+fn serve_dashboard_job_status_json(
+    stream: &mut TcpStream,
+    store: &dyn weave_core::store::Store,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    match store.get_job(job_id)? {
+        Some(job) => write_http_json(stream, &serde_json::json!({"job": job_summary_json(&job)}))?,
+        None => write_http(stream, 404, b"Not Found")?,
+    }
     Ok(())
 }
 
