@@ -113,10 +113,36 @@ Expanded the selected-peer surface toward upstream `PeerView.tsx`:
 - Integration coverage proves form reply delivery and transcript search/no-match
   behavior.
 
+## 2026-06-26 structured pending-question slice
+
+Closed the basic structured-ask UX gap in the pending questions panel:
+
+- Choice asks now render one answer form/button per option.
+- Tool-permission asks now render approve/deny buttons.
+- Free-text asks now render an inline answer form.
+- All controls post to the existing `/api/answer` adapter and route through
+  canonical `weave_answer`; no dashboard-local ask mutation logic was added.
+- Integration coverage proves choice and tool-permission answers go through the
+  dashboard form surface and leave the pending list.
+
+## 2026-06-26 selected-peer session-control slice
+
+Added the first non-destructive selected-peer session controls:
+
+- Selected peer details now render Session controls for turn state and description.
+- `POST /api/turn-state` adapts form-url-encoded input into canonical
+  `weave_set_turn_state`.
+- `POST /api/description` adapts form-url-encoded input into canonical
+  `weave_set_description`.
+- Both controls route through the same `dispatch_request` JSON-RPC path used by
+  MCP/CLI and remain gated by `weave dashboard --write`.
+- Integration coverage proves the forms update canonical peer fields visible from
+  `GET /peers`.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
-1. Selected peer detail view: current active session controls and richer timeline/thread rendering; basic transcript search, before pagination, and reply are now present.
-2. Pending questions panel: structured choice/tool-permission rendering and answer UX beyond the basic answer form.
+1. Selected peer detail view: non-destructive turn-state/description controls are now present; remaining work is richer timeline/thread rendering and dangerous session controls (kill/spawn) with clear preview/allowlist posture.
+2. Pending questions panel: basic choice/tool-permission/free-text answer controls are now present; remaining work is richer validation/status and tool-args display.
 3. Write forms: richer notify/ask/answer/reply affordances; current notify/ask/answer/reply forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
 4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.
 5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.

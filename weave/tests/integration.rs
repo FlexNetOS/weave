@@ -13097,6 +13097,19 @@ mod surfaces_dashboard {
             .to_string()
     }
 
+    fn pending_ask_id_by_subject(resp: &str, subject: &str) -> String {
+        let body = http_body(resp);
+        let v: serde_json::Value = serde_json::from_str(body).expect("pending asks json");
+        v["pending_questions"]
+            .as_array()
+            .expect("pending_questions array")
+            .iter()
+            .find(|ask| ask["subject"].as_str() == Some(subject))
+            .and_then(|ask| ask["ask_id"].as_str())
+            .unwrap_or_else(|| panic!("missing pending ask subject {subject}: {resp}"))
+            .to_string()
+    }
+
     fn first_transcript_message_id(resp: &str) -> i64 {
         let body = http_body(resp);
         let v: serde_json::Value = serde_json::from_str(body).expect("transcript json");
@@ -13227,6 +13240,135 @@ mod surfaces_dashboard {
         assert!(
             !pending_after.contains(&ask_id),
             "answered ask should leave pending list: {pending_after}"
+        );
+    }
+
+    /// Selected-peer session controls update the canonical presence fields through
+    /// the same dashboard action adapter, not dashboard-local mutation code.
+    #[test]
+    fn dashboard_session_controls_route_through_presence_tools() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("Session controls")
+                && page.contains("action=\"/api/turn-state\"")
+                && page.contains("action=\"/api/description\""),
+            "selected peer session controls render: {page}"
+        );
+
+        let turn = http_post_form(
+            dash.port,
+            "/api/turn-state",
+            "secret-tok",
+            "me=alice&state=working",
+        );
+        assert!(
+            turn.starts_with("HTTP/1.1 200") && turn.contains("\"isError\":false"),
+            "turn-state form routes through dispatch_request: {turn}"
+        );
+        let desc = http_post_form(
+            dash.port,
+            "/api/description",
+            "secret-tok",
+            "me=alice&description=dashboard+session+control",
+        );
+        assert!(
+            desc.starts_with("HTTP/1.1 200") && desc.contains("\"isError\":false"),
+            "description form routes through dispatch_request: {desc}"
+        );
+
+        let peers = http_get(dash.port, "/peers", Some("secret-tok"));
+        assert!(
+            peers.contains("working") && peers.contains("dashboard session control"),
+            "presence fields updated through canonical tools: {peers}"
+        );
+    }
+
+    /// Structured pending-question controls render choice buttons and tool-permission
+    /// approve/deny forms, all still routed through canonical `weave_answer`.
+    #[test]
+    fn dashboard_structured_ask_controls_route_through_answer() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        run_env(
+            &db,
+            &[
+                "ask",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--subject",
+                "pick-one",
+                "--body",
+                "choose",
+                "--kind",
+                "choice",
+                "--options",
+                "red\nblue",
+            ],
+            &[("HOSTNAME", "h2")],
+        );
+        run_env(
+            &db,
+            &[
+                "ask",
+                "--from",
+                "alice",
+                "--to",
+                "bob",
+                "--subject",
+                "tool-gate",
+                "--body",
+                "allow tool?",
+                "--kind",
+                "tool_permission",
+                "--options",
+                "Bash\necho hi",
+            ],
+            &[("HOSTNAME", "h2")],
+        );
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("pick-one")
+                && page.contains("blue")
+                && page.contains("tool-gate")
+                && page.contains("approve")
+                && page.contains("deny"),
+            "structured pending controls render: {page}"
+        );
+
+        let pending = http_get(dash.port, "/asks/pending", Some("secret-tok"));
+        let choice_id = pending_ask_id_by_subject(&pending, "pick-one");
+        let answer = http_post_form(
+            dash.port,
+            "/api/answer",
+            "secret-tok",
+            &format!("from=bob&correlation_id={choice_id}&body=blue"),
+        );
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.contains("\"isError\":false"),
+            "choice answer should route through dispatch_request: {answer}"
+        );
+        let after_choice = http_get(dash.port, "/asks/pending", Some("secret-tok"));
+        assert!(
+            !after_choice.contains(&choice_id) && after_choice.contains("tool-gate"),
+            "answered choice leaves only remaining pending asks: {after_choice}"
+        );
+
+        let tool_id = pending_ask_id_by_subject(&after_choice, "tool-gate");
+        let approve = http_post_form(
+            dash.port,
+            "/api/answer",
+            "secret-tok",
+            &format!("from=bob&correlation_id={tool_id}&body=approve"),
+        );
+        assert!(
+            approve.starts_with("HTTP/1.1 200") && approve.contains("\"isError\":false"),
+            "tool permission approve should route through dispatch_request: {approve}"
         );
     }
 
