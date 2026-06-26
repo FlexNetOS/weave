@@ -44,9 +44,24 @@ Implemented the first aligned Rust-native slice toward the real repowire UI whil
 
 ## Remaining work to call the dashboard parity complete
 
+## 2026-06-26 follow-up slice
+
+Added the next Rust-native parity slice after the initial shell:
+
+- Selected peer panel now renders session id, role/turn state, cwd/repo/branch,
+  description, and a bounded transcript preview for the selected peer.
+- Pending questions panel now renders open tracked asks.
+- Snapshot/read API now includes `asks` and `pending_questions`.
+- Added repowire-style read endpoints:
+  - `GET /asks/pending`
+  - `GET /peers/{name}/transcript`
+  - `GET /jobs/{id}/status`
+- Verification added to the surfaces dashboard integration test for asks and
+  transcript endpoints, plus browser/curl smoke evidence under `.handoff/run/`.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
-1. Selected peer detail view: transcript/history pagination, thread/timeline search, selected-peer message rendering, and current active session controls.
+1. Selected peer detail view: full transcript/history pagination, thread/timeline search, rich selected-peer message rendering, and current active session controls.
 2. Pending questions panel: structured choices/text/tool-permission answering via the shared handler.
 3. Write forms: notify/ask/answer/reply forms route through the single `dispatch_request` path; no dashboard-local mutation logic; CSRF/bearer posture documented and tested.
 4. Jobs panel parity: selected job detail plus retry/cancel routed through the job API or shared handler.

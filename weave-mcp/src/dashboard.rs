@@ -15,7 +15,9 @@
 //! of raw Store text. The XSS regression test below locks this in.
 
 use weave_core::export::html_escape;
-use weave_core::model::{fmt_ts, Job, Lease, Message, Peer, Schedule};
+use weave_core::model::{
+    fmt_ts, peer_session_id, Ask, AskState, Job, Lease, Message, Peer, Schedule,
+};
 
 /// Build a single Server-Sent Events frame. Per the SSE spec each line of `data`
 /// is emitted as its own `data:` field and the event is terminated by a blank
@@ -55,6 +57,8 @@ pub enum Route {
     EventsJson,
     /// `GET /jobs?view=summary` — repowire-dashboard compatibility job summary.
     JobsJson,
+    /// `GET /asks/pending` — repowire-dashboard compatibility pending question list.
+    AsksPendingJson,
     /// `GET /health` — read-only dashboard API health.
     HealthJson,
     /// `POST /` — the existing MCP JSON-RPC surface (left untouched).
@@ -76,6 +80,7 @@ pub fn route(method: &str, path: &str) -> Route {
         ("GET", "/api/snapshot") => Route::SnapshotJson,
         ("GET", "/peers") => Route::PeersJson,
         ("GET", "/jobs") => Route::JobsJson,
+        ("GET", "/asks/pending") => Route::AsksPendingJson,
         ("GET", "/health") => Route::HealthJson,
         ("POST", "/") => Route::JsonRpc,
         _ => Route::NotFound,
@@ -90,6 +95,7 @@ pub struct DashboardSnapshot {
     pub peers: Vec<Peer>,
     pub messages: Vec<Message>,
     pub jobs: Vec<Job>,
+    pub asks: Vec<Ask>,
     pub leases: Vec<Lease>,
     pub schedules: Vec<Schedule>,
 }
@@ -114,11 +120,11 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
          *{box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,sans-serif;margin:0;background:radial-gradient(circle at 10% 0%,#12233a 0,#070b12 36rem);color:var(--text)}\
          .shell{min-height:100vh;display:grid;grid-template-rows:auto 1fr}.top{height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 1rem;border-bottom:1px solid var(--line);background:rgba(7,11,18,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:1}\
          .brand{font-weight:800;letter-spacing:.02em}.brand code{color:var(--accent)}.pill{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:.25rem .55rem;color:var(--muted);font-size:.8rem}\
-         .grid{display:grid;grid-template-columns:320px minmax(0,1fr) 360px;gap:1rem;padding:1rem}.panel{background:linear-gradient(180deg,var(--panel),#0a101b);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px #0006;overflow:hidden}\
+         .grid{display:grid;grid-template-columns:320px minmax(0,1fr) 360px;gap:1rem;padding:1rem}.main-col{display:flex;flex-direction:column;gap:1rem}.panel{background:linear-gradient(180deg,var(--panel),#0a101b);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px #0006;overflow:hidden}\
          .panel h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0;padding:.85rem 1rem;border-bottom:1px solid var(--line)}\
          .panel-body{padding:.8rem 1rem}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:.8rem}.stat strong{display:block;font-size:1.4rem}.stat span{color:var(--muted);font-size:.78rem}\
          table{border-collapse:collapse;width:100%;font-size:.82rem}td,th{text-align:left;padding:.35rem .45rem;border-bottom:1px solid #1c2739;vertical-align:top}\
-         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
+         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
     );
     b.push_str("</style></head><body>");
     b.push_str(
@@ -136,21 +142,28 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
         .count();
     b.push_str("<section class=\"panel\"><h2>Peer roster</h2><div class=\"panel-body\">");
     b.push_str(&format!(
-        "<div class=\"stats\"><div class=\"stat\"><strong>{}</strong><span>peers</span></div><div class=\"stat\"><strong>{}</strong><span>live</span></div><div class=\"stat\"><strong>{}</strong><span>jobs</span></div><div class=\"stat\"><strong>{}</strong><span>leases</span></div></div>",
+        "<div class=\"stats\"><div class=\"stat\"><strong>{}</strong><span>peers</span></div><div class=\"stat\"><strong>{}</strong><span>live</span></div><div class=\"stat\"><strong>{}</strong><span>jobs</span></div><div class=\"stat\"><strong>{}</strong><span>open asks</span></div></div>",
         snap.peers.len(),
         live,
         snap.jobs.len(),
-        snap.leases.len()
+        snap.asks.iter().filter(|a| a.state == AskState::Open).count()
     ));
     render_peer_cards(&mut b, snap, now);
     b.push_str("</div></section>");
 
-    b.push_str("<section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">");
+    b.push_str("<div class=\"main-col\"><section class=\"panel\"><h2>Selected peer</h2><div class=\"panel-body\">");
+    render_selected_peer_detail(&mut b, snap);
+    b.push_str("</div></section><section class=\"panel\"><h2>Pending questions</h2><div class=\"panel-body\">");
+    render_pending_questions(&mut b, snap);
+    b.push_str(
+        "</div></section><section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">",
+    );
     render_feed_cards(&mut b, snap);
-    b.push_str("</div></section>");
+    b.push_str("</div></section></div>");
 
     b.push_str("<aside class=\"panel\"><h2>Control plane</h2><div class=\"panel-body\">");
 
+    render_jobs_cards(&mut b, snap);
     render_peers(&mut b, snap, now);
     render_messages(&mut b, snap);
     render_jobs(&mut b, snap);
@@ -212,6 +225,138 @@ fn render_feed_cards(b: &mut String, snap: &DashboardSnapshot) {
         b.push_str("</div></article>");
     }
     b.push_str("</div>");
+}
+
+fn render_selected_peer_detail(b: &mut String, snap: &DashboardSnapshot) {
+    let Some(p) = snap.peers.first() else {
+        b.push_str("<p class=\"empty\">select a peer to inspect its session, transcript, MCP context, and controls</p>");
+        return;
+    };
+    b.push_str("<div class=\"detail-grid\">");
+    detail_item(b, "name", &p.name);
+    detail_item(b, "session", &peer_session_id(p));
+    detail_item(b, "role", if p.role.is_empty() { "peer" } else { &p.role });
+    detail_item(
+        b,
+        "turn state",
+        if p.turn_state.is_empty() {
+            "unknown"
+        } else {
+            &p.turn_state
+        },
+    );
+    detail_item(b, "cwd", p.cwd.as_deref().unwrap_or(""));
+    detail_item(b, "repo", if p.repo.is_empty() { "-" } else { &p.repo });
+    detail_item(
+        b,
+        "branch",
+        if p.branch.is_empty() { "-" } else { &p.branch },
+    );
+    detail_item(
+        b,
+        "description",
+        if p.description.is_empty() {
+            "-"
+        } else {
+            &p.description
+        },
+    );
+    b.push_str("</div><h2>Transcript preview</h2>");
+    let mut count = 0usize;
+    b.push_str("<div class=\"feed\">");
+    for m in snap
+        .messages
+        .iter()
+        .filter(|m| m.sender == p.name || m.recipient == p.name)
+        .take(8)
+    {
+        count += 1;
+        b.push_str("<article class=\"event\"><div class=\"event-meta\">");
+        b.push_str(&html_escape(&fmt_ts(m.ts)));
+        b.push_str(" · ");
+        b.push_str(&html_escape(&m.sender));
+        b.push_str(" → ");
+        b.push_str(&html_escape(&m.recipient));
+        b.push_str("</div><div class=\"event-body\">");
+        b.push_str(&html_escape(&m.body));
+        b.push_str("</div></article>");
+    }
+    b.push_str("</div>");
+    if count == 0 {
+        b.push_str("<p class=\"empty\">no transcript messages for selected peer</p>");
+    }
+}
+
+fn detail_item(b: &mut String, label: &str, value: &str) {
+    b.push_str("<div class=\"detail-item\"><span>");
+    b.push_str(&html_escape(label));
+    b.push_str("</span>");
+    b.push_str(&html_escape(value));
+    b.push_str("</div>");
+}
+
+fn render_pending_questions(b: &mut String, snap: &DashboardSnapshot) {
+    let mut open = snap
+        .asks
+        .iter()
+        .filter(|a| a.state == AskState::Open)
+        .peekable();
+    if open.peek().is_none() {
+        b.push_str("<p class=\"empty\">no pending questions</p>");
+        return;
+    }
+    for a in open.take(12) {
+        b.push_str("<article class=\"ask-card\"><strong>");
+        b.push_str(&html_escape(a.subject.as_deref().unwrap_or("question")));
+        b.push_str("</strong><div class=\"ask-meta\"><code>");
+        b.push_str(&html_escape(&a.id));
+        b.push_str("</code> · ");
+        b.push_str(&html_escape(&a.asker));
+        b.push_str(" → ");
+        b.push_str(&html_escape(&a.askee));
+        b.push_str(" · ");
+        b.push_str(&html_escape(a.kind.as_str()));
+        b.push_str(" · updated ");
+        b.push_str(&html_escape(&fmt_ts(a.updated_ts)));
+        b.push_str("</div>");
+        if let Some(options) = a.options.as_deref().filter(|s| !s.is_empty()) {
+            b.push_str("<div class=\"event-body\">");
+            b.push_str(&html_escape(options));
+            b.push_str("</div>");
+        }
+        b.push_str("</article>");
+    }
+}
+
+fn render_jobs_cards(b: &mut String, snap: &DashboardSnapshot) {
+    b.push_str("<h2>Job cards</h2>");
+    if snap.jobs.is_empty() {
+        b.push_str("<p class=\"empty\">no jobs</p>");
+        return;
+    }
+    for j in snap.jobs.iter().take(8) {
+        b.push_str("<article class=\"job-card\"><strong>");
+        b.push_str(&html_escape(&j.title));
+        b.push_str("</strong><div class=\"job-meta\"><code>");
+        b.push_str(&html_escape(&j.id));
+        b.push_str("</code> · ");
+        b.push_str(&html_escape(j.state.as_str()));
+        if let Some(assignee) = j.assignee.as_deref() {
+            b.push_str(" · assigned ");
+            b.push_str(&html_escape(assignee));
+        }
+        if let Some(phase) = j.phase.as_deref() {
+            b.push_str(" · ");
+            b.push_str(&html_escape(phase));
+        }
+        b.push_str("</div>");
+        if !j.description.is_empty() {
+            b.push_str("<div class=\"event-body\">");
+            b.push_str(&html_escape(&j.description));
+            b.push_str("</div>");
+        }
+        b.push_str("</article>");
+    }
 }
 
 fn render_peers(b: &mut String, snap: &DashboardSnapshot, now: i64) {
@@ -467,6 +612,7 @@ mod tests {
         assert_eq!(route("GET", "/api/snapshot"), Route::SnapshotJson);
         assert_eq!(route("GET", "/peers"), Route::PeersJson);
         assert_eq!(route("GET", "/jobs?view=summary"), Route::JobsJson);
+        assert_eq!(route("GET", "/asks/pending"), Route::AsksPendingJson);
         assert_eq!(route("GET", "/health"), Route::HealthJson);
         assert_eq!(route("POST", "/"), Route::JsonRpc);
         assert_eq!(route("GET", "/nope"), Route::NotFound);
