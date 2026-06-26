@@ -1,0 +1,40 @@
+{
+  "acceptance_criteria": [
+    ".handoff is resynced/readable before new plan/task edits: hf doctor reports health OK after migrating the legacy Weave handoff ledger to redb, with the legacy SQLite backup path recorded.",
+    "A new handoff plan/backlog entry distinguishes the requested real terminal TUI from existing `weave sessions --watch` and feature-gated HTTP/SSE `weave dashboard`.",
+    "The plan covers graph intelligence and operator panes for sessions, messages, asks, jobs, leases, doctor status, and command catalog coverage.",
+    "A black-box integration test enumerates the current top-level command surface from `weave --help` expectations and exercises a documented help path for every command.",
+    "Generated handoff redb/RVF/lock sidecars remain ignored so local sync/migration state does not pollute git status."
+  ],
+  "allows_dependency_addition": false,
+  "allows_network": false,
+  "blocked_by": [],
+  "correlation_id": "weave-dashboard-command-coverage",
+  "dependencies": [],
+  "id": "TASK-0002",
+  "intent_lock": {
+    "acceptance_hash": "blake3:8f07cad04e0e0156a44fb29ab74ce11fa824fb27f70f7cdbab93c2865f7cc6f9",
+    "objective_hash": "blake3:29f9830cbcaf5f6d33b2e911a5ff0afa9128c30585593141c83999bca9efe438",
+    "path_scope_hash": "blake3:800ccbccbeef0325162c685185209618e6e266c9dcbe0ad618e9a4487d169d1c"
+  },
+  "objective": "Build Weave toward a real terminal dashboard TUI like `icm dashboard`, after resyncing `.handoff` with the current handoff kernel state. Walk the current `weave --help` command surface, include graph-intelligence/operator workflows in the dashboard plan, and add a test contract that exercises every top-level command's documented help path before deeper per-command behavior tests are expanded.",
+  "path_scope": [
+    ".gitignore",
+    ".handoff/loop/backlog.md",
+    ".handoff/loop/plan_WL-082_dashboard_tui.md",
+    ".handoff/tasks/TASK-0002.task.json",
+    "weave/tests/integration.rs"
+  ],
+  "priority": "P1",
+  "role": "planner-implementer",
+  "schema": "handoff.task.v1",
+  "status": "claimed",
+  "test_commands": [
+    "hf doctor",
+    "weave --help",
+    "weave graph --help",
+    "cargo test -p weave every_top_level_command_has_documented_help -- --nocapture",
+    "git diff --check"
+  ],
+  "title": "Plan real terminal dashboard TUI and command coverage gate"
+}
