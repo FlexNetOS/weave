@@ -13067,6 +13067,36 @@ mod surfaces_dashboard {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    fn http_post_form(port: u16, path: &str, cookie_token: &str, body: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut req = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        req.push_str(&format!(
+            "Cookie: weave_dashboard_token={cookie_token}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+        req.push_str("Connection: close\r\n\r\n");
+        req.push_str(body);
+        s.write_all(req.as_bytes()).expect("write form request");
+        s.flush().ok();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn http_body(resp: &str) -> &str {
+        resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(resp)
+    }
+
+    fn first_pending_ask_id(resp: &str) -> String {
+        let body = http_body(resp);
+        let v: serde_json::Value = serde_json::from_str(body).expect("pending asks json");
+        v["pending_questions"][0]["ask_id"]
+            .as_str()
+            .expect("ask_id")
+            .to_string()
+    }
+
     /// WL-052a: `weave dashboard --write` exposes a `POST /api` action surface that
     /// routes through the SAME `dispatch_request` handler as MCP/CLI — proven by
     /// sending a message and reading it back, both via the dashboard API, end-to-end
@@ -13100,6 +13130,74 @@ mod surfaces_dashboard {
         assert!(
             inbox.contains("via-dash"),
             "the message sent via dashboard API is delivered: {inbox}"
+        );
+    }
+
+    /// Repowire-style browser form endpoints are thin adapters over the same
+    /// dashboard JSON-RPC action path. Cookie auth mirrors the browser page that
+    /// sets `weave_dashboard_token` from `?token=...`.
+    #[test]
+    fn dashboard_write_form_actions_route_through_same_handler() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(page.contains("<h2>Actions</h2>"), "actions panel: {page}");
+        assert!(
+            page.contains("action=\"/api/notify\"")
+                && page.contains("action=\"/api/ask\"")
+                && page.contains("action=\"/api/answer\""),
+            "dashboard renders form actions: {page}"
+        );
+
+        let notify = http_post_form(
+            dash.port,
+            "/api/notify",
+            "secret-tok",
+            "from=alice&to=bob&subject=form-notify&body=notify-from-form",
+        );
+        assert!(
+            notify.starts_with("HTTP/1.1 200") && notify.contains("\"isError\":false"),
+            "notify form should route through dispatch_request: {notify}"
+        );
+        let transcript = http_get(dash.port, "/peers/bob/transcript", Some("secret-tok"));
+        assert!(
+            transcript.contains("notify-from-form"),
+            "notify form delivered through store: {transcript}"
+        );
+
+        let ask = http_post_form(
+            dash.port,
+            "/api/ask",
+            "secret-tok",
+            "from=alice&to=bob&subject=form-ask&body=question+from+form%3F",
+        );
+        assert!(
+            ask.starts_with("HTTP/1.1 200") && ask.contains("\"isError\":false"),
+            "ask form should route through dispatch_request: {ask}"
+        );
+        let pending = http_get(dash.port, "/asks/pending", Some("secret-tok"));
+        assert!(
+            pending.contains("form-ask"),
+            "ask form opened a tracked pending question: {pending}"
+        );
+        let ask_id = first_pending_ask_id(&pending);
+
+        let answer = http_post_form(
+            dash.port,
+            "/api/answer",
+            "secret-tok",
+            &format!("from=bob&correlation_id={ask_id}&body=answer+from+form"),
+        );
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.contains("\"isError\":false"),
+            "answer form should route through dispatch_request: {answer}"
+        );
+        let pending_after = http_get(dash.port, "/asks/pending", Some("secret-tok"));
+        assert!(
+            !pending_after.contains(&ask_id),
+            "answered ask should leave pending list: {pending_after}"
         );
     }
 

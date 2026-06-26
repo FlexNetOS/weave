@@ -230,13 +230,15 @@ fn handle_dashboard_connection(
             )?;
             return Ok(());
         }
-        if path != "/api" {
+        let action = dashboard_action_tool(&path);
+        if path_without_query(&path) != "/api" && action.is_none() {
             write_http(stream, 404, b"Not Found")?;
             return Ok(());
         }
-        // Parse headers (content-length + bearer), mirroring the JSON-RPC POST path.
+        // Parse headers (content-length + bearer/cookie), mirroring the JSON-RPC POST
+        // path while also allowing browser forms authenticated by the dashboard cookie.
         let mut content_length = 0usize;
-        let mut auth_ok = token.is_empty();
+        let mut auth_ok = token.is_empty() || query_token_matches(Some(&path), token);
         loop {
             let mut line = String::new();
             reader.read_line(&mut line)?;
@@ -257,6 +259,9 @@ fn handle_dashboard_connection(
                     auth_ok = true;
                 }
             }
+            if lower.starts_with("cookie:") && cookie_token_matches(&line, token) {
+                auth_ok = true;
+            }
         }
         if !auth_ok {
             write_http(stream, 401, b"Unauthorized")?;
@@ -264,11 +269,15 @@ fn handle_dashboard_connection(
         }
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body)?;
-        let req: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                write_http(stream, 400, format!("Invalid JSON: {e}").as_bytes())?;
-                return Ok(());
+        let req: Value = if let Some(tool) = action {
+            dashboard_action_request(tool, &body)?
+        } else {
+            match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    write_http(stream, 400, format!("Invalid JSON: {e}").as_bytes())?;
+                    return Ok(());
+                }
             }
         };
         // The SAME handler as MCP/CLI. `dangerous = true` because `--write` is the
@@ -516,6 +525,100 @@ fn cookie_token_matches(line: &str, token: &str) -> bool {
         let (k, v) = part.trim().split_once('=').unwrap_or(("", ""));
         k == "weave_dashboard_token" && v == token
     })
+}
+
+#[cfg(feature = "surfaces")]
+fn path_without_query(path: &str) -> &str {
+    path.split_once('?').map(|(p, _)| p).unwrap_or(path)
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_action_tool(path: &str) -> Option<&'static str> {
+    match path_without_query(path) {
+        "/api/notify" => Some("weave_notify"),
+        "/api/ask" => Some("weave_ask"),
+        "/api/answer" => Some("weave_answer"),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
+    let fields = parse_form_urlencoded(std::str::from_utf8(body).unwrap_or_default());
+    let mut args = serde_json::Map::new();
+    for key in [
+        "from",
+        "to",
+        "subject",
+        "body",
+        "correlation_id",
+        "reply_to",
+        "kind",
+        "options",
+        "priority",
+    ] {
+        if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
+            args.insert(key.to_string(), Value::String(value.clone()));
+        }
+    }
+    Ok(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "dashboard-action",
+        "method": "tools/call",
+        "params": {
+            "name": tool,
+            "arguments": Value::Object(args),
+        }
+    }))
+}
+
+#[cfg(feature = "surfaces")]
+fn parse_form_urlencoded(body: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for pair in body.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(percent_decode_form(key), percent_decode_form(value));
+    }
+    out
+}
+
+#[cfg(feature = "surfaces")]
+fn percent_decode_form(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(feature = "surfaces")]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Compose a read-only [`dashboard::DashboardSnapshot`] from existing `Store`
