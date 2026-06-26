@@ -13243,6 +13243,49 @@ mod surfaces_dashboard {
         );
     }
 
+    /// Selected-peer session controls update the canonical presence fields through
+    /// the same dashboard action adapter, not dashboard-local mutation code.
+    #[test]
+    fn dashboard_session_controls_route_through_presence_tools() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("Session controls")
+                && page.contains("action=\"/api/turn-state\"")
+                && page.contains("action=\"/api/description\""),
+            "selected peer session controls render: {page}"
+        );
+
+        let turn = http_post_form(
+            dash.port,
+            "/api/turn-state",
+            "secret-tok",
+            "me=alice&state=working",
+        );
+        assert!(
+            turn.starts_with("HTTP/1.1 200") && turn.contains("\"isError\":false"),
+            "turn-state form routes through dispatch_request: {turn}"
+        );
+        let desc = http_post_form(
+            dash.port,
+            "/api/description",
+            "secret-tok",
+            "me=alice&description=dashboard+session+control",
+        );
+        assert!(
+            desc.starts_with("HTTP/1.1 200") && desc.contains("\"isError\":false"),
+            "description form routes through dispatch_request: {desc}"
+        );
+
+        let peers = http_get(dash.port, "/peers", Some("secret-tok"));
+        assert!(
+            peers.contains("working") && peers.contains("dashboard session control"),
+            "presence fields updated through canonical tools: {peers}"
+        );
+    }
+
     /// Structured pending-question controls render choice buttons and tool-permission
     /// approve/deny forms, all still routed through canonical `weave_answer`.
     #[test]

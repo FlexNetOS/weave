@@ -540,6 +540,8 @@ fn dashboard_action_tool(path: &str) -> Option<&'static str> {
         "/api/answer" => Some("weave_answer"),
         "/api/reply" => Some("weave_reply"),
         "/api/job-cancel" => Some("weave_job_cancel"),
+        "/api/turn-state" => Some("weave_set_turn_state"),
+        "/api/description" => Some("weave_set_description"),
         _ => None,
     }
 }
@@ -561,6 +563,9 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "priority",
         "job_id",
         "reason",
+        "me",
+        "state",
+        "description",
     ] {
         if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
             if matches!(key, "in_reply_to" | "ttl" | "supersedes") {

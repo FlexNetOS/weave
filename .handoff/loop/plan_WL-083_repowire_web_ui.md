@@ -125,9 +125,23 @@ Closed the basic structured-ask UX gap in the pending questions panel:
 - Integration coverage proves choice and tool-permission answers go through the
   dashboard form surface and leave the pending list.
 
+## 2026-06-26 selected-peer session-control slice
+
+Added the first non-destructive selected-peer session controls:
+
+- Selected peer details now render Session controls for turn state and description.
+- `POST /api/turn-state` adapts form-url-encoded input into canonical
+  `weave_set_turn_state`.
+- `POST /api/description` adapts form-url-encoded input into canonical
+  `weave_set_description`.
+- Both controls route through the same `dispatch_request` JSON-RPC path used by
+  MCP/CLI and remain gated by `weave dashboard --write`.
+- Integration coverage proves the forms update canonical peer fields visible from
+  `GET /peers`.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
-1. Selected peer detail view: current active session controls and richer timeline/thread rendering; basic transcript search, before pagination, and reply are now present.
+1. Selected peer detail view: non-destructive turn-state/description controls are now present; remaining work is richer timeline/thread rendering and dangerous session controls (kill/spawn) with clear preview/allowlist posture.
 2. Pending questions panel: basic choice/tool-permission/free-text answer controls are now present; remaining work is richer validation/status and tool-args display.
 3. Write forms: richer notify/ask/answer/reply affordances; current notify/ask/answer/reply forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
 4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.

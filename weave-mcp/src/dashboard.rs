@@ -273,7 +273,22 @@ fn render_selected_peer_detail(b: &mut String, snap: &DashboardSnapshot) {
             &p.description
         },
     );
-    b.push_str("</div><h2>Transcript preview</h2>");
+    b.push_str("</div><h2>Session controls</h2><div class=\"choice-row\">");
+    b.push_str("<form method=\"post\" action=\"/api/turn-state\" class=\"inline-form\"><input type=\"hidden\" name=\"me\" value=\"");
+    b.push_str(&html_escape(&p.name));
+    b.push_str("\"><input name=\"state\" placeholder=\"working|awaiting_input|idle\" value=\"");
+    b.push_str(&html_escape(if p.turn_state.is_empty() {
+        "working"
+    } else {
+        &p.turn_state
+    }));
+    b.push_str("\"><button type=\"submit\">Set turn state</button></form>");
+    b.push_str("<form method=\"post\" action=\"/api/description\" class=\"inline-form\"><input type=\"hidden\" name=\"me\" value=\"");
+    b.push_str(&html_escape(&p.name));
+    b.push_str("\"><input name=\"description\" placeholder=\"task description\" value=\"");
+    b.push_str(&html_escape(&p.description));
+    b.push_str("\"><button type=\"submit\">Set description</button></form></div>");
+    b.push_str("<h2>Transcript preview</h2>");
     let mut count = 0usize;
     let mut latest_message_id = None;
     b.push_str("<div class=\"feed\">");
