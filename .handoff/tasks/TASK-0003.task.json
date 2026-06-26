@@ -1,0 +1,46 @@
+{
+  "schema": "handoff.task.v1",
+  "id": "TASK-0003",
+  "title": "Review and correct local repowire parity audit truth evidence",
+  "status": "done",
+  "priority": "P1",
+  "objective": "Review and correct the completed local repowire source parity audit against current merged Weave and local repowire zip evidence. Re-sync the hf/handoff kernel path before touching ledger/cards, run a /review-style truth audit, correct any false classifications, record a review artifact, and prove completion with code/source/test evidence without weakening Rust-native/no-daemon invariants.",
+  "path_scope": [
+    ".handoff/loop/audit_REPOWIRE_LOCAL_SOURCE_PARITY.md",
+    ".handoff/loop/review_REPOWIRE_LOCAL_SOURCE_PARITY.md",
+    ".handoff/tasks/TASK-0003.task.json"
+  ],
+  "acceptance_criteria": [
+    "hf sync/hf doctor evidence is recorded before card/ledger finalization.",
+    "The completed repowire local source parity audit is re-reviewed against current merged Weave code and the local repowire zip evidence, not memory.",
+    "Any false audit classifications found by review are corrected in .handoff/loop/audit_REPOWIRE_LOCAL_SOURCE_PARITY.md.",
+    "A /review artifact records the zip hash, merged PR state, drift guard result, concrete findings, and verification commands.",
+    "Dashboard required-area parity conclusion remains evidence-backed after corrections.",
+    "Verification commands pass and git diff has no whitespace errors.",
+    "Task card and witnessed ledger transitions are synchronized per .handoff policy."
+  ],
+  "test_commands": [
+    "cargo fmt --all --check",
+    "cargo clippy -p weave --features surfaces --all-targets -- -D warnings",
+    "cargo test -p weave-mcp --features surfaces",
+    "cargo test -p weave --features surfaces --test integration surfaces_dashboard -- --nocapture",
+    "cargo test -p weave-core --features sqlite review_add_list_mark_remove_roundtrip -- --nocapture",
+    "cargo test -p weave-core --features sqlite review_rejects_bad_url -- --nocapture",
+    "cargo test -p weave-core --features sqlite delivery_log_records_and_lists_oldest_first -- --nocapture",
+    "cargo test -p weave-mcp every_catalog_op_is_dispatchable -- --nocapture",
+    "cargo test -p weave-mcp catalog_weave_send_lists_ttl -- --nocapture",
+    "hf doctor",
+    "git diff --check"
+  ],
+  "dependencies": [],
+  "blocked_by": [],
+  "allows_network": true,
+  "allows_dependency_addition": false,
+  "correlation_id": "repowire-local-source-parity-review",
+  "role": "reviewer-verifier",
+  "intent_lock": {
+    "objective_hash": "blake3:87722c5494ebc6b691225097444017da533665593d0becff5d727d59ec3fb67f",
+    "path_scope_hash": "blake3:81c4ee8015d68cb1c193336ea0decb0724f0cb9b714027c9ba0039084a128cac",
+    "acceptance_hash": "blake3:c0a41247ad4ef044646e08f59c78012c2dd6d0ea32ac448e353a92a1d8f5074b"
+  }
+}

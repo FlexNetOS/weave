@@ -101,8 +101,8 @@ Verdicts:
 | `daemon/routes/peers.py` registry/touch/offline/doctor | Peer registry and liveness | `sessions`, hooks, peer list in dashboard, wake/stop hook handling | code/test/doc | covered | Weave's peer concept is session/mailbox centric rather than daemon registry centric. |
 | `daemon/routes/peers.py` timeline/transcript | Session transcript history | `weave session export/import`, store history/thread/search, `/peers/{name}/transcript` | code/test/doc | covered | Weave transcript is bounded through messages/history rather than repowire runtime transcript DB. |
 | `daemon/routes/attachments.py` | Binary attachment upload/download | none | code | gap | True feature gap, but outside the required dashboard parity list. Do not import until product asks for attachment semantics. |
-| `daemon/routes/traces.py` | Delivery trace lookup | delivery refs, job progress, messages/outbox state | code/doc | unclear | Weave has trace ids and delivery refs, but no exact browser `/traces/{id}` parity. Low priority unless debugging UX requires it. |
-| `daemon/routes/reviews.py` | Review queue CRUD | no direct review queue | code/doc | superseded | Weave delegates review/PR behavior to jobs/harness/GitHub workflows, not a daemon review queue. |
+| `daemon/routes/traces.py` | Delivery trace lookup | `weave_delivery`; `Store::list_delivery`; delivery trace rows | code/test/doc | covered | Weave has metadata-only delivery traces keyed by message id. It is MCP/CLI parity rather than a browser `/traces/{id}` clone, and intentionally excludes message bodies/secrets. |
+| `daemon/routes/reviews.py` | Review queue CRUD | `weave_review_queue`, `weave_review_add`, `weave_review_mark`, `weave_review_remove`; `Store::{add_review_item,review_queue,mark_reviewed,remove_review_item}` | code/test/doc | covered | Review queue parity exists in CLI/MCP/store, not in the browser dashboard. This row was corrected during the post-completion /review pass. |
 | `daemon/routes/shares.py`, `relay/server.py` shares | Hosted share tokens/viewer | `weave push`, dashboard/server bearer auth, signed intent federation | code/doc | superseded | Weave intentionally avoids hosted relay runtime; ADR-0005-style signed push and owner-only writes replace relay isolation. |
 | `relay/server.py` `/events/stream` hosted bridge | Hosted dashboard/relay SSE | local `/events/stream` and cross-machine push/pull | code/runtime/doc | superseded | No hosted relay process is adopted. |
 | `hooks/pretooluse_handler.py` | Dangerous tool approval through ask primitive | `weave hook pretooluse`, `pretooluse_is_dangerous`, ask permission flow | code/test/doc | covered | Weave gates native host mutators and weave dangerous tools. |
@@ -130,7 +130,7 @@ Verdicts:
 | auth/token/cookie/write gating | covered | `serve_dashboard` and `handle_dashboard_connection` enforce route auth and refuse POST unless `--write`; routable bind requires token. |
 | JSON/SSE endpoint compatibility | covered | Repowire-style endpoint names present for the dashboard-critical read APIs. Exact unsupported upstream daemon endpoints are classified above. |
 
-No high-priority dashboard parity gap was found in the required areas. True gaps discovered by the local zip audit are non-required/non-dashboard or intentionally superseded by Weave's Rust-native/no-daemon design: binary attachments, exact `/traces/{id}` browser lookup, orphan-pane browser adoption, and peer-scoped MCP CRUD.
+No high-priority dashboard parity gap was found in the required areas. True gaps discovered by the local zip audit are non-required/non-dashboard or intentionally superseded by Weave's Rust-native/no-daemon design: binary attachments, orphan-pane browser adoption, and peer-scoped MCP CRUD. A post-completion review corrected the trace and review-queue rows to covered because Weave already has `weave_delivery` plus `weave_review_*`/store support.
 
 ## Current verification commands
 
@@ -147,4 +147,4 @@ Result: all four commands passed. `weave-mcp` reported 33 unit tests passed; `we
 
 ## Decision
 
-The local source audit supports the current claim that Weave's **Rust-native dashboard parity** covers repowire's real dashboard operator workflow without adopting the Next.js/Python daemon runtime. The remaining gaps are either explicit non-goals/superseded surfaces or lower-priority adjacent features, not blockers for the WL-083 dashboard parity claim.
+The local source audit supports the current claim that Weave's **Rust-native dashboard parity** covers repowire's real dashboard operator workflow without adopting the Next.js/Python daemon runtime. The remaining gaps are either explicit non-goals/superseded surfaces or lower-priority adjacent features, not blockers for the WL-083 dashboard parity claim. Post-completion /review found and fixed two audit-classification errors: delivery traces and review queue are covered by existing Weave MCP/store surfaces, even though they are not browser dashboard clones.
