@@ -202,7 +202,13 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
         "<div class=\"shell\"><header class=\"top\"><div class=\"brand\">weave dashboard <code>",
     );
     b.push_str(&html_escape(host));
-    b.push_str("</code></div><div class=\"pill\">repowire-grade Rust surface · read-only · ");
+    b.push_str("</code></div><div class=\"pill\">repowire-grade Rust surface · ");
+    b.push_str(if snap.settings.write_enabled {
+        "write-enabled"
+    } else {
+        "read-only"
+    });
+    b.push_str(" · ");
     b.push_str(&html_escape(&fmt_ts(now)));
     b.push_str("</div></header><main class=\"grid\">");
 

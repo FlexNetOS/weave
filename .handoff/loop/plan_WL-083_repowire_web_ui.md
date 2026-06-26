@@ -235,3 +235,18 @@ Expanded browser/recovery event semantics toward upstream dashboard event typing
   compatibility and keeps `next_since` behavior unchanged.
 - Integration coverage proves `/api/events` includes typed message/ask/job/peer
   events while existing gap-recovery filtering still works.
+
+## 2026-06-26 runtime smoke + parity-doc audit slice
+
+Finalized the dashboard audit trail for the real repowire web UI port:
+
+- Runtime smoke starts `weave dashboard --write` against a hermetic DB, opens the
+  browser-auth URL, and checks the rendered page includes peer roster, selected
+  peer, pending questions, actions, Danger zone, Settings, mesh feed, selected
+  job, and control plane sections.
+- Runtime smoke checks JSON endpoint shapes for `/api/snapshot`, `/api/events`,
+  `/events?since=0`, `/jobs?view=summary`, `/asks/pending`, `/settings`, and
+  `/health`.
+- `docs/REPOWIRE-PARITY.md` now records the browser dashboard as a Rust-native
+  HAVE for the real upstream dashboard shape, with explicit caveat that Weave did
+  not adopt the Next.js runtime and all writes stay bearer/`--write` gated.

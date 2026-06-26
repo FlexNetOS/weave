@@ -13360,7 +13360,8 @@ mod surfaces_dashboard {
         );
         let page = http_get(dash.port, "/?token=secret-tok", None);
         assert!(
-            page.contains("<h2>Settings</h2>")
+            page.contains("write-enabled")
+                && page.contains("<h2>Settings</h2>")
                 && page.contains("dash-circle")
                 && page.contains("enabled")
                 && page.contains("dash-bridge")
