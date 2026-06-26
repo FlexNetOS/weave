@@ -549,6 +549,8 @@ fn dashboard_action_tool(path: &str) -> Option<&'static str> {
         "/api/job-create" => Some("weave_job_create"),
         "/api/turn-state" => Some("weave_set_turn_state"),
         "/api/description" => Some("weave_set_description"),
+        "/api/spawn-peer" => Some("weave_spawn_peer"),
+        "/api/kill-peer" => Some("weave_kill_peer"),
         _ => None,
     }
 }
@@ -580,8 +582,25 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "assignee",
         "circle",
         "prompt",
+        "name",
+        "cmd",
+        "cwd",
+        "mux",
+        "window",
     ] {
         if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
+            if tool == "weave_spawn_peer" && key == "cmd" {
+                if let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(value) {
+                    args.insert(key.to_string(), v);
+                    continue;
+                }
+            }
+            if tool == "weave_spawn_peer" && key == "window" {
+                if let Ok(v) = value.parse::<bool>() {
+                    args.insert(key.to_string(), Value::Bool(v));
+                    continue;
+                }
+            }
             if matches!(key, "in_reply_to" | "ttl" | "supersedes") {
                 if let Ok(n) = value.parse::<i64>() {
                     args.insert(key.to_string(), Value::Number(n.into()));

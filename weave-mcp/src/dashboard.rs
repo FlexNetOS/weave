@@ -208,6 +208,10 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
     );
     render_action_forms(&mut b, snap);
     b.push_str(
+        "</div></section><section class=\"panel\"><h2>Danger zone</h2><div class=\"panel-body\">",
+    );
+    render_danger_zone(&mut b, snap);
+    b.push_str(
         "</div></section><section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">",
     );
     render_feed_cards(&mut b, snap);
@@ -645,6 +649,36 @@ fn render_action_forms(b: &mut String, snap: &DashboardSnapshot) {
     );
     textarea(b, "body", "answer", "");
     b.push_str("<button type=\"submit\">Answer ask</button></form>");
+    b.push_str("</div>");
+}
+
+fn render_danger_zone(b: &mut String, snap: &DashboardSnapshot) {
+    let cwd = snap
+        .peers
+        .first()
+        .and_then(|p| p.cwd.as_deref())
+        .unwrap_or("");
+    let kill_target = snap.peers.first().map(|p| p.name.as_str()).unwrap_or("");
+    b.push_str("<p class=\"muted\">Destructive session controls are intentionally explicit. Spawn is argv-only JSON and is denied unless the dashboard was started with <code>--write</code>, the command program is trusted by the injector, and <code>spawn_allowed_dirs</code>/<code>WEAVE_SPAWN_DIRS</code> allows the cwd. Kill uses canonical <code>weave_kill_peer</code> and may be coarse for zellij/screen.</p>");
+    b.push_str("<div class=\"action-grid\">");
+    b.push_str("<form class=\"action-form\" method=\"post\" action=\"/api/spawn-peer\"><strong>Spawn peer</strong>");
+    input(b, "name", "new peer", "");
+    textarea(
+        b,
+        "cmd",
+        "cmd argv JSON",
+        "[\"weave\",\"hook\",\"session\"]",
+    );
+    input(b, "cwd", "cwd", cwd);
+    input(b, "mux", "mux override", "");
+    input(b, "circle", "circle", "");
+    b.push_str("<label><input name=\"window\" value=\"false\">new window true|false</label>");
+    b.push_str("<button type=\"submit\">Spawn via shared handler</button></form>");
+
+    b.push_str("<form class=\"action-form\" method=\"post\" action=\"/api/kill-peer\"><strong>Kill peer</strong>");
+    input(b, "name", "peer", kill_target);
+    b.push_str("<p class=\"muted\">Preview the peer/mux target first; submitting calls <code>weave_kill_peer</code> through the bearer-gated write API.</p>");
+    b.push_str("<button type=\"submit\">Kill selected peer</button></form>");
     b.push_str("</div>");
 }
 

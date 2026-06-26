@@ -11265,10 +11265,11 @@ fn cli_lease_path_conflict_parent_child() {
 #[test]
 fn cli_lease_sweep_removes_expired() {
     let db = TestDb::new();
-    // Reserve with 1-second TTL.
+    // Reserve with a TTL long enough that process startup/scheduling jitter in
+    // slower CI feature matrices cannot expire it before the immediate list.
     run_ok(
         &db,
-        &["lease", "reserve", "--resource", "tmp/file", "--ttl", "1"],
+        &["lease", "reserve", "--resource", "tmp/file", "--ttl", "5"],
     );
 
     // List shows it.
@@ -11276,7 +11277,7 @@ fn cli_lease_sweep_removes_expired() {
     assert!(list1.contains("tmp/file"), "list before expiry: {list1}");
 
     // Wait for expiry.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(6));
 
     // Sweep removes it.
     let sweep = run_ok(&db, &["lease", "sweep"]);
@@ -13283,6 +13284,38 @@ mod surfaces_dashboard {
         assert!(
             peers.contains("working") && peers.contains("dashboard session control"),
             "presence fields updated through canonical tools: {peers}"
+        );
+    }
+
+    /// Dangerous repowire-style session controls are visible but remain explicit:
+    /// forms route through canonical spawn/kill tools, and remote spawn keeps the
+    /// existing allowlist denial before any mux command can run.
+    #[test]
+    fn dashboard_danger_zone_renders_and_spawn_respects_allowlist() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("Danger zone")
+                && page.contains("action=\"/api/spawn-peer\"")
+                && page.contains("action=\"/api/kill-peer\"")
+                && page.contains("argv-only")
+                && page.contains("spawn_allowed_dirs"),
+            "danger zone should render explicit spawn/kill posture: {page}"
+        );
+
+        let spawn = http_post_form(
+            dash.port,
+            "/api/spawn-peer",
+            "secret-tok",
+            "name=dash-kid&cmd=%5B%22echo%22%2C%22hi%22%5D&cwd=/tmp&window=false",
+        );
+        assert!(
+            spawn.starts_with("HTTP/1.1 200")
+                && (spawn.contains("\"isError\":true") || spawn.contains("\"isError\": true"))
+                && spawn.contains("spawn_allowed_dirs"),
+            "spawn form should route to canonical tool and deny without allowlist: {spawn}"
         );
     }
 
