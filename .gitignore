@@ -7,3 +7,11 @@ target/
 .handoff/**/ledger.db
 # Local upstream archives supplied for audit/integration evidence. Do not delete.
 cc-switch-main.zip
+.handoff/ledger.db-wal
+.handoff/ledger.db-shm
+.handoff/**/*.rvf
+.handoff/**/*.rvf.lock
+.handoff/ledger.db.sqlite.bak
+.handoff/ledger.redb.tmp
+.handoff/locks/
+.handoff/workspaces/main/scratch/

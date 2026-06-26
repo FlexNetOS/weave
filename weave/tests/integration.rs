@@ -14615,3 +14615,127 @@ fn setup_rejects_invalid_provider() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn every_top_level_command_has_documented_help() {
+    // The owner-facing dashboard/test audit starts with a hard contract: every
+    // top-level command advertised by `weave --help` must have an exercised help
+    // path. Keep this list in sync with the command surface so new commands must
+    // add at least a black-box usage smoke before shipping deeper behavior tests.
+    let db = TestDb::new();
+    let expected = [
+        "mcp",
+        "setup",
+        "uninstall",
+        #[cfg(feature = "sqlite")]
+        "provider-switch",
+        "harness",
+        "send",
+        "notify",
+        "broadcast-notify",
+        "broadcast-ask",
+        "outbox",
+        "pull",
+        "reply",
+        "thread",
+        "summarize",
+        "receipts",
+        "delivery",
+        "watch",
+        "responder",
+        "inbox",
+        "search",
+        "peers",
+        "sessions",
+        "tui",
+        "scan",
+        "gc",
+        "doctor",
+        "register",
+        "attach",
+        "connect",
+        "inject",
+        "spawn",
+        "kill",
+        "ask",
+        "answer",
+        "ack",
+        "asks",
+        "ask-get",
+        "ask-status",
+        "ask-many",
+        "ask-many-result",
+        "job",
+        "orchestrator",
+        "config",
+        "completions",
+        "man",
+        "describe",
+        "status",
+        "peer-policy",
+        "schedule",
+        "schedules",
+        "cancel-schedule",
+        "tick",
+        "hook",
+        "memory",
+        "daemon",
+        "review",
+        "permission",
+        "lease",
+        "serve",
+        "graph",
+        "export",
+        "backup",
+        "restore",
+        "session",
+        "help",
+    ];
+
+    let top = run_ok(&db, &["--help"]);
+    for command in expected {
+        assert!(
+            top.contains(&format!("  {command}")),
+            "top-level help omitted expected command `{command}`:\n{top}"
+        );
+
+        let help = if command == "help" {
+            run_ok(&db, &["help", "help"])
+        } else {
+            run_ok(&db, &[command, "--help"])
+        };
+        assert!(
+            help.contains("Usage:") || help.contains("Print this message"),
+            "help for `{command}` did not look like clap help:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn tui_once_and_json_are_default_build_operator_surfaces() {
+    let db = TestDb::new();
+
+    let once = run_ok(&db, &["tui", "--once", "--no-color"]);
+    assert!(once.contains("weave tui"), "{once}");
+    assert!(once.contains("panes:"), "{once}");
+    assert!(
+        once.contains("HTTP `dashboard` is feature-gated"),
+        "default-build TUI should explain the old dashboard-icon failure mode: {once}"
+    );
+
+    let graph = run_ok(&db, &["tui", "--once", "--no-color", "--pane", "graph"]);
+    assert!(graph.contains("graph intelligence"), "{graph}");
+    assert!(graph.contains("nodes="), "{graph}");
+
+    let json = run_ok(&db, &["tui", "--json", "--pane", "commands"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("tui json");
+    assert_eq!(parsed["pane"], "commands");
+    assert!(
+        parsed["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .any(|cmd| cmd["name"] == "tui" && cmd["domain"] == "dashboard"),
+        "command catalog includes tui dashboard entry: {parsed}"
+    );
+}

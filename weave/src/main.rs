@@ -59,7 +59,7 @@ use weave_core::sign;
 mod testenv;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -520,6 +520,30 @@ enum Cmd {
         /// show sessions in every circle (mesh-wide)
         #[arg(long)]
         all_circles: bool,
+    },
+    /// Real terminal operator dashboard (dependency-light, read-only). Unlike
+    /// `sessions --watch` this is a multi-pane cockpit; unlike the feature-gated
+    /// HTTP `dashboard`, it exists in the default binary. `--once` renders one
+    /// deterministic frame for tests/headless launchers.
+    Tui {
+        /// render a single frame and exit (headless/test mode)
+        #[arg(long)]
+        once: bool,
+        /// machine-readable snapshot output
+        #[arg(long)]
+        json: bool,
+        /// dashboard pane to render
+        #[arg(long, value_enum, default_value_t = TuiPane::Overview)]
+        pane: TuiPane,
+        /// substring filter for sessions/messages/asks/jobs/leases/commands
+        #[arg(long)]
+        filter: Option<String>,
+        /// dashboard poll interval in seconds for interactive mode
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        /// disable ANSI clear/color sequences
+        #[arg(long)]
+        no_color: bool,
     },
     /// Scan, identify, and tag running sessions: refresh your own row's git tags,
     /// then list every (federated) peer joined with liveness and its
@@ -3587,6 +3611,104 @@ struct DashboardOpts {
     branch: Option<String>,
 }
 
+/// Default-build terminal dashboard panes. Kept as a small value enum so shell
+/// completions/help/TUI tests all share one canonical pane vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TuiPane {
+    Overview,
+    Sessions,
+    Messages,
+    Asks,
+    Jobs,
+    Graph,
+    Leases,
+    Commands,
+}
+
+impl TuiPane {
+    fn as_str(self) -> &'static str {
+        match self {
+            TuiPane::Overview => "overview",
+            TuiPane::Sessions => "sessions",
+            TuiPane::Messages => "messages",
+            TuiPane::Asks => "asks",
+            TuiPane::Jobs => "jobs",
+            TuiPane::Graph => "graph",
+            TuiPane::Leases => "leases",
+            TuiPane::Commands => "commands",
+        }
+    }
+}
+
+const TUI_COMMANDS: &[(&str, &str)] = &[
+    ("mcp", "protocol"),
+    ("setup", "host wiring"),
+    ("uninstall", "host wiring"),
+    #[cfg(feature = "sqlite")]
+    ("provider-switch", "provider policy"),
+    ("harness", "orchestration"),
+    ("send", "messaging"),
+    ("notify", "messaging"),
+    ("broadcast-notify", "messaging"),
+    ("broadcast-ask", "asks"),
+    ("outbox", "federation"),
+    ("pull", "federation"),
+    ("reply", "messaging"),
+    ("thread", "read view"),
+    ("summarize", "llm"),
+    ("receipts", "delivery"),
+    ("delivery", "delivery"),
+    ("watch", "read view"),
+    ("responder", "asks"),
+    ("inbox", "read view"),
+    ("search", "read view"),
+    ("peers", "presence"),
+    ("sessions", "presence"),
+    ("tui", "dashboard"),
+    ("scan", "presence"),
+    ("gc", "maintenance"),
+    ("doctor", "diagnostics"),
+    ("register", "presence"),
+    ("attach", "presence"),
+    ("connect", "presence"),
+    ("inject", "dangerous"),
+    ("spawn", "dangerous"),
+    ("kill", "dangerous"),
+    ("ask", "asks"),
+    ("answer", "asks"),
+    ("ack", "asks"),
+    ("asks", "asks"),
+    ("ask-get", "asks"),
+    ("ask-status", "asks"),
+    ("ask-many", "asks"),
+    ("ask-many-result", "asks"),
+    ("job", "jobs"),
+    ("orchestrator", "orchestration"),
+    ("config", "configuration"),
+    ("completions", "shell"),
+    ("man", "docs"),
+    ("describe", "presence"),
+    ("status", "presence"),
+    ("peer-policy", "presence"),
+    ("schedule", "scheduling"),
+    ("schedules", "scheduling"),
+    ("cancel-schedule", "scheduling"),
+    ("tick", "scheduling"),
+    ("hook", "hooks"),
+    ("memory", "memory"),
+    ("daemon", "presence"),
+    ("review", "reviews"),
+    ("permission", "permissions"),
+    ("lease", "leases"),
+    ("serve", "http"),
+    ("graph", "graph"),
+    ("export", "archive"),
+    ("backup", "archive"),
+    ("restore", "archive"),
+    ("session", "resume"),
+    ("help", "docs"),
+];
+
 /// Decide whether the ANSI clear-home prefix should be emitted: only when stdout is
 /// a real TTY AND neither `NO_COLOR` nor `WEAVE_NO_CLEAR` is set (either, even empty,
 /// disables it). For `--json` the caller forces this off. Reads env + the terminal —
@@ -3792,6 +3914,317 @@ fn render_sessions_dashboard(
         i = j;
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct GraphSummary {
+    nodes: usize,
+    edges: usize,
+    density: f64,
+    component_count: usize,
+    largest_component: usize,
+    components: Vec<Vec<String>>,
+    centrality: Vec<(String, f64)>,
+}
+
+fn graph_summary(
+    store: &dyn Store,
+    cfg: &Config,
+    me: &str,
+    circle: Option<&str>,
+) -> Result<GraphSummary> {
+    let target_circle = resolve_list_circle(store, cfg, me, circle, false);
+    let peers = store.list_peers()?;
+    let peers_in_circle: Vec<_> = peers
+        .into_iter()
+        .filter(|p| {
+            target_circle
+                .as_ref()
+                .map(|c| model::circle_or_default(&p.circle) == c)
+                .unwrap_or(true)
+        })
+        .map(|p| p.name)
+        .collect();
+    let peer_set: std::collections::HashSet<_> = peers_in_circle.iter().cloned().collect();
+
+    let mut g = fnx_classes::Graph::new(fnx_runtime::CompatibilityMode::Strict);
+    for peer in &peers_in_circle {
+        g.add_node(peer.clone());
+    }
+    let mut seen_edges = std::collections::HashSet::new();
+    for peer in &peers_in_circle {
+        let hist = store.history(peer, None, 10_000)?;
+        for msg in &hist {
+            if peer_set.contains(&msg.sender)
+                && peer_set.contains(&msg.recipient)
+                && msg.sender != msg.recipient
+            {
+                let key = if msg.sender <= msg.recipient {
+                    (msg.sender.clone(), msg.recipient.clone())
+                } else {
+                    (msg.recipient.clone(), msg.sender.clone())
+                };
+                if seen_edges.insert(key) {
+                    let _ = g.add_edge(&msg.sender, &msg.recipient);
+                }
+            }
+        }
+    }
+
+    let cc = fnx_algorithms::connected_components(&g);
+    let dc = fnx_algorithms::degree_centrality(&g);
+    let dens = fnx_algorithms::density(&g);
+    let largest = cc.components.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut centrality: Vec<_> = dc.scores.into_iter().map(|s| (s.node, s.score)).collect();
+    centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(GraphSummary {
+        nodes: g.node_count(),
+        edges: g.edge_count(),
+        density: dens.density,
+        component_count: cc.components.len(),
+        largest_component: largest,
+        components: cc.components,
+        centrality,
+    })
+}
+
+fn filter_match(filter: Option<&str>, hay: impl AsRef<str>) -> bool {
+    match filter {
+        Some(f) if !f.trim().is_empty() => hay.as_ref().to_lowercase().contains(&f.to_lowercase()),
+        _ => true,
+    }
+}
+
+fn render_tui_frame(
+    store: &dyn Store,
+    cfg: &Config,
+    pane: TuiPane,
+    filter: Option<&str>,
+    no_color: bool,
+) -> Result<String> {
+    let (me, _) = resolve_me_explicit(None, None, cfg);
+    let this_host = config::this_host();
+    let now = model::now();
+    let extra = cfg.peer_db_sources();
+    let views = store::federated_peers(store, &extra)?;
+    let mut rows = dashboard_rows(&views);
+    rows.retain(|r| {
+        filter_match(
+            filter,
+            format!(
+                "{} {} {} {} {} {}",
+                r.name, r.session_id, r.repo, r.branch, r.worktree, r.description
+            ),
+        )
+    });
+
+    let graph = graph_summary(store, cfg, &me, None)?;
+    let asks = store.list_asks(&me, model::AskRole::Any, 50)?;
+    let jobs = store.list_jobs(
+        model::JobFilter {
+            state: None,
+            owner: None,
+            creator: None,
+            assignee: None,
+            circle: None,
+        },
+        50,
+    )?;
+    let leases = store.list_leases(50)?;
+    let (inbox, _unread_total) = store.inbox(&me, false, false, 10)?;
+
+    if pane == TuiPane::Sessions {
+        return Ok(render_sessions_dashboard(
+            &rows,
+            &DashboardOpts {
+                clear: !no_color && clear_enabled(),
+                repo: None,
+                branch: None,
+            },
+            &this_host,
+            now,
+        ));
+    }
+
+    let mut out = String::new();
+    if !no_color && clear_enabled() {
+        out.push_str(ANSI_CLEAR_HOME);
+    }
+    out.push_str(&format!(
+        "weave tui [{}] pane={} me={} backend={} db={}\n",
+        model::fmt_ts(now),
+        pane.as_str(),
+        me,
+        store.backend(),
+        cfg.db_path().display()
+    ));
+    out.push_str("panes: overview sessions messages asks jobs graph leases commands\n");
+    out.push('\n');
+
+    match pane {
+        TuiPane::Overview => {
+            let stale = rows
+                .iter()
+                .filter(|r| matches!(row_liveness(r, &this_host, now), store::Liveness::Stale))
+                .count();
+            out.push_str("overview\n");
+            out.push_str(&format!("  sessions: {} ({} stale)\n", rows.len(), stale));
+            out.push_str(&format!("  inbox unread: {}\n", inbox.len()));
+            out.push_str(&format!("  asks tracked: {}\n", asks.len()));
+            out.push_str(&format!("  jobs listed: {}\n", jobs.len()));
+            out.push_str(&format!("  active leases: {}\n", leases.len()));
+            out.push_str(&format!(
+                "  graph: {} nodes, {} edges, {} components, density {:.4}\n",
+                graph.nodes, graph.edges, graph.component_count, graph.density
+            ));
+            out.push_str("  note: HTTP `dashboard` is feature-gated; this TUI is default-build.\n");
+        }
+        TuiPane::Messages => {
+            out.push_str("messages\n");
+            if inbox.is_empty() {
+                out.push_str("  no unread messages\n");
+            }
+            for m in inbox {
+                if filter_match(
+                    filter,
+                    format!(
+                        "{} {} {}",
+                        m.sender,
+                        m.subject.clone().unwrap_or_default(),
+                        m.body
+                    ),
+                ) {
+                    out.push_str(&format!(
+                        "  #{} {} -> {} [{}] {}\n",
+                        m.id,
+                        m.sender,
+                        m.recipient,
+                        model::fmt_ts(m.ts),
+                        m.subject.unwrap_or_else(|| "-".to_string())
+                    ));
+                }
+            }
+        }
+        TuiPane::Asks => {
+            out.push_str("asks\n");
+            if asks.is_empty() {
+                out.push_str("  no asks\n");
+            }
+            for a in asks {
+                if filter_match(
+                    filter,
+                    format!("{} {} {} {:?}", a.id, a.asker, a.askee, a.state),
+                ) {
+                    out.push_str(&format!(
+                        "  {} [{}] {} -> {} updated {}\n",
+                        a.id,
+                        a.state.as_str(),
+                        a.asker,
+                        a.askee,
+                        model::fmt_ts(a.updated_ts)
+                    ));
+                }
+            }
+        }
+        TuiPane::Jobs => {
+            out.push_str("jobs\n");
+            if jobs.is_empty() {
+                out.push_str("  no jobs\n");
+            }
+            for j in jobs {
+                if filter_match(
+                    filter,
+                    format!("{} {} {} {:?}", j.id, j.title, j.creator, j.state),
+                ) {
+                    out.push_str(&format!(
+                        "  {} [{}] {} owner={} assignee={}\n",
+                        j.id,
+                        j.state.as_str(),
+                        j.title,
+                        j.owner.as_deref().unwrap_or("-"),
+                        j.assignee.as_deref().unwrap_or("-")
+                    ));
+                }
+            }
+        }
+        TuiPane::Graph => {
+            out.push_str("graph intelligence\n");
+            out.push_str(&format!(
+                "  nodes={} edges={} density={:.4} components={} largest={}\n",
+                graph.nodes,
+                graph.edges,
+                graph.density,
+                graph.component_count,
+                graph.largest_component
+            ));
+            for (i, comp) in graph.components.iter().enumerate().take(10) {
+                out.push_str(&format!("  component {}: {}\n", i + 1, comp.join(", ")));
+            }
+            out.push_str("  top centrality:\n");
+            for (node, score) in graph.centrality.iter().take(10) {
+                out.push_str(&format!("    {node}: {score:.4}\n"));
+            }
+        }
+        TuiPane::Leases => {
+            out.push_str("leases\n");
+            if leases.is_empty() {
+                out.push_str("  no active leases\n");
+            }
+            for l in leases {
+                if filter_match(filter, format!("{} {} {}", l.resource, l.holder, l.note)) {
+                    out.push_str(&format!(
+                        "  {} holder={} expires={} {}\n",
+                        l.resource,
+                        l.holder,
+                        model::fmt_ts(l.expires),
+                        if l.note.is_empty() { "-" } else { &l.note }
+                    ));
+                }
+            }
+        }
+        TuiPane::Commands => {
+            out.push_str("commands\n");
+            for (cmd, domain) in TUI_COMMANDS {
+                if filter_match(filter, format!("{cmd} {domain}")) {
+                    out.push_str(&format!("  {cmd:<18} {domain}\n"));
+                }
+            }
+        }
+        TuiPane::Sessions => unreachable!("handled above"),
+    }
+    Ok(out)
+}
+
+fn tui_json_snapshot(
+    store: &dyn Store,
+    cfg: &Config,
+    pane: TuiPane,
+    filter: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (me, _) = resolve_me_explicit(None, None, cfg);
+    let extra = cfg.peer_db_sources();
+    let mut rows = dashboard_rows(&store::federated_peers(store, &extra)?);
+    rows.retain(|r| {
+        filter_match(
+            filter,
+            format!("{} {} {} {}", r.name, r.repo, r.branch, r.description),
+        )
+    });
+    let graph = graph_summary(store, cfg, &me, None)?;
+    Ok(serde_json::json!({
+        "pane": pane.as_str(),
+        "me": me,
+        "backend": cfg.backend(),
+        "sessions": rows.len(),
+        "graph": {
+            "nodes": graph.nodes,
+            "edges": graph.edges,
+            "density": graph.density,
+            "component_count": graph.component_count,
+            "largest_component": graph.largest_component,
+        },
+        "commands": TUI_COMMANDS.iter().map(|(name, domain)| serde_json::json!({"name": name, "domain": domain})).collect::<Vec<_>>(),
+    }))
 }
 
 /// Emit a shell completion script to stdout.
@@ -5745,6 +6178,41 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Tui {
+            once,
+            json,
+            pane,
+            filter,
+            interval,
+            no_color,
+        } => {
+            let interval = config::clamp_watch_interval(interval);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tui_json_snapshot(
+                        store,
+                        &cfg,
+                        pane,
+                        filter.as_deref()
+                    )?)?
+                );
+            } else {
+                loop {
+                    print!(
+                        "{}",
+                        render_tui_frame(store, &cfg, pane, filter.as_deref(), no_color)?
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    if once {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(interval));
+                }
+            }
+        }
+
         Cmd::Scan {
             repo,
             branch,
@@ -6285,81 +6753,39 @@ fn main() -> Result<()> {
 
         Cmd::Graph { me, circle, json } => {
             let (me, _explicit) = resolve_me_explicit(me, None, &cfg);
-            let target_circle = resolve_list_circle(store, &cfg, &me, circle.as_deref(), false);
-            let peers = store.list_peers()?;
-            let peers_in_circle: Vec<_> = peers
-                .into_iter()
-                .filter(|p| {
-                    target_circle
-                        .as_ref()
-                        .map(|c| model::circle_or_default(&p.circle) == c)
-                        .unwrap_or(true)
-                })
-                .map(|p| p.name)
-                .collect();
-            let peer_set: std::collections::HashSet<_> = peers_in_circle.iter().cloned().collect();
-
-            let mut g = fnx_classes::Graph::new(fnx_runtime::CompatibilityMode::Strict);
-            for peer in &peers_in_circle {
-                g.add_node(peer.clone());
-            }
-            // Collect all messages among peers in the circle.
-            let mut seen_edges = std::collections::HashSet::new();
-            for peer in &peers_in_circle {
-                let hist = store.history(peer, None, 10_000)?;
-                for msg in &hist {
-                    if peer_set.contains(&msg.sender)
-                        && peer_set.contains(&msg.recipient)
-                        && msg.sender != msg.recipient
-                    {
-                        let key = if msg.sender <= msg.recipient {
-                            (msg.sender.clone(), msg.recipient.clone())
-                        } else {
-                            (msg.recipient.clone(), msg.sender.clone())
-                        };
-                        if seen_edges.insert(key) {
-                            let _ = g.add_edge(&msg.sender, &msg.recipient);
-                        }
-                    }
-                }
-            }
-
-            let cc = fnx_algorithms::connected_components(&g);
-            let dc = fnx_algorithms::degree_centrality(&g);
-            let dens = fnx_algorithms::density(&g);
-            let comp_count = cc.components.len();
-            let largest = cc.components.iter().map(|c| c.len()).max().unwrap_or(0);
+            let graph = graph_summary(store, &cfg, &me, circle.as_deref())?;
 
             if json {
-                let components: Vec<Vec<String>> = cc.components;
                 let scores: std::collections::HashMap<String, f64> =
-                    dc.scores.into_iter().map(|s| (s.node, s.score)).collect();
+                    graph.centrality.iter().cloned().collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "nodes": g.node_count(),
-                        "edges": g.edge_count(),
-                        "density": dens.density,
-                        "components": components,
-                        "component_count": comp_count,
-                        "largest_component": largest,
+                        "nodes": graph.nodes,
+                        "edges": graph.edges,
+                        "density": graph.density,
+                        "components": graph.components,
+                        "component_count": graph.component_count,
+                        "largest_component": graph.largest_component,
                         "centrality": scores,
                     }))?
                 );
             } else {
                 println!(
                     "communication graph ({} nodes, {} edges)",
-                    g.node_count(),
-                    g.edge_count()
+                    graph.nodes, graph.edges
                 );
-                println!("  density: {:.4}", dens.density);
-                println!("  components: {} (largest: {} nodes)", comp_count, largest);
-                for (i, comp) in cc.components.iter().enumerate() {
+                println!("  density: {:.4}", graph.density);
+                println!(
+                    "  components: {} (largest: {} nodes)",
+                    graph.component_count, graph.largest_component
+                );
+                for (i, comp) in graph.components.iter().enumerate() {
                     println!("    component {}: {}", i + 1, comp.join(", "));
                 }
                 println!("  degree centrality:");
-                for s in &dc.scores {
-                    println!("    {}: {:.4}", s.node, s.score);
+                for (node, score) in &graph.centrality {
+                    println!("    {node}: {score:.4}");
                 }
             }
         }
