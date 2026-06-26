@@ -124,9 +124,9 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
          .panel h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0;padding:.85rem 1rem;border-bottom:1px solid var(--line)}\
          .panel-body{padding:.8rem 1rem}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:.8rem}.stat strong{display:block;font-size:1.4rem}.stat span{color:var(--muted);font-size:.78rem}\
          table{border-collapse:collapse;width:100%;font-size:.82rem}td,th{text-align:left;padding:.35rem .45rem;border-bottom:1px solid #1c2739;vertical-align:top}\
-         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
+         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.action-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem}.action-form{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.75rem}.action-form label{display:block;color:var(--muted);font-size:.72rem;margin-top:.45rem}.action-form input,.action-form textarea{width:100%;margin-top:.18rem;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.42rem}.action-form textarea{min-height:4rem;resize:vertical}.action-form button{margin-top:.55rem;border:1px solid #2f81f7;background:#1f6feb;color:white;border-radius:999px;padding:.42rem .75rem;cursor:pointer}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
     );
-    b.push_str("</style></head><body>");
+    b.push_str("</style><script>try{const p=new URLSearchParams(location.search);const t=p.get('token')||p.get('access_token');if(t)document.cookie='weave_dashboard_token='+encodeURIComponent(t)+'; SameSite=Lax; path=/';}catch(_){}</script></head><body>");
     b.push_str(
         "<div class=\"shell\"><header class=\"top\"><div class=\"brand\">weave dashboard <code>",
     );
@@ -155,6 +155,10 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
     render_selected_peer_detail(&mut b, snap);
     b.push_str("</div></section><section class=\"panel\"><h2>Pending questions</h2><div class=\"panel-body\">");
     render_pending_questions(&mut b, snap);
+    b.push_str(
+        "</div></section><section class=\"panel\"><h2>Actions</h2><div class=\"panel-body\">",
+    );
+    render_action_forms(&mut b, snap);
     b.push_str(
         "</div></section><section class=\"panel\"><h2>Mesh feed</h2><div class=\"panel-body\">",
     );
@@ -357,6 +361,66 @@ fn render_jobs_cards(b: &mut String, snap: &DashboardSnapshot) {
         }
         b.push_str("</article>");
     }
+}
+
+fn render_action_forms(b: &mut String, snap: &DashboardSnapshot) {
+    let from = snap.peers.first().map(|p| p.name.as_str()).unwrap_or("");
+    let to = snap.peers.get(1).map(|p| p.name.as_str()).unwrap_or("");
+    let pending = snap.asks.iter().find(|a| a.state == AskState::Open);
+    b.push_str("<p class=\"muted\">Forms post to the bearer-gated dashboard action API and are routed through the same JSON-RPC dispatch path as MCP/CLI. Start with <code>weave dashboard --write</code> to enable them.</p>");
+    b.push_str("<div class=\"action-grid\">");
+    b.push_str("<form class=\"action-form\" method=\"post\" action=\"/api/notify\"><strong>Notify</strong>");
+    input(b, "from", "from", from);
+    input(b, "to", "to", to);
+    input(b, "subject", "subject", "");
+    textarea(b, "body", "message", "");
+    b.push_str("<button type=\"submit\">Send notify</button></form>");
+
+    b.push_str(
+        "<form class=\"action-form\" method=\"post\" action=\"/api/ask\"><strong>Ask</strong>",
+    );
+    input(b, "from", "from", from);
+    input(b, "to", "to", to);
+    input(b, "subject", "subject", "");
+    textarea(b, "body", "question", "");
+    b.push_str("<button type=\"submit\">Open ask</button></form>");
+
+    b.push_str("<form class=\"action-form\" method=\"post\" action=\"/api/answer\"><strong>Answer</strong>");
+    input(
+        b,
+        "from",
+        "from",
+        pending.map(|a| a.askee.as_str()).unwrap_or(from),
+    );
+    input(
+        b,
+        "correlation_id",
+        "ask id",
+        pending.map(|a| a.id.as_str()).unwrap_or(""),
+    );
+    textarea(b, "body", "answer", "");
+    b.push_str("<button type=\"submit\">Answer ask</button></form>");
+    b.push_str("</div>");
+}
+
+fn input(b: &mut String, name: &str, label: &str, value: &str) {
+    b.push_str("<label>");
+    b.push_str(&html_escape(label));
+    b.push_str("<input name=\"");
+    b.push_str(&html_escape(name));
+    b.push_str("\" value=\"");
+    b.push_str(&html_escape(value));
+    b.push_str("\"></label>");
+}
+
+fn textarea(b: &mut String, name: &str, label: &str, value: &str) {
+    b.push_str("<label>");
+    b.push_str(&html_escape(label));
+    b.push_str("<textarea name=\"");
+    b.push_str(&html_escape(name));
+    b.push_str("\">");
+    b.push_str(&html_escape(value));
+    b.push_str("</textarea></label>");
 }
 
 fn render_peers(b: &mut String, snap: &DashboardSnapshot, now: i64) {
