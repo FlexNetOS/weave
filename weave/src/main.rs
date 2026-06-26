@@ -6810,6 +6810,7 @@ fn main() -> Result<()> {
             if write {
                 eprintln!("[weave] dashboard WRITE surface enabled (POST /api)");
             }
+            eprintln!("[weave] dashboard browser URL: http://{bind}:{port}/?token={token}");
             // Each accepted connection thread opens its OWN read-only store handle
             // (Store is Send, not Sync) — the factory clones the resolved Config.
             // WL-052a: the `--write` POST /api route reuses the SAME dispatch_request

@@ -641,7 +641,8 @@ cargo build --release --features surfaces        # composes: --features "libsql 
 
 # Read-only web dashboard (sessions/presence, recent messages, jobs, leases,
 # schedules). Localhost-bound, bearer-gated; a random token is printed to stderr
-# when --token is omitted. Open http://127.0.0.1:8788/ with that bearer token.
+# when --token is omitted. Open the printed browser URL (`/?token=…`) or send
+# `Authorization: Bearer <token>`.
 weave dashboard                                   # default port 8788
 weave dashboard --port 9000 --token mysecret
 

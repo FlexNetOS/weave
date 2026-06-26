@@ -194,7 +194,7 @@ fn handle_dashboard_connection(
     let path = rl.next().unwrap_or("").to_string();
 
     if method == "GET" {
-        let auth_ok = read_headers_auth_only(&mut reader, token)?;
+        let auth_ok = read_headers_auth_only(&mut reader, token, Some(&path))?;
         if !auth_ok {
             write_http(stream, 401, b"Unauthorized")?;
             return Ok(());
@@ -318,7 +318,7 @@ fn handle_connection(
         use crate::dashboard::{route, Route};
         if method == "GET" {
             // GET routes still require bearer auth; parse headers to find it.
-            let auth_ok = read_headers_auth_only(&mut reader, token)?;
+            let auth_ok = read_headers_auth_only(&mut reader, token, Some(&path))?;
             if !auth_ok {
                 write_http(stream, 401, b"Unauthorized")?;
                 return Ok(());
@@ -428,8 +428,12 @@ fn log(msg: &str) {
 /// GET dashboard routes, which carry no body). Mirrors the auth logic in the POST
 /// path; an empty configured token means auth is open.
 #[cfg(feature = "surfaces")]
-fn read_headers_auth_only<R: BufRead>(reader: &mut R, token: &str) -> anyhow::Result<bool> {
-    let mut auth_ok = token.is_empty();
+fn read_headers_auth_only<R: BufRead>(
+    reader: &mut R,
+    token: &str,
+    path: Option<&str>,
+) -> anyhow::Result<bool> {
+    let mut auth_ok = token.is_empty() || query_token_matches(path, token);
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -442,8 +446,40 @@ fn read_headers_auth_only<R: BufRead>(reader: &mut R, token: &str) -> anyhow::Re
                 auth_ok = true;
             }
         }
+        if line.to_lowercase().starts_with("cookie:") && cookie_token_matches(&line, token) {
+            auth_ok = true;
+        }
     }
     Ok(auth_ok)
+}
+
+#[cfg(feature = "surfaces")]
+fn query_token_matches(path: Option<&str>, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    let Some((_, query)) = path.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        matches!(k, "token" | "access_token") && v == token
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn cookie_token_matches(line: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let cookie = line.split_once(':').map(|(_, v)| v).unwrap_or("");
+    cookie.split(';').any(|part| {
+        let (k, v) = part.trim().split_once('=').unwrap_or(("", ""));
+        k == "weave_dashboard_token" && v == token
+    })
 }
 
 /// Compose a read-only [`dashboard::DashboardSnapshot`] from existing `Store`

@@ -13017,12 +13017,22 @@ mod surfaces_dashboard {
     /// Send a raw `GET <path>` (optionally with a bearer token) and return the
     /// full raw HTTP response text.
     fn http_get(port: u16, path: &str, bearer: Option<&str>) -> String {
+        http_get_with_extra_headers(port, path, bearer, "")
+    }
+
+    fn http_get_with_extra_headers(
+        port: u16,
+        path: &str,
+        bearer: Option<&str>,
+        extra_headers: &str,
+    ) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
         if let Some(t) = bearer {
             req.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }
+        req.push_str(extra_headers);
         req.push_str("Connection: close\r\n\r\n");
         s.write_all(req.as_bytes()).expect("write request");
         s.flush().ok();
@@ -13184,6 +13194,33 @@ mod surfaces_dashboard {
         // Seeded peer + message body show through.
         assert!(resp.contains("alice"), "seeded peer alice missing");
         assert!(resp.contains("hello-dash"), "seeded message body missing");
+    }
+
+    #[test]
+    fn dashboard_serves_page_with_browser_query_token() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let dash = spawn_dashboard(&db, "secret-tok");
+        let resp = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "browser query token should authenticate page loads:\n{resp}"
+        );
+        assert!(
+            resp.contains("weave dashboard"),
+            "page body missing: {resp}"
+        );
+
+        let cookie = http_get_with_extra_headers(
+            dash.port,
+            "/",
+            None,
+            "Cookie: weave_dashboard_token=secret-tok\r\n",
+        );
+        assert!(
+            cookie.starts_with("HTTP/1.1 200"),
+            "browser cookie token should authenticate page loads:\n{cookie}"
+        );
     }
 
     #[test]
