@@ -538,6 +538,7 @@ fn dashboard_action_tool(path: &str) -> Option<&'static str> {
         "/api/notify" => Some("weave_notify"),
         "/api/ask" => Some("weave_ask"),
         "/api/answer" => Some("weave_answer"),
+        "/api/job-cancel" => Some("weave_job_cancel"),
         _ => None,
     }
 }
@@ -556,6 +557,8 @@ fn dashboard_action_request(tool: &str, body: &[u8]) -> anyhow::Result<Value> {
         "kind",
         "options",
         "priority",
+        "job_id",
+        "reason",
     ] {
         if let Some(value) = fields.get(key).filter(|v| !v.trim().is_empty()) {
             args.insert(key.to_string(), Value::String(value.clone()));

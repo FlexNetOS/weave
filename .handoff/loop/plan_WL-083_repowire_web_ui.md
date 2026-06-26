@@ -77,12 +77,22 @@ mutation logic:
   through the form endpoints; runtime curl and Playwright evidence are under
   `.handoff/run/repowire-action-forms/`.
 
+## 2026-06-26 job-control slice
+
+Extended the action-form work into the jobs panel:
+
+- Job cards now render a cooperative Cancel form for non-terminal jobs.
+- `POST /api/job-cancel` adapts form-url-encoded input into the existing
+  `weave_job_cancel` JSON-RPC tool call.
+- Integration coverage proves a dashboard job-cancel form updates canonical job
+  state and that `GET /jobs/{id}/status` reports the cancelled job.
+
 Do not mark repowire dashboard parity complete until these are true and verified:
 
 1. Selected peer detail view: full transcript/history pagination, thread/timeline search, rich selected-peer message rendering, and current active session controls.
 2. Pending questions panel: structured choice/tool-permission rendering and answer UX beyond the basic answer form.
 3. Write forms: reply forms and richer notify/ask/answer affordances; current notify/ask/answer forms route through the single `dispatch_request` path with no dashboard-local mutation logic.
-4. Jobs panel parity: selected job detail plus retry/cancel routed through the job API or shared handler.
+4. Jobs panel parity: selected job detail plus retry/recreate; cooperative cancel is now routed through the shared handler.
 5. Settings/spawn controls: if adopted, spawn stays allowlist/birth-cert/argv-only and surfaces clear dry-run/preview where possible.
 6. Event stream gap recovery: `/events/stream` plus `/events?since=...` or an equivalent documented route.
 7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
