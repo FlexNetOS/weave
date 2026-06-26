@@ -173,3 +173,17 @@ Do not mark repowire dashboard parity complete until these are true and verified
 6. Event stream gap recovery: `/events/stream` SSE plus browser-side `/events?since=...` recovery is now present; remaining work is richer event typing.
 7. Playwright/browser smoke: opened page visibly contains peer roster, mesh feed, selected-peer or placeholder, jobs/control plane; JSON endpoints return expected shapes.
 8. Docs parity matrix stays honest: Browser dashboard remains PARTIAL until the above surfaces exist.
+
+## 2026-06-26 selected-job detail slice
+
+Expanded the jobs panel toward upstream selected-work detail:
+
+- The main dashboard now renders a Selected job panel for the newest job, with
+  lifecycle fields (state/kind/owner/assignee/phase), timing, cancellation,
+  description/prompt, progress note, result summary, and progress timeline.
+- The selected-job panel links the read APIs for `/jobs/{id}/status` and the new
+  `/jobs/{id}/result` endpoint.
+- `GET /jobs/{id}/result` exposes the canonical store `job_result` view as JSON,
+  including `ready`, terminal state, result summary, and terminal payload fields.
+- Integration coverage proves the selected-job HTML renders progress/result
+  details and that both status/result endpoints expose the richer job data.
