@@ -12927,7 +12927,7 @@ fn post_send_hook_fires_with_env_and_skips_non_match() {
 
 #[cfg(feature = "surfaces")]
 mod surfaces_dashboard {
-    use super::{run_env, scrub_env, weave_bin, TestDb};
+    use super::{run_env, run_ok, scrub_env, weave_bin, TestDb};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
@@ -13198,6 +13198,57 @@ mod surfaces_dashboard {
         assert!(
             !pending_after.contains(&ask_id),
             "answered ask should leave pending list: {pending_after}"
+        );
+    }
+
+    /// Job cards expose cooperative cancellation, again as a form adapter over the
+    /// canonical JSON-RPC job tool instead of a dashboard-local mutation path.
+    #[test]
+    fn dashboard_job_cancel_form_routes_through_same_handler() {
+        let db = TestDb::new();
+        seed_peers(&db);
+        let created = run_ok(
+            &db,
+            &[
+                "job",
+                "create",
+                "--title",
+                "dashboard cancel me",
+                "--from",
+                "alice",
+                "--json",
+            ],
+        );
+        let v: serde_json::Value = serde_json::from_str(&created).expect("job create json");
+        let job_id = v["job"]["id"].as_str().expect("job id").to_string();
+
+        let dash = spawn_dashboard_write(&db, "secret-tok");
+        let page = http_get(dash.port, "/?token=secret-tok", None);
+        assert!(
+            page.contains("dashboard cancel me") && page.contains("action=\"/api/job-cancel\""),
+            "job card should render cancel form: {page}"
+        );
+
+        let cancel = http_post_form(
+            dash.port,
+            "/api/job-cancel",
+            "secret-tok",
+            &format!("from=alice&job_id={job_id}&reason=obsolete+from+dashboard"),
+        );
+        assert!(
+            cancel.starts_with("HTTP/1.1 200") && cancel.contains("\"isError\":false"),
+            "job cancel form should route through dispatch_request: {cancel}"
+        );
+
+        let status = http_get(
+            dash.port,
+            &format!("/jobs/{job_id}/status"),
+            Some("secret-tok"),
+        );
+        assert!(
+            status.contains("\"state\": \"cancelled\"")
+                && status.contains("\"cancel_requested\": true"),
+            "job status reflects form cancel: {status}"
         );
     }
 
