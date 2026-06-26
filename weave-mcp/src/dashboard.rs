@@ -132,7 +132,7 @@ pub fn render_dashboard(snap: &DashboardSnapshot, now: i64, host: &str) -> Strin
          .panel h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0;padding:.85rem 1rem;border-bottom:1px solid var(--line)}\
          .panel-body{padding:.8rem 1rem}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:.8rem}.stat strong{display:block;font-size:1.4rem}.stat span{color:var(--muted);font-size:.78rem}\
          table{border-collapse:collapse;width:100%;font-size:.82rem}td,th{text-align:left;padding:.35rem .45rem;border-bottom:1px solid #1c2739;vertical-align:top}\
-         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.action-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem}.action-form{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.75rem}.action-form label{display:block;color:var(--muted);font-size:.72rem;margin-top:.45rem}.action-form input,.action-form textarea{width:100%;margin-top:.18rem;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.42rem}.action-form textarea{min-height:4rem;resize:vertical}.action-form button,.inline-form button{margin-top:.55rem;border:1px solid #2f81f7;background:#1f6feb;color:white;border-radius:999px;padding:.42rem .75rem;cursor:pointer}.inline-form{display:flex;gap:.35rem;align-items:center;margin-top:.55rem}.inline-form input{min-width:0;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.35rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
+         th{color:var(--muted);font-weight:650}.live{color:var(--ok)}.idle{color:var(--muted)}.busy{color:var(--warn)}.empty,.muted{color:var(--muted);font-style:italic}code{color:#79c0ff}.feed{display:flex;flex-direction:column;gap:.6rem}.event{padding:.65rem .75rem;border:1px solid var(--line);border-radius:12px;background:#0b1220}.event-meta{color:var(--muted);font-size:.75rem;margin-bottom:.3rem}.event-body{white-space:pre-wrap;overflow-wrap:anywhere}.peer-card{display:grid;grid-template-columns:1fr auto;gap:.25rem .5rem;border-bottom:1px solid #1c2739;padding:.55rem 0}.peer-card:last-child{border-bottom:0}.peer-name{font-weight:700}.peer-sub{color:var(--muted);font-size:.78rem}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem}.detail-item{border:1px solid var(--line);background:var(--panel2);border-radius:12px;padding:.55rem}.detail-item span{display:block;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}.ask-card,.job-card{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.65rem .75rem;margin-bottom:.55rem}.ask-card strong,.job-card strong{display:block}.ask-meta,.job-meta{color:var(--muted);font-size:.75rem;margin-top:.25rem}.action-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem}.action-form{border:1px solid var(--line);background:#0b1220;border-radius:12px;padding:.75rem}.action-form label{display:block;color:var(--muted);font-size:.72rem;margin-top:.45rem}.action-form input,.action-form textarea{width:100%;margin-top:.18rem;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.42rem}.action-form textarea{min-height:4rem;resize:vertical}.action-form button,.inline-form button{margin-top:.55rem;border:1px solid #2f81f7;background:#1f6feb;color:white;border-radius:999px;padding:.42rem .75rem;cursor:pointer}.choice-row{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.55rem}.inline-form{display:flex;gap:.35rem;align-items:center;margin-top:.55rem}.inline-form input{min-width:0;border:1px solid var(--line);border-radius:8px;background:#060a11;color:var(--text);padding:.35rem}.section{margin-bottom:1rem}@media(max-width:1100px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}",
     );
     b.push_str("</style><script>try{const p=new URLSearchParams(location.search);const t=p.get('token')||p.get('access_token');if(t)document.cookie='weave_dashboard_token='+encodeURIComponent(t)+'; SameSite=Lax; path=/';}catch(_){}</script></head><body>");
     b.push_str(
@@ -346,7 +346,57 @@ fn render_pending_questions(b: &mut String, snap: &DashboardSnapshot) {
             b.push_str(&html_escape(options));
             b.push_str("</div>");
         }
+        render_ask_answer_controls(b, a);
         b.push_str("</article>");
+    }
+}
+
+fn render_ask_answer_controls(b: &mut String, ask: &Ask) {
+    match ask.kind {
+        weave_core::model::AskKind::Choice => {
+            if let Some(options) = ask.options.as_deref() {
+                b.push_str("<div class=\"choice-row\">");
+                for option in options
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .take(8)
+                {
+                    b.push_str("<form method=\"post\" action=\"/api/answer\" class=\"inline-form\"><input type=\"hidden\" name=\"from\" value=\"");
+                    b.push_str(&html_escape(&ask.askee));
+                    b.push_str("\"><input type=\"hidden\" name=\"correlation_id\" value=\"");
+                    b.push_str(&html_escape(&ask.id));
+                    b.push_str("\"><input type=\"hidden\" name=\"body\" value=\"");
+                    b.push_str(&html_escape(option));
+                    b.push_str("\"><button type=\"submit\">");
+                    b.push_str(&html_escape(option));
+                    b.push_str("</button></form>");
+                }
+                b.push_str("</div>");
+            }
+        }
+        weave_core::model::AskKind::ToolPermission => {
+            b.push_str("<div class=\"choice-row\">");
+            for verdict in ["approve", "deny"] {
+                b.push_str("<form method=\"post\" action=\"/api/answer\" class=\"inline-form\"><input type=\"hidden\" name=\"from\" value=\"");
+                b.push_str(&html_escape(&ask.askee));
+                b.push_str("\"><input type=\"hidden\" name=\"correlation_id\" value=\"");
+                b.push_str(&html_escape(&ask.id));
+                b.push_str("\"><input type=\"hidden\" name=\"body\" value=\"");
+                b.push_str(verdict);
+                b.push_str("\"><button type=\"submit\">");
+                b.push_str(verdict);
+                b.push_str("</button></form>");
+            }
+            b.push_str("</div>");
+        }
+        weave_core::model::AskKind::FreeText => {
+            b.push_str("<form method=\"post\" action=\"/api/answer\" class=\"inline-form\"><input type=\"hidden\" name=\"from\" value=\"");
+            b.push_str(&html_escape(&ask.askee));
+            b.push_str("\"><input type=\"hidden\" name=\"correlation_id\" value=\"");
+            b.push_str(&html_escape(&ask.id));
+            b.push_str("\"><input name=\"body\" placeholder=\"answer\"><button type=\"submit\">Answer</button></form>");
+        }
     }
 }
 
