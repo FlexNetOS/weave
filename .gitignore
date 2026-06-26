@@ -14,4 +14,5 @@ cc-switch-main.zip
 .handoff/ledger.db.sqlite.bak
 .handoff/ledger.redb.tmp
 .handoff/locks/
+.handoff/run/
 .handoff/workspaces/main/scratch/

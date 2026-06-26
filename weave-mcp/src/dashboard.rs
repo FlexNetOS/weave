@@ -57,6 +57,7 @@ pub enum Route {
 /// route to the right writer. `POST /` stays [`Route::JsonRpc`] so the surfaces
 /// extension provably does not alter the MCP path.
 pub fn route(method: &str, path: &str) -> Route {
+    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
     match (method, path) {
         ("GET", "/") => Route::Page,
         ("GET", "/events") => Route::Events,
@@ -362,7 +363,9 @@ mod tests {
     #[test]
     fn route_classification() {
         assert_eq!(route("GET", "/"), Route::Page);
+        assert_eq!(route("GET", "/?token=browser"), Route::Page);
         assert_eq!(route("GET", "/events"), Route::Events);
+        assert_eq!(route("GET", "/events?token=browser"), Route::Events);
         assert_eq!(route("POST", "/"), Route::JsonRpc);
         assert_eq!(route("GET", "/nope"), Route::NotFound);
         assert_eq!(route("DELETE", "/"), Route::NotFound);
