@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [Unreleased] — docs: accept layered workspace architecture (WL-077)
+
+- Added ADR-0006 accepting the current `weave-core` / `weave-inject` /
+  `weave-mcp` / `weave` Cargo workspace as supported architecture. The invariant
+  is one dependency-light Rust binary, not one crate.
+- Closed/replaced WL-043 so the backlog no longer carries a stale mechanical
+  single-crate collapse mandate. Future structural changes require a fresh
+  ADR-level reason tied to user-visible simplification or build-risk reduction.
+- Synced CLAUDE.md, ARCHITECTURE.md, PRD, and the handoff backlog to the accepted
+  workspace decision; no Rust source, Cargo metadata, or dependency graph change.
+- Strict-upgraded surfaced verification flakes: `setup --git-hooks` integration
+  tests now isolate HOME, and the fake Ollama model-discovery smoke skips cleanly
+  when local loopback binds are blocked by the execution sandbox.
+
+
 ## [Unreleased] — chore: add backlog/docs freshness gate (WL-076)
 
 - Added `scripts/docs_freshness_check.py`, a stdlib CI helper that flags PRs
@@ -464,7 +479,7 @@
 > dashboard/Telegram/Slack, no Next.js/Python), governed obscura web access
 > (WL-049 / ADR-0002, no V8 in core), and the token-light progressive-disclosure
 > MCP refactor + budget invariant + multi-surface parity (WL-050..052 / ADR-0003).
-> Structural: collapse the interim 4-crate workspace to single-crate (WL-043).
+> Structural: WL-077 / ADR-0006 accepts the four-crate workspace as the supported architecture; WL-043's mechanical single-crate collapse mandate is closed/replaced.
 
 ## [Unreleased] — Rust-native human surfaces (WL-048)
 

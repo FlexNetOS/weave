@@ -96,16 +96,15 @@ The provable have/superset/gap parity matrix against repowire's inventory is
 every capability mapped onto CLI / MCP / dashboard / bots, with the remaining
 human-surface write follow-through tracked as WL-052a/b — is
 `docs/MULTI-SURFACE-PARITY.md` (**WL-052**, ADR-0003): CLI and MCP are at
-**full** parity; dashboard write paths and bot command grammar have both shipped. Structurally, the four-crate workspace below is **interim** —
-single-crate remains the goal (WL-043).
+**full** parity; dashboard write paths and bot command grammar have both shipped. Structurally, ADR-0006 accepts the four-crate workspace below as the supported architecture: the invariant is one dependency-light Rust binary, not one crate.
 
 ---
 
 ## 1. Workspace map
 
-`weave` is organized as a Cargo workspace. The default build still produces one
+`weave` is organized as a small, accepted Cargo workspace (ADR-0006). The default build still produces one
 static binary (`weave`), but the code is split into crates so the core types,
-store, injector, and MCP server can be reused and tested independently.
+store, injector, and MCP server can be reused, feature-gated, and tested independently.
 
 ```
 weave-core/          library: model + config + Store trait + both backends + sign
