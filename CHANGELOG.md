@@ -6,7 +6,7 @@
   explicit command-surface decision rule: every top-level CLI command must declare
   its MCP parity decision and read-only status/diagnostic surface.
 - Extended the default-build TUI command catalog (`weave tui --json --pane commands`)
-  with `mcp_decision` and `status_surface`, including `codex-tools` and the sign-gated `key`/`audit` commands, and made the
+  with `mcp_decision` and `status_surface`, including `codex-tools`, the sign-gated `key`/`audit` commands, and the surfaces-gated `dashboard`/`push`/`telegram`/`slack` commands, and made the
   integration gate compare the catalog exactly to `weave --help`.
 - Added status/health visibility checks for background/hook surfaces (`daemon`,
   `hook`, and `responder`) so CLI/daemon-first work cannot become invisible to

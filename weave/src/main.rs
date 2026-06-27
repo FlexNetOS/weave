@@ -4182,6 +4182,34 @@ const TUI_COMMANDS: &[CommandSurface] = &[
         mcp_decision: "mcp-catalog",
         status_surface: "graph",
     },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "dashboard",
+        domain: "http dashboard",
+        mcp_decision: "feature-gated-http-surface",
+        status_surface: "dashboard read-only / doctor",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "push",
+        domain: "federation",
+        mcp_decision: "mcp-catalog-surface",
+        status_surface: "push result / delivery",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "telegram",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "slack",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+    },
     CommandSurface {
         name: "export",
         domain: "archive",
