@@ -15768,6 +15768,11 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
         let name = cmd["name"].as_str().unwrap_or("<missing>");
         let mcp_decision = cmd["mcp_decision"].as_str().unwrap_or_default();
         let status_surface = cmd["status_surface"].as_str().unwrap_or_default();
+        let help_smoke = cmd["help_smoke"].as_str().unwrap_or_default();
+        let behavior_coverage = cmd["behavior_coverage"].as_str().unwrap_or_default();
+        let docs_surface = cmd["docs_surface"].as_str().unwrap_or_default();
+        let tui_exposure = cmd["tui_exposure"].as_str().unwrap_or_default();
+        let risk = cmd["risk"].as_str().unwrap_or_default();
         assert!(
             !mcp_decision.is_empty(),
             "{name} must declare an explicit MCP parity decision"
@@ -15776,12 +15781,44 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
             !status_surface.is_empty(),
             "{name} must declare the read-only status/diagnostic surface that proves visibility"
         );
+        assert!(
+            !help_smoke.is_empty(),
+            "{name} must declare the help-smoke gate that covers its help path"
+        );
+        assert!(
+            !behavior_coverage.is_empty(),
+            "{name} must declare behavior coverage or an explicit help-only classification"
+        );
+        assert!(
+            !docs_surface.is_empty(),
+            "{name} must declare docs/help coverage"
+        );
+        assert!(
+            !tui_exposure.is_empty(),
+            "{name} must declare TUI/dashboard exposure"
+        );
+        assert!(
+            !risk.is_empty(),
+            "{name} must declare risk/write classification"
+        );
         if name == "daemon" || name == "hook" || name == "responder" {
             assert!(
                 status_surface.contains("status")
                     || status_surface.contains("health")
                     || status_surface.contains("doctor"),
                 "background/hook surface {name} must advertise a read-only status/health surface: {status_surface}"
+            );
+        }
+        if ["inject", "spawn", "kill"].contains(&name) {
+            assert!(
+                risk.contains("dangerous"),
+                "dangerous command {name} must be classified as dangerous: {risk}"
+            );
+        }
+        if ["setup", "uninstall", "restore"].contains(&name) {
+            assert!(
+                risk.contains("write") || risk.contains("restore"),
+                "host-mutating command {name} must be classified as write/restore: {risk}"
             );
         }
     }

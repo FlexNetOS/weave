@@ -1102,7 +1102,11 @@ done:
 2. **New CLI subcommand / flag → an integration test** in `tests/integration.rs`
    using the `tests/common` helpers (`run_ok`, `run`, `run_hook`,
    `run_stdin_full`). If it has machine-readable output, assert the `--json`
-   shape, not just substrings.
+   shape, not just substrings. Every new top-level command must also be added to
+   the `weave tui --json --pane commands` ledger with `mcp_decision`,
+   `status_surface`, `help_smoke`, `behavior_coverage`, `docs_surface`,
+   `tui_exposure`, and `risk`; `tui_once_and_json_are_default_build_operator_surfaces`
+   fails if any classification is missing.
 3. **New MCP tool / protocol behavior → an `McpServer` test** (`spawn`,
    `call_tool`, assert `isError` and the returned text). Include the failure path
    (bad/oversized args → `isError`, never a panic or silent persist).

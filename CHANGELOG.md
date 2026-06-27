@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased] — test: deepen command-surface coverage gate (WL-083)
+
+- Expanded the enforced `weave tui --json --pane commands` ledger from MCP/status metadata to a command coverage contract: every top-level command now carries help-smoke, behavior coverage, docs surface, TUI exposure, and risk/write classification fields.
+- Extended the integration gate so new CLI commands must update the command ledger with all coverage classifications before they can pass.
+
 ## [Unreleased] — feat: complete terminal dashboard TUI snapshot (WL-082)
 
 - Completed the default-build `weave tui` cockpit JSON contract: `--json` now returns one machine-readable snapshot containing overview counts plus sessions, messages, asks, jobs, graph, leases, and command-catalog pane arrays.
