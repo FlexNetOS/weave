@@ -51,8 +51,10 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
   the `weave` meta-tool catalog. Every CLI command must carry an explicit `mcp_decision`
   (`mcp-catalog`, `mcp-catalog-dangerous`, feature-gated MCP, or a documented CLI-only
   rationale) in the command-surface ledger exposed by `weave tui --json --pane commands`.
-  The integration gate compares that ledger exactly to `weave --help`, so new CLI-first work
-  cannot bypass the MCP/status decision.
+  WL-083 extends that ledger into a coverage gate: each command also declares its
+  help-smoke gate, behavior-coverage lane, docs/help surface, TUI exposure, and
+  risk/write classification. The integration gate compares that ledger exactly to
+  `weave --help`, so new CLI-first work cannot bypass MCP/status/coverage decisions.
 - **Dashboard and bots are deliberately the v1 baseline** (WL-048/WL-073): the dashboard is a read-only
   presence/activity view; the bots relay text (inbound human→agent + outbound notify) and answer
   the first command grammar. They are
