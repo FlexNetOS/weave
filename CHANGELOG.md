@@ -1,6 +1,18 @@
 # Changelog
 
 
+## [Unreleased] — chore: add backlog/docs freshness gate (WL-076)
+
+- Added `scripts/docs_freshness_check.py`, a stdlib CI helper that flags PRs
+  touching operator-visible CLI/MCP/user-facing paths unless they update
+  `CHANGELOG.md` or `.handoff/loop/backlog.md`, or explicitly carry the
+  `[no backlog/doc change]` PR marker.
+- Wired the helper into CI as the `docs freshness` job and documented local use
+  in `docs/TESTING.md`.
+- Marked WL-076 complete in the handoff backlog so release-note/backlog drift is
+  now guarded instead of relying on reviewer memory.
+
+
 ## [Unreleased] — docs: complete TASK-0001 north-star reconciliation
 
 - Reconciled the canonical PRD with the actually shipped repowire-superset

@@ -19,6 +19,21 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+
+  docs-freshness:
+    # WL-076: if operator-visible behavior changes, the planning/release ledger
+    # must move with it or the PR must explicitly state why no doc/backlog change
+    # is needed. This prevents shipped CLI/MCP surfaces from disappearing from
+    # CHANGELOG.md and .handoff/loop/backlog.md again.
+    name: docs freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: backlog/release-note freshness
+        run: python3 scripts/docs_freshness_check.py
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
