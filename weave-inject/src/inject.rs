@@ -1276,8 +1276,15 @@ pub fn capability(target: &Target) -> Capability {
 /// capture; an empty/garbled capture never reaches here (it returns `true` upstream).
 fn id_present(mux: Mux, out: &str, id: &str) -> bool {
     match mux {
+        // zellij lists exited sessions too, e.g.
+        // `name [Created ...] (EXITED - attach to resurrect)`. Those session
+        // names are present in `list-sessions` output, but `write-chars` cannot
+        // target them until they are resurrected, so only count non-EXITED rows.
+        Mux::Zellij => out
+            .lines()
+            .any(|line| !line.contains("(EXITED") && line.split_whitespace().any(|tok| tok == id)),
         // Exact whitespace-delimited token anywhere in the listing.
-        Mux::Zellij | Mux::Wezterm => out.split_whitespace().any(|tok| tok == id),
+        Mux::Wezterm => out.split_whitespace().any(|tok| tok == id),
         // Kitty emits JSON; an integer window id appears as `"id": <n>`. Match that
         // field exactly. Fall back to exact-token matching if the output isn't the
         // JSON we expect (defensive: a future kitty format change shouldn't make us
@@ -2342,6 +2349,23 @@ mod tests {
         assert!(
             !id_present(Mux::Zellij, zj, "env"),
             "a prefix of a session name must not match"
+        );
+    }
+
+    #[test]
+    fn zellij_exited_sessions_do_not_count_alive() {
+        let sessions = "\
+judicious-tiger [Created 9h 45m 38s ago] (EXITED - attach to resurrect)
+zippy-brachiosaur [Created 9h 27m 47s ago] (current)
+";
+
+        assert!(
+            !id_present(Mux::Zellij, sessions, "judicious-tiger"),
+            "zellij EXITED sessions are listed by name but cannot receive write-chars"
+        );
+        assert!(
+            id_present(Mux::Zellij, sessions, "zippy-brachiosaur"),
+            "current/live zellij sessions should still count as injectable"
         );
     }
 
