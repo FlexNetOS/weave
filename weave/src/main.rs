@@ -1594,6 +1594,15 @@ enum ProviderSwitchCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Report read-only CC Switch provider/proxy/health diagnostics.
+    Status {
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Emit machine-readable JSON. Human output is the default.
+        #[arg(long)]
+        json: bool,
+    },
     /// List models discovered from CC Switch providers and local Ollama.
     Models {
         /// App namespace to inspect.
@@ -2778,6 +2787,116 @@ fn routing_anomaly_last_ts(anomalies: &[model::Message]) -> i64 {
     anomalies.iter().map(|m| m.ts).max().unwrap_or(0)
 }
 
+#[cfg(feature = "sqlite")]
+fn print_provider_switch_status(report: &serde_json::Value) {
+    println!("weave provider-switch status");
+    println!(
+        "  db:             {}",
+        report
+            .get("db_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  db present:     {}",
+        yes_no(
+            report
+                .get("db_present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    println!(
+        "  db readable:    {}",
+        yes_no(
+            report
+                .get("db_readable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    println!(
+        "  schema ok:      {}",
+        yes_no(
+            report
+                .get("schema_ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    if let Some(error) = report.get("error").and_then(serde_json::Value::as_str) {
+        println!("  diagnostic:     {error}");
+    }
+    if let Some(apps) = report.get("apps").and_then(serde_json::Value::as_array) {
+        println!("  apps:");
+        for app in apps {
+            let name = app
+                .get("app")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let providers = app
+                .get("providers")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let current = app
+                .get("current_provider")
+                .and_then(|p| p.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let model = app
+                .get("current_model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let live = app
+                .get("live_config_agrees")
+                .and_then(serde_json::Value::as_bool)
+                .map(yes_no)
+                .unwrap_or("unknown");
+            println!(
+                "    {name}: providers={providers} current={current} model={model} live_agrees={live}"
+            );
+        }
+    }
+    if let Some(proxy) = report.get("proxy_health") {
+        println!(
+            "  proxy/failover: provider_health={} proxy_config={} failover_queue={} usage_logs={}",
+            yes_no(
+                proxy
+                    .get("provider_health_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("proxy_config_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("failover_queue_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("usage_logs_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let target = inject::detect_target_with_preference(parse_mux_preference(cfg));
@@ -2896,6 +3015,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     // pointing at a different WEAVE_DB, so surface it as a diagnostic hint.
     let db_default = config::default_db_path();
     let db_is_default = db == db_default;
+    #[cfg(feature = "sqlite")]
+    let provider_switch_status = provider_switch::status(None);
     if json {
         let mut report = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -2938,6 +3059,10 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "federation_remote_token_shared": token_shared,
             "federation_remote_token_none": token_none,
         });
+        #[cfg(feature = "sqlite")]
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("provider_switch".into(), provider_switch_status);
+        }
         // Signed-identity summary (counts + local fingerprint only, secret-free):
         // surfaces the trust/revocation policy and this session's own fingerprint so
         // a misconfigured trust set is diagnosable. Sign-gated; never any secret.
@@ -3111,6 +3236,27 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             .join(", ");
         println!("  peer status:    {status_summary}");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+        #[cfg(feature = "sqlite")]
+        {
+            let present = provider_switch_status
+                .get("db_present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let readable = provider_switch_status
+                .get("db_readable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let schema_ok = provider_switch_status
+                .get("schema_ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            println!(
+                "  provider switch: db_present={} db_readable={} schema_ok={}",
+                yes_no(present),
+                yes_no(readable),
+                yes_no(schema_ok),
+            );
+        }
         // Signed-identity summary (secret-free): trust/revocation counts, the
         // strict-verify mode, and this session's OWN fingerprint (never the secret).
         #[cfg(feature = "sign")]
@@ -4696,6 +4842,15 @@ fn main() -> Result<()> {
                         row.name
                     );
                     println!("weave lifecycle hooks were preserved where present");
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::Status { db, json } => {
+                let report = provider_switch::status(db.clone());
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_provider_switch_status(&report);
                 }
                 return Ok(());
             }

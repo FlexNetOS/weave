@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased] — feat: expose provider-switch status diagnostics (WL-078)
+
+- Added `weave provider-switch status [--json]` as a read-only CC Switch bridge
+  diagnostic surface. It reports DB presence/readability, schema coverage,
+  supported vs observed app types, current provider/model per supported app, live
+  config agreement, and proxy/failover/health table presence without writing CC
+  Switch or host config state.
+- Added the same secret-free provider-switch rollup to `weave doctor --json` and
+  concise human `doctor` output, so absent `~/.cc-switch/cc-switch.db` is an
+  explicit diagnostic state instead of an opaque open failure.
+- Added integration coverage for populated CC Switch status and missing-DB
+  diagnostics.
 
 ## [Unreleased] — docs: accept layered workspace architecture (WL-077)
 
