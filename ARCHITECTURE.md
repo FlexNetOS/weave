@@ -129,10 +129,20 @@ weave/               binary crate: CLI, setup, hooks, git tagging, harness
   src/main.rs          clap CLI; wires core + inject + mcp
   src/git.rs           best-effort git session tagging
   src/setup.rs         `weave setup` / `weave uninstall`
-  src/harness.rs       `weave harness ide-merge-ide` Codex 7-layer orchestration
+  src/harness.rs       `weave harness forge-loop` Codex task execution + `ide-merge-ide` 7-layer orchestration
   tests/               black-box integration / security / property tests
   benches/weave_bench.rs  criterion throughput benchmarks
 ```
+
+
+### Codex forge loop front door
+
+`weave harness forge-loop` is the Rust-owned task-execution surface for Codex.
+It prints a dry-run plan by default and, with `--execute`, spawns `codex exec`
+argv-only with a bounded prompt that points at `.agents/skills/forge-loop/SKILL.md`.
+The optional `/forge-loop` slash command is installed by `weave codex-tools
+install` as a user-level prompt shim; it is not a second workflow source of truth.
+Repo `.codex/` files are inert agent/config sidecars and never carry secrets.
 
 Dependency direction (top depends on bottom):
 

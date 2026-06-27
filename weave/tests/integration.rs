@@ -11722,6 +11722,78 @@ fn harness_ide_merge_ide_dry_run_prints_seven_layer_plan() {
     );
 }
 
+#[test]
+fn harness_forge_loop_dry_run_prints_codex_plan() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "harness",
+            "forge-loop",
+            "--worktree",
+            "/tmp/weave-forge-test",
+            "--task",
+            "implement a small task",
+        ],
+    );
+
+    assert!(
+        out.contains("codex-forge-loop harness (dry-run)"),
+        "dry run should identify the forge loop: {out:?}"
+    );
+    assert!(
+        out.contains(".agents/skills/forge-loop/SKILL.md")
+            && out.contains("WEAVE_FORGE_TASK=implement a small task"),
+        "dry run should expose the skill and task env: {out:?}"
+    );
+    assert!(
+        out.contains("commit, push, PR, and arm auto-merge"),
+        "dry run should show the delivery layer: {out:?}"
+    );
+}
+
+#[test]
+fn codex_tools_install_and_doctor_use_temp_home() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("codex-tools-home");
+    let home_s = home.to_str().unwrap();
+
+    let install = run_ok(
+        &db,
+        &[
+            "codex-tools",
+            "install",
+            "--home",
+            home_s,
+            "--weave-exe",
+            "/usr/bin/weave",
+        ],
+    );
+    assert!(
+        install.contains("installed Codex /forge-loop shim"),
+        "{install}"
+    );
+
+    let shim = std::fs::read_to_string(home.join("prompts").join("forge-loop.md")).unwrap();
+    assert!(shim.contains("weave-managed: forge-loop"));
+    assert!(shim.contains("/usr/bin/weave harness forge-loop"));
+
+    let doctor = run_ok(
+        &db,
+        &[
+            "codex-tools",
+            "doctor",
+            "--home",
+            home_s,
+            "--codex-cmd",
+            "definitely-not-a-codex-binary",
+        ],
+    );
+    assert!(doctor.contains("forge_skill:      ok"), "{doctor}");
+    assert!(doctor.contains("/forge-loop shim: ok"), "{doctor}");
+    assert!(doctor.contains("codex_cli:        missing"), "{doctor}");
+}
+
 // ---------------------------------------------------------------------------
 // WL-047: agent spawn / kill via a fake mux (CLI surface, black-box)
 // ---------------------------------------------------------------------------

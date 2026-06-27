@@ -46,3 +46,15 @@ config_file = "agents/reviewer.toml"
 [agents.docs_researcher]
 description = "Documentation specialist that verifies APIs, framework behavior, and release notes."
 config_file = "agents/docs-researcher.toml"
+
+[agents.implementer]
+description = "Single-writer implementation agent for approved forge-loop tasks."
+config_file = "agents/implementer.toml"
+
+[agents.verifier]
+description = "Fresh-shell verifier for Weave gates and regression coverage."
+config_file = "agents/verifier.toml"
+
+[agents.guardian]
+description = "Read-only invariant, security, and Rust-native drift guardian."
+config_file = "agents/guardian.toml"

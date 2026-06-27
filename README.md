@@ -1047,22 +1047,32 @@ counts, the registered-key count, the number of registered keys currently revoke
 the recorded revocation-event count, and this session's own fingerprint — counts
 and the local fingerprint only, never a peer key.
 
-## Codex 7-layer harness
+## Codex forge loops and 7-layer harnesses
 
-The checked-in autonomous weave-loop can be driven through the binary:
+The checked-in autonomous weave-loop and the Codex-native forge loop are driven
+through the Rust binary:
 
 ```bash
+weave harness forge-loop --task "close the next task"   # dry-run Codex forge plan
+weave harness forge-loop --execute --task "..."         # delegate one cycle to codex exec
+weave codex-tools doctor                                # check Codex CLI/assets/shim
+weave codex-tools install                               # install the user /forge-loop shim
+
 weave harness ide-merge-ide            # dry-run: print the seven layers + exact env
 weave harness ide-merge-ide --execute  # run the loop (ralph-weave.sh)
 ```
 
-Dry-run is the default and prints the seven layers plus the exact `WEAVE_*`
-environment handed to the runner. It wraps
-`.claude/skills/weave-loop/scripts/ralph-weave.sh`: Kimi Code plans/reviews,
-Ollama launches Claude MiniMax for the implementation pass, and durable
-`.handoff/loop` sentinels control resume/handoff. `--json` emits the plan
-machine-readably; `--safe` keeps destructive applies disabled inside the loop.
-The script is spawned argv-only (`bash <script>`), never via a shell string.
+`forge-loop` is the Rust-native Codex front door: dry-run is the default, it
+prints the `.agents/skills/forge-loop/SKILL.md` workflow, the `codex exec`
+command shape, and the exact `WEAVE_FORGE_*` environment. `codex-tools install`
+writes only a weave-managed user-level prompt shim; the repo `.codex/` files stay
+inert sidecars and secrets remain in user config.
+
+`ide-merge-ide` wraps `.claude/skills/weave-loop/scripts/ralph-weave.sh`: Kimi
+Code plans/reviews, Ollama launches Claude MiniMax for the implementation pass,
+and durable `.handoff/loop` sentinels control resume/handoff. `--json` emits the
+plan machine-readably; `--safe` keeps destructive applies disabled inside the
+loop. External commands are spawned argv-only, never via a shell string.
 
 ## Status
 
