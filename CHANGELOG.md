@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased] — docs: refresh architecture graph contract (WL-080)
+
+- Refreshed `docs/ARCHITECTURE-GRAPHS.md` to remove stale notes after WL-068,
+  WL-069, WL-078, and WL-079: dimensional liveness is now current state, ambiguous
+  mux targets are an injection safety barrier, provider-switch status/doctor is
+  wired, and the command-surface ledger covers sign/surfaces-gated commands.
+- Added a graph freshness contract that names which diagram must move when a PR
+  changes component boundaries, local/across-wire session flow, diagnostics,
+  Obscura governance, CC Switch/provider policy, CLI/MCP/hook/daemon tradeoffs,
+  or orchestrator→worker/runner execution.
+
 ## [Unreleased] — docs/test: enforce MCP friction decisions (WL-079)
 
 - Narrowed ADR-0003 and multi-surface docs from broad CLI/MCP parity claims to an
