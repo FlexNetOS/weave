@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased] — feat: complete terminal dashboard TUI snapshot (WL-082)
+
+- Completed the default-build `weave tui` cockpit JSON contract: `--json` now returns one machine-readable snapshot containing overview counts plus sessions, messages, asks, jobs, graph, leases, and command-catalog pane arrays.
+- Preserved the std-only/default-build posture while making `--pane` deterministic for headless agents: every pane-specific JSON call carries the full cockpit payload and echoes the selected pane.
+- Extended integration coverage so the TUI command remains a default-build operator surface and its JSON snapshot cannot regress to command-only metadata.
+- Hardened Claude MCP setup/uninstall calls with an argv-only timeout so a broken `claude` wrapper cannot wedge the full test gate or headless setup.
+
 ## [Unreleased] — docs: refresh architecture graph contract (WL-080)
 
 - Refreshed `docs/ARCHITECTURE-GRAPHS.md` to remove stale notes after WL-068,

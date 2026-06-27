@@ -28,7 +28,9 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Which coding-agent host `weave setup` / `weave uninstall` targets.
 ///
@@ -270,17 +272,18 @@ fn register_mcp(exe: &str) {
     // Remove first so re-running setup updates an existing registration in place.
     let _ = claude_mcp_remove();
 
-    match Command::new("claude")
-        .args(["mcp", "add", "weave", "--scope", "user", "--", exe, "mcp"])
-        .status()
-    {
-        Ok(status) if status.success() => {
+    match claude_mcp_status(&["mcp", "add", "weave", "--scope", "user", "--", exe, "mcp"]) {
+        Ok(Some(status)) if status.success() => {
             println!("registered MCP server 'weave' (user scope)");
         }
-        Ok(status) => {
+        Ok(Some(status)) => {
             eprintln!(
                 "note: `claude mcp add weave` exited with {status}; you can register manually:"
             );
+            eprintln!("      claude mcp add weave --scope user -- {exe} mcp");
+        }
+        Ok(None) => {
+            eprintln!("note: `claude mcp add weave` timed out — skipping MCP registration.");
             eprintln!("      claude mcp add weave --scope user -- {exe} mcp");
         }
         Err(_) => {
@@ -296,12 +299,28 @@ fn register_mcp(exe: &str) {
 /// failed (e.g. not registered) or `claude` is missing, Err only on spawn errors
 /// we cannot classify.
 fn claude_mcp_remove() -> Result<bool> {
-    match Command::new("claude")
-        .args(["mcp", "remove", "weave", "-s", "user"])
-        .status()
-    {
-        Ok(status) => Ok(status.success()),
-        Err(_) => Ok(false),
+    match claude_mcp_status(&["mcp", "remove", "weave", "-s", "user"]) {
+        Ok(Some(status)) => Ok(status.success()),
+        Ok(None) | Err(_) => Ok(false),
+    }
+}
+
+/// Bound calls into the external `claude` CLI so setup/uninstall remain best-effort
+/// and can never wedge tests or a headless operator session when a wrapper exists
+/// on PATH but hangs before returning. Pure argv construction; no shell.
+fn claude_mcp_status(args: &[&str]) -> std::io::Result<Option<ExitStatus>> {
+    let mut child = Command::new("claude").args(args).spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

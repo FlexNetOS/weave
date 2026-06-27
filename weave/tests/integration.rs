@@ -15702,6 +15702,52 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
     let json = run_ok(&db, &["tui", "--json", "--pane", "commands"]);
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("tui json");
     assert_eq!(parsed["pane"], "commands");
+    assert_eq!(parsed["overview"]["sessions"], parsed["session_count"]);
+    for key in [
+        "sessions_detail",
+        "messages",
+        "asks",
+        "jobs",
+        "leases",
+        "commands",
+    ] {
+        assert!(
+            parsed[key].is_array(),
+            "TUI JSON must expose a machine-readable `{key}` pane array: {parsed}"
+        );
+    }
+    for key in [
+        "sessions",
+        "stale_sessions",
+        "unread_messages",
+        "messages_listed",
+        "asks_tracked",
+        "jobs_listed",
+        "active_leases",
+        "commands_listed",
+    ] {
+        assert!(
+            parsed["overview"][key].is_number(),
+            "overview must carry numeric `{key}`: {parsed}"
+        );
+    }
+    for pane in [
+        "overview", "sessions", "messages", "asks", "jobs", "graph", "leases",
+    ] {
+        let pane_json = run_ok(&db, &["tui", "--json", "--pane", pane]);
+        let pane_parsed: serde_json::Value =
+            serde_json::from_str(&pane_json).expect("pane-specific tui json");
+        assert_eq!(pane_parsed["pane"], pane);
+        assert!(
+            pane_parsed["overview"].is_object()
+                && pane_parsed["sessions_detail"].is_array()
+                && pane_parsed["messages"].is_array()
+                && pane_parsed["asks"].is_array()
+                && pane_parsed["jobs"].is_array()
+                && pane_parsed["leases"].is_array(),
+            "pane `{pane}` should still return the full cockpit snapshot: {pane_parsed}"
+        );
+    }
     let commands = parsed["commands"].as_array().expect("commands array");
     let names: Vec<&str> = commands
         .iter()

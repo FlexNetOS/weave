@@ -1,6 +1,6 @@
 # WL-082 plan — real terminal dashboard TUI + command-intelligence coverage
 
-Status: planned after `.handoff` resync/migration on 2026-06-26.
+Status: completed in the WL-082 slice after `.handoff` resync/migration on 2026-06-26.
 
 ## Evidence gathered first
 
@@ -107,3 +107,14 @@ Implemented first slice:
 - `--filter <text>` and `--no-color`.
 - Graph pane reuses the same graph-intelligence summary as `weave graph`.
 - The overview explicitly states: `HTTP dashboard is feature-gated; this TUI is default-build.`
+
+## Completion update (2026-06-27)
+
+Completed the default-build terminal cockpit contract without adding TUI dependencies:
+
+- `weave tui --once --no-color` renders a deterministic operator frame.
+- `weave tui --json` now emits a full machine-readable cockpit snapshot, not only command metadata. The payload contains overview counts plus `sessions_detail`, `messages`, `asks`, `jobs`, `leases`, `graph`, and `commands` sections.
+- `--pane` continues to echo the selected pane while returning the full snapshot so headless agents can query any pane without losing cross-pane context.
+- Integration coverage asserts the default-build human frame, graph pane, command catalog parity, required MCP/status metadata, and the JSON arrays/overview counters across pane selections.
+
+No richer TUI dependency was added; the first cockpit remains Rust-native and dependency-light.
