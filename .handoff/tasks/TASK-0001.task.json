@@ -27,7 +27,13 @@
   "priority": "P1",
   "role": "implementer",
   "schema": "handoff.task.v1",
-  "status": "backlog",
+  "status": "done",
   "test_commands": [],
-  "title": "Refresh canonical docs to the corrected north star (repowire-superset + obscura)"
+  "title": "Refresh canonical docs to the corrected north star (repowire-superset + obscura)",
+  "completed_at": "2026-06-27T07:22:00Z",
+  "completion_evidence": [
+    "Reviewed Rust surface with git-kb code index in /tmp/weave-gitkb: 2160 symbols from 30 Rust files; source evidence includes weave-mcp/src/mcp.rs, weave/src/main.rs, weave/src/harness.rs, weave-mcp/src/http.rs, weave-mcp/src/obscura.rs, weave/src/telegram.rs, weave/src/slack.rs, weave-inject/src/inject.rs, weave-core/src/store.rs, weave-core/src/store_libsql.rs.",
+    "Reconciled PRD shipped-vs-future status for WL-047, WL-048/WL-052a/WL-073, WL-049, WL-050..052 against .handoff/loop/backlog.md and source references.",
+    "Updated ARCHITECTURE.md WL-052 wording and CHANGELOG.md TASK-0001 note; no dependency or code changes."
+  ]
 }
