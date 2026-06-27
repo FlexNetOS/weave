@@ -1068,6 +1068,9 @@ command shape, and the exact `WEAVE_FORGE_*` environment. `codex-tools install`
 writes only a weave-managed user-level prompt shim; the repo `.codex/` files stay
 inert sidecars and secrets remain in user config.
 
+For the focused operator manual and rationale, see
+[`.agents/skills/forge-loop/README.md`](.agents/skills/forge-loop/README.md).
+
 `ide-merge-ide` wraps `.claude/skills/weave-loop/scripts/ralph-weave.sh`: Kimi
 Code plans/reviews, Ollama launches Claude MiniMax for the implementation pass,
 and durable `.handoff/loop` sentinels control resume/handoff. `--json` emits the
