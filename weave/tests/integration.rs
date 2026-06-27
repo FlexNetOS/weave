@@ -96,6 +96,14 @@ fn expected_top_level_commands() -> Vec<&'static str> {
         "lease",
         "serve",
         "graph",
+        #[cfg(feature = "surfaces")]
+        "dashboard",
+        #[cfg(feature = "surfaces")]
+        "push",
+        #[cfg(feature = "surfaces")]
+        "telegram",
+        #[cfg(feature = "surfaces")]
+        "slack",
         "export",
         "backup",
         "restore",
