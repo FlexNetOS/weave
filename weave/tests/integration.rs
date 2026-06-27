@@ -351,6 +351,102 @@ fn provider_switch_gemini_applies_env_and_preserves_settings() {
 
 #[test]
 #[cfg(feature = "sqlite")]
+fn provider_switch_status_reports_db_schema_apps_and_proxy_health_readonly() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-status-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+    let conn = rusqlite::Connection::open(&cc_db).unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'codex' AND id = 'deepseek'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE provider_health(provider_id TEXT, status TEXT);
+        CREATE TABLE proxy_config(id TEXT PRIMARY KEY, config TEXT);
+        CREATE TABLE failover_queue(id TEXT PRIMARY KEY);
+        CREATE TABLE usage_logs(id TEXT PRIMARY KEY);
+        "#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "model_provider = \"custom\"\nmodel = \"deepseek-chat\"\n",
+    )
+    .unwrap();
+
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "status",
+            "--db",
+            cc_db.to_str().unwrap(),
+            "--json",
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["db_present"], true);
+    assert_eq!(report["db_readable"], true);
+    assert_eq!(report["schema_ok"], true);
+    assert_eq!(report["tables"]["provider_health"], true);
+    assert_eq!(report["proxy_health"]["proxy_config_present"], true);
+    assert_eq!(report["app_coverage"]["claude-desktop"]["supported"], false);
+    let codex = report["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["app"] == "codex")
+        .unwrap();
+    assert_eq!(codex["providers"], 1);
+    assert_eq!(codex["current_provider"]["id"], "deepseek");
+    assert_eq!(codex["current_model"], "deepseek-chat");
+    assert_eq!(codex["live_config_agrees"], true);
+
+    let human = run_ok_env(
+        &db,
+        &["provider-switch", "status", "--db", cc_db.to_str().unwrap()],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    assert!(human.contains("weave provider-switch status"), "{human}");
+    assert!(
+        human.contains("codex: providers=1 current=deepseek model=deepseek-chat live_agrees=yes"),
+        "{human}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_status_treats_missing_db_as_diagnostic_state() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-status-missing-home");
+    let missing = home.join(".cc-switch/cc-switch.db");
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "status",
+            "--db",
+            missing.to_str().unwrap(),
+            "--json",
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["db_present"], false);
+    assert_eq!(report["db_readable"], false);
+    assert_eq!(report["schema_ok"], false);
+    assert_eq!(report["error"], "cc-switch-db-missing");
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
 fn provider_switch_models_auto_loads_cc_switch_and_ollama() {
     let db = TestDb::new();
     let home = unique_temp_dir("provider-switch-models-home");
