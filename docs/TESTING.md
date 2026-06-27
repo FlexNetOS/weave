@@ -13,6 +13,26 @@ This document describes what is tested, how the suite runs on **both** storage
 backends, the fake-mux harness, what proptest caught, and a checklist for adding
 tests alongside a new feature.
 
+
+## Backlog/docs freshness gate (WL-076)
+
+CI runs:
+
+```bash
+python3 scripts/docs_freshness_check.py
+```
+
+The gate is intentionally lightweight: if a PR changes operator-visible CLI, MCP,
+workflow, or user-facing documentation paths, it must also update `CHANGELOG.md`
+or `.handoff/loop/backlog.md`. If the change truly has no release-note/backlog
+impact, add `[no backlog/doc change]` to the PR body. The script also supports
+`--marker` for local dry runs and `--self-test` for its built-in checks.
+
+```bash
+python3 scripts/docs_freshness_check.py --self-test
+python3 scripts/docs_freshness_check.py --marker '[no backlog/doc change]'
+```
+
 ## Test layers at a glance
 
 | Layer | Location | Style | What it pins down |
