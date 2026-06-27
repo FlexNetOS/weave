@@ -4564,7 +4564,7 @@ fn render_tui_frame(
         50,
     )?;
     let leases = store.list_leases(50)?;
-    let (inbox, _unread_total) = store.inbox(&me, false, false, 10)?;
+    let (inbox, unread_total) = store.inbox(&me, false, false, 10)?;
 
     if pane == TuiPane::Sessions {
         return Ok(render_sessions_dashboard(
@@ -4602,7 +4602,7 @@ fn render_tui_frame(
                 .count();
             out.push_str("overview\n");
             out.push_str(&format!("  sessions: {} ({} stale)\n", rows.len(), stale));
-            out.push_str(&format!("  inbox unread: {}\n", inbox.len()));
+            out.push_str(&format!("  inbox unread: {}\n", unread_total));
             out.push_str(&format!("  asks tracked: {}\n", asks.len()));
             out.push_str(&format!("  jobs listed: {}\n", jobs.len()));
             out.push_str(&format!("  active leases: {}\n", leases.len()));
@@ -4744,36 +4744,255 @@ fn tui_json_snapshot(
     filter: Option<&str>,
 ) -> Result<serde_json::Value> {
     let (me, _) = resolve_me_explicit(None, None, cfg);
+    let this_host = config::this_host();
+    let now = model::now();
     let extra = cfg.peer_db_sources();
     let mut rows = dashboard_rows(&store::federated_peers(store, &extra)?);
     rows.retain(|r| {
         filter_match(
             filter,
-            format!("{} {} {} {}", r.name, r.repo, r.branch, r.description),
+            format!(
+                "{} {} {} {} {} {}",
+                r.name, r.session_id, r.repo, r.branch, r.worktree, r.description
+            ),
         )
     });
+
     let graph = graph_summary(store, cfg, &me, None)?;
+    let asks = store
+        .list_asks(&me, model::AskRole::Any, 50)?
+        .into_iter()
+        .filter(|a| {
+            filter_match(
+                filter,
+                format!("{} {} {} {:?}", a.id, a.asker, a.askee, a.state),
+            )
+        })
+        .collect::<Vec<_>>();
+    let jobs = store
+        .list_jobs(
+            model::JobFilter {
+                state: None,
+                owner: None,
+                creator: None,
+                assignee: None,
+                circle: None,
+            },
+            50,
+        )?
+        .into_iter()
+        .filter(|j| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {} {} {:?}",
+                    j.id,
+                    j.title,
+                    j.creator,
+                    j.owner.as_deref().unwrap_or_default(),
+                    j.assignee.as_deref().unwrap_or_default(),
+                    j.state
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let leases = store
+        .list_leases(50)?
+        .into_iter()
+        .filter(|l| filter_match(filter, format!("{} {} {}", l.resource, l.holder, l.note)))
+        .collect::<Vec<_>>();
+    let (messages, unread_total) = store.inbox(&me, false, false, 50)?;
+    let messages = messages
+        .into_iter()
+        .filter(|m| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {}",
+                    m.sender,
+                    m.recipient,
+                    m.subject.as_deref().unwrap_or_default(),
+                    m.body
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let commands = TUI_COMMANDS
+        .iter()
+        .filter(|cmd| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {}",
+                    cmd.name, cmd.domain, cmd.mcp_decision, cmd.status_surface
+                ),
+            )
+        })
+        .map(|cmd| {
+            serde_json::json!({
+                "name": cmd.name,
+                "domain": cmd.domain,
+                "mcp_decision": cmd.mcp_decision,
+                "status_surface": cmd.status_surface,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let sessions_detail = rows
+        .iter()
+        .map(|r| {
+            let liveness = row_liveness(r, &this_host, now);
+            let liveness = liveness.token();
+            serde_json::json!({
+                "name": r.name,
+                "session_id": r.session_id,
+                "session_id_basis": r.session_id_basis,
+                "repo": r.repo,
+                "branch": r.branch,
+                "worktree": r.worktree,
+                "mux": r.mux,
+                "host": r.host,
+                "pid": r.pid,
+                "last_seen": r.last_seen,
+                "last_seen_ts": model::fmt_ts(r.last_seen),
+                "via": r.via,
+                "turn_state": r.turn_state,
+                "description": r.description,
+                "liveness": liveness,
+            })
+        })
+        .collect::<Vec<_>>();
+    let stale_sessions = sessions_detail
+        .iter()
+        .filter(|row| row["liveness"] == "stale")
+        .count();
+
+    let messages_json = messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "sender": m.sender,
+                "recipient": m.recipient,
+                "subject": m.subject,
+                "body": m.body,
+                "ts": m.ts,
+                "ts_iso": model::fmt_ts(m.ts),
+                "in_reply_to": m.in_reply_to,
+                "priority": m.priority,
+                "trace_id": m.trace_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let asks_json = asks
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "asker": a.asker,
+                "askee": a.askee,
+                "subject": a.subject,
+                "state": a.state.as_str(),
+                "kind": a.kind.as_str(),
+                "question_msg_id": a.question_msg_id,
+                "answer_msg_id": a.answer_msg_id,
+                "reply_to": a.reply_to,
+                "parent_id": a.parent_id,
+                "opened_ts": a.opened_ts,
+                "opened_ts_iso": model::fmt_ts(a.opened_ts),
+                "updated_ts": a.updated_ts,
+                "updated_ts_iso": model::fmt_ts(a.updated_ts),
+                "closed_ts": a.closed_ts,
+                "closed_ts_iso": a.closed_ts.map(model::fmt_ts),
+            })
+        })
+        .collect::<Vec<_>>();
+    let jobs_json = jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "title": j.title,
+                "description": j.description,
+                "kind": j.kind,
+                "state": j.state.as_str(),
+                "state_reason": j.state_reason,
+                "phase": j.phase,
+                "progress_note": j.progress_note,
+                "creator": j.creator,
+                "owner": j.owner,
+                "assignee": j.assignee,
+                "circle": j.circle,
+                "scope": j.scope,
+                "attempt_id": j.attempt_id,
+                "deadline_at": j.deadline_at,
+                "expires_at": j.expires_at,
+                "cancel_requested": j.cancel_requested,
+                "opened_ts": j.opened_ts,
+                "opened_ts_iso": model::fmt_ts(j.opened_ts),
+                "updated_ts": j.updated_ts,
+                "updated_ts_iso": model::fmt_ts(j.updated_ts),
+                "completed_ts": j.completed_ts,
+                "completed_ts_iso": j.completed_ts.map(model::fmt_ts),
+            })
+        })
+        .collect::<Vec<_>>();
+    let leases_json = leases
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "resource": l.resource,
+                "holder": l.holder,
+                "acquired": l.acquired,
+                "acquired_ts": model::fmt_ts(l.acquired),
+                "expires": l.expires,
+                "expires_ts": model::fmt_ts(l.expires),
+                "note": l.note,
+            })
+        })
+        .collect::<Vec<_>>();
+
     Ok(serde_json::json!({
         "pane": pane.as_str(),
         "me": me,
         "backend": cfg.backend(),
+        "db": cfg.db_path().display().to_string(),
+        "generated_at": now,
+        "generated_at_iso": model::fmt_ts(now),
+        "filter": filter,
         "sessions": rows.len(),
+        "session_count": rows.len(),
+        "overview": {
+            "sessions": rows.len(),
+            "stale_sessions": stale_sessions,
+            "unread_messages": unread_total,
+            "messages_listed": messages_json.len(),
+            "asks_tracked": asks_json.len(),
+            "jobs_listed": jobs_json.len(),
+            "active_leases": leases_json.len(),
+            "commands_listed": commands.len(),
+            "dashboard_note": "HTTP dashboard is feature-gated; this TUI is default-build.",
+        },
+        "sessions_detail": sessions_detail,
+        "messages": messages_json,
+        "asks": asks_json,
+        "jobs": jobs_json,
+        "leases": leases_json,
         "graph": {
             "nodes": graph.nodes,
             "edges": graph.edges,
             "density": graph.density,
             "component_count": graph.component_count,
             "largest_component": graph.largest_component,
+            "components": graph.components,
+            "centrality": graph.centrality.iter().map(|(node, score)| serde_json::json!({
+                "node": node,
+                "score": score,
+            })).collect::<Vec<_>>(),
         },
-        "commands": TUI_COMMANDS.iter().map(|cmd| serde_json::json!({
-            "name": cmd.name,
-            "domain": cmd.domain,
-            "mcp_decision": cmd.mcp_decision,
-            "status_surface": cmd.status_surface,
-        })).collect::<Vec<_>>(),
+        "commands": commands,
     }))
 }
-
 /// Emit a shell completion script to stdout.
 fn print_completions(shell: CompletionShell) -> Result<()> {
     use clap::CommandFactory;
