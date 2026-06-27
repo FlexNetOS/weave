@@ -1,6 +1,18 @@
 # Changelog
 
 
+## [Unreleased] — docs: complete TASK-0001 north-star reconciliation
+
+- Reconciled the canonical PRD with the actually shipped repowire-superset
+  surface: WL-047 spawn/kill, WL-048/WL-052a/WL-073 human surfaces, WL-049
+  obscura governance, and WL-050..052 token-light MCP are now recorded as
+  shipped rather than future gaps.
+- Refreshed the ARCHITECTURE WL-052 wording so dashboard writes and bot command
+  grammar are not described as still-pending.
+- Marked `.handoff/tasks/TASK-0001.task.json` complete with git-kb/source-review
+  evidence; no source code or dependency changes.
+
+
 ## [Unreleased] — test: fix free_port TOCTOU dashboard-spawn flake (WL-058)
 
 > **fix(test): race-robust dashboard spawner.** `spawn_dashboard`/`spawn_dashboard_write`

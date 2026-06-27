@@ -1,14 +1,16 @@
 # weave — Product Requirements Document
 
-**Status:** v0.2.0 — delivered and shipping. weave is a working Rust-native
+**Status:** v0.2.x — delivered and shipping. weave is a working Rust-native
 agent-to-agent **orchestration mesh** in one dependency-light static binary:
-**70 `weave_*` MCP tools** plus full CLI parity, a `Store` trait with BOTH
-**sqlite** (default, bundled) and **libSQL/Turso** (feature) backends, optional
-`sign` (ed25519) and `llm` (thread summarization) features, a native injector
-for **five muxes** (tmux, zellij, kitty, wezterm, screen) plus iTerm2,
-lifecycle-hook auto-delivery, `weave setup` automation, cross-store federation +
-Tier-2 pull, a CI gate of six required checks across both backends (≈531 sqlite
-/ ≈491 libsql tests), and the binary shipped in the RTX-5090 wizard image.
+**70+ `weave_*` MCP operations** behind the token-light `weave` meta-tool
+plus full CLI parity, a `Store` trait with BOTH **sqlite** (default, bundled)
+and **libSQL/Turso** (feature) backends, optional `sign` (ed25519), `llm`
+(thread summarization), `surfaces` (dashboard/Telegram/Slack), and `obscura`
+(governed web access) features, a native injector for **five muxes** (tmux,
+zellij, kitty, wezterm, screen) plus iTerm2, lifecycle-hook auto-delivery,
+`weave setup` automation, cross-store federation + Tier-2 pull, a CI gate of
+six required checks across both backends, and the binary shipped in the
+RTX-5090 wizard image.
 **Owner:** drdave
 **One-liner:** The definitive **Rust-native superset of repowire** — a full
 agent-to-agent orchestration mesh (messaging + native pane injection, structured
@@ -68,8 +70,9 @@ for a fleet of coding-agent sessions:
   **paste-safe** per mux, with no Python and no reliance on repowire.
 - Falls back to **hook-driven delivery-on-next-turn** when no multiplexer is
   present, so it degrades gracefully everywhere.
-- Is **MCP-native**: exposes **70 `weave_*` tools** over stdio (and an optional
-  HTTP surface) so any agent can drive the full mesh without shelling out — with
+- Is **MCP-native**: exposes **70+ `weave_*` operations** over stdio through the
+  token-light `weave` meta-tool (with an eager-flat fallback) and optional HTTP
+  surface, so any agent can drive the full mesh without shelling out — with
   **full CLI parity** as the zero-standing-token-cost path.
 - Coordinates real work: **structured asks/answers/acks**, **broadcast** and
   **ask-many** fan-out, **tool-permission gating**, a **durable job board**,
@@ -110,7 +113,8 @@ exceeded, and the gaps that remain (below) are explicitly in scope, not dropped.
 - Linking a browser engine (V8) into weave's core. Web reach is delivered by
   **governing** the separate `obscura-mcp` binary (ADR-0002), not by embedding it.
 - Re-introducing a Python runtime or a Next.js human surface. The dashboard /
-  Telegram / Slack surfaces return (WL-048) **Rust-native and feature-flagged**.
+  Telegram / Slack surfaces have returned (WL-048/WL-052/WL-073) **Rust-native
+  and feature-flagged**.
 
 ## 4. Architecture
 
@@ -118,7 +122,7 @@ exceeded, and the gaps that remain (below) are explicitly in scope, not dropped.
 ```
 weave-core/   library: model + config + Store trait + both backends + memory + sign + llm
 weave-inject/ library: native multi-mux injector (pure command tables + runner)
-weave-mcp/    library: MCP stdio JSON-RPC 2.0 server (70 weave_* tools) + optional HTTP surface
+weave-mcp/    library: MCP stdio JSON-RPC 2.0 server (70+ weave_* ops via meta-tool) + optional HTTP surface
 weave/        binary: clap CLI (full parity) + setup + hooks + git tagging + harness
 ```
 Strictly layered — `weave ▸ weave-mcp ▸ {weave-inject ▸} weave-core`, no upward
@@ -151,7 +155,7 @@ id)`, captured from env at `SessionStart`. Submission is **paste-safe per mux**
 - memory: filesystem-backed scoped store under `~/.config/weave/memory/`.
 
 ## 6. Agent surface (MCP + CLI parity)
-**70 `weave_*` MCP tools** spanning: messaging + inject (`weave_send`,
+**70+ `weave_*` MCP operations** spanning: messaging + inject (`weave_send`,
 `weave_notify`, `weave_inbox`, `weave_history`, `weave_thread`, `weave_reply`,
 `weave_scan`, `weave_search`, `weave_clear`); peers/presence (`weave_peers`,
 `weave_sessions`, `weave_connect`, `weave_whoami`, `weave_set_turn_state`,
@@ -175,7 +179,7 @@ token path (`rtk weave …` for compressed output), per ADR-0003.
   `additionalContext` to drive the next turn without polling (WL-025).
 - `weave tick` (and the prompt hook) fire due scheduled deliveries.
 
-## 8. repowire-superset framing (honest, with the in-scope gaps)
+## 8. repowire-superset framing (honest, with shipped parity and open gaps)
 
 weave **supersets** repowire on the local agent mesh: messaging + push (native,
 multi-mux, paste-safe vs. tmux-only), structured asks/answers/acks, broadcast and
@@ -185,32 +189,44 @@ extras repowire lacks (ed25519 signed identity, LLM summarization, cross-store
 federation + Tier-2 pull, FTS search). The provable parity matrix is
 `docs/REPOWIRE-PARITY.md` (**WL-046**).
 
-The remaining mission gaps — **in scope, not dropped**:
+Repowire-superset parity has moved from planned to mostly shipped:
 - **Agent spawn/kill** (`weave_spawn_peer`/`weave_kill_peer`, argv-only, per-mux,
-  birth-cert identity) — repowire parity weave currently lacks — **WL-047**.
+  birth-cert identity, trusted-program + cwd allowlists) — **shipped in WL-047**.
 - **Rust-native human surfaces** — repowire's dashboard / Telegram / Slack, but
   **Rust-native, no Next.js/Python**, over `weave-mcp/http.rs`, behind a
-  `--features surfaces` flag so the default build stays lean — **WL-048 / WL-052**.
+  default-off `--features surfaces` flag so the default build stays lean —
+  **shipped in WL-048**, with dashboard writes in **WL-052a** and bot command
+  grammar completed by **WL-073**.
 - **Governed web reach** — close the mesh's web/network weakness via **obscura**
   (separate `obscura-mcp` binary) registered as a weave-governed capability
   (permission/lease/job-gated stealth browsing); **NO V8 in weave's core** —
-  **WL-049**, decided in **ADR-0002** (`.handoff/decisions/ADR-0002-…`).
-- **token-light surface** — replace the 70 eager flat MCP tools with
-  progressive-disclosure dispatchers/meta-tool (≤ ~2k standing tokens, zero
-  capability loss); add `token-light` as a guarded invariant — **WL-050..052**,
-  decided in **ADR-0003** (`.handoff/decisions/ADR-0003-…`).
+  **shipped in WL-049**, decided in **ADR-0002** (`.handoff/decisions/ADR-0002-…`).
+- **token-light surface** — the 70+ eager flat MCP tools are available on demand
+  through progressive disclosure (`weave` meta-tool search/describe/call/list),
+  with zero capability loss and a CI standing-token budget — **shipped in
+  WL-050..052**, decided in **ADR-0003** (`.handoff/decisions/ADR-0003-…`).
+
+Current open follow-up gaps are narrower and are tracked in `.handoff/loop/backlog.md`:
+backlog/docs freshness (WL-076), the single-crate-vs-workspace decision refresh
+(WL-077), provider-bridge policy integration (WL-078), MCP/CLI/daemon parity
+gating (WL-079), architecture graph freshness (WL-080), the real terminal TUI
+(WL-082), and deeper command-surface behavior coverage (WL-083).
 
 ## 9. Milestones
 - **M0–M3 (done):** store + native injector (5 muxes) + MCP server + CLI + hooks +
   `weave setup` + workspace split + libSQL backend + presence daemon + the full
   orchestration surface (asks, jobs, leases, orchestrator, reviews, scheduling,
   memory, permissions, sign, summarization) — WL-001..033 merged.
-- **M4 — repowire-superset completion:** parity audit (WL-046), agent spawn/kill
-  (WL-047), Rust-native human surfaces (WL-048), obscura governance (WL-049).
-- **M5 — token-light:** progressive-disclosure MCP (WL-050), invariant + budget
-  gate (WL-051), full multi-surface parity (WL-052).
-- **Structural:** collapse the interim 4-crate workspace back to single-crate
-  after the meta workspace is aligned (WL-043).
+- **M4 — repowire-superset completion (done):** parity audit (WL-046), agent
+  spawn/kill (WL-047), Rust-native human surfaces (WL-048/WL-052a/WL-073), and
+  obscura governance (WL-049).
+- **M5 — token-light (done):** progressive-disclosure MCP (WL-050), invariant +
+  budget gate (WL-051), full multi-surface parity foundation and write-path
+  follow-through (WL-052/WL-052a/WL-052b).
+- **M6 — current backlog:** docs/backlog freshness (WL-076), architecture decision
+  refresh (WL-077), provider policy integration (WL-078), CLI/MCP/daemon parity
+  gates (WL-079), architecture graphs (WL-080), terminal dashboard TUI (WL-082),
+  and command-surface coverage depth (WL-083).
 
 ## 10. Comparison
 | | mcp-broker | repowire | **weave** |
@@ -218,11 +234,11 @@ The remaining mission gaps — **in scope, not dropped**:
 | Language | Python | Python | **Rust (1 binary)** |
 | Push to running session | ❌ poll only | ✅ tmux | ✅ **tmux + zellij + kitty + wezterm + screen + iTerm2 (native, paste-safe)** |
 | Daemon required | no | **yes** | **no** (optional presence daemon only) |
-| MCP-native | ✅ | ✅ | ✅ **70 tools + full CLI parity** |
+| MCP-native | ✅ | ✅ | ✅ **70+ ops via token-light meta-tool + full CLI parity** |
 | Orchestration (asks/jobs/leases/orchestrator/reviews/schedule) | ❌ | ✅ | ✅ **superset** |
 | Agent memory / signing / LLM summary / FTS | ❌ | partial | ✅ |
 | Cross-store federation / Tier-2 pull | ❌ | relay-based | ✅ **no-daemon** |
-| Agent spawn/kill | ❌ | ✅ | ⏳ **WL-047 (in scope)** |
-| Human surfaces (dashboard/TG/Slack) | ❌ | ✅ (Python/Next.js) | ⏳ **WL-048 (Rust-native, in scope)** |
-| Governed web access | ❌ | hosted relay | ⏳ **WL-049 / ADR-0002 (obscura, no V8 in core)** |
-| Token-light surface | n/a | n/a | ⏳ **WL-050..052 / ADR-0003** |
+| Agent spawn/kill | ❌ | ✅ | ✅ **WL-047 (argv-only, gated)** |
+| Human surfaces (dashboard/TG/Slack) | ❌ | ✅ (Python/Next.js) | ✅ **WL-048/WL-052a/WL-073 (Rust-native, feature-gated)** |
+| Governed web access | ❌ | hosted relay | ✅ **WL-049 / ADR-0002 (obscura governed, no V8 in core)** |
+| Token-light surface | n/a | n/a | ✅ **WL-050..052 / ADR-0003** |
