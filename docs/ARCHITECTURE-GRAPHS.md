@@ -521,7 +521,10 @@ control path. CLI and daemon/hook paths win for long-running orchestration becau
 they do not consume standing context, can run out-of-band, and keep the main
 interactive agent free. This creates parity pressure: when a capability lands in
 CLI first, MCP catalog/handler parity must be checked explicitly; when a capability
-lands in MCP first, CLI parity must also be checked.
+lands in MCP first, CLI parity must also be checked. The enforced ledger is
+`weave tui --json --pane commands`: every command listed by `weave --help` must
+carry an `mcp_decision` and a read-only `status_surface`, and background paths
+(`daemon`, `hook`, `responder`) must advertise status/health visibility.
 
 ## 9. Orchestrator to worker/runner flow
 

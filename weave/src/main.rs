@@ -3792,73 +3792,454 @@ impl TuiPane {
     }
 }
 
-const TUI_COMMANDS: &[(&str, &str)] = &[
-    ("mcp", "protocol"),
-    ("setup", "host wiring"),
-    ("uninstall", "host wiring"),
+#[derive(Debug, Clone, Copy)]
+struct CommandSurface {
+    name: &'static str,
+    domain: &'static str,
+    mcp_decision: &'static str,
+    status_surface: &'static str,
+}
+
+const TUI_COMMANDS: &[CommandSurface] = &[
+    CommandSurface {
+        name: "mcp",
+        domain: "protocol",
+        mcp_decision: "protocol-entrypoint",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "setup",
+        domain: "host wiring",
+        mcp_decision: "cli-only-host-config",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "uninstall",
+        domain: "host wiring",
+        mcp_decision: "cli-only-host-config",
+        status_surface: "doctor",
+    },
     #[cfg(feature = "sqlite")]
-    ("provider-switch", "provider policy"),
-    ("harness", "orchestration"),
-    ("send", "messaging"),
-    ("notify", "messaging"),
-    ("broadcast-notify", "messaging"),
-    ("broadcast-ask", "asks"),
-    ("outbox", "federation"),
-    ("pull", "federation"),
-    ("reply", "messaging"),
-    ("thread", "read view"),
-    ("summarize", "llm"),
-    ("receipts", "delivery"),
-    ("delivery", "delivery"),
-    ("watch", "read view"),
-    ("responder", "asks"),
-    ("inbox", "read view"),
-    ("search", "read view"),
-    ("peers", "presence"),
-    ("sessions", "presence"),
-    ("tui", "dashboard"),
-    ("scan", "presence"),
-    ("gc", "maintenance"),
-    ("doctor", "diagnostics"),
-    ("register", "presence"),
-    ("attach", "presence"),
-    ("connect", "presence"),
-    ("inject", "dangerous"),
-    ("spawn", "dangerous"),
-    ("kill", "dangerous"),
-    ("ask", "asks"),
-    ("answer", "asks"),
-    ("ack", "asks"),
-    ("asks", "asks"),
-    ("ask-get", "asks"),
-    ("ask-status", "asks"),
-    ("ask-many", "asks"),
-    ("ask-many-result", "asks"),
-    ("job", "jobs"),
-    ("orchestrator", "orchestration"),
-    ("config", "configuration"),
-    ("completions", "shell"),
-    ("man", "docs"),
-    ("describe", "presence"),
-    ("status", "presence"),
-    ("peer-policy", "presence"),
-    ("schedule", "scheduling"),
-    ("schedules", "scheduling"),
-    ("cancel-schedule", "scheduling"),
-    ("tick", "scheduling"),
-    ("hook", "hooks"),
-    ("memory", "memory"),
-    ("daemon", "presence"),
-    ("review", "reviews"),
-    ("permission", "permissions"),
-    ("lease", "leases"),
-    ("serve", "http"),
-    ("graph", "graph"),
-    ("export", "archive"),
-    ("backup", "archive"),
-    ("restore", "archive"),
-    ("session", "resume"),
-    ("help", "docs"),
+    CommandSurface {
+        name: "provider-switch",
+        domain: "provider policy",
+        mcp_decision: "cli-now-mcp-follow-up-WL-078",
+        status_surface: "provider-switch status / doctor",
+    },
+    CommandSurface {
+        name: "harness",
+        domain: "orchestration",
+        mcp_decision: "cli-only-operator-harness",
+        status_surface: "dry-run plan",
+    },
+    CommandSurface {
+        name: "codex-tools",
+        domain: "orchestration",
+        mcp_decision: "cli-only-operator-install",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "send",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery / receipts",
+    },
+    CommandSurface {
+        name: "notify",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+    },
+    CommandSurface {
+        name: "broadcast-notify",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+    },
+    CommandSurface {
+        name: "broadcast-ask",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+    },
+    CommandSurface {
+        name: "outbox",
+        domain: "federation",
+        mcp_decision: "mcp-catalog",
+        status_surface: "outbox",
+    },
+    CommandSurface {
+        name: "pull",
+        domain: "federation",
+        mcp_decision: "mcp-catalog",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "reply",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "thread / delivery",
+    },
+    CommandSurface {
+        name: "thread",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "thread",
+    },
+    CommandSurface {
+        name: "summarize",
+        domain: "llm",
+        mcp_decision: "feature-gated-mcp-catalog",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "receipts",
+        domain: "delivery",
+        mcp_decision: "mcp-catalog",
+        status_surface: "receipts",
+    },
+    CommandSurface {
+        name: "delivery",
+        domain: "delivery",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+    },
+    CommandSurface {
+        name: "watch",
+        domain: "read view",
+        mcp_decision: "cli-only-stream",
+        status_surface: "inbox",
+    },
+    CommandSurface {
+        name: "responder",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "responder --health / MCP health",
+    },
+    CommandSurface {
+        name: "inbox",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "inbox",
+    },
+    CommandSurface {
+        name: "search",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "search",
+    },
+    CommandSurface {
+        name: "peers",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / doctor",
+    },
+    CommandSurface {
+        name: "sessions",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "sessions / tui",
+    },
+    CommandSurface {
+        name: "tui",
+        domain: "dashboard",
+        mcp_decision: "cli-only-terminal-dashboard",
+        status_surface: "tui --json",
+    },
+    CommandSurface {
+        name: "scan",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "scan / doctor",
+    },
+    CommandSurface {
+        name: "gc",
+        domain: "maintenance",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "doctor",
+        domain: "diagnostics",
+        mcp_decision: "mcp-catalog",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "register",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions / doctor",
+    },
+    CommandSurface {
+        name: "attach",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions / doctor",
+    },
+    CommandSurface {
+        name: "connect",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "connect / delivery",
+    },
+    CommandSurface {
+        name: "inject",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "delivery",
+    },
+    CommandSurface {
+        name: "spawn",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "peers / sessions",
+    },
+    CommandSurface {
+        name: "kill",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "peers / sessions",
+    },
+    CommandSurface {
+        name: "ask",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+    },
+    CommandSurface {
+        name: "answer",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+    },
+    CommandSurface {
+        name: "ack",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+    },
+    CommandSurface {
+        name: "asks",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "asks",
+    },
+    CommandSurface {
+        name: "ask-get",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-get",
+    },
+    CommandSurface {
+        name: "ask-status",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+    },
+    CommandSurface {
+        name: "ask-many",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-many-result",
+    },
+    CommandSurface {
+        name: "ask-many-result",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-many-result",
+    },
+    CommandSurface {
+        name: "job",
+        domain: "jobs",
+        mcp_decision: "mcp-catalog",
+        status_surface: "job list/status",
+    },
+    CommandSurface {
+        name: "orchestrator",
+        domain: "orchestration",
+        mcp_decision: "mcp-catalog",
+        status_surface: "orchestrator status",
+    },
+    CommandSurface {
+        name: "config",
+        domain: "configuration",
+        mcp_decision: "mcp-catalog-read-mostly",
+        status_surface: "config get / doctor",
+    },
+    CommandSurface {
+        name: "completions",
+        domain: "shell",
+        mcp_decision: "cli-only-shell-integration",
+        status_surface: "help",
+    },
+    CommandSurface {
+        name: "man",
+        domain: "docs",
+        mcp_decision: "cli-only-doc-generation",
+        status_surface: "help",
+    },
+    #[cfg(feature = "sign")]
+    CommandSurface {
+        name: "key",
+        domain: "signing",
+        mcp_decision: "mcp-catalog-sign",
+        status_surface: "key list / doctor",
+    },
+    #[cfg(feature = "sign")]
+    CommandSurface {
+        name: "audit",
+        domain: "signing",
+        mcp_decision: "mcp-catalog-sign",
+        status_surface: "audit revocations",
+    },
+    CommandSurface {
+        name: "describe",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions",
+    },
+    CommandSurface {
+        name: "status",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions",
+    },
+    CommandSurface {
+        name: "peer-policy",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peer-policy get",
+    },
+    CommandSurface {
+        name: "schedule",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+    },
+    CommandSurface {
+        name: "schedules",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+    },
+    CommandSurface {
+        name: "cancel-schedule",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+    },
+    CommandSurface {
+        name: "tick",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules / delivery",
+    },
+    CommandSurface {
+        name: "hook",
+        domain: "hooks",
+        mcp_decision: "cli-only-host-lifecycle",
+        status_surface: "status / peers / responder health / doctor",
+    },
+    CommandSurface {
+        name: "memory",
+        domain: "memory",
+        mcp_decision: "mcp-catalog",
+        status_surface: "memory list/search",
+    },
+    CommandSurface {
+        name: "daemon",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "daemon status / doctor",
+    },
+    CommandSurface {
+        name: "review",
+        domain: "reviews",
+        mcp_decision: "mcp-catalog",
+        status_surface: "review list",
+    },
+    CommandSurface {
+        name: "permission",
+        domain: "permissions",
+        mcp_decision: "mcp-catalog",
+        status_surface: "permission status",
+    },
+    CommandSurface {
+        name: "lease",
+        domain: "leases",
+        mcp_decision: "mcp-catalog",
+        status_surface: "lease list",
+    },
+    CommandSurface {
+        name: "serve",
+        domain: "http",
+        mcp_decision: "protocol-entrypoint",
+        status_surface: "doctor",
+    },
+    CommandSurface {
+        name: "graph",
+        domain: "graph",
+        mcp_decision: "mcp-catalog",
+        status_surface: "graph",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "dashboard",
+        domain: "http dashboard",
+        mcp_decision: "feature-gated-http-surface",
+        status_surface: "dashboard read-only / doctor",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "push",
+        domain: "federation",
+        mcp_decision: "mcp-catalog-surface",
+        status_surface: "push result / delivery",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "telegram",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "slack",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+    },
+    CommandSurface {
+        name: "export",
+        domain: "archive",
+        mcp_decision: "cli-only-file-output",
+        status_surface: "export summary",
+    },
+    CommandSurface {
+        name: "backup",
+        domain: "archive",
+        mcp_decision: "cli-only-host-snapshot",
+        status_surface: "backup manifest",
+    },
+    CommandSurface {
+        name: "restore",
+        domain: "archive",
+        mcp_decision: "cli-only-host-restore",
+        status_surface: "restore dry-run / manifest",
+    },
+    CommandSurface {
+        name: "session",
+        domain: "resume",
+        mcp_decision: "cli-only-file-interchange",
+        status_surface: "session import --dry-run",
+    },
+    CommandSurface {
+        name: "help",
+        domain: "docs",
+        mcp_decision: "n/a-docs",
+        status_surface: "help",
+    },
 ];
 
 /// Decide whether the ANSI clear-home prefix should be emitted: only when stdout is
@@ -4336,9 +4717,18 @@ fn render_tui_frame(
         }
         TuiPane::Commands => {
             out.push_str("commands\n");
-            for (cmd, domain) in TUI_COMMANDS {
-                if filter_match(filter, format!("{cmd} {domain}")) {
-                    out.push_str(&format!("  {cmd:<18} {domain}\n"));
+            for cmd in TUI_COMMANDS {
+                if filter_match(
+                    filter,
+                    format!(
+                        "{} {} {} {}",
+                        cmd.name, cmd.domain, cmd.mcp_decision, cmd.status_surface
+                    ),
+                ) {
+                    out.push_str(&format!(
+                        "  {:<18} {:<16} mcp={:<24} status={}\n",
+                        cmd.name, cmd.domain, cmd.mcp_decision, cmd.status_surface
+                    ));
                 }
             }
         }
@@ -4375,7 +4765,12 @@ fn tui_json_snapshot(
             "component_count": graph.component_count,
             "largest_component": graph.largest_component,
         },
-        "commands": TUI_COMMANDS.iter().map(|(name, domain)| serde_json::json!({"name": name, "domain": domain})).collect::<Vec<_>>(),
+        "commands": TUI_COMMANDS.iter().map(|cmd| serde_json::json!({
+            "name": cmd.name,
+            "domain": cmd.domain,
+            "mcp_decision": cmd.mcp_decision,
+            "status_surface": cmd.status_surface,
+        })).collect::<Vec<_>>(),
     }))
 }
 

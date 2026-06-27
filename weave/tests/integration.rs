@@ -28,6 +28,116 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "sqlite")]
 use std::thread;
 
+fn expected_top_level_commands() -> Vec<&'static str> {
+    vec![
+        "mcp",
+        "setup",
+        "uninstall",
+        #[cfg(feature = "sqlite")]
+        "provider-switch",
+        "harness",
+        "codex-tools",
+        "send",
+        "notify",
+        "broadcast-notify",
+        "broadcast-ask",
+        "outbox",
+        "pull",
+        "reply",
+        "thread",
+        "summarize",
+        "receipts",
+        "delivery",
+        "watch",
+        "responder",
+        "inbox",
+        "search",
+        "peers",
+        "sessions",
+        "tui",
+        "scan",
+        "gc",
+        "doctor",
+        "register",
+        "attach",
+        "connect",
+        "inject",
+        "spawn",
+        "kill",
+        "ask",
+        "answer",
+        "ack",
+        "asks",
+        "ask-get",
+        "ask-status",
+        "ask-many",
+        "ask-many-result",
+        "job",
+        "orchestrator",
+        "config",
+        "completions",
+        "man",
+        #[cfg(feature = "sign")]
+        "key",
+        #[cfg(feature = "sign")]
+        "audit",
+        "describe",
+        "status",
+        "peer-policy",
+        "schedule",
+        "schedules",
+        "cancel-schedule",
+        "tick",
+        "hook",
+        "memory",
+        "daemon",
+        "review",
+        "permission",
+        "lease",
+        "serve",
+        "graph",
+        #[cfg(feature = "surfaces")]
+        "dashboard",
+        #[cfg(feature = "surfaces")]
+        "push",
+        #[cfg(feature = "surfaces")]
+        "telegram",
+        #[cfg(feature = "surfaces")]
+        "slack",
+        "export",
+        "backup",
+        "restore",
+        "session",
+        "help",
+    ]
+}
+
+fn advertised_top_level_commands(help: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.trim() == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if in_commands && line.trim() == "Options:" {
+            break;
+        }
+        if in_commands {
+            let Some(rest) = line.strip_prefix("  ") else {
+                continue;
+            };
+            let Some((cmd, _)) = rest.trim_start().split_once(char::is_whitespace) else {
+                continue;
+            };
+            if !cmd.is_empty() {
+                out.push(cmd.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "sqlite")]
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -15542,81 +15652,19 @@ fn setup_rejects_invalid_provider() {
 
 #[test]
 fn every_top_level_command_has_documented_help() {
-    // The owner-facing dashboard/test audit starts with a hard contract: every
-    // top-level command advertised by `weave --help` must have an exercised help
-    // path. Keep this list in sync with the command surface so new commands must
-    // add at least a black-box usage smoke before shipping deeper behavior tests.
+    // The owner-facing surface audit is intentionally exact: every top-level
+    // command advertised by `weave --help` must be in the command-surface ledger
+    // and must have an exercised help path. Extra commands are failures too;
+    // otherwise CLI-first work can silently bypass MCP/status parity decisions.
     let db = TestDb::new();
-    let expected = [
-        "mcp",
-        "setup",
-        "uninstall",
-        #[cfg(feature = "sqlite")]
-        "provider-switch",
-        "harness",
-        "send",
-        "notify",
-        "broadcast-notify",
-        "broadcast-ask",
-        "outbox",
-        "pull",
-        "reply",
-        "thread",
-        "summarize",
-        "receipts",
-        "delivery",
-        "watch",
-        "responder",
-        "inbox",
-        "search",
-        "peers",
-        "sessions",
-        "tui",
-        "scan",
-        "gc",
-        "doctor",
-        "register",
-        "attach",
-        "connect",
-        "inject",
-        "spawn",
-        "kill",
-        "ask",
-        "answer",
-        "ack",
-        "asks",
-        "ask-get",
-        "ask-status",
-        "ask-many",
-        "ask-many-result",
-        "job",
-        "orchestrator",
-        "config",
-        "completions",
-        "man",
-        "describe",
-        "status",
-        "peer-policy",
-        "schedule",
-        "schedules",
-        "cancel-schedule",
-        "tick",
-        "hook",
-        "memory",
-        "daemon",
-        "review",
-        "permission",
-        "lease",
-        "serve",
-        "graph",
-        "export",
-        "backup",
-        "restore",
-        "session",
-        "help",
-    ];
-
+    let expected = expected_top_level_commands();
     let top = run_ok(&db, &["--help"]);
+    let advertised = advertised_top_level_commands(&top);
+    assert_eq!(
+        advertised, expected,
+        "top-level help and expected command-surface ledger diverged"
+    );
+
     for command in expected {
         assert!(
             top.contains(&format!("  {command}")),
@@ -15654,12 +15702,41 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
     let json = run_ok(&db, &["tui", "--json", "--pane", "commands"]);
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("tui json");
     assert_eq!(parsed["pane"], "commands");
+    let commands = parsed["commands"].as_array().expect("commands array");
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|cmd| cmd["name"].as_str().expect("command name"))
+        .collect();
+    assert_eq!(
+        names,
+        expected_top_level_commands(),
+        "TUI command catalog must track every top-level CLI command exactly"
+    );
     assert!(
-        parsed["commands"]
-            .as_array()
-            .expect("commands array")
+        commands
             .iter()
             .any(|cmd| cmd["name"] == "tui" && cmd["domain"] == "dashboard"),
         "command catalog includes tui dashboard entry: {parsed}"
     );
+    for cmd in commands {
+        let name = cmd["name"].as_str().unwrap_or("<missing>");
+        let mcp_decision = cmd["mcp_decision"].as_str().unwrap_or_default();
+        let status_surface = cmd["status_surface"].as_str().unwrap_or_default();
+        assert!(
+            !mcp_decision.is_empty(),
+            "{name} must declare an explicit MCP parity decision"
+        );
+        assert!(
+            !status_surface.is_empty(),
+            "{name} must declare the read-only status/diagnostic surface that proves visibility"
+        );
+        if name == "daemon" || name == "hook" || name == "responder" {
+            assert!(
+                status_surface.contains("status")
+                    || status_surface.contains("health")
+                    || status_surface.contains("doctor"),
+                "background/hook surface {name} must advertise a read-only status/health surface: {status_surface}"
+            );
+        }
+    }
 }
