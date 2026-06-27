@@ -154,7 +154,7 @@ HUMAN-FACING NAME                    STABLE LIVE INSTANCE
 | routing resolution                                              |
 | - alias route: "worker"                                         |
 | - exact route: "sess_<16-hex>" -> exactly one peer              |
-| - ambiguous target: diagnostics flag now; avoidance is backlog  |
+| - ambiguous target: diagnostics + injection avoidance barrier     |
 +----------------------------------------------------------------+
 ```
 
@@ -166,6 +166,10 @@ Current state:
 - CLI `job delegate` and MCP `weave_job_delegate` accept a peer alias or exact
   session id, create a queued assigned job, and notify the worker with
   `JOB_DELEGATED <job_id>`.
+- Shared mux targets are now a safety barrier: point-to-point sends/asks/answers
+  that resolve to an ambiguous `(mux, target, socket)` skip live injection, keep
+  durable delivery queued, and record `not_injectable/ambiguous_target` in
+  `delivery_log` instead of typing into the wrong pane.
 
 ## 4. Doctor and scan diagnostics
 
@@ -198,10 +202,12 @@ Current state:
 ```
 
 Important current nuance: a row can be process/heartbeat-stale but still have a
-reachable mux target. A single folded status token can hide that nuance, so the
-backlog calls for dimensional fields such as `registered`, `process_alive`,
-`pane_alive`, `injectable`, `responsive_recently`, `last_heartbeat`,
-`last_transport_success`, `last_response`, and `stale_reason`.
+reachable mux target. Weave therefore exposes both folded human status tokens and
+orthogonal JSON dimensions such as `registered`, `process_alive`, `pane_alive`,
+`injectable`, `reachable`, `responsive_recently`, `last_heartbeat`,
+`last_transport_success`, `last_response`, `stale_reason`, and `inject_probe`.
+`doctor --json` aggregates the same dimensions so status is visible without
+reconstructing it from ad-hoc CLI text.
 
 ## 5. Across-wire communication
 
@@ -430,6 +436,22 @@ settings(common_config_<app>, current_provider_<app>, ...)
                                       (keep until shimmy/ruvllm
                                        are proven replacements)
 
+READ-ONLY STATUS PATH TODAY
+===========================
+
+weave provider-switch status [--json]
+        |
+        v
+open CC Switch DB read-only
+        |
+        v
+report DB present/readable, provider schema coverage,
+supported-vs-observed apps, current provider/model per supported app,
+live config agreement, proxy/failover/health table presence
+        |
+        v
+weave doctor / doctor --json provider_switch rollup
+
 WRITE/SWITCH PATH TODAY
 =======================
 
@@ -462,13 +484,13 @@ update CC Switch DB:
 ```text
 CC SWITCH CAPABILITY               WEAVE STATE NOW             GAP
 --------------------               ---------------             ---
-Claude/Codex/Gemini providers ---> provider-switch CLI ------> no doctor/scan status
-OpenCode/OpenClaw/Hermes --------> not in bridge -----------> no as-is app coverage
-Claude Desktop 3P profiles ------> not in bridge -----------> no proxy route mapping
-local proxy/takeover ------------> not in bridge -----------> no route/failover view
-provider_health/failover --------> not in bridge -----------> no orchestration signal
-MCP/prompt/skill sync -----------> setup has own paths -----> no CC Switch sync map
-usage/proxy logs ----------------> not in bridge -----------> no cost/health feedback
+Claude/Codex/Gemini providers ---> CLI + status/doctor -----> no MCP status yet
+OpenCode/OpenClaw/Hermes --------> reported unsupported ----> no bridge semantics yet
+Claude Desktop profiles ---------> reported unsupported ----> no proxy route mapping
+local proxy/takeover ------------> table presence shown ----> no route/failover view
+provider_health/failover --------> table presence shown ----> no orchestration signal
+MCP/prompt/skill sync -----------> table presence shown ----> no CC Switch sync map
+usage/proxy logs ----------------> table presence shown ----> no cost/health feedback
 DeepLink import -----------------> not in bridge -----------> no import/status story
 ```
 
@@ -490,11 +512,12 @@ Bridge owns:    exact, source-truth interop contracts:
                 - never silently drop unsupported CC Switch apps/capabilities
 ```
 
-Next implementation slice implied by this graph: replace the current
-three-app-only mental model with a CC Switch status contract that reads the actual
-archive schema (`providers`, `provider_health`, `proxy_config`, failover/usage
-state, MCP/prompt/skill tables) and reports which pieces Weave honors, ignores,
-or cannot safely drive yet.
+The status/doctor slice now reads enough of the actual CC Switch schema to make
+unsupported coverage explicit instead of silent. Remaining implementation slices
+are MCP read-only status (if it stays token-light), runner/job provider/model
+policy requests, deeper app coverage beyond Claude/Codex/Gemini, and additive
+shimmy/ruvllm model discovery while preserving Ollama until replacements are
+parity-proven.
 
 ## 8. CLI/daemon-first vs MCP friction map
 
@@ -523,8 +546,9 @@ interactive agent free. This creates parity pressure: when a capability lands in
 CLI first, MCP catalog/handler parity must be checked explicitly; when a capability
 lands in MCP first, CLI parity must also be checked. The enforced ledger is
 `weave tui --json --pane commands`: every command listed by `weave --help` must
-carry an `mcp_decision` and a read-only `status_surface`, and background paths
-(`daemon`, `hook`, `responder`) must advertise status/health visibility.
+carry an `mcp_decision` and a read-only `status_surface`, including sign-gated
+`key`/`audit` and surfaces-gated `dashboard`/`push`/`telegram`/`slack`; background
+paths (`daemon`, `hook`, `responder`) must advertise status/health visibility.
 
 ## 9. Orchestrator to worker/runner flow
 
@@ -576,3 +600,28 @@ Ownership boundary:
 - Rusty-IDD: code intelligence / symbol graph.
 - flexnetos_runner: execution-plane mechanics.
 - ATC/model backends: actual model/provider execution.
+
+
+## 10. Architecture graph freshness contract
+
+These diagrams are review scaffolding, not replacement source truth. A change is
+"graph-visible" when it changes any of these planes:
+
+```text
+PLANE                        REQUIRED GRAPH TOUCH
+-----                        --------------------
+crate/component boundary --> §1 component graph
+message / ask / wake path -> §2 primary/secondary flow
+routing/session identity --> §3 session identity and routing
+doctor/scan/status facts --> §4 diagnostics
+cross-store/network path --> §5 across-wire communication
+web/browser governance ----> §6 Obscura domain flow
+provider/model policy -----> §7 CC Switch provider/vendor flow
+CLI/MCP/hook/daemon trade -> §8 friction map + command ledger
+job/runner execution ------> §9 orchestrator to worker/runner flow
+```
+
+Review rule: if a PR changes one of those planes, either update this document and
+`CHANGELOG.md`/`.handoff/loop/backlog.md`, or state explicitly why the graph is
+unchanged. This keeps future handoffs from treating stale diagrams as current
+operator truth.
