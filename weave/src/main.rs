@@ -26,6 +26,7 @@
 //!   weave man            print a roff man page to stdout
 //!   weave hook <event>   Claude Code lifecycle hook: session|prompt|stop|wake|notification|pretooluse
 //!   weave harness        dry-run/run autonomous orchestration harnesses (Codex 7-layer)
+//!   weave codex-tools    doctor/install Codex forge-loop integration
 
 // The MCP `tools()` registry is a single large `json!([...])` literal; each added
 // tool deepens the `serde_json::json!` macro recursion. Raising the crate recursion
@@ -229,6 +230,11 @@ enum Cmd {
     Harness {
         #[command(subcommand)]
         cmd: HarnessCmd,
+    },
+    /// Doctor/install Codex forge-loop integration assets.
+    CodexTools {
+        #[command(subcommand)]
+        cmd: CodexToolsCmd,
     },
     /// Send a message to another session.
     Send {
@@ -4403,6 +4409,71 @@ enum HarnessCmd {
         #[arg(long, default_value = "--quiet")]
         kimi_extra_args: String,
     },
+    /// Rust-native Codex forge loop for one cohesive task cycle.
+    ForgeLoop {
+        /// Worktree that contains Cargo.toml and the forge-loop skill.
+        #[arg(long)]
+        worktree: Option<std::path::PathBuf>,
+        /// Task/objective for this cycle.
+        #[arg(long, default_value = "continue the top forge-loop task")]
+        task: String,
+        /// Number of cohesive tasks to close before handoff.
+        #[arg(long, default_value_t = 1)]
+        budget: u32,
+        /// External runner hard stop.
+        #[arg(long, default_value_t = 1)]
+        max_iters: u32,
+        /// Seconds between loop checks when the delegated runner self-paces.
+        #[arg(long, default_value_t = 5)]
+        sleep: u64,
+        /// Execute the harness through `codex exec`; default is dry-run.
+        #[arg(long)]
+        execute: bool,
+        /// Keep destructive applies disabled inside the loop.
+        #[arg(long)]
+        safe: bool,
+        /// Print machine-readable JSON plan in dry-run mode.
+        #[arg(long)]
+        json: bool,
+        /// Codex CLI command.
+        #[arg(long, default_value = "codex")]
+        codex_cmd: String,
+        /// Codex model to pass to `codex exec`.
+        #[arg(long, default_value = "gpt-5.5")]
+        codex_model: String,
+    },
+}
+
+/// Codex-facing install and health-check helpers.
+#[derive(Subcommand)]
+enum CodexToolsCmd {
+    /// Check Codex CLI, repo assets, and the user-level /forge-loop shim.
+    Doctor {
+        /// Codex home directory (default: ~/.codex).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        /// Codex CLI command.
+        #[arg(long, default_value = "codex")]
+        codex_cmd: String,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install/update the user-level /forge-loop prompt shim.
+    Install {
+        /// Codex home directory (default: ~/.codex).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        /// Stable weave executable written into the shim.
+        #[arg(long, default_value = "weave")]
+        weave_exe: String,
+        /// Show what would be written without mutating.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite an existing non-weave-managed prompt shim.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn run_harness(cmd: &HarnessCmd) -> Result<()> {
@@ -4444,6 +4515,57 @@ fn run_harness(cmd: &HarnessCmd) -> Result<()> {
             opts.kimi_session_flag = kimi_session_flag.clone();
             opts.kimi_extra_args = kimi_extra_args.clone();
             harness::run_ide_merge_ide(opts)
+        }
+        HarnessCmd::ForgeLoop {
+            worktree,
+            task,
+            budget,
+            max_iters,
+            sleep,
+            execute,
+            safe,
+            json,
+            codex_cmd,
+            codex_model,
+        } => {
+            let mut opts = harness::ForgeLoop::with_defaults(worktree.clone());
+            opts.task = task.clone();
+            opts.budget = *budget;
+            opts.max_iters = *max_iters;
+            opts.sleep_secs = *sleep;
+            opts.execute = *execute;
+            opts.apply = !*safe;
+            opts.json = *json;
+            opts.codex_cmd = codex_cmd.clone();
+            opts.codex_model = codex_model.clone();
+            harness::run_forge_loop(opts)
+        }
+    }
+}
+
+fn run_codex_tools(cmd: &CodexToolsCmd) -> Result<()> {
+    match cmd {
+        CodexToolsCmd::Doctor {
+            home,
+            codex_cmd,
+            json,
+        } => {
+            let mut opts = harness::CodexTools::with_defaults(home.clone());
+            opts.codex_cmd = codex_cmd.clone();
+            opts.json = *json;
+            harness::run_codex_doctor(opts)
+        }
+        CodexToolsCmd::Install {
+            home,
+            weave_exe,
+            dry_run,
+            force,
+        } => {
+            let mut opts = harness::CodexTools::with_defaults(home.clone());
+            opts.weave_exe = weave_exe.clone();
+            opts.dry_run = *dry_run;
+            opts.force = *force;
+            harness::run_codex_install(opts)
         }
     }
 }
@@ -4647,6 +4769,7 @@ fn main() -> Result<()> {
         Cmd::Completions { shell } => return print_completions(*shell),
         Cmd::Man => return print_man(),
         Cmd::Harness { cmd } => return run_harness(cmd),
+        Cmd::CodexTools { cmd } => return run_codex_tools(cmd),
         // Restore replaces the live store/config — it must NOT open the store first
         // (the on-disk DB may be absent or about to be overwritten). It opens only a
         // verified snapshot of its own.
@@ -4669,6 +4792,7 @@ fn main() -> Result<()> {
         | Cmd::Completions { .. }
         | Cmd::Man
         | Cmd::Harness { .. }
+        | Cmd::CodexTools { .. }
         | Cmd::Restore { .. } => {
             unreachable!("handled above")
         }

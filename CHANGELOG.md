@@ -535,6 +535,21 @@
   `Store` method, no schema column, no migration; every pre-WL-047 caller passes
   `None`, so existing behavior is byte-identical.
 
+
+## [Unreleased] — Codex forge loop (`weave harness forge-loop`)
+
+> **Rust-native Codex task-execution front door.** `weave harness forge-loop`
+> dry-runs (default) or delegates one cohesive cycle to `codex exec`, using the
+> repo-local `.agents/skills/forge-loop/SKILL.md` as the durable workflow source
+> of truth. `weave codex-tools doctor/install` checks and installs the optional
+> user-level `/forge-loop` prompt shim without making repo config the source of
+> secrets or user-level Codex settings.
+
+### Added
+- **cli (`weave`):** `weave harness forge-loop` with task/worktree/budget/execute/safe/json and Codex command/model overrides.
+- **cli (`weave`):** `weave codex-tools doctor` and `weave codex-tools install` for Codex forge-loop integration.
+- **codex sidecars:** forge-loop skill plus implementer/verifier/guardian agent configs for Codex subagent workflows.
+
 ## [Unreleased] — Codex 7-layer harness (`weave harness ide-merge-ide`)
 
 > **Autonomous orchestration surface in the binary.** `weave harness
