@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — fix: ignore exited zellij sessions in liveness
+
+- Fixed zellij liveness detection so `zellij list-sessions` rows marked
+  `(EXITED - attach to resurrect)` no longer make `weave connect`, `peers`,
+  or delivery planning report a false live/injectable target.
+- Added a regression test for the observed exited/current zellij session listing
+  shape while preserving live/current zellij sessions as injectable.
+
 ## [Unreleased] — test: deepen command-surface coverage gate (WL-083)
 
 - Expanded the enforced `weave tui --json --pane commands` ledger from MCP/status metadata to a command coverage contract: every top-level command now carries help-smoke, behavior coverage, docs surface, TUI exposure, and risk/write classification fields.
