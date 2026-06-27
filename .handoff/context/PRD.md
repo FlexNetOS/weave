@@ -118,7 +118,7 @@ exceeded, and the gaps that remain (below) are explicitly in scope, not dropped.
 
 ## 4. Architecture
 
-### Current (v0.2.0) — interim Cargo workspace, one binary
+### Current (v0.2.0) — accepted Cargo workspace, one binary
 ```
 weave-core/   library: model + config + Store trait + both backends + memory + sign + llm
 weave-inject/ library: native multi-mux injector (pure command tables + runner)
@@ -127,9 +127,9 @@ weave/        binary: clap CLI (full parity) + setup + hooks + git tagging + har
 ```
 Strictly layered — `weave ▸ weave-mcp ▸ {weave-inject ▸} weave-core`, no upward
 deps (compiler-enforced). The default build still produces **one** static binary
-(`target/release/weave`). **The four-crate split is interim; single-crate remains
-the structural goal** (collapse after the meta workspace is aligned — WL-043).
-Deep detail is in `ARCHITECTURE.md`.
+(`target/release/weave`). **ADR-0006 accepts the four-crate workspace as the
+supported architecture**: the invariant is one dependency-light Rust binary, not
+one crate. Deep detail is in `ARCHITECTURE.md`.
 
 ### How push works (no daemon)
 `tmux send-keys -t <pane>`, `zellij --session <name> action write-chars`,
@@ -207,8 +207,7 @@ Repowire-superset parity has moved from planned to mostly shipped:
   WL-050..052**, decided in **ADR-0003** (`.handoff/decisions/ADR-0003-…`).
 
 Current open follow-up gaps are narrower and are tracked in `.handoff/loop/backlog.md`:
-backlog/docs freshness (WL-076), the single-crate-vs-workspace decision refresh
-(WL-077), provider-bridge policy integration (WL-078), MCP/CLI/daemon parity
+provider-bridge policy integration (WL-078), MCP/CLI/daemon parity
 gating (WL-079), architecture graph freshness (WL-080), the real terminal TUI
 (WL-082), and deeper command-surface behavior coverage (WL-083).
 

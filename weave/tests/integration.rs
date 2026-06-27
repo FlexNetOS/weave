@@ -98,8 +98,15 @@ fn seed_cc_switch_db(path: &std::path::Path) {
 }
 
 #[cfg(feature = "sqlite")]
-fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+fn fake_ollama_server() -> Option<(String, thread::JoinHandle<()>)> {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping: local loopback bind is not permitted in this sandbox: {err}");
+            return None;
+        }
+        Err(err) => panic!("bind fake ollama: {err}"),
+    };
     listener.set_nonblocking(true).ok();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -136,7 +143,7 @@ fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
             let _ = stream.flush();
         }
     });
-    (format!("http://{addr}"), handle)
+    Some((format!("http://{addr}"), handle))
 }
 
 #[test]
@@ -351,7 +358,9 @@ fn provider_switch_models_auto_loads_cc_switch_and_ollama() {
     std::fs::create_dir_all(&cc_dir).unwrap();
     let cc_db = cc_dir.join("cc-switch.db");
     seed_cc_switch_db(&cc_db);
-    let (ollama_host, handle) = fake_ollama_server();
+    let Some((ollama_host, handle)) = fake_ollama_server() else {
+        return;
+    };
 
     let (ok, out, err) = run_env(
         &db,
@@ -770,8 +779,16 @@ fn cli_setup_git_hooks_installs_pre_commit() {
         .unwrap();
     assert!(git_init.status.success(), "git init failed");
 
-    // Run setup --git-hooks inside the repo.
-    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    // Run setup --git-hooks inside the repo with HOME isolated because setup also
+    // performs user-level MCP/hook registration before installing git hooks.
+    let home = unique_tmp_dir("git-hook-setup-home");
+    let home_str = home.to_string_lossy().into_owned();
+    let (ok, out, err) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(
         ok,
         "setup --git-hooks should succeed:\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
@@ -790,7 +807,12 @@ fn cli_setup_git_hooks_installs_pre_commit() {
     );
 
     // Idempotent: second run should not duplicate.
-    let (ok2, out2, _err2) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    let (ok2, out2, _err2) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(ok2, "second setup should succeed: {out2}");
     assert!(
         out2.contains("already contains") || out2.contains("pre-commit already contains"),
@@ -12581,7 +12603,14 @@ fn git_hook_install_is_read_back_verified_and_preserves_foreign() {
     )
     .unwrap();
 
-    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    let home = unique_tmp_dir("git-hook-readback-home");
+    let home_str = home.to_string_lossy().into_owned();
+    let (ok, out, err) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(ok, "setup --git-hooks should succeed:\n{out}\n{err}");
 
     // Read-back: BOTH the guard line and the pre-existing foreign line are present.
