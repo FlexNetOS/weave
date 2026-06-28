@@ -198,7 +198,6 @@ fn default_worktree() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-
 #[derive(Clone, Debug)]
 pub struct ForgeLoop {
     pub worktree: PathBuf,
@@ -338,10 +337,7 @@ fn forge_env_pairs(opts: &ForgeLoop) -> Vec<(String, String)> {
             "WEAVE_FORGE_MAX_ITERS".to_string(),
             opts.max_iters.to_string(),
         ),
-        (
-            "WEAVE_FORGE_SLEEP".to_string(),
-            opts.sleep_secs.to_string(),
-        ),
+        ("WEAVE_FORGE_SLEEP".to_string(), opts.sleep_secs.to_string()),
         (
             "WEAVE_FORGE_APPLY".to_string(),
             if opts.apply { "1" } else { "0" }.to_string(),
@@ -436,7 +432,10 @@ pub fn run_codex_install(opts: CodexTools) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     fs::write(&prompt_path, content)
         .with_context(|| format!("writing {}", prompt_path.display()))?;
-    println!("installed Codex /forge-loop shim: {}", prompt_path.display());
+    println!(
+        "installed Codex /forge-loop shim: {}",
+        prompt_path.display()
+    );
     Ok(())
 }
 
@@ -468,7 +467,11 @@ fn codex_report(opts: &CodexTools) -> CodexDoctorReport {
 }
 
 fn status(ok: bool) -> &'static str {
-    if ok { "ok" } else { "missing" }
+    if ok {
+        "ok"
+    } else {
+        "missing"
+    }
 }
 
 fn default_codex_home() -> PathBuf {
@@ -544,7 +547,10 @@ mod tests {
         assert_eq!(plan.mode, "dry-run");
         assert_eq!(plan.layers.len(), 7);
         assert!(plan.command.iter().any(|p| p == "codex"));
-        assert!(plan.env.iter().any(|(k, v)| k == "WEAVE_FORGE_APPLY" && v == "1"));
+        assert!(plan
+            .env
+            .iter()
+            .any(|(k, v)| k == "WEAVE_FORGE_APPLY" && v == "1"));
     }
 
     #[test]
