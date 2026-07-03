@@ -20,3 +20,13 @@ status: |
   sqlite+libsql+sign (--all-targets); fmt clean; +12 tests; ZERO Cargo.toml change. Guardian APPROVE.
   Rebased onto origin/develop (9719a89) before delivery. Next open: WL-044 (5 Dependabot vulns, P1).
 ---
+
+---
+last_update: 2026-06-27
+status: |
+  Forge loop paused for owner reboot/GPU issue. PR #167 completed WL-082 and PR #168 completed WL-083.
+  Active continuation target is WL-078 remaining provider-switch integration work. Pause branch
+  goal/weave-wl078-provider-mcp-status is based on origin/develop @ 89a0876 and contains only the
+  pause handoff note .handoff/loop/pause_2026-06-27_reboot.md. Resume with mandatory worktree reap,
+  ICM recall, fetch develop, then continue WL-078 without downgrades/removals.
+---

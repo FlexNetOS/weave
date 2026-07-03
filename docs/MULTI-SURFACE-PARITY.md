@@ -13,8 +13,8 @@ multi-surface parity) is checked against.
 
 | Surface | Build | Standing token cost | Audience | Status |
 |---|---|---|---|---|
-| **CLI** (`weave <subcmd>`) | default | **zero** (pay per invocation) | agents (token-bound) + humans | the reference surface — **full** |
-| **MCP** (`weave mcp`) | default | bounded (`weave` meta-tool, WL-050/051) | agents that speak MCP | **full** — all ops via meta-tool `call` |
+| **CLI** (`weave <subcmd>`) | default | **zero** (pay per invocation) | agents (token-bound) + humans | the reference surface — every command carries an MCP decision |
+| **MCP** (`weave mcp`) | default | bounded (`weave` meta-tool, WL-050/051) | agents that speak MCP | full catalog where appropriate; intentional CLI-only decisions are ledgered |
 | **Dashboard** (`weave dashboard`, HTTP/SSE) | `--features surfaces` | n/a (out-of-band) | humans (browser) | **read-only v1** (WL-048) |
 | **Bots** (`weave telegram` / `weave slack`) | `--features surfaces` | n/a (out-of-band) | humans (chat) | relay + command grammar (WL-048/WL-073) |
 
@@ -46,10 +46,15 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 
 ### The headline result
 
-- **CLI and MCP are at full parity** — every capability domain is ✅ on both. These are the
-  **agent-facing** surfaces and the ones that matter for the orchestration mesh; the mission's
-  "more than repowire" holds on both. (CLI ≈ 40 subcommands; MCP = the full `tool_catalog()`
-  reachable via the `weave` meta-tool. The two stay in lock-step.)
+- **CLI and MCP parity is now decision-backed, not asserted by slogan** — CLI remains the
+  zero-standing-cost reference path and MCP remains the token-light structured path through
+  the `weave` meta-tool catalog. Every CLI command must carry an explicit `mcp_decision`
+  (`mcp-catalog`, `mcp-catalog-dangerous`, feature-gated MCP, or a documented CLI-only
+  rationale) in the command-surface ledger exposed by `weave tui --json --pane commands`.
+  WL-083 extends that ledger into a coverage gate: each command also declares its
+  help-smoke gate, behavior-coverage lane, docs/help surface, TUI exposure, and
+  risk/write classification. The integration gate compares that ledger exactly to
+  `weave --help`, so new CLI-first work cannot bypass MCP/status/coverage decisions.
 - **Dashboard and bots are deliberately the v1 baseline** (WL-048/WL-073): the dashboard is a read-only
   presence/activity view; the bots relay text (inbound human→agent + outbound notify) and answer
   the first command grammar. They are
@@ -89,7 +94,7 @@ gap is never mistaken for "covered":
 
 ## Why this is the right v1 boundary
 
-Agents drive weave through CLI/MCP (full parity, token-light). Humans observe through the
+Agents drive weave through CLI/MCP with explicit parity decisions and token-light discovery. Humans observe through the
 dashboard and nudge through chat. Shipping the **read/relay** human surfaces first (WL-048) and
 **measuring** the write gap here (WL-052) — rather than rushing write paths into a hand-rolled
 HTTP server and a chat parser — keeps the security invariants (no-shell, parameterized SQL,

@@ -6,7 +6,7 @@
 //! host config files while preserving weave-owned lifecycle hooks.
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -232,6 +232,283 @@ pub fn models(
         a.provider_id == b.provider_id && a.source == b.source && a.model == b.model
     });
     Ok(out)
+}
+
+/// Secret-free CC Switch bridge diagnostics for orchestration/status surfaces.
+///
+/// This intentionally opens the DB read-only and never applies provider config:
+/// absent or unreadable stores are diagnostic states, not hard failures. The
+/// bridge only owns visibility into the CC Switch store; CC Switch remains the
+/// source of truth for provider/proxy/failover semantics.
+pub fn status(db_path: Option<PathBuf>) -> Value {
+    let path = db_path.unwrap_or_else(default_db_path);
+    let path_text = path.to_string_lossy().to_string();
+    let supported_apps = [
+        ProviderSwitchApp::Claude,
+        ProviderSwitchApp::Codex,
+        ProviderSwitchApp::Gemini,
+    ];
+    let app_coverage = json!({
+        "claude": {"supported": true},
+        "claude-desktop": {"supported": false},
+        "codex": {"supported": true},
+        "gemini": {"supported": true},
+        "opencode": {"supported": false},
+        "openclaw": {"supported": false},
+        "hermes": {"supported": false},
+    });
+
+    if !path.exists() {
+        return json!({
+            "db_path": path_text,
+            "db_present": false,
+            "db_readable": false,
+            "schema_ok": false,
+            "error": "cc-switch-db-missing",
+            "supported_apps": supported_apps.iter().map(|a| a.as_cc_switch()).collect::<Vec<_>>(),
+            "app_coverage": app_coverage,
+        });
+    }
+
+    let conn = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return json!({
+                "db_path": path_text,
+                "db_present": true,
+                "db_readable": false,
+                "schema_ok": false,
+                "error": format!("opening CC Switch DB read-only: {err}"),
+                "supported_apps": supported_apps.iter().map(|a| a.as_cc_switch()).collect::<Vec<_>>(),
+                "app_coverage": app_coverage,
+            });
+        }
+    };
+
+    let providers_exists = table_exists(&conn, "providers").unwrap_or(false);
+    let settings_exists = table_exists(&conn, "settings").unwrap_or(false);
+    let provider_health_exists = table_exists(&conn, "provider_health").unwrap_or(false);
+    let proxy_config_exists = table_exists(&conn, "proxy_config").unwrap_or(false);
+    let failover_queue_exists = table_exists(&conn, "failover_queue").unwrap_or(false);
+    let usage_logs_exists = table_exists(&conn, "usage_logs").unwrap_or(false)
+        || table_exists(&conn, "proxy_usage_logs").unwrap_or(false);
+    let prompt_sync_exists = table_exists(&conn, "prompt_sync").unwrap_or(false)
+        || table_exists(&conn, "prompts").unwrap_or(false);
+    let skill_sync_exists = table_exists(&conn, "skill_sync").unwrap_or(false)
+        || table_exists(&conn, "skills").unwrap_or(false);
+    let mcp_sync_exists = table_exists(&conn, "mcp_sync").unwrap_or(false)
+        || table_exists(&conn, "mcp_servers").unwrap_or(false);
+
+    let provider_columns = if providers_exists {
+        column_names(&conn, "providers").unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let required = ["id", "app_type", "name", "settings_config", "is_current"];
+    let missing_columns = required
+        .iter()
+        .filter(|col| !provider_columns.iter().any(|have| have == **col))
+        .copied()
+        .collect::<Vec<_>>();
+    let schema_ok = providers_exists && missing_columns.is_empty();
+
+    let apps = supported_apps
+        .iter()
+        .map(|app| provider_status_for_app(&conn, *app, schema_ok))
+        .collect::<Vec<_>>();
+    let app_types = if schema_ok {
+        distinct_strings(
+            &conn,
+            "SELECT DISTINCT app_type FROM providers ORDER BY app_type",
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    json!({
+        "db_path": path_text,
+        "db_present": true,
+        "db_readable": true,
+        "schema_ok": schema_ok,
+        "missing_provider_columns": missing_columns,
+        "tables": {
+            "providers": providers_exists,
+            "settings": settings_exists,
+            "provider_health": provider_health_exists,
+            "proxy_config": proxy_config_exists,
+            "failover_queue": failover_queue_exists,
+            "usage_logs": usage_logs_exists,
+            "mcp_sync": mcp_sync_exists,
+            "prompt_sync": prompt_sync_exists,
+            "skill_sync": skill_sync_exists,
+        },
+        "supported_apps": supported_apps.iter().map(|a| a.as_cc_switch()).collect::<Vec<_>>(),
+        "known_app_types": app_types,
+        "app_coverage": app_coverage,
+        "apps": apps,
+        "proxy_health": {
+            "proxy_config_present": proxy_config_exists,
+            "failover_queue_present": failover_queue_exists,
+            "provider_health_present": provider_health_exists,
+            "usage_logs_present": usage_logs_exists,
+        }
+    })
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn distinct_strings(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn count_for(conn: &Connection, sql: &str, param: &str) -> Option<i64> {
+    conn.query_row(sql, params![param], |row| row.get::<_, i64>(0))
+        .ok()
+}
+
+fn provider_status_for_app(conn: &Connection, app: ProviderSwitchApp, schema_ok: bool) -> Value {
+    let app_name = app.as_cc_switch();
+    if !schema_ok {
+        return json!({
+            "app": app_name,
+            "supported": true,
+            "providers": 0,
+            "current_provider": null,
+            "current_model": null,
+            "settings_current_provider": null,
+            "live_config_present": live_config_present(app),
+            "live_config_agrees": null,
+        });
+    }
+
+    let providers = count_for(
+        conn,
+        "SELECT COUNT(*) FROM providers WHERE app_type = ?1",
+        app_name,
+    )
+    .unwrap_or(0);
+    let current = current_from_conn(conn, app).ok().flatten();
+    let settings_current = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![format!("current_provider_{app_name}")],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (current_provider, current_model_value) = current
+        .as_ref()
+        .map(|row| {
+            (
+                Some(json!({"id": row.id, "name": row.name, "category": row.category})),
+                current_model_opt(app, row)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            )
+        })
+        .unwrap_or((None, Value::Null));
+    let live_present = live_config_present(app);
+    let live_agrees = current
+        .as_ref()
+        .and_then(|row| live_config_agrees(app, row).ok());
+
+    json!({
+        "app": app_name,
+        "supported": true,
+        "providers": providers,
+        "current_provider": current_provider,
+        "current_model": current_model_value,
+        "settings_current_provider": settings_current,
+        "live_config_present": live_present,
+        "live_config_agrees": live_agrees,
+    })
+}
+
+fn current_from_conn(conn: &Connection, app: ProviderSwitchApp) -> Result<Option<ProviderRow>> {
+    Ok(list_from_conn(conn, app)?
+        .into_iter()
+        .find(|p| p.is_current))
+}
+
+fn live_config_present(app: ProviderSwitchApp) -> bool {
+    match app {
+        ProviderSwitchApp::Claude => claude_settings_path().exists(),
+        ProviderSwitchApp::Codex => codex_config_path().exists(),
+        ProviderSwitchApp::Gemini => gemini_env_path().exists() || gemini_settings_path().exists(),
+    }
+}
+
+fn live_config_agrees(app: ProviderSwitchApp, provider: &ProviderRow) -> Result<Option<bool>> {
+    let Some(expected_model) = current_model_opt(app, provider) else {
+        return Ok(None);
+    };
+    match app {
+        ProviderSwitchApp::Claude => {
+            let path = claude_settings_path();
+            if !path.exists() {
+                return Ok(Some(false));
+            }
+            let live = read_json(&path)?;
+            Ok(Some(
+                live.get("model").and_then(Value::as_str).map(str::trim)
+                    == Some(expected_model.as_str()),
+            ))
+        }
+        ProviderSwitchApp::Codex => {
+            let Some(text) = read_text_if_exists(&codex_config_path())? else {
+                return Ok(Some(false));
+            };
+            Ok(Some(
+                extract_codex_model(&text).as_deref() == Some(expected_model.as_str()),
+            ))
+        }
+        ProviderSwitchApp::Gemini => {
+            if let Some(text) = read_text_if_exists(&gemini_env_path())? {
+                let agrees = text.lines().any(|line| {
+                    let trimmed = line.trim();
+                    trimmed == format!("GEMINI_MODEL={expected_model}")
+                        || trimmed == format!("GOOGLE_GEMINI_MODEL={expected_model}")
+                });
+                return Ok(Some(agrees));
+            }
+            let path = gemini_settings_path();
+            if !path.exists() {
+                return Ok(Some(false));
+            }
+            let live = read_json(&path)?;
+            Ok(Some(
+                live.pointer("/env/GEMINI_MODEL")
+                    .or_else(|| live.pointer("/env/GOOGLE_GEMINI_MODEL"))
+                    .or_else(|| live.pointer("/model"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    == Some(expected_model.as_str()),
+            ))
+        }
+    }
 }
 
 pub fn switch_model(

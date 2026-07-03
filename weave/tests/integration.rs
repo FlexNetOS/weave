@@ -28,6 +28,116 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "sqlite")]
 use std::thread;
 
+fn expected_top_level_commands() -> Vec<&'static str> {
+    vec![
+        "mcp",
+        "setup",
+        "uninstall",
+        #[cfg(feature = "sqlite")]
+        "provider-switch",
+        "harness",
+        "codex-tools",
+        "send",
+        "notify",
+        "broadcast-notify",
+        "broadcast-ask",
+        "outbox",
+        "pull",
+        "reply",
+        "thread",
+        "summarize",
+        "receipts",
+        "delivery",
+        "watch",
+        "responder",
+        "inbox",
+        "search",
+        "peers",
+        "sessions",
+        "tui",
+        "scan",
+        "gc",
+        "doctor",
+        "register",
+        "attach",
+        "connect",
+        "inject",
+        "spawn",
+        "kill",
+        "ask",
+        "answer",
+        "ack",
+        "asks",
+        "ask-get",
+        "ask-status",
+        "ask-many",
+        "ask-many-result",
+        "job",
+        "orchestrator",
+        "config",
+        "completions",
+        "man",
+        #[cfg(feature = "sign")]
+        "key",
+        #[cfg(feature = "sign")]
+        "audit",
+        "describe",
+        "status",
+        "peer-policy",
+        "schedule",
+        "schedules",
+        "cancel-schedule",
+        "tick",
+        "hook",
+        "memory",
+        "daemon",
+        "review",
+        "permission",
+        "lease",
+        "serve",
+        "graph",
+        #[cfg(feature = "surfaces")]
+        "dashboard",
+        #[cfg(feature = "surfaces")]
+        "push",
+        #[cfg(feature = "surfaces")]
+        "telegram",
+        #[cfg(feature = "surfaces")]
+        "slack",
+        "export",
+        "backup",
+        "restore",
+        "session",
+        "help",
+    ]
+}
+
+fn advertised_top_level_commands(help: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_commands = false;
+    for line in help.lines() {
+        if line.trim() == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if in_commands && line.trim() == "Options:" {
+            break;
+        }
+        if in_commands {
+            let Some(rest) = line.strip_prefix("  ") else {
+                continue;
+            };
+            let Some((cmd, _)) = rest.trim_start().split_once(char::is_whitespace) else {
+                continue;
+            };
+            if !cmd.is_empty() {
+                out.push(cmd.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "sqlite")]
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -98,8 +208,15 @@ fn seed_cc_switch_db(path: &std::path::Path) {
 }
 
 #[cfg(feature = "sqlite")]
-fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ollama");
+fn fake_ollama_server() -> Option<(String, thread::JoinHandle<()>)> {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping: local loopback bind is not permitted in this sandbox: {err}");
+            return None;
+        }
+        Err(err) => panic!("bind fake ollama: {err}"),
+    };
     listener.set_nonblocking(true).ok();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -136,7 +253,7 @@ fn fake_ollama_server() -> (String, thread::JoinHandle<()>) {
             let _ = stream.flush();
         }
     });
-    (format!("http://{addr}"), handle)
+    Some((format!("http://{addr}"), handle))
 }
 
 #[test]
@@ -344,6 +461,102 @@ fn provider_switch_gemini_applies_env_and_preserves_settings() {
 
 #[test]
 #[cfg(feature = "sqlite")]
+fn provider_switch_status_reports_db_schema_apps_and_proxy_health_readonly() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-status-home");
+    let cc_dir = home.join(".cc-switch");
+    std::fs::create_dir_all(&cc_dir).unwrap();
+    let cc_db = cc_dir.join("cc-switch.db");
+    seed_cc_switch_db(&cc_db);
+    let conn = rusqlite::Connection::open(&cc_db).unwrap();
+    conn.execute(
+        "UPDATE providers SET is_current = 1 WHERE app_type = 'codex' AND id = 'deepseek'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE provider_health(provider_id TEXT, status TEXT);
+        CREATE TABLE proxy_config(id TEXT PRIMARY KEY, config TEXT);
+        CREATE TABLE failover_queue(id TEXT PRIMARY KEY);
+        CREATE TABLE usage_logs(id TEXT PRIMARY KEY);
+        "#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "model_provider = \"custom\"\nmodel = \"deepseek-chat\"\n",
+    )
+    .unwrap();
+
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "status",
+            "--db",
+            cc_db.to_str().unwrap(),
+            "--json",
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["db_present"], true);
+    assert_eq!(report["db_readable"], true);
+    assert_eq!(report["schema_ok"], true);
+    assert_eq!(report["tables"]["provider_health"], true);
+    assert_eq!(report["proxy_health"]["proxy_config_present"], true);
+    assert_eq!(report["app_coverage"]["claude-desktop"]["supported"], false);
+    let codex = report["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["app"] == "codex")
+        .unwrap();
+    assert_eq!(codex["providers"], 1);
+    assert_eq!(codex["current_provider"]["id"], "deepseek");
+    assert_eq!(codex["current_model"], "deepseek-chat");
+    assert_eq!(codex["live_config_agrees"], true);
+
+    let human = run_ok_env(
+        &db,
+        &["provider-switch", "status", "--db", cc_db.to_str().unwrap()],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    assert!(human.contains("weave provider-switch status"), "{human}");
+    assert!(
+        human.contains("codex: providers=1 current=deepseek model=deepseek-chat live_agrees=yes"),
+        "{human}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn provider_switch_status_treats_missing_db_as_diagnostic_state() {
+    let db = TestDb::new();
+    let home = unique_temp_dir("provider-switch-status-missing-home");
+    let missing = home.join(".cc-switch/cc-switch.db");
+    let out = run_ok_env(
+        &db,
+        &[
+            "provider-switch",
+            "status",
+            "--db",
+            missing.to_str().unwrap(),
+            "--json",
+        ],
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["db_present"], false);
+    assert_eq!(report["db_readable"], false);
+    assert_eq!(report["schema_ok"], false);
+    assert_eq!(report["error"], "cc-switch-db-missing");
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
 fn provider_switch_models_auto_loads_cc_switch_and_ollama() {
     let db = TestDb::new();
     let home = unique_temp_dir("provider-switch-models-home");
@@ -351,7 +564,9 @@ fn provider_switch_models_auto_loads_cc_switch_and_ollama() {
     std::fs::create_dir_all(&cc_dir).unwrap();
     let cc_db = cc_dir.join("cc-switch.db");
     seed_cc_switch_db(&cc_db);
-    let (ollama_host, handle) = fake_ollama_server();
+    let Some((ollama_host, handle)) = fake_ollama_server() else {
+        return;
+    };
 
     let (ok, out, err) = run_env(
         &db,
@@ -770,8 +985,16 @@ fn cli_setup_git_hooks_installs_pre_commit() {
         .unwrap();
     assert!(git_init.status.success(), "git init failed");
 
-    // Run setup --git-hooks inside the repo.
-    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    // Run setup --git-hooks inside the repo with HOME isolated because setup also
+    // performs user-level MCP/hook registration before installing git hooks.
+    let home = unique_tmp_dir("git-hook-setup-home");
+    let home_str = home.to_string_lossy().into_owned();
+    let (ok, out, err) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(
         ok,
         "setup --git-hooks should succeed:\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
@@ -790,7 +1013,12 @@ fn cli_setup_git_hooks_installs_pre_commit() {
     );
 
     // Idempotent: second run should not duplicate.
-    let (ok2, out2, _err2) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    let (ok2, out2, _err2) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(ok2, "second setup should succeed: {out2}");
     assert!(
         out2.contains("already contains") || out2.contains("pre-commit already contains"),
@@ -11722,6 +11950,78 @@ fn harness_ide_merge_ide_dry_run_prints_seven_layer_plan() {
     );
 }
 
+#[test]
+fn harness_forge_loop_dry_run_prints_codex_plan() {
+    let db = TestDb::new();
+    let out = run_ok(
+        &db,
+        &[
+            "harness",
+            "forge-loop",
+            "--worktree",
+            "/tmp/weave-forge-test",
+            "--task",
+            "implement a small task",
+        ],
+    );
+
+    assert!(
+        out.contains("codex-forge-loop harness (dry-run)"),
+        "dry run should identify the forge loop: {out:?}"
+    );
+    assert!(
+        out.contains(".agents/skills/forge-loop/SKILL.md")
+            && out.contains("WEAVE_FORGE_TASK=implement a small task"),
+        "dry run should expose the skill and task env: {out:?}"
+    );
+    assert!(
+        out.contains("commit, push, PR, and arm auto-merge"),
+        "dry run should show the delivery layer: {out:?}"
+    );
+}
+
+#[test]
+fn codex_tools_install_and_doctor_use_temp_home() {
+    let db = TestDb::new();
+    let home = unique_tmp_dir("codex-tools-home");
+    let home_s = home.to_str().unwrap();
+
+    let install = run_ok(
+        &db,
+        &[
+            "codex-tools",
+            "install",
+            "--home",
+            home_s,
+            "--weave-exe",
+            "/usr/bin/weave",
+        ],
+    );
+    assert!(
+        install.contains("installed Codex /forge-loop shim"),
+        "{install}"
+    );
+
+    let shim = std::fs::read_to_string(home.join("prompts").join("forge-loop.md")).unwrap();
+    assert!(shim.contains("weave-managed: forge-loop"));
+    assert!(shim.contains("/usr/bin/weave harness forge-loop"));
+
+    let doctor = run_ok(
+        &db,
+        &[
+            "codex-tools",
+            "doctor",
+            "--home",
+            home_s,
+            "--codex-cmd",
+            "definitely-not-a-codex-binary",
+        ],
+    );
+    assert!(doctor.contains("forge_skill:      ok"), "{doctor}");
+    assert!(doctor.contains("/forge-loop shim: ok"), "{doctor}");
+    assert!(doctor.contains("codex_cli:        missing"), "{doctor}");
+}
+
 // ---------------------------------------------------------------------------
 // WL-047: agent spawn / kill via a fake mux (CLI surface, black-box)
 // ---------------------------------------------------------------------------
@@ -12509,7 +12809,14 @@ fn git_hook_install_is_read_back_verified_and_preserves_foreign() {
     )
     .unwrap();
 
-    let (ok, out, err) = run_in_cwd(&db, &["setup", "--git-hooks"], &repo);
+    let home = unique_tmp_dir("git-hook-readback-home");
+    let home_str = home.to_string_lossy().into_owned();
+    let (ok, out, err) = run_in_cwd_env(
+        &db,
+        &["setup", "--git-hooks"],
+        &repo,
+        &[("HOME", home_str.as_str())],
+    );
     assert!(ok, "setup --git-hooks should succeed:\n{out}\n{err}");
 
     // Read-back: BOTH the guard line and the pre-existing foreign line are present.
@@ -15345,81 +15652,19 @@ fn setup_rejects_invalid_provider() {
 
 #[test]
 fn every_top_level_command_has_documented_help() {
-    // The owner-facing dashboard/test audit starts with a hard contract: every
-    // top-level command advertised by `weave --help` must have an exercised help
-    // path. Keep this list in sync with the command surface so new commands must
-    // add at least a black-box usage smoke before shipping deeper behavior tests.
+    // The owner-facing surface audit is intentionally exact: every top-level
+    // command advertised by `weave --help` must be in the command-surface ledger
+    // and must have an exercised help path. Extra commands are failures too;
+    // otherwise CLI-first work can silently bypass MCP/status parity decisions.
     let db = TestDb::new();
-    let expected = [
-        "mcp",
-        "setup",
-        "uninstall",
-        #[cfg(feature = "sqlite")]
-        "provider-switch",
-        "harness",
-        "send",
-        "notify",
-        "broadcast-notify",
-        "broadcast-ask",
-        "outbox",
-        "pull",
-        "reply",
-        "thread",
-        "summarize",
-        "receipts",
-        "delivery",
-        "watch",
-        "responder",
-        "inbox",
-        "search",
-        "peers",
-        "sessions",
-        "tui",
-        "scan",
-        "gc",
-        "doctor",
-        "register",
-        "attach",
-        "connect",
-        "inject",
-        "spawn",
-        "kill",
-        "ask",
-        "answer",
-        "ack",
-        "asks",
-        "ask-get",
-        "ask-status",
-        "ask-many",
-        "ask-many-result",
-        "job",
-        "orchestrator",
-        "config",
-        "completions",
-        "man",
-        "describe",
-        "status",
-        "peer-policy",
-        "schedule",
-        "schedules",
-        "cancel-schedule",
-        "tick",
-        "hook",
-        "memory",
-        "daemon",
-        "review",
-        "permission",
-        "lease",
-        "serve",
-        "graph",
-        "export",
-        "backup",
-        "restore",
-        "session",
-        "help",
-    ];
-
+    let expected = expected_top_level_commands();
     let top = run_ok(&db, &["--help"]);
+    let advertised = advertised_top_level_commands(&top);
+    assert_eq!(
+        advertised, expected,
+        "top-level help and expected command-surface ledger diverged"
+    );
+
     for command in expected {
         assert!(
             top.contains(&format!("  {command}")),
@@ -15457,12 +15702,124 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
     let json = run_ok(&db, &["tui", "--json", "--pane", "commands"]);
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("tui json");
     assert_eq!(parsed["pane"], "commands");
+    assert_eq!(parsed["overview"]["sessions"], parsed["session_count"]);
+    for key in [
+        "sessions_detail",
+        "messages",
+        "asks",
+        "jobs",
+        "leases",
+        "commands",
+    ] {
+        assert!(
+            parsed[key].is_array(),
+            "TUI JSON must expose a machine-readable `{key}` pane array: {parsed}"
+        );
+    }
+    for key in [
+        "sessions",
+        "stale_sessions",
+        "unread_messages",
+        "messages_listed",
+        "asks_tracked",
+        "jobs_listed",
+        "active_leases",
+        "commands_listed",
+    ] {
+        assert!(
+            parsed["overview"][key].is_number(),
+            "overview must carry numeric `{key}`: {parsed}"
+        );
+    }
+    for pane in [
+        "overview", "sessions", "messages", "asks", "jobs", "graph", "leases",
+    ] {
+        let pane_json = run_ok(&db, &["tui", "--json", "--pane", pane]);
+        let pane_parsed: serde_json::Value =
+            serde_json::from_str(&pane_json).expect("pane-specific tui json");
+        assert_eq!(pane_parsed["pane"], pane);
+        assert!(
+            pane_parsed["overview"].is_object()
+                && pane_parsed["sessions_detail"].is_array()
+                && pane_parsed["messages"].is_array()
+                && pane_parsed["asks"].is_array()
+                && pane_parsed["jobs"].is_array()
+                && pane_parsed["leases"].is_array(),
+            "pane `{pane}` should still return the full cockpit snapshot: {pane_parsed}"
+        );
+    }
+    let commands = parsed["commands"].as_array().expect("commands array");
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|cmd| cmd["name"].as_str().expect("command name"))
+        .collect();
+    assert_eq!(
+        names,
+        expected_top_level_commands(),
+        "TUI command catalog must track every top-level CLI command exactly"
+    );
     assert!(
-        parsed["commands"]
-            .as_array()
-            .expect("commands array")
+        commands
             .iter()
             .any(|cmd| cmd["name"] == "tui" && cmd["domain"] == "dashboard"),
         "command catalog includes tui dashboard entry: {parsed}"
     );
+    for cmd in commands {
+        let name = cmd["name"].as_str().unwrap_or("<missing>");
+        let mcp_decision = cmd["mcp_decision"].as_str().unwrap_or_default();
+        let status_surface = cmd["status_surface"].as_str().unwrap_or_default();
+        let help_smoke = cmd["help_smoke"].as_str().unwrap_or_default();
+        let behavior_coverage = cmd["behavior_coverage"].as_str().unwrap_or_default();
+        let docs_surface = cmd["docs_surface"].as_str().unwrap_or_default();
+        let tui_exposure = cmd["tui_exposure"].as_str().unwrap_or_default();
+        let risk = cmd["risk"].as_str().unwrap_or_default();
+        assert!(
+            !mcp_decision.is_empty(),
+            "{name} must declare an explicit MCP parity decision"
+        );
+        assert!(
+            !status_surface.is_empty(),
+            "{name} must declare the read-only status/diagnostic surface that proves visibility"
+        );
+        assert!(
+            !help_smoke.is_empty(),
+            "{name} must declare the help-smoke gate that covers its help path"
+        );
+        assert!(
+            !behavior_coverage.is_empty(),
+            "{name} must declare behavior coverage or an explicit help-only classification"
+        );
+        assert!(
+            !docs_surface.is_empty(),
+            "{name} must declare docs/help coverage"
+        );
+        assert!(
+            !tui_exposure.is_empty(),
+            "{name} must declare TUI/dashboard exposure"
+        );
+        assert!(
+            !risk.is_empty(),
+            "{name} must declare risk/write classification"
+        );
+        if name == "daemon" || name == "hook" || name == "responder" {
+            assert!(
+                status_surface.contains("status")
+                    || status_surface.contains("health")
+                    || status_surface.contains("doctor"),
+                "background/hook surface {name} must advertise a read-only status/health surface: {status_surface}"
+            );
+        }
+        if ["inject", "spawn", "kill"].contains(&name) {
+            assert!(
+                risk.contains("dangerous"),
+                "dangerous command {name} must be classified as dangerous: {risk}"
+            );
+        }
+        if ["setup", "uninstall", "restore"].contains(&name) {
+            assert!(
+                risk.contains("write") || risk.contains("restore"),
+                "host-mutating command {name} must be classified as write/restore: {risk}"
+            );
+        }
+    }
 }
