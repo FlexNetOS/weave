@@ -1594,6 +1594,15 @@ enum ProviderSwitchCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Report read-only CC Switch provider/proxy/health diagnostics.
+    Status {
+        /// Override CC Switch DB path (default: ~/.cc-switch/cc-switch.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Emit machine-readable JSON. Human output is the default.
+        #[arg(long)]
+        json: bool,
+    },
     /// List models discovered from CC Switch providers and local Ollama.
     Models {
         /// App namespace to inspect.
@@ -2778,6 +2787,116 @@ fn routing_anomaly_last_ts(anomalies: &[model::Message]) -> i64 {
     anomalies.iter().map(|m| m.ts).max().unwrap_or(0)
 }
 
+#[cfg(feature = "sqlite")]
+fn print_provider_switch_status(report: &serde_json::Value) {
+    println!("weave provider-switch status");
+    println!(
+        "  db:             {}",
+        report
+            .get("db_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    println!(
+        "  db present:     {}",
+        yes_no(
+            report
+                .get("db_present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    println!(
+        "  db readable:    {}",
+        yes_no(
+            report
+                .get("db_readable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    println!(
+        "  schema ok:      {}",
+        yes_no(
+            report
+                .get("schema_ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        )
+    );
+    if let Some(error) = report.get("error").and_then(serde_json::Value::as_str) {
+        println!("  diagnostic:     {error}");
+    }
+    if let Some(apps) = report.get("apps").and_then(serde_json::Value::as_array) {
+        println!("  apps:");
+        for app in apps {
+            let name = app
+                .get("app")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let providers = app
+                .get("providers")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let current = app
+                .get("current_provider")
+                .and_then(|p| p.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let model = app
+                .get("current_model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-");
+            let live = app
+                .get("live_config_agrees")
+                .and_then(serde_json::Value::as_bool)
+                .map(yes_no)
+                .unwrap_or("unknown");
+            println!(
+                "    {name}: providers={providers} current={current} model={model} live_agrees={live}"
+            );
+        }
+    }
+    if let Some(proxy) = report.get("proxy_health") {
+        println!(
+            "  proxy/failover: provider_health={} proxy_config={} failover_queue={} usage_logs={}",
+            yes_no(
+                proxy
+                    .get("provider_health_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("proxy_config_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("failover_queue_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            yes_no(
+                proxy
+                    .get("usage_logs_present")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 /// Diagnostics: backend, db, detected multiplexer, peers, Claude wiring.
 fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let target = inject::detect_target_with_preference(parse_mux_preference(cfg));
@@ -2896,6 +3015,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     // pointing at a different WEAVE_DB, so surface it as a diagnostic hint.
     let db_default = config::default_db_path();
     let db_is_default = db == db_default;
+    #[cfg(feature = "sqlite")]
+    let provider_switch_status = provider_switch::status(None);
     if json {
         let mut report = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -2938,6 +3059,10 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             "federation_remote_token_shared": token_shared,
             "federation_remote_token_none": token_none,
         });
+        #[cfg(feature = "sqlite")]
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("provider_switch".into(), provider_switch_status);
+        }
         // Signed-identity summary (counts + local fingerprint only, secret-free):
         // surfaces the trust/revocation policy and this session's own fingerprint so
         // a misconfigured trust set is diagnosable. Sign-gated; never any secret.
@@ -3111,6 +3236,27 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             .join(", ");
         println!("  peer status:    {status_summary}");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+        #[cfg(feature = "sqlite")]
+        {
+            let present = provider_switch_status
+                .get("db_present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let readable = provider_switch_status
+                .get("db_readable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let schema_ok = provider_switch_status
+                .get("schema_ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            println!(
+                "  provider switch: db_present={} db_readable={} schema_ok={}",
+                yes_no(present),
+                yes_no(readable),
+                yes_no(schema_ok),
+            );
+        }
         // Signed-identity summary (secret-free): trust/revocation counts, the
         // strict-verify mode, and this session's OWN fingerprint (never the secret).
         #[cfg(feature = "sign")]
@@ -3646,73 +3792,819 @@ impl TuiPane {
     }
 }
 
-const TUI_COMMANDS: &[(&str, &str)] = &[
-    ("mcp", "protocol"),
-    ("setup", "host wiring"),
-    ("uninstall", "host wiring"),
+#[derive(Debug, Clone, Copy)]
+struct CommandSurface {
+    name: &'static str,
+    domain: &'static str,
+    mcp_decision: &'static str,
+    status_surface: &'static str,
+    help_smoke: &'static str,
+    behavior_coverage: &'static str,
+    docs_surface: &'static str,
+    tui_exposure: &'static str,
+    risk: &'static str,
+}
+
+const TUI_COMMANDS: &[CommandSurface] = &[
+    CommandSurface {
+        name: "mcp",
+        domain: "protocol",
+        mcp_decision: "protocol-entrypoint",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:mcp-stdio",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "protocol-server",
+    },
+    CommandSurface {
+        name: "setup",
+        domain: "host wiring",
+        mcp_decision: "cli-only-host-config",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:setup-provider-roundtrip",
+        docs_surface: "docs/SETUP.md",
+        tui_exposure: "commands pane",
+        risk: "host-config-write",
+    },
+    CommandSurface {
+        name: "uninstall",
+        domain: "host wiring",
+        mcp_decision: "cli-only-host-config",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:setup-provider-roundtrip",
+        docs_surface: "docs/SETUP.md",
+        tui_exposure: "commands pane",
+        risk: "host-config-write",
+    },
     #[cfg(feature = "sqlite")]
-    ("provider-switch", "provider policy"),
-    ("harness", "orchestration"),
-    ("send", "messaging"),
-    ("notify", "messaging"),
-    ("broadcast-notify", "messaging"),
-    ("broadcast-ask", "asks"),
-    ("outbox", "federation"),
-    ("pull", "federation"),
-    ("reply", "messaging"),
-    ("thread", "read view"),
-    ("summarize", "llm"),
-    ("receipts", "delivery"),
-    ("delivery", "delivery"),
-    ("watch", "read view"),
-    ("responder", "asks"),
-    ("inbox", "read view"),
-    ("search", "read view"),
-    ("peers", "presence"),
-    ("sessions", "presence"),
-    ("tui", "dashboard"),
-    ("scan", "presence"),
-    ("gc", "maintenance"),
-    ("doctor", "diagnostics"),
-    ("register", "presence"),
-    ("attach", "presence"),
-    ("connect", "presence"),
-    ("inject", "dangerous"),
-    ("spawn", "dangerous"),
-    ("kill", "dangerous"),
-    ("ask", "asks"),
-    ("answer", "asks"),
-    ("ack", "asks"),
-    ("asks", "asks"),
-    ("ask-get", "asks"),
-    ("ask-status", "asks"),
-    ("ask-many", "asks"),
-    ("ask-many-result", "asks"),
-    ("job", "jobs"),
-    ("orchestrator", "orchestration"),
-    ("config", "configuration"),
-    ("completions", "shell"),
-    ("man", "docs"),
-    ("describe", "presence"),
-    ("status", "presence"),
-    ("peer-policy", "presence"),
-    ("schedule", "scheduling"),
-    ("schedules", "scheduling"),
-    ("cancel-schedule", "scheduling"),
-    ("tick", "scheduling"),
-    ("hook", "hooks"),
-    ("memory", "memory"),
-    ("daemon", "presence"),
-    ("review", "reviews"),
-    ("permission", "permissions"),
-    ("lease", "leases"),
-    ("serve", "http"),
-    ("graph", "graph"),
-    ("export", "archive"),
-    ("backup", "archive"),
-    ("restore", "archive"),
-    ("session", "resume"),
-    ("help", "docs"),
+    CommandSurface {
+        name: "provider-switch",
+        domain: "provider policy",
+        mcp_decision: "cli-now-mcp-follow-up-WL-078",
+        status_surface: "provider-switch status / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:provider-switch-status",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "host-config-write",
+    },
+    CommandSurface {
+        name: "harness",
+        domain: "orchestration",
+        mcp_decision: "cli-only-operator-harness",
+        status_surface: "dry-run plan",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:orchestrator-harness",
+        docs_surface: ".handoff/context/PRD.md",
+        tui_exposure: "commands pane",
+        risk: "dry-run-by-default",
+    },
+    CommandSurface {
+        name: "codex-tools",
+        domain: "orchestration",
+        mcp_decision: "cli-only-operator-install",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:orchestrator-harness",
+        docs_surface: ".handoff/context/PRD.md",
+        tui_exposure: "commands pane",
+        risk: "host-tool-install",
+    },
+    CommandSurface {
+        name: "send",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery / receipts",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:messaging-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "message-write",
+    },
+    CommandSurface {
+        name: "notify",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:messaging-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "message-write",
+    },
+    CommandSurface {
+        name: "broadcast-notify",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:messaging-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "broadcast-write",
+    },
+    CommandSurface {
+        name: "broadcast-ask",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write",
+    },
+    CommandSurface {
+        name: "outbox",
+        domain: "federation",
+        mcp_decision: "mcp-catalog",
+        status_surface: "outbox",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:tier2-federation",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "pull",
+        domain: "federation",
+        mcp_decision: "mcp-catalog",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:tier2-federation",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "federation-write-local",
+    },
+    CommandSurface {
+        name: "reply",
+        domain: "messaging",
+        mcp_decision: "mcp-catalog",
+        status_surface: "thread / delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:messaging-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "message-write",
+    },
+    CommandSurface {
+        name: "thread",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "thread",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:read-surface",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "summarize",
+        domain: "llm",
+        mcp_decision: "feature-gated-mcp-catalog",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "help-smoke-plus-doctor",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "llm-read-mostly",
+    },
+    CommandSurface {
+        name: "receipts",
+        domain: "delivery",
+        mcp_decision: "mcp-catalog",
+        status_surface: "receipts",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:delivery-trace",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "delivery",
+        domain: "delivery",
+        mcp_decision: "mcp-catalog",
+        status_surface: "delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:delivery-trace",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "watch",
+        domain: "read view",
+        mcp_decision: "cli-only-stream",
+        status_surface: "inbox",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:read-surface",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only-stream",
+    },
+    CommandSurface {
+        name: "responder",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "responder --health / MCP health",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write-agent",
+    },
+    CommandSurface {
+        name: "inbox",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "inbox",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:read-surface",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "search",
+        domain: "read view",
+        mcp_decision: "mcp-catalog",
+        status_surface: "search",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:read-surface",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "peers",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "sessions",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "sessions / tui",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "tui",
+        domain: "dashboard",
+        mcp_decision: "cli-only-terminal-dashboard",
+        status_surface: "tui --json",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:tui-snapshot",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only-dashboard",
+    },
+    CommandSurface {
+        name: "scan",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "scan / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "gc",
+        domain: "maintenance",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:gc-confirmed",
+        docs_surface: "docs/TESTING.md",
+        tui_exposure: "commands pane",
+        risk: "destructive-confirmed",
+    },
+    CommandSurface {
+        name: "doctor",
+        domain: "diagnostics",
+        mcp_decision: "mcp-catalog",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:doctor-json",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "register",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "presence-write",
+    },
+    CommandSurface {
+        name: "attach",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "presence-write",
+    },
+    CommandSurface {
+        name: "connect",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "connect / delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "delivery-probe-write",
+    },
+    CommandSurface {
+        name: "inject",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:dangerous-safe-fakes",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "dangerous-live-injection",
+    },
+    CommandSurface {
+        name: "spawn",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "peers / sessions",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:dangerous-safe-fakes",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "dangerous-process-spawn",
+    },
+    CommandSurface {
+        name: "kill",
+        domain: "dangerous",
+        mcp_decision: "mcp-catalog-dangerous",
+        status_surface: "peers / sessions",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:dangerous-safe-fakes",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "dangerous-process-kill",
+    },
+    CommandSurface {
+        name: "ask",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write",
+    },
+    CommandSurface {
+        name: "answer",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write",
+    },
+    CommandSurface {
+        name: "ack",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write",
+    },
+    CommandSurface {
+        name: "asks",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "asks",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "write-or-operator",
+    },
+    CommandSurface {
+        name: "ask-get",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-get",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "write-or-operator",
+    },
+    CommandSurface {
+        name: "ask-status",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "write-or-operator",
+    },
+    CommandSurface {
+        name: "ask-many",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-many-result",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "ask-write",
+    },
+    CommandSurface {
+        name: "ask-many-result",
+        domain: "asks",
+        mcp_decision: "mcp-catalog",
+        status_surface: "ask-many-result",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:ask-lifecycle",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "write-or-operator",
+    },
+    CommandSurface {
+        name: "job",
+        domain: "jobs",
+        mcp_decision: "mcp-catalog",
+        status_surface: "job list/status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:job-board-dispatch",
+        docs_surface: ".handoff/context/PRD.md",
+        tui_exposure: "commands pane",
+        risk: "job-write",
+    },
+    CommandSurface {
+        name: "orchestrator",
+        domain: "orchestration",
+        mcp_decision: "mcp-catalog",
+        status_surface: "orchestrator status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:orchestrator-harness",
+        docs_surface: ".handoff/context/PRD.md",
+        tui_exposure: "commands pane",
+        risk: "role-write",
+    },
+    CommandSurface {
+        name: "config",
+        domain: "configuration",
+        mcp_decision: "mcp-catalog-read-mostly",
+        status_surface: "config get / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:config-roundtrip",
+        docs_surface: "docs/CONFIG.md",
+        tui_exposure: "commands pane",
+        risk: "config-write-capable",
+    },
+    CommandSurface {
+        name: "completions",
+        domain: "shell",
+        mcp_decision: "cli-only-shell-integration",
+        status_surface: "help",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "help-smoke-only-shell-output",
+        docs_surface: "generated shell help",
+        tui_exposure: "commands pane",
+        risk: "doc-output",
+    },
+    CommandSurface {
+        name: "man",
+        domain: "docs",
+        mcp_decision: "cli-only-doc-generation",
+        status_surface: "help",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "help-smoke-only-doc-output",
+        docs_surface: "generated man/help",
+        tui_exposure: "commands pane",
+        risk: "doc-output",
+    },
+    #[cfg(feature = "sign")]
+    CommandSurface {
+        name: "key",
+        domain: "signing",
+        mcp_decision: "mcp-catalog-sign",
+        status_surface: "key list / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:sign-coverage",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "signing-write",
+    },
+    #[cfg(feature = "sign")]
+    CommandSurface {
+        name: "audit",
+        domain: "signing",
+        mcp_decision: "mcp-catalog-sign",
+        status_surface: "audit revocations",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:sign-coverage",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "describe",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "presence-write",
+    },
+    CommandSurface {
+        name: "status",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peers / sessions",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "presence-write",
+    },
+    CommandSurface {
+        name: "peer-policy",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "peer-policy get",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "policy-write",
+    },
+    CommandSurface {
+        name: "schedule",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:schedule-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "schedule-write",
+    },
+    CommandSurface {
+        name: "schedules",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:schedule-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    CommandSurface {
+        name: "cancel-schedule",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:schedule-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "schedule-write",
+    },
+    CommandSurface {
+        name: "tick",
+        domain: "scheduling",
+        mcp_decision: "mcp-catalog",
+        status_surface: "schedules / delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:schedule-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "schedule-execution-write",
+    },
+    CommandSurface {
+        name: "hook",
+        domain: "hooks",
+        mcp_decision: "cli-only-host-lifecycle",
+        status_surface: "status / peers / responder health / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:hook-lifecycle",
+        docs_surface: "docs/SETUP.md",
+        tui_exposure: "commands pane",
+        risk: "host-lifecycle-write",
+    },
+    CommandSurface {
+        name: "memory",
+        domain: "memory",
+        mcp_decision: "mcp-catalog",
+        status_surface: "memory list/search",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:memory-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "memory-write",
+    },
+    CommandSurface {
+        name: "daemon",
+        domain: "presence",
+        mcp_decision: "mcp-catalog",
+        status_surface: "daemon status / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:presence-liveness",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "daemon-control",
+    },
+    CommandSurface {
+        name: "review",
+        domain: "reviews",
+        mcp_decision: "mcp-catalog",
+        status_surface: "review list",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:review-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "review-write",
+    },
+    CommandSurface {
+        name: "permission",
+        domain: "permissions",
+        mcp_decision: "mcp-catalog",
+        status_surface: "permission status",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:permission-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "permission-write",
+    },
+    CommandSurface {
+        name: "lease",
+        domain: "leases",
+        mcp_decision: "mcp-catalog",
+        status_surface: "lease list",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:lease-roundtrip",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "lease-write",
+    },
+    CommandSurface {
+        name: "serve",
+        domain: "http",
+        mcp_decision: "protocol-entrypoint",
+        status_surface: "doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:surfaces-http",
+        docs_surface: "feature-gated help",
+        tui_exposure: "commands pane",
+        risk: "protocol-server",
+    },
+    CommandSurface {
+        name: "graph",
+        domain: "graph",
+        mcp_decision: "mcp-catalog",
+        status_surface: "graph",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:graph-summary",
+        docs_surface: "docs/ARCHITECTURE-GRAPHS.md",
+        tui_exposure: "commands pane",
+        risk: "read-only",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "dashboard",
+        domain: "http dashboard",
+        mcp_decision: "feature-gated-http-surface",
+        status_surface: "dashboard read-only / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:surfaces-dashboard",
+        docs_surface: "feature-gated help",
+        tui_exposure: "commands pane",
+        risk: "http-surface",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "push",
+        domain: "federation",
+        mcp_decision: "mcp-catalog-surface",
+        status_surface: "push result / delivery",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:tier2-federation",
+        docs_surface: "docs/MULTI-SURFACE-PARITY.md",
+        tui_exposure: "commands pane",
+        risk: "federation-push-write",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "telegram",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:surfaces-bot",
+        docs_surface: "feature-gated help",
+        tui_exposure: "commands pane",
+        risk: "bot-bridge",
+    },
+    #[cfg(feature = "surfaces")]
+    CommandSurface {
+        name: "slack",
+        domain: "bot",
+        mcp_decision: "feature-gated-bot-surface",
+        status_surface: "bot poll log / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "feature:surfaces-bot",
+        docs_surface: "feature-gated help",
+        tui_exposure: "commands pane",
+        risk: "bot-bridge",
+    },
+    CommandSurface {
+        name: "export",
+        domain: "archive",
+        mcp_decision: "cli-only-file-output",
+        status_surface: "export summary",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:archive-roundtrip",
+        docs_surface: "docs/FORMAT-session-export.md",
+        tui_exposure: "commands pane",
+        risk: "file-output",
+    },
+    CommandSurface {
+        name: "backup",
+        domain: "archive",
+        mcp_decision: "cli-only-host-snapshot",
+        status_surface: "backup manifest",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:archive-roundtrip",
+        docs_surface: "docs/FORMAT-session-export.md",
+        tui_exposure: "commands pane",
+        risk: "file-output",
+    },
+    CommandSurface {
+        name: "restore",
+        domain: "archive",
+        mcp_decision: "cli-only-host-restore",
+        status_surface: "restore dry-run / manifest",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:archive-roundtrip",
+        docs_surface: "docs/FORMAT-session-export.md",
+        tui_exposure: "commands pane",
+        risk: "host-restore-write",
+    },
+    CommandSurface {
+        name: "session",
+        domain: "resume",
+        mcp_decision: "cli-only-file-interchange",
+        status_surface: "session import --dry-run",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:session-export-import",
+        docs_surface: "docs/FORMAT-session-export.md",
+        tui_exposure: "commands pane",
+        risk: "file-import-export",
+    },
+    CommandSurface {
+        name: "help",
+        domain: "docs",
+        mcp_decision: "n/a-docs",
+        status_surface: "help",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "help-smoke-only-doc-output",
+        docs_surface: "generated man/help",
+        tui_exposure: "commands pane",
+        risk: "doc-output",
+    },
 ];
 
 /// Decide whether the ANSI clear-home prefix should be emitted: only when stdout is
@@ -4037,7 +4929,7 @@ fn render_tui_frame(
         50,
     )?;
     let leases = store.list_leases(50)?;
-    let (inbox, _unread_total) = store.inbox(&me, false, false, 10)?;
+    let (inbox, unread_total) = store.inbox(&me, false, false, 10)?;
 
     if pane == TuiPane::Sessions {
         return Ok(render_sessions_dashboard(
@@ -4075,7 +4967,7 @@ fn render_tui_frame(
                 .count();
             out.push_str("overview\n");
             out.push_str(&format!("  sessions: {} ({} stale)\n", rows.len(), stale));
-            out.push_str(&format!("  inbox unread: {}\n", inbox.len()));
+            out.push_str(&format!("  inbox unread: {}\n", unread_total));
             out.push_str(&format!("  asks tracked: {}\n", asks.len()));
             out.push_str(&format!("  jobs listed: {}\n", jobs.len()));
             out.push_str(&format!("  active leases: {}\n", leases.len()));
@@ -4190,9 +5082,31 @@ fn render_tui_frame(
         }
         TuiPane::Commands => {
             out.push_str("commands\n");
-            for (cmd, domain) in TUI_COMMANDS {
-                if filter_match(filter, format!("{cmd} {domain}")) {
-                    out.push_str(&format!("  {cmd:<18} {domain}\n"));
+            for cmd in TUI_COMMANDS {
+                if filter_match(
+                    filter,
+                    format!(
+                        "{} {} {} {} {} {} {} {} {}",
+                        cmd.name,
+                        cmd.domain,
+                        cmd.mcp_decision,
+                        cmd.status_surface,
+                        cmd.help_smoke,
+                        cmd.behavior_coverage,
+                        cmd.docs_surface,
+                        cmd.tui_exposure,
+                        cmd.risk
+                    ),
+                ) {
+                    out.push_str(&format!(
+                        "  {:<18} {:<16} mcp={:<24} status={} behavior={} risk={}\n",
+                        cmd.name,
+                        cmd.domain,
+                        cmd.mcp_decision,
+                        cmd.status_surface,
+                        cmd.behavior_coverage,
+                        cmd.risk
+                    ));
                 }
             }
         }
@@ -4208,31 +5122,260 @@ fn tui_json_snapshot(
     filter: Option<&str>,
 ) -> Result<serde_json::Value> {
     let (me, _) = resolve_me_explicit(None, None, cfg);
+    let this_host = config::this_host();
+    let now = model::now();
     let extra = cfg.peer_db_sources();
     let mut rows = dashboard_rows(&store::federated_peers(store, &extra)?);
     rows.retain(|r| {
         filter_match(
             filter,
-            format!("{} {} {} {}", r.name, r.repo, r.branch, r.description),
+            format!(
+                "{} {} {} {} {} {}",
+                r.name, r.session_id, r.repo, r.branch, r.worktree, r.description
+            ),
         )
     });
+
     let graph = graph_summary(store, cfg, &me, None)?;
+    let asks = store
+        .list_asks(&me, model::AskRole::Any, 50)?
+        .into_iter()
+        .filter(|a| {
+            filter_match(
+                filter,
+                format!("{} {} {} {:?}", a.id, a.asker, a.askee, a.state),
+            )
+        })
+        .collect::<Vec<_>>();
+    let jobs = store
+        .list_jobs(
+            model::JobFilter {
+                state: None,
+                owner: None,
+                creator: None,
+                assignee: None,
+                circle: None,
+            },
+            50,
+        )?
+        .into_iter()
+        .filter(|j| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {} {} {:?}",
+                    j.id,
+                    j.title,
+                    j.creator,
+                    j.owner.as_deref().unwrap_or_default(),
+                    j.assignee.as_deref().unwrap_or_default(),
+                    j.state
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let leases = store
+        .list_leases(50)?
+        .into_iter()
+        .filter(|l| filter_match(filter, format!("{} {} {}", l.resource, l.holder, l.note)))
+        .collect::<Vec<_>>();
+    let (messages, unread_total) = store.inbox(&me, false, false, 50)?;
+    let messages = messages
+        .into_iter()
+        .filter(|m| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {}",
+                    m.sender,
+                    m.recipient,
+                    m.subject.as_deref().unwrap_or_default(),
+                    m.body
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let commands = TUI_COMMANDS
+        .iter()
+        .filter(|cmd| {
+            filter_match(
+                filter,
+                format!(
+                    "{} {} {} {}",
+                    cmd.name, cmd.domain, cmd.mcp_decision, cmd.status_surface
+                ),
+            )
+        })
+        .map(|cmd| {
+            serde_json::json!({
+                "name": cmd.name,
+                "domain": cmd.domain,
+                "mcp_decision": cmd.mcp_decision,
+                "status_surface": cmd.status_surface,
+                "help_smoke": cmd.help_smoke,
+                "behavior_coverage": cmd.behavior_coverage,
+                "docs_surface": cmd.docs_surface,
+                "tui_exposure": cmd.tui_exposure,
+                "risk": cmd.risk,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let sessions_detail = rows
+        .iter()
+        .map(|r| {
+            let liveness = row_liveness(r, &this_host, now);
+            let liveness = liveness.token();
+            serde_json::json!({
+                "name": r.name,
+                "session_id": r.session_id,
+                "session_id_basis": r.session_id_basis,
+                "repo": r.repo,
+                "branch": r.branch,
+                "worktree": r.worktree,
+                "mux": r.mux,
+                "host": r.host,
+                "pid": r.pid,
+                "last_seen": r.last_seen,
+                "last_seen_ts": model::fmt_ts(r.last_seen),
+                "via": r.via,
+                "turn_state": r.turn_state,
+                "description": r.description,
+                "liveness": liveness,
+            })
+        })
+        .collect::<Vec<_>>();
+    let stale_sessions = sessions_detail
+        .iter()
+        .filter(|row| row["liveness"] == "stale")
+        .count();
+
+    let messages_json = messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "sender": m.sender,
+                "recipient": m.recipient,
+                "subject": m.subject,
+                "body": m.body,
+                "ts": m.ts,
+                "ts_iso": model::fmt_ts(m.ts),
+                "in_reply_to": m.in_reply_to,
+                "priority": m.priority,
+                "trace_id": m.trace_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let asks_json = asks
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "asker": a.asker,
+                "askee": a.askee,
+                "subject": a.subject,
+                "state": a.state.as_str(),
+                "kind": a.kind.as_str(),
+                "question_msg_id": a.question_msg_id,
+                "answer_msg_id": a.answer_msg_id,
+                "reply_to": a.reply_to,
+                "parent_id": a.parent_id,
+                "opened_ts": a.opened_ts,
+                "opened_ts_iso": model::fmt_ts(a.opened_ts),
+                "updated_ts": a.updated_ts,
+                "updated_ts_iso": model::fmt_ts(a.updated_ts),
+                "closed_ts": a.closed_ts,
+                "closed_ts_iso": a.closed_ts.map(model::fmt_ts),
+            })
+        })
+        .collect::<Vec<_>>();
+    let jobs_json = jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "title": j.title,
+                "description": j.description,
+                "kind": j.kind,
+                "state": j.state.as_str(),
+                "state_reason": j.state_reason,
+                "phase": j.phase,
+                "progress_note": j.progress_note,
+                "creator": j.creator,
+                "owner": j.owner,
+                "assignee": j.assignee,
+                "circle": j.circle,
+                "scope": j.scope,
+                "attempt_id": j.attempt_id,
+                "deadline_at": j.deadline_at,
+                "expires_at": j.expires_at,
+                "cancel_requested": j.cancel_requested,
+                "opened_ts": j.opened_ts,
+                "opened_ts_iso": model::fmt_ts(j.opened_ts),
+                "updated_ts": j.updated_ts,
+                "updated_ts_iso": model::fmt_ts(j.updated_ts),
+                "completed_ts": j.completed_ts,
+                "completed_ts_iso": j.completed_ts.map(model::fmt_ts),
+            })
+        })
+        .collect::<Vec<_>>();
+    let leases_json = leases
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "resource": l.resource,
+                "holder": l.holder,
+                "acquired": l.acquired,
+                "acquired_ts": model::fmt_ts(l.acquired),
+                "expires": l.expires,
+                "expires_ts": model::fmt_ts(l.expires),
+                "note": l.note,
+            })
+        })
+        .collect::<Vec<_>>();
+
     Ok(serde_json::json!({
         "pane": pane.as_str(),
         "me": me,
         "backend": cfg.backend(),
+        "db": cfg.db_path().display().to_string(),
+        "generated_at": now,
+        "generated_at_iso": model::fmt_ts(now),
+        "filter": filter,
         "sessions": rows.len(),
+        "session_count": rows.len(),
+        "overview": {
+            "sessions": rows.len(),
+            "stale_sessions": stale_sessions,
+            "unread_messages": unread_total,
+            "messages_listed": messages_json.len(),
+            "asks_tracked": asks_json.len(),
+            "jobs_listed": jobs_json.len(),
+            "active_leases": leases_json.len(),
+            "commands_listed": commands.len(),
+            "dashboard_note": "HTTP dashboard is feature-gated; this TUI is default-build.",
+        },
+        "sessions_detail": sessions_detail,
+        "messages": messages_json,
+        "asks": asks_json,
+        "jobs": jobs_json,
+        "leases": leases_json,
         "graph": {
             "nodes": graph.nodes,
             "edges": graph.edges,
             "density": graph.density,
             "component_count": graph.component_count,
             "largest_component": graph.largest_component,
+            "components": graph.components,
+            "centrality": graph.centrality.iter().map(|(node, score)| serde_json::json!({
+                "node": node,
+                "score": score,
+            })).collect::<Vec<_>>(),
         },
-        "commands": TUI_COMMANDS.iter().map(|(name, domain)| serde_json::json!({"name": name, "domain": domain})).collect::<Vec<_>>(),
+        "commands": commands,
     }))
 }
-
 /// Emit a shell completion script to stdout.
 fn print_completions(shell: CompletionShell) -> Result<()> {
     use clap::CommandFactory;
@@ -4696,6 +5839,15 @@ fn main() -> Result<()> {
                         row.name
                     );
                     println!("weave lifecycle hooks were preserved where present");
+                }
+                return Ok(());
+            }
+            ProviderSwitchCmd::Status { db, json } => {
+                let report = provider_switch::status(db.clone());
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_provider_switch_status(&report);
                 }
                 return Ok(());
             }

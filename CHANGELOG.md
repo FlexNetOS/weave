@@ -1,5 +1,99 @@
 # Changelog
 
+## [Unreleased] — fix: ignore exited zellij sessions in liveness
+
+- Fixed zellij liveness detection so `zellij list-sessions` rows marked
+  `(EXITED - attach to resurrect)` no longer make `weave connect`, `peers`,
+  or delivery planning report a false live/injectable target.
+- Added a regression test for the observed exited/current zellij session listing
+  shape while preserving live/current zellij sessions as injectable.
+
+## [Unreleased] — test: deepen command-surface coverage gate (WL-083)
+
+- Expanded the enforced `weave tui --json --pane commands` ledger from MCP/status metadata to a command coverage contract: every top-level command now carries help-smoke, behavior coverage, docs surface, TUI exposure, and risk/write classification fields.
+- Extended the integration gate so new CLI commands must update the command ledger with all coverage classifications before they can pass.
+
+## [Unreleased] — feat: complete terminal dashboard TUI snapshot (WL-082)
+
+- Completed the default-build `weave tui` cockpit JSON contract: `--json` now returns one machine-readable snapshot containing overview counts plus sessions, messages, asks, jobs, graph, leases, and command-catalog pane arrays.
+- Preserved the std-only/default-build posture while making `--pane` deterministic for headless agents: every pane-specific JSON call carries the full cockpit payload and echoes the selected pane.
+- Extended integration coverage so the TUI command remains a default-build operator surface and its JSON snapshot cannot regress to command-only metadata.
+- Hardened Claude MCP setup/uninstall calls with an argv-only timeout so a broken `claude` wrapper cannot wedge the full test gate or headless setup.
+
+## [Unreleased] — docs: refresh architecture graph contract (WL-080)
+
+- Refreshed `docs/ARCHITECTURE-GRAPHS.md` to remove stale notes after WL-068,
+  WL-069, WL-078, and WL-079: dimensional liveness is now current state, ambiguous
+  mux targets are an injection safety barrier, provider-switch status/doctor is
+  wired, and the command-surface ledger covers sign/surfaces-gated commands.
+- Added a graph freshness contract that names which diagram must move when a PR
+  changes component boundaries, local/across-wire session flow, diagnostics,
+  Obscura governance, CC Switch/provider policy, CLI/MCP/hook/daemon tradeoffs,
+  or orchestrator→worker/runner execution.
+
+## [Unreleased] — docs/test: enforce MCP friction decisions (WL-079)
+
+- Narrowed ADR-0003 and multi-surface docs from broad CLI/MCP parity claims to an
+  explicit command-surface decision rule: every top-level CLI command must declare
+  its MCP parity decision and read-only status/diagnostic surface.
+- Extended the default-build TUI command catalog (`weave tui --json --pane commands`)
+  with `mcp_decision` and `status_surface`, including `codex-tools`, the sign-gated `key`/`audit` commands, and the surfaces-gated `dashboard`/`push`/`telegram`/`slack` commands, and made the
+  integration gate compare the catalog exactly to `weave --help`.
+- Added status/health visibility checks for background/hook surfaces (`daemon`,
+  `hook`, and `responder`) so CLI/daemon-first work cannot become invisible to
+  MCP-only agents.
+
+## [Unreleased] — feat: expose provider-switch status diagnostics (WL-078)
+
+- Added `weave provider-switch status [--json]` as a read-only CC Switch bridge
+  diagnostic surface. It reports DB presence/readability, schema coverage,
+  supported vs observed app types, current provider/model per supported app, live
+  config agreement, and proxy/failover/health table presence without writing CC
+  Switch or host config state.
+- Added the same secret-free provider-switch rollup to `weave doctor --json` and
+  concise human `doctor` output, so absent `~/.cc-switch/cc-switch.db` is an
+  explicit diagnostic state instead of an opaque open failure.
+- Added integration coverage for populated CC Switch status and missing-DB
+  diagnostics.
+
+## [Unreleased] — docs: accept layered workspace architecture (WL-077)
+
+- Added ADR-0006 accepting the current `weave-core` / `weave-inject` /
+  `weave-mcp` / `weave` Cargo workspace as supported architecture. The invariant
+  is one dependency-light Rust binary, not one crate.
+- Closed/replaced WL-043 so the backlog no longer carries a stale mechanical
+  single-crate collapse mandate. Future structural changes require a fresh
+  ADR-level reason tied to user-visible simplification or build-risk reduction.
+- Synced CLAUDE.md, ARCHITECTURE.md, PRD, and the handoff backlog to the accepted
+  workspace decision; no Rust source, Cargo metadata, or dependency graph change.
+- Strict-upgraded surfaced verification flakes: `setup --git-hooks` integration
+  tests now isolate HOME, and the fake Ollama model-discovery smoke skips cleanly
+  when local loopback binds are blocked by the execution sandbox.
+
+
+## [Unreleased] — chore: add backlog/docs freshness gate (WL-076)
+
+- Added `scripts/docs_freshness_check.py`, a stdlib CI helper that flags PRs
+  touching operator-visible CLI/MCP/user-facing paths unless they update
+  `CHANGELOG.md` or `.handoff/loop/backlog.md`, or explicitly carry the
+  `[no backlog/doc change]` PR marker.
+- Wired the helper into CI as the `docs freshness` job and documented local use
+  in `docs/TESTING.md`.
+- Marked WL-076 complete in the handoff backlog so release-note/backlog drift is
+  now guarded instead of relying on reviewer memory.
+
+
+## [Unreleased] — docs: complete TASK-0001 north-star reconciliation
+
+- Reconciled the canonical PRD with the actually shipped repowire-superset
+  surface: WL-047 spawn/kill, WL-048/WL-052a/WL-073 human surfaces, WL-049
+  obscura governance, and WL-050..052 token-light MCP are now recorded as
+  shipped rather than future gaps.
+- Refreshed the ARCHITECTURE WL-052 wording so dashboard writes and bot command
+  grammar are not described as still-pending.
+- Marked `.handoff/tasks/TASK-0001.task.json` complete with git-kb/source-review
+  evidence; no source code or dependency changes.
+
 
 ## [Unreleased] — test: fix free_port TOCTOU dashboard-spawn flake (WL-058)
 
@@ -440,7 +534,7 @@
 > dashboard/Telegram/Slack, no Next.js/Python), governed obscura web access
 > (WL-049 / ADR-0002, no V8 in core), and the token-light progressive-disclosure
 > MCP refactor + budget invariant + multi-surface parity (WL-050..052 / ADR-0003).
-> Structural: collapse the interim 4-crate workspace to single-crate (WL-043).
+> Structural: WL-077 / ADR-0006 accepts the four-crate workspace as the supported architecture; WL-043's mechanical single-crate collapse mandate is closed/replaced.
 
 ## [Unreleased] — Rust-native human surfaces (WL-048)
 

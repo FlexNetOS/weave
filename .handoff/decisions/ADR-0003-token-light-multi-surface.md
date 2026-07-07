@@ -51,3 +51,24 @@ The resolution is NOT to amputate the surface (the half-measure the owner explic
 - **Web (2026-06-13):** modelcontextprotocol issue #2808 — "tool schema token overhead (~1000 tokens/tool/session)"; Anthropic Engineering, "Code execution with MCP: building more efficient AI agents" (up to 98% reduction); MindStudio, "Optimize MCP Server Token Usage" (code execution / tool search / TOON); apideck, "Your MCP Server Is Eating Your Context Window… CLI alternative"; demiliani, "MCP and the 'too many tools' problem"; Solo.io & SynapticLabs, progressive-disclosure / meta-tool pattern ("47 tools → 2 tools, 98% reduction"); jenova.ai, "AI Tool Overload: more tools = worse performance"; GitHub Copilot's 128-tool hard cap.
 - **Codebase (verified 2026-06-13):** `weave-mcp/src/mcp.rs` (70 `weave_*` tools, ~179 KB source incl. schemas); `weave/src/main.rs` (~40 CLI subcommands — full parity already exists); `weave-mcp/src/http.rs` (the HTTP seam for the dashboard); the permission/lease/job systems (the governance primitives reused by `weave_web`); RTK (`rtk weave`, the token-killer ethos this ADR aligns to).
 - **Sources:** https://github.com/modelcontextprotocol/modelcontextprotocol/issues/2808 · https://www.anthropic.com/engineering/code-execution-with-mcp · https://www.apideck.com/blog/mcp-server-eating-context-window-cli-alternative · https://demiliani.com/2025/09/04/model-context-protocol-and-the-too-many-tools-problem/ · https://www.solo.io/blog/mcp-progressive-disclosure · https://blog.synapticlabs.ai/bounded-context-packs-meta-tool-pattern · https://www.mindstudio.ai/blog/optimize-mcp-server-token-usage
+
+## 2026-06-27 update — parity decisions, not blanket parity claims (WL-079)
+
+WL-079 narrows this ADR's original "full parity" language into a reviewable rule:
+new CLI capability is acceptable only when it carries an explicit MCP parity decision.
+The decision can be `mcp-catalog`, `mcp-catalog-dangerous`, feature-gated MCP,
+or an intentional CLI-only rationale such as host-local file/config mutation, but it
+must be present in the command-surface ledger before the command ships. This avoids
+token-light MCP becoming a hidden subset while still preserving CLI as the
+zero-standing-cost primary path.
+
+Background surfaces have a second rule: daemon, hook, responder, and other
+out-of-band workers must expose a read-only status/health/doctor surface that can
+be reached without mutating state. MCP-only agents should be able to discover that
+such paths exist and inspect their health through the catalog/meta-tool or a
+CLI-readable status command; hook-only behavior must not be invisible.
+
+The enforced ledger is the default-build `weave tui --json --pane commands` command
+catalog. Integration tests now compare it exactly with `weave --help`, require a
+non-empty `mcp_decision` and `status_surface` for every command, and specifically
+check status/health visibility for `daemon`, `hook`, and `responder`.

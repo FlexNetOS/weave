@@ -85,27 +85,26 @@ capabilities themselves remain in scope, to land **Rust-native**:
   first-class invariant with a CI-enforced standing-token budget
   (`MAX_STANDING_TOOLS_BYTES` ≈ 2k tokens, guarded by
   `standing_mcp_surface_is_within_token_budget`) — adding a capability must not add
-  standing tokens. **WL-052 (foundation done):** the multi-surface parity matrix
-  (`docs/MULTI-SURFACE-PARITY.md`) proves CLI + MCP are at full parity; remaining
-  human-surface write-parity is tracked as **WL-052a** (dashboard write) / **WL-052b**
-  (bot commands). Decided in
-  **ADR-0003** (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
+  standing tokens. **WL-052 (done):** the multi-surface parity matrix
+  (`docs/MULTI-SURFACE-PARITY.md`) proves CLI + MCP are at full parity; the human
+  surface follow-through has shipped as **WL-052a** (dashboard write) and
+  **WL-052b/WL-073** (bot commands). Decided in **ADR-0003**
+  (`.handoff/decisions/ADR-0003-token-light-multi-surface.md`).
 
 The provable have/superset/gap parity matrix against repowire's inventory is
 `docs/REPOWIRE-PARITY.md` (**WL-046**); the **multi-surface** parity matrix —
 every capability mapped onto CLI / MCP / dashboard / bots, with the remaining
-human-surface write-parity tracked as WL-052a/b — is `docs/MULTI-SURFACE-PARITY.md`
-(**WL-052**, ADR-0003): CLI and MCP are at **full** parity; the dashboard (read-only)
-and bots (relay) are the v1 baseline. Structurally, the four-crate workspace below is **interim** —
-single-crate remains the goal (WL-043).
+human-surface write follow-through tracked as WL-052a/b — is
+`docs/MULTI-SURFACE-PARITY.md` (**WL-052**, ADR-0003): CLI and MCP are at
+**full** parity; dashboard write paths and bot command grammar have both shipped. Structurally, ADR-0006 accepts the four-crate workspace below as the supported architecture: the invariant is one dependency-light Rust binary, not one crate.
 
 ---
 
 ## 1. Workspace map
 
-`weave` is organized as a Cargo workspace. The default build still produces one
+`weave` is organized as a small, accepted Cargo workspace (ADR-0006). The default build still produces one
 static binary (`weave`), but the code is split into crates so the core types,
-store, injector, and MCP server can be reused and tested independently.
+store, injector, and MCP server can be reused, feature-gated, and tested independently.
 
 ```
 weave-core/          library: model + config + Store trait + both backends + sign

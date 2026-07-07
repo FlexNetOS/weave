@@ -13,6 +13,26 @@ This document describes what is tested, how the suite runs on **both** storage
 backends, the fake-mux harness, what proptest caught, and a checklist for adding
 tests alongside a new feature.
 
+
+## Backlog/docs freshness gate (WL-076)
+
+CI runs:
+
+```bash
+python3 scripts/docs_freshness_check.py
+```
+
+The gate is intentionally lightweight: if a PR changes operator-visible CLI, MCP,
+workflow, or user-facing documentation paths, it must also update `CHANGELOG.md`
+or `.handoff/loop/backlog.md`. If the change truly has no release-note/backlog
+impact, add `[no backlog/doc change]` to the PR body. The script also supports
+`--marker` for local dry runs and `--self-test` for its built-in checks.
+
+```bash
+python3 scripts/docs_freshness_check.py --self-test
+python3 scripts/docs_freshness_check.py --marker '[no backlog/doc change]'
+```
+
 ## Test layers at a glance
 
 | Layer | Location | Style | What it pins down |
@@ -1082,7 +1102,11 @@ done:
 2. **New CLI subcommand / flag → an integration test** in `tests/integration.rs`
    using the `tests/common` helpers (`run_ok`, `run`, `run_hook`,
    `run_stdin_full`). If it has machine-readable output, assert the `--json`
-   shape, not just substrings.
+   shape, not just substrings. Every new top-level command must also be added to
+   the `weave tui --json --pane commands` ledger with `mcp_decision`,
+   `status_surface`, `help_smoke`, `behavior_coverage`, `docs_surface`,
+   `tui_exposure`, and `risk`; `tui_once_and_json_are_default_build_operator_surfaces`
+   fails if any classification is missing.
 3. **New MCP tool / protocol behavior → an `McpServer` test** (`spawn`,
    `call_tool`, assert `isError` and the returned text). Include the failure path
    (bad/oversized args → `isError`, never a panic or silent persist).
