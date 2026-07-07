@@ -151,19 +151,40 @@ fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
 pub fn serve<I: Injector>(
     store: &dyn Store,
     me_default: Option<String>,
+    me_default_is_guess: bool,
     nudge_template: Option<&str>,
     extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
     injector: &I,
 ) -> Result<()> {
     log(&format!(
-        "starting; backend={} default_session={:?}",
+        "starting; backend={} default_session={:?} guess={me_default_is_guess}",
         store.backend(),
         me_default
     ));
+    let mut me_default = me_default;
+    // WL-084: when the default identity is a basename(cwd) GUESS, it can name
+    // another session's peer (same-basename collision → this session was
+    // auto-uniquified at SessionStart) — or no row at all (the MCP server often
+    // boots BEFORE the SessionStart hook registers). Re-pin lazily: before each
+    // request, until a hit, look up the row owned by our own long-lived client
+    // process and adopt ITS name. A miss keeps the guess (pre-WL-084 behavior).
+    let mut repin_done = !me_default_is_guess;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
+        if !repin_done {
+            if let Some(owned) = client_owned_peer_name(store) {
+                if me_default.as_deref() != Some(owned.as_str()) {
+                    log(&format!(
+                        "WL-084 re-pin: default identity {:?} -> '{owned}' (row owned by this session's client process)",
+                        me_default
+                    ));
+                }
+                me_default = Some(owned);
+                repin_done = true;
+            }
+        }
         // A per-line read error (e.g. invalid UTF-8 on the wire) must not be
         // fatal to the whole server. Log and skip it; one bad line cannot crash
         // the loop.
@@ -209,6 +230,25 @@ pub fn serve<I: Injector>(
     }
     log("stdin closed; exiting");
     Ok(())
+}
+
+/// WL-084: the peer row registered by THIS session — matched by the long-lived
+/// client process pid on this host (the same anchor the SessionStart hook
+/// stores), so the MCP server and the hooks agree on identity even when the
+/// alias was auto-uniquified. `None` on no/ambiguous match or any store error
+/// (never guess here — the caller already holds the basename guess).
+fn client_owned_peer_name(store: &dyn Store) -> Option<String> {
+    let pid = store::client_pid()?;
+    let host = weave_core::config::this_host();
+    let peers = store.list_peers().ok()?;
+    let mut owned = peers
+        .into_iter()
+        .filter(|p| p.pid == Some(pid) && p.host == host);
+    let first = owned.next()?;
+    if owned.next().is_some() {
+        return None;
+    }
+    Some(first.name)
 }
 
 /// Maximum accepted length (in characters) for a session identity — sender or
@@ -1938,6 +1978,7 @@ fn tool_scan(
                 &tags.worktree_id,
                 &weave_core::config::Config::load().circle(),
                 None,
+                "",
             ) {
                 eprintln!("[weave] scan self-refresh skipped (non-fatal): {err}");
             }
@@ -2563,6 +2604,7 @@ fn tool_attach(
             args.get("cert")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty()),
+            "",
         )
         .map_err(e)?;
     let tgt = if t.id.is_empty() { "-" } else { &t.id };
@@ -2712,6 +2754,7 @@ fn tool_spawn_peer(
                 "",
                 &circle,
                 Some(cert.as_str()),
+                "",
             )
             .map_err(e)?;
     }
@@ -6380,7 +6423,7 @@ mod tests {
         std::env::set_var("WEAVE_SPAWN_DIRS", &allow_real);
         let st = store();
         st.register_peer_full(
-            "taken", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+            "taken", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
         )
         .unwrap();
         let inj = RecordingInjector {
@@ -6420,7 +6463,7 @@ mod tests {
     fn kill_peer_records_kill() {
         let st = store();
         st.register_peer_full(
-            "victim", "tmux", "%3", "", None, None, "h", "", "", "", "default", None,
+            "victim", "tmux", "%3", "", None, None, "h", "", "", "", "default", None, "",
         )
         .unwrap();
         let inj = RecordingInjector::default();
@@ -6443,7 +6486,7 @@ mod tests {
     fn kill_peer_unsupported_mux_is_graceful() {
         let st = store();
         st.register_peer_full(
-            "it", "iterm2", "anything", "", None, None, "h", "", "", "", "default", None,
+            "it", "iterm2", "anything", "", None, None, "h", "", "", "", "default", None, "",
         )
         .unwrap();
         let inj = RecordingInjector::default();

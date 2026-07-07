@@ -975,6 +975,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         }
     }
 

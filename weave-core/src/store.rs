@@ -137,6 +137,13 @@ pub trait Store: Send {
     ///   - `birth_cert` arg is `None` → rejects (must provide cert to re-register).
     ///   - `birth_cert` arg mismatches → rejects (identity takeover protection).
     ///   - `birth_cert` arg matches → UPDATEs other fields, returns existing cert.
+    ///
+    /// **Client session key (WL-084):** `client_session` is the launcher-session
+    /// id (e.g. the Claude Code hook payload's `session_id`), bounded +
+    /// control-stripped at this seam like the git tags. An EMPTY value means
+    /// "unknown — preserve whatever the row already holds" (so non-hook callers
+    /// can never wipe the mapping); a non-empty value overwrites (the new
+    /// session owns the row after a legitimate takeover).
     #[allow(clippy::too_many_arguments)]
     fn register_peer_full(
         &self,
@@ -152,6 +159,7 @@ pub trait Store: Send {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String>;
 
     /// Register (upsert) a peer without PID/host liveness info or git tags.
@@ -186,9 +194,17 @@ pub trait Store: Send {
             "",
             "default",
             cert.as_deref(),
+            "",
         )
     }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
+
+    /// Resolve the peer row owned by launcher session `client_session` (WL-084).
+    /// `Ok(None)` for an empty/unknown key. When several rows carry the same key
+    /// (possible only via manual writes — registration never fans one session
+    /// out), the most recently seen row wins, so the lookup self-heals toward
+    /// the live one.
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>>;
     fn get_birth_cert(&self, name: &str) -> Result<Option<String>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
 
@@ -1091,6 +1107,93 @@ pub fn pid_alive(_pid: i64) -> bool {
     true
 }
 
+/// Env override for [`client_pid`] (WL-084). Lets tests pin a deterministic
+/// client process and lets exotic launchers that know their session's real
+/// long-lived process better than the ancestry walk export it explicitly.
+pub const CLIENT_PID_ENV: &str = "WEAVE_CLIENT_PID";
+
+/// Wrapper `comm` names that die with a single hook/tool invocation and must
+/// never be mistaken for the session's client process. Shells (Claude Code runs
+/// hook commands via `sh -c`-style wrappers), `env`, `timeout`, the `rtk`
+/// output proxy, and `weave` itself (a hook invoked through a weave wrapper).
+const TRANSIENT_COMMS: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "fish", "nu", "env", "timeout", "rtk", "weave",
+];
+
+/// First long-lived ancestor in an ancestry `chain` of `(pid, comm)` pairs
+/// ordered nearest-first (parent, grandparent, …) — the PURE classifier under
+/// [`client_pid`], parameterized on the parsed chain so it is exhaustively
+/// testable with synthetic process trees. Skips [`TRANSIENT_COMMS`] wrappers,
+/// stops at pid 1 (init — reaching it means every real ancestor already
+/// exited), and returns `None` when nothing qualifies (⇒ presence falls back
+/// to the TTL guess, the same degradation as an unknown pid).
+pub fn first_longlived_ancestor(chain: &[(i64, String)]) -> Option<i64> {
+    for (pid, comm) in chain {
+        if *pid <= 1 {
+            return None;
+        }
+        if !TRANSIENT_COMMS.contains(&comm.as_str()) {
+            return Some(*pid);
+        }
+    }
+    None
+}
+
+/// The pid this session's presence should track (WL-084): the nearest
+/// LONG-LIVED ancestor of the current process — e.g. the `claude`/`node`
+/// process a hook invocation belongs to — NOT the hook process itself, which
+/// exits milliseconds later and would make every hook-registered peer read
+/// `process_dead` (the pre-WL-084 bug). `WEAVE_CLIENT_PID` overrides
+/// (validated > 0); non-Linux targets have no dependency-free ancestry walk
+/// and return `None` (TTL presence, matching [`pid_alive`]'s degradation).
+pub fn client_pid() -> Option<i64> {
+    if let Ok(v) = std::env::var(CLIENT_PID_ENV) {
+        if let Ok(pid) = v.trim().parse::<i64>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+    first_longlived_ancestor(&proc_ancestry(std::process::id() as i64, 8))
+}
+
+/// Walk `/proc/<pid>/status` `PPid:` links up to `max_hops` ancestors, pairing
+/// each with its `/proc/<pid>/comm`. Nearest-first, starting at `start`'s
+/// PARENT. Any read/parse failure ends the walk (fail toward `None` ⇒ TTL
+/// presence). Linux-only, dependency-free (the [`pid_alive`] precedent).
+#[cfg(target_os = "linux")]
+fn proc_ancestry(start: i64, max_hops: usize) -> Vec<(i64, String)> {
+    let mut chain = Vec::new();
+    let mut pid = start;
+    for _ in 0..max_hops {
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<i64>().ok());
+        let ppid = match ppid {
+            Some(p) if p > 0 => p,
+            _ => break,
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        chain.push((ppid, comm));
+        pid = ppid;
+    }
+    chain
+}
+
+/// Non-Linux: no dependency-free ancestry walk; the classifier gets an empty
+/// chain and [`client_pid`] resolves `None` (TTL presence).
+#[cfg(not(target_os = "linux"))]
+fn proc_ancestry(_start: i64, _max_hops: usize) -> Vec<(i64, String)> {
+    Vec::new()
+}
+
 /// Host-aware liveness verdict for a peer (the "A2 — fail-open by host" rule).
 ///
 /// This is the single, PURE classifier behind presence. It takes `this_host`
@@ -1187,6 +1290,56 @@ pub fn is_alive(peer: &Peer) -> bool {
         liveness_for(peer, &crate::config::this_host(), now()),
         Liveness::Stale
     )
+}
+
+/// Verdict for registering under a name that already has a peer row (WL-084).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RegisterConflict {
+    /// The existing row belongs to THIS launcher session — update it in place
+    /// (idempotent SessionStart re-fire, resume, compact).
+    SameSession,
+    /// The existing row is dead/stale — take the name over (name continuity
+    /// across restarts in the same directory).
+    Reusable,
+    /// The existing row belongs to a DIFFERENT live session (local or remote)
+    /// — do NOT steal it; register under a uniquified name instead.
+    LiveOther,
+}
+
+/// Classify a same-name registration conflict — the PURE decision core behind
+/// hook-time auto-uniquification, parameterized on `this_host`/`now_ts` like
+/// [`liveness_from_fields`] so the full matrix is testable with fixed values.
+///
+/// Ownership evidence, strongest first:
+/// 1. Launcher-session key match (`client_session`) → [`RegisterConflict::SameSession`].
+/// 2. Same live client pid on this host → `SameSession` (covers a host that
+///    rotates its session id across resume/compact while the client process
+///    survives).
+/// 3. Stale row ([`liveness_from_fields`] — past TTL, or same-host dead pid)
+///    → [`RegisterConflict::Reusable`].
+/// 4. Anything else is a live foreign session → [`RegisterConflict::LiveOther`].
+///    A same-host recent row with an UNKNOWN pid reads live-by-TTL, so two
+///    concurrent pid-less sessions coexist under distinct names rather than
+///    silently swapping one row (fail toward NOT stealing).
+pub fn registration_conflict(
+    existing: &Peer,
+    our_client_session: &str,
+    our_client_pid: Option<i64>,
+    this_host: &str,
+    now_ts: i64,
+) -> RegisterConflict {
+    if !our_client_session.is_empty() && existing.client_session == our_client_session {
+        return RegisterConflict::SameSession;
+    }
+    if let (Some(theirs), Some(ours)) = (existing.pid, our_client_pid) {
+        if theirs == ours && existing.host == this_host {
+            return RegisterConflict::SameSession;
+        }
+    }
+    if liveness_for(existing, this_host, now_ts) == Liveness::Stale {
+        return RegisterConflict::Reusable;
+    }
+    RegisterConflict::LiveOther
 }
 
 /// Hard upper bound on a query `LIMIT`. A negative limit means *unbounded* in
@@ -1542,7 +1695,8 @@ CREATE TABLE IF NOT EXISTS peers (
     description    TEXT NOT NULL DEFAULT '',
     description_ts INTEGER NOT NULL DEFAULT 0,
     birth_cert     TEXT,
-    contact_policy TEXT NOT NULL DEFAULT 'open'
+    contact_policy TEXT NOT NULL DEFAULT 'open',
+    client_session TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1979,6 +2133,7 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         description_ts: r.get(15)?,
         birth_cert: r.get(16).unwrap_or(None),
         contact_policy: r.get(17).unwrap_or("open".to_string()),
+        client_session: r.get(18).unwrap_or_default(),
     })
 }
 
@@ -2108,6 +2263,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     // a cert get one minted on their next re-registration.
     if !column_exists(conn, "peers", "birth_cert")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN birth_cert TEXT;")?;
+    }
+    // WL-084: launcher-session key for collision-proof identity. Holds the
+    // coding-agent host's per-session id (e.g. the Claude Code hook payload's
+    // `session_id`) so every hook event of one session resolves to the SAME
+    // peer row even when the human alias was auto-uniquified. '' == unknown
+    // (legacy row, or a host that sends no session id), matching
+    // `Peer::client_session`'s empty default. Idempotent, constant DDL.
+    if !column_exists(conn, "peers", "client_session")? {
+        conn.execute_batch(
+            "ALTER TABLE peers ADD COLUMN client_session TEXT NOT NULL DEFAULT '';",
+        )?;
     }
     // Wake-hook watermark table (P5): tracks the last unread message id that
     // caused a block for each reader. Created here for legacy DBs that predate
@@ -3559,6 +3725,7 @@ impl Store for SqliteStore {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String> {
         check_ident("peer name", name)?;
         if let Some(cert) = birth_cert {
@@ -3569,6 +3736,10 @@ impl Store for SqliteStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // WL-084: the launcher-session key is an opaque host token — bound it
+        // like a tag (lossy-but-total; a hostile/garbled id degrades, never
+        // fails registration).
+        let client_session = sanitize_tag(client_session, MAX_IDENT);
         // Re-validate the circle at the store seam (defense-in-depth, the
         // check_ident precedent): an invalid value falls back to the default
         // circle rather than being stored raw.
@@ -3597,19 +3768,22 @@ impl Store for SqliteStore {
                     None => mint_birth_cert()?,
                 };
                 tx.execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                    params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert],
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert, client_session)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, &client_session],
                 )?;
                 new_cert
             }
             Some(None) => {
                 // Existing peer without a cert (backward-compat): mint one and UPDATE.
+                // client_session preserve-on-empty: '' means "unknown", so only a
+                // non-empty key overwrites the stored mapping (see the trait doc).
                 let new_cert = mint_birth_cert()?;
                 tx.execute(
-                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
-                     WHERE name=?13",
-                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, name],
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12,
+                                      client_session = CASE WHEN ?13 = '' THEN client_session ELSE ?13 END
+                     WHERE name=?14",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, &client_session, name],
                 )?;
                 new_cert
             }
@@ -3625,10 +3799,12 @@ impl Store for SqliteStore {
                     );
                 }
                 // Cert matches: UPDATE fields, preserve stored cert.
+                // client_session preserve-on-empty (see the trait doc).
                 tx.execute(
-                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
-                     WHERE name=?12",
-                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, name],
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11,
+                                      client_session = CASE WHEN ?12 = '' THEN client_session ELSE ?12 END
+                     WHERE name=?13",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &client_session, name],
                 )?;
                 stored_cert
             }
@@ -3639,7 +3815,7 @@ impl Store for SqliteStore {
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
@@ -3647,6 +3823,24 @@ impl Store for SqliteStore {
                 let mut p = p?;
                 // Read-time TTL: a stale description ages out to "" (daemon-free;
                 // the stored row is left untouched — pure read-time view).
+                crate::model::expire_description(&mut p, now());
+                Ok(Some(p))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        if client_session.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE client_session=?1 ORDER BY last_seen DESC LIMIT 1",
+        )?;
+        let mut it = stmt.query_map(params![client_session], row_to_peer)?;
+        match it.next() {
+            Some(p) => {
+                let mut p = p?;
                 crate::model::expire_description(&mut p, now());
                 Ok(Some(p))
             }
@@ -3670,7 +3864,7 @@ impl Store for SqliteStore {
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers ORDER BY name",
         )?;
         let mut rows: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3710,7 +3904,7 @@ impl Store for SqliteStore {
         };
         // Current orchestrators in the circle (normalize empty/legacy to default).
         let mut stmt = tx.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3757,7 +3951,7 @@ impl Store for SqliteStore {
             .unwrap_or(crate::model::DEFAULT_CIRCLE)
             .to_string();
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -5741,6 +5935,7 @@ mod federation_tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         }
     }
 
@@ -6657,6 +6852,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("envctl").unwrap().unwrap();
@@ -7107,6 +7303,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/b.sock");
@@ -7139,6 +7336,7 @@ mod tests {
                 "",
                 "default",
                 Some(&cert),
+                "",
             )
             .unwrap();
         assert_eq!(returned, cert, "register returns the supplied cert");
@@ -7151,12 +7349,207 @@ mod tests {
         // valid shape, and NOT the one we supplied above).
         let minted = s
             .register_peer_full(
-                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
             )
             .unwrap();
         assert!(check_birth_cert(&minted).is_ok(), "minted cert is valid");
         assert_ne!(minted, cert, "the None path mints a fresh, distinct cert");
         assert_eq!(s.get_birth_cert("auto").unwrap().unwrap(), minted);
+    }
+
+    /// WL-084: the launcher-session key roundtrips through registration, is
+    /// PRESERVED by an empty-key re-register (CLI/spawn callers must not wipe
+    /// the mapping), is overwritten by a non-empty key (legitimate takeover),
+    /// and drives `get_peer_by_client_session` (empty key never matches).
+    #[test]
+    fn client_session_roundtrips_and_preserves_on_empty() {
+        let s = mem();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%1",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            None,
+            "sid-A",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-A");
+        assert_eq!(
+            s.get_peer_by_client_session("sid-A").unwrap().unwrap().name,
+            "a"
+        );
+        // Empty-key re-register preserves the stored key.
+        let cert = s.get_birth_cert("a").unwrap();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%2",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_peer("a").unwrap().unwrap().client_session,
+            "sid-A",
+            "'' must mean preserve, not wipe"
+        );
+        // Non-empty key overwrites (the new session owns the row).
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%3",
+            "",
+            Some("/x"),
+            Some(12),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "sid-B",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-B");
+        assert!(s.get_peer_by_client_session("sid-A").unwrap().is_none());
+        // The empty key never matches — legacy rows all store ''.
+        s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
+        assert!(s.get_peer_by_client_session("").unwrap().is_none());
+    }
+
+    /// WL-084 conflict classifier matrix (pure; fixed host/clock). Ownership
+    /// evidence order: session key > live client pid > liveness verdict.
+    #[test]
+    fn registration_conflict_matrix() {
+        let this_host = crate::config::this_host();
+        let now_ts = now();
+        let base = Peer {
+            name: "p".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: now_ts,
+            pid: None,
+            host: this_host.clone(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
+            client_session: String::new(),
+        };
+        // 1. Session-key match wins even when the row would read stale.
+        let keyed = Peer {
+            client_session: "sid-A".into(),
+            last_seen: now_ts - 10_000_000,
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&keyed, "sid-A", None, &this_host, now_ts),
+            RegisterConflict::SameSession
+        );
+        // 2. Same live client pid on this host → ours (sid rotated on resume).
+        let ours = Peer {
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(
+                &ours,
+                "sid-NEW",
+                Some(std::process::id() as i64),
+                &this_host,
+                now_ts
+            ),
+            RegisterConflict::SameSession
+        );
+        // 3. Past the TTL window → Reusable (name continuity on restart).
+        let stale = Peer {
+            last_seen: now_ts - 10_000_000,
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&stale, "sid-B", Some(1234), &this_host, now_ts),
+            RegisterConflict::Reusable
+        );
+        // 4. Recent but same-host DEAD pid → Reusable (the probe sees the gap).
+        let dead = Peer {
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&dead, "sid-B", None, &this_host, now_ts),
+            RegisterConflict::Reusable
+        );
+        // 5. Recent + unknown pid → LiveOther (fail toward NOT stealing).
+        assert_eq!(
+            registration_conflict(&base, "sid-B", Some(42), &this_host, now_ts),
+            RegisterConflict::LiveOther
+        );
+        // 6. Recent remote row → LiveOther (never pid-probed; fail open).
+        let remote = Peer {
+            host: format!("{this_host}-elsewhere"),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&remote, "sid-B", None, &this_host, now_ts),
+            RegisterConflict::LiveOther
+        );
+    }
+
+    /// WL-084 ancestry classifier: skips transient wrapper comms, returns the
+    /// first long-lived ancestor, stops at pid 1, and maps an empty chain
+    /// (non-Linux / walk failure) to `None`.
+    #[test]
+    fn first_longlived_ancestor_skips_wrappers_and_stops_at_init() {
+        let chain = |v: &[(i64, &str)]| {
+            v.iter()
+                .map(|(p, c)| (*p, c.to_string()))
+                .collect::<Vec<(i64, String)>>()
+        };
+        // Direct-exec hook: the parent IS the client.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(42, "claude")])),
+            Some(42)
+        );
+        // sh -c wrapper → skip to the node/claude ancestor.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(7, "bash"), (42, "node")])),
+            Some(42)
+        );
+        // rtk proxy under sh under claude.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(5, "rtk"), (7, "sh"), (42, "claude")])),
+            Some(42)
+        );
+        // Everything transient up to init → None (TTL fallback).
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(7, "bash"), (1, "systemd")])),
+            None
+        );
+        assert_eq!(first_longlived_ancestor(&[]), None);
     }
 
     /// `sanitize_tag` is lossy-but-total: it strips control chars, truncates to
@@ -7262,6 +7655,7 @@ mod tests {
                 description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
             // Determinism: two evaluations of the same inputs agree.
@@ -7323,6 +7717,7 @@ mod tests {
                 "wt-1",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -7346,6 +7741,7 @@ mod tests {
             "(main)",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -7418,6 +7814,7 @@ mod tests {
                 "(main)",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -7444,6 +7841,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -7516,6 +7914,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let n = s2.get_peer("new").unwrap().unwrap();
@@ -7598,6 +7997,7 @@ mod tests {
             "wt-9",
             "default",
             None,
+            "",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -7690,7 +8090,7 @@ mod tests {
         let s = mem();
         let cert_p = s
             .register_peer_full(
-                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None, "",
             )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
@@ -7711,6 +8111,7 @@ mod tests {
             "",
             "team-a",
             Some(&cert_p),
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -7720,7 +8121,7 @@ mod tests {
         );
         // An invalid circle at the seam falls back to the default circle.
         s.register_peer_full(
-            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm", None,
+            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm", None, "",
         )
         .unwrap();
         assert_eq!(s.get_peer("q").unwrap().unwrap().circle, "default");
@@ -7732,11 +8133,11 @@ mod tests {
     fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         // a claims (no contest) ⇒ Claimed.
@@ -7776,11 +8177,11 @@ mod tests {
     fn list_peers_in_circle_scopes() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c2", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c2", None, "",
         )
         .unwrap();
         assert_eq!(s.list_peers_in_circle(Some("c1")).unwrap().len(), 1);
@@ -7803,7 +8204,7 @@ mod tests {
         let path = dir.join("orch.db");
         let s = SqliteStore::open(&path).unwrap();
         s.register_peer_full(
-            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
@@ -7857,6 +8258,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -7950,6 +8352,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
         // same-host + live pid (our own) => AliveLocal.
@@ -8141,6 +8544,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         }
@@ -8153,7 +8557,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
         );
         assert!(wr.is_err(), "a write through a read-only handle must error");
         let send = ro.send("a", "b", None, "x", None, None);
@@ -8184,14 +8588,14 @@ mod tests {
         let local = SqliteStore::open(&local_path).unwrap();
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .unwrap();
         {
             let foreign = SqliteStore::open(&foreign_path).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
                 )
                 .unwrap();
         }
@@ -10144,6 +10548,7 @@ mod tests {
             "wt",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();
@@ -10188,6 +10593,7 @@ mod tests {
             "wt",
             "default",
             None,
+            "",
         );
         assert!(
             bare.is_err(),
@@ -10215,6 +10621,7 @@ mod tests {
                 "wt",
                 "default",
                 stored.as_deref(),
+                "",
             )
             .expect("self-cert fallback re-registration is idempotent");
         assert_eq!(returned, minted, "re-register preserves the existing cert");
@@ -10238,6 +10645,7 @@ mod tests {
             "wt",
             "default",
             Some("deadbeef"),
+            "",
         );
         assert!(
             takeover.is_err(),
@@ -10323,6 +10731,7 @@ mod tests {
             description_ts: ts,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let ttl = crate::model::DESCRIPTION_TTL_SECS;
         // Exactly at the TTL boundary => expired (>=).
@@ -10420,6 +10829,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let liveness = s.peer_liveness(&p).unwrap();
         assert_eq!(

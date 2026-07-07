@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased] — feat: collision-proof per-session identity (WL-084)
+
+- Every agent session now launches with a unique mesh identity. The SessionStart
+  hook classifies a same-name registration (`RegisterConflict`): a row owned by
+  THIS launcher session (matching `session_id` key or live client pid) is
+  updated in place; a dead/stale row is reclaimed (name continuity across
+  restarts); a row held by another LIVE session is **never stolen** — the new
+  session registers under a deterministic `name-2`/`name-3` alias instead.
+  Pre-WL-084, the second same-basename session silently re-bound the first
+  one's pane and stole its messages.
+- New `peers.client_session` column (both backends, idempotent migration):
+  the launcher's per-session id (Claude Code hook `session_id`), so every hook
+  event of a session resolves to the SAME row even when the alias was
+  uniquified — prompt/stop drains now deliver the right inbox by key, and a
+  key-resolved identity counts as explicit (safe to mark read). Empty keys
+  preserve the stored mapping (CLI/spawn callers can't wipe it). Surfaced as
+  `client_session` in `peers --json`.
+- SessionStart announces the assigned identity on stdout (context injection)
+  and best-effort appends `export WEAVE_SESSION='<name>'` to `$CLAUDE_ENV_FILE`
+  so CLI sends from inside the session resolve the same name.
+- The MCP server lazily re-pins a GUESSED default identity to the row owned by
+  its own client process (`serve` gained `me_default_is_guess`), so MCP tools
+  agree with the hooks even when the server boots before SessionStart.
+
+## [Unreleased] — fix: hook presence tracked the dying hook process (WL-084)
+
+- `weave hook session` stored its OWN pid, which exits milliseconds later —
+  every hook-registered peer read `[stale] process_dead` moments after
+  registration. Presence now tracks the first long-lived ancestor of the hook
+  (the `claude`/agent client process) via a dependency-free `/proc` ancestry
+  walk (`WEAVE_CLIENT_PID` overrides; non-Linux falls back to TTL presence).
+
 ## [Unreleased] — fix: ignore exited zellij sessions in liveness
 
 - Fixed zellij liveness detection so `zellij list-sessions` rows marked

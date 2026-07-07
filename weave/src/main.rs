@@ -5954,8 +5954,15 @@ fn main() -> Result<()> {
         }
 
         Cmd::Mcp { session } => {
+            let session = session.filter(|s| !s.is_empty());
+            // WL-084: an identity from --session or config/$WEAVE_SESSION is
+            // PINNED (deliberate); anything derived from the cwd is a GUESS the
+            // server may lazily re-pin to this session's own registered row
+            // (see `serve` — the row can appear after MCP boot, and a guessed
+            // basename may name a sibling session after auto-uniquify).
+            let pinned =
+                session.is_some() || cfg.session.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
             let def = session
-                .filter(|s| !s.is_empty())
                 .or_else(|| cfg.session.clone())
                 // MCP stdio mode has no per-call `--from`/`--me` flag, so without this it
                 // left the server identity *unset* and every tool errored with
@@ -5987,6 +5994,7 @@ fn main() -> Result<()> {
             mcp::serve(
                 store,
                 def,
+                !pinned,
                 nudge_tpl.as_deref(),
                 extra_dbs,
                 pull,
@@ -7157,6 +7165,10 @@ fn main() -> Result<()> {
                             "name": p.name, "mux": p.mux, "target": p.target,
                             "session_id": model::peer_session_id(p),
                             "session_id_basis": model::peer_session_id_basis(p),
+                            // WL-084: which launcher session owns this row
+                            // ('' = unknown/legacy) — the ops surface for
+                            // debugging identity collisions and takeovers.
+                            "client_session": p.client_session,
                             "socket": p.socket, "cwd": p.cwd,
                             "last_seen": p.last_seen,
                             "pid": p.pid, "host": p.host,
@@ -7280,6 +7292,7 @@ fn main() -> Result<()> {
                     &tags.worktree_id,
                     &cfg.circle(),
                     None,
+                    "",
                 ) {
                     eprintln!("[weave] sessions watch self-refresh skipped (non-fatal): {e}");
                 }
@@ -7520,6 +7533,7 @@ fn main() -> Result<()> {
                     &tags.worktree_id,
                     &cfg.circle(),
                     None,
+                    "",
                 ) {
                     eprintln!("[weave] scan self-refresh skipped (non-fatal): {e}");
                 }
@@ -7699,6 +7713,7 @@ fn main() -> Result<()> {
                 &tags.worktree_id,
                 &cfg.circle(),
                 None,
+                "",
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -7757,6 +7772,7 @@ fn main() -> Result<()> {
                 &tags.worktree_id,
                 &cfg.circle(),
                 cert,
+                "",
             )?;
             let tgt = if t.id.is_empty() {
                 "-".to_string()
@@ -7891,6 +7907,7 @@ fn main() -> Result<()> {
                     "",
                     &circle,
                     Some(cert.as_str()),
+                    "",
                 )?;
             }
             let tgt = if outcome.target.is_empty() {
@@ -9804,6 +9821,11 @@ fn run_hook_responder_best_effort(store: &dyn Store, cfg: &Config, me: &str, eve
     }
 }
 
+/// WL-084: how many deterministic `-N` aliases the session hook probes before
+/// falling back to a session-key/pid-salted name. Bounds hook latency (each try
+/// is one indexed row lookup) while comfortably covering real fleets.
+const MAX_UNIQUIFY_TRIES: u32 = 16;
+
 fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -9824,13 +9846,37 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
         }
     };
     let cwd = v.get("cwd").and_then(|x| x.as_str());
-    let me = resolve_me(None, cwd, cfg);
+    // WL-084: the host's per-session id — Claude Code sends `session_id` in
+    // EVERY hook payload. Empty for hosts that send none; every WL-084 path
+    // degrades to the pre-WL-084 behavior on empty.
+    let sid = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let mut me = resolve_me(None, cwd, cfg);
 
     // An identity is "explicit" (trustworthy) when it comes from config/$WEAVE_SESSION
     // or from a `cwd` the payload actually supplied — NOT from basename(current_dir()),
     // which in a hook is not guaranteed to be the project dir.
-    let explicit_identity = cfg.session.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-        || (payload_ok && cwd.is_some());
+    let cfg_explicit = cfg.session.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+    let mut explicit_identity = cfg_explicit || (payload_ok && cwd.is_some());
+    // WL-084: a peer row keyed to THIS launcher session overrides any cwd
+    // guess — it is the name this session actually registered under (possibly
+    // auto-uniquified at SessionStart), so a same-basename sibling session can
+    // no longer drain or re-register another session's row. Config stays
+    // strongest (the operator's explicit choice); a lookup miss/failure
+    // degrades to the guess. `name_is_pinned` records that the NAME itself is
+    // authoritative (config or own-row) — only a pure basename guess may be
+    // auto-uniquified by the `session` arm below.
+    let mut name_is_pinned = cfg_explicit;
+    if !cfg_explicit && !sid.is_empty() {
+        if let Ok(Some(row)) = store.get_peer_by_client_session(sid) {
+            me = row.name;
+            explicit_identity = true;
+            name_is_pinned = true;
+        }
+    }
 
     match event {
         "session" => {
@@ -9846,6 +9892,14 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             let env_cert = std::env::var("WEAVE_BIRTH_CERT")
                 .ok()
                 .filter(|s| !s.is_empty());
+            // WL-084: presence tracks the long-lived CLIENT process (the
+            // `claude`/agent ancestor of this hook), never the hook process
+            // itself — the hook exits in milliseconds, and storing its pid made
+            // every hook-registered peer read `process_dead` moments after
+            // SessionStart. `None` (walk failed / non-Linux) falls back to TTL
+            // presence, the same degradation as an unknown pid.
+            let client_pid = store::client_pid();
+            let this_host = config::this_host();
             // SessionStart re-fires on every restart, so an already-registered
             // peer holds a minted cert. Mirror `attach`: fall back to our OWN
             // stored cert so re-registration is idempotent for the peer owner
@@ -9854,26 +9908,139 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // precedence; identity-takeover protection is unchanged — a
             // *mismatched* supplied cert still hard-bails inside
             // register_peer_full, and a brand-new peer still mints fresh.
-            let stored_cert = store.get_birth_cert(&me)?;
-            let cert = env_cert.as_deref().or(stored_cert.as_deref());
+            //
+            // WL-084: that stored-cert fallback is safe ONLY for a name we own
+            // (config/$WEAVE_SESSION, or our own session-keyed row) or a
+            // dead/stale row (name continuity across restarts). For a GUESSED
+            // basename colliding with another LIVE session's row it was the
+            // silent-takeover bug: the second session re-bound the first one's
+            // pane and stole its messages. Classify the conflict and register
+            // under a deterministic `-N` alias instead of stealing.
+            let (reg_name, supplied_cert): (String, Option<String>) = if name_is_pinned {
+                let stored = store.get_birth_cert(&me)?;
+                (me.clone(), env_cert.clone().or(stored))
+            } else {
+                match store.get_peer(&me)? {
+                    None => (me.clone(), env_cert.clone()),
+                    Some(existing) => match store::registration_conflict(
+                        &existing,
+                        sid,
+                        client_pid,
+                        &this_host,
+                        model::now(),
+                    ) {
+                        store::RegisterConflict::SameSession
+                        | store::RegisterConflict::Reusable => {
+                            let stored = store.get_birth_cert(&me)?;
+                            (me.clone(), env_cert.clone().or(stored))
+                        }
+                        store::RegisterConflict::LiveOther => {
+                            // Deterministic `-N` scan; a dead suffixed row is
+                            // reclaimed (its stored cert re-presented), a live
+                            // foreign one is skipped. Fresh candidates mint.
+                            let mut pick: Option<(String, Option<String>)> = None;
+                            for n in 2..=MAX_UNIQUIFY_TRIES {
+                                let cand = model::suffixed_name(&me, n, store::MAX_IDENT);
+                                match store.get_peer(&cand)? {
+                                    None => {
+                                        pick = Some((cand, None));
+                                        break;
+                                    }
+                                    Some(row) => match store::registration_conflict(
+                                        &row,
+                                        sid,
+                                        client_pid,
+                                        &this_host,
+                                        model::now(),
+                                    ) {
+                                        store::RegisterConflict::SameSession
+                                        | store::RegisterConflict::Reusable => {
+                                            let stored = store.get_birth_cert(&cand)?;
+                                            pick = Some((cand, stored));
+                                            break;
+                                        }
+                                        store::RegisterConflict::LiveOther => {}
+                                    },
+                                }
+                            }
+                            pick.unwrap_or_else(|| {
+                                // Pathological pile-up (> MAX_UNIQUIFY_TRIES live
+                                // same-basename sessions): salt with the session
+                                // key or client pid — still deterministic per
+                                // session, practically collision-free.
+                                let salt: String = if !sid.is_empty() {
+                                    sid.chars()
+                                        .filter(|c| c.is_ascii_alphanumeric())
+                                        .take(6)
+                                        .collect()
+                                } else {
+                                    client_pid
+                                        .unwrap_or_else(|| std::process::id() as i64)
+                                        .to_string()
+                                };
+                                let base: String = me
+                                    .chars()
+                                    .take(store::MAX_IDENT.saturating_sub(salt.chars().count() + 1))
+                                    .collect();
+                                (format!("{base}-{salt}"), None)
+                            })
+                        }
+                    },
+                }
+            };
             let cert = store.register_peer_full(
-                &me,
+                &reg_name,
                 t.mux.as_str(),
                 &t.id,
                 &t.socket,
                 cwd,
-                Some(std::process::id() as i64),
-                &config::this_host(),
+                client_pid,
+                &this_host,
                 &tags.repo,
                 &tags.branch,
                 &tags.worktree_id,
                 &cfg.circle(),
-                cert,
+                supplied_cert.as_deref(),
+                sid,
             )?;
+            if reg_name != me {
+                eprintln!(
+                    "[weave] '{me}' is held by another live session; registered as '{reg_name}' (WL-084 auto-uniquify)"
+                );
+            }
             eprintln!(
-                "[weave] registered peer '{me}' [{}] (birth-cert: {cert})",
+                "[weave] registered peer '{reg_name}' [{}] (birth-cert: {cert})",
                 t.mux.as_str()
             );
+            // WL-084: tell the AGENT its mesh identity — SessionStart stdout is
+            // added to the model context, so the session learns the exact name
+            // peers must address and the name it must pass itself when the
+            // alias was auto-uniquified.
+            println!(
+                "[weave] mesh identity: '{reg_name}' (peers address you as '{reg_name}'; use --from '{reg_name}' or WEAVE_SESSION={reg_name} for CLI sends)"
+            );
+            // Best-effort: pin the identity for this session's subsequent shell
+            // tool calls so CLI `weave send` resolves the SAME (possibly
+            // uniquified) name. CLAUDE_ENV_FILE is Claude-Code-specific and
+            // sometimes absent; any failure is non-fatal by design. Skipped
+            // when config/$WEAVE_SESSION already pins the name.
+            if !cfg_explicit {
+                if let Ok(envf) = std::env::var("CLAUDE_ENV_FILE") {
+                    if !envf.trim().is_empty() {
+                        use std::io::Write;
+                        let quoted = reg_name.replace('\'', "'\\''");
+                        let line = format!("export WEAVE_SESSION='{quoted}'\n");
+                        let write = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(envf.trim())
+                            .and_then(|mut f| f.write_all(line.as_bytes()));
+                        if let Err(e) = write {
+                            eprintln!("[weave] CLAUDE_ENV_FILE append failed (non-fatal): {e}");
+                        }
+                    }
+                }
+            }
             // S2 — opportunistic retention sweep. Best-effort: a GC failure must
             // never sink the session hook (which also drives presence/registration),
             // so errors are reported and swallowed. A configured retention of 0
@@ -9894,7 +10061,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // precedent). UPDATE-only on the caller's own row — not gated on
             // `explicit_identity` because a guessed name worst-case touches 0 rows
             // (it cannot consume an inbox the way read-marking can).
-            set_turn_state_best_effort(store, &me, model::TurnState::PendingFirstTurn);
+            set_turn_state_best_effort(store, &reg_name, model::TurnState::PendingFirstTurn);
         }
         // UserPromptSubmit: Claude Code injects this hook's stdout into the model
         // as additionalContext, so the printed messages are actually delivered.
@@ -10657,6 +10824,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let cases: &[(&str, Option<i64>, i64)] = &[
             ("h1", None, now),                               // same host, recent, no pid
