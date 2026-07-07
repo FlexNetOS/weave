@@ -15823,3 +15823,251 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
         }
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// WL-084 — collision-proof per-session identity.
+//
+// Every test pins WEAVE_CLIENT_PID explicitly: inside `cargo test` the hook's
+// ancestry walk would otherwise resolve the SAME test-runner process for every
+// fake session, and the conflict classifier would (correctly) treat them as
+// one session. Pid `1` doubles as "a different, always-alive client";
+// `999999999` as "a dead client" (beyond any real pid_max).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Two DIFFERENT live sessions whose cwds share a basename must NOT share a
+/// peer row: the second registers under the deterministic `-2` alias, and each
+/// row carries its own launcher-session key.
+#[test]
+fn wl084_same_basename_live_sessions_get_distinct_identities() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let (ok, out_a, err_a) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wa/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "A failed: {err_a}");
+    assert!(
+        out_a.contains("mesh identity: 'proj'"),
+        "A announces the base name on stdout (context injection): {out_a}"
+    );
+    let (ok, out_b, err_b) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wb/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    assert!(ok, "B failed: {err_b}");
+    assert!(
+        err_b.contains("registered as 'proj-2'"),
+        "B is auto-uniquified with a visible notice: {err_b}"
+    );
+    assert!(
+        out_b.contains("mesh identity: 'proj-2'"),
+        "B announces the uniquified name: {out_b}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        peers.contains("\"proj\"") && peers.contains("\"proj-2\""),
+        "two rows: {peers}"
+    );
+    assert!(
+        peers.contains("sid-A") && peers.contains("sid-B"),
+        "each row keeps its key: {peers}"
+    );
+}
+
+/// A re-fired SessionStart of the SAME session (same `session_id`) updates its
+/// own row in place — no `-2` alias, still exactly one row for the name.
+#[test]
+fn wl084_same_session_refire_is_idempotent() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let payload = r#"{"cwd":"/tmp/wr/proj","session_id":"sid-R"}"#;
+    let (ok, _o, e1) = run_hook_env(
+        &db,
+        "session",
+        payload,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "first: {e1}");
+    let (ok, out2, e2) = run_hook_env(
+        &db,
+        "session",
+        payload,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "refire: {e2}");
+    assert!(
+        out2.contains("mesh identity: 'proj'"),
+        "refire keeps the base name: {out2}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2"),
+        "no alias minted on refire: {peers}"
+    );
+}
+
+/// A DEAD same-basename row is reclaimed under the same name (name continuity
+/// across restarts), and the reclaiming session's key takes over the row.
+#[test]
+fn wl084_dead_row_is_reclaimed_under_same_name() {
+    let db = TestDb::new();
+    let (ok, _o, e1) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wd/proj","session_id":"sid-OLD"}"#,
+        &[("WEAVE_CLIENT_PID", "999999999")],
+    );
+    assert!(ok, "old: {e1}");
+    let my_pid = std::process::id().to_string();
+    let (ok, out2, e2) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wd2/proj","session_id":"sid-NEW"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "new: {e2}");
+    assert!(
+        out2.contains("mesh identity: 'proj'"),
+        "dead row reclaimed, not aliased: {out2}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2"),
+        "no alias for a dead row: {peers}"
+    );
+    assert!(
+        peers.contains("sid-NEW") && !peers.contains("sid-OLD"),
+        "key taken over: {peers}"
+    );
+}
+
+/// The prompt drain of a uniquified session resolves its identity via the
+/// session key — it delivers ITS OWN inbox (the `-2` alias), never the base
+/// name's, even though its cwd basename still says the base name.
+#[test]
+fn wl084_prompt_drain_resolves_by_session_key() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wp/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wq/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj-2",
+            "--body",
+            "for the alias only",
+        ],
+    );
+    // B (the alias) drains it…
+    let (ok, out_b, err_b) = run_hook_env(
+        &db,
+        "prompt",
+        r#"{"cwd":"/tmp/wq/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    assert!(ok, "B prompt: {err_b}");
+    assert!(
+        out_b.contains("for the alias only"),
+        "the alias session receives its message: {out_b}"
+    );
+    // …and A (the base name) never sees it.
+    let (ok, out_a, err_a) = run_hook_env(
+        &db,
+        "prompt",
+        r#"{"cwd":"/tmp/wp/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "A prompt: {err_a}");
+    assert!(
+        !out_a.contains("for the alias only"),
+        "the base-name session must not drain the alias inbox: {out_a}"
+    );
+}
+
+/// SessionStart appends `export WEAVE_SESSION='<name>'` to $CLAUDE_ENV_FILE
+/// (best-effort identity pinning for the session's shell tool calls), and
+/// skips the write when config/$WEAVE_SESSION already pins the name.
+#[test]
+fn wl084_session_hook_pins_identity_into_claude_env_file() {
+    let db = TestDb::new();
+    let envf = std::env::temp_dir().join(format!("weave-envfile-{}", std::process::id()));
+    let _ = std::fs::remove_file(&envf);
+    let my_pid = std::process::id().to_string();
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/we/proj","session_id":"sid-E"}"#,
+        &[
+            ("WEAVE_CLIENT_PID", my_pid.as_str()),
+            ("CLAUDE_ENV_FILE", envf.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "session: {e}");
+    let written = std::fs::read_to_string(&envf).expect("env file written");
+    assert!(
+        written.contains("export WEAVE_SESSION='proj'"),
+        "identity export appended: {written}"
+    );
+    // Explicit WEAVE_SESSION: no export line is appended (operator's pin wins).
+    let envf2 = std::env::temp_dir().join(format!("weave-envfile2-{}", std::process::id()));
+    let _ = std::fs::remove_file(&envf2);
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/we/proj","session_id":"sid-F"}"#,
+        &[
+            ("WEAVE_CLIENT_PID", "1"),
+            ("WEAVE_SESSION", "pinned-name"),
+            ("CLAUDE_ENV_FILE", envf2.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "pinned session: {e}");
+    assert!(
+        !envf2.exists(),
+        "no env-file write under an explicit WEAVE_SESSION"
+    );
+    let _ = std::fs::remove_file(&envf);
+}
+
+/// Hook-registered presence tracks the CLIENT process, not the hook process:
+/// with a live client pid the fresh row reads alive (`process_alive=true`),
+/// never `stale_reason=process_dead` (the pre-WL-084 bug).
+#[test]
+fn wl084_presence_tracks_client_process_not_hook_process() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wl/proj","session_id":"sid-L"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "session: {e}");
+    let peers = run_ok(&db, &["peers"]);
+    assert!(
+        peers.contains("process_alive=true"),
+        "presence keys on the live client pid: {peers}"
+    );
+    assert!(
+        !peers.contains("stale_reason=process_dead"),
+        "the dying-hook-pid bug must not resurface: {peers}"
+    );
+}

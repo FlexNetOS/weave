@@ -178,6 +178,17 @@ weave pull --me envctl               # pull + commit intents from your pull_from
 Identity resolution: `--from/--me/--name` > `$WEAVE_SESSION` > basename of cwd.
 Send `--to all` (or `*`) to broadcast; read state is tracked per-reader.
 
+**Every session gets a unique identity (WL-084).** Hooks resolve identity as
+config > *session-key row* > basename guess: the SessionStart hook stores the
+host's per-session id (Claude Code `session_id`) on the peer row, and a guessed
+basename that collides with another **live** session auto-registers as
+`name-2`/`name-3` instead of stealing the row (a dead row is still reclaimed, so
+restarting in the same directory keeps its name). The hook announces the
+assigned name into the session's context and exports `WEAVE_SESSION` via
+`$CLAUDE_ENV_FILE` (best-effort), and the MCP server re-pins its default
+identity to the row owned by its own client process — so hooks, MCP, and CLI
+agree even when six teammates share one checkout.
+
 `weave attach` captures the current pane and upserts **your own** peer row, so a
 session that started outside a mux (or before `weave setup`) becomes injectable
 without a restart. `weave connect --to <peer>` reports a capability verdict —

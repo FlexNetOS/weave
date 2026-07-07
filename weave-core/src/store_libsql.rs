@@ -51,8 +51,9 @@ use crate::store::{
     merge_peer_views, merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject,
     sanitize_tag, store_label, validate_job_patch, validate_job_spec, AskManyOutcome, Origin,
     PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo, SessionView, Store,
-    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
-    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
+    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_IDENT, MAX_KEYS_PER_IDENT,
+    MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -122,7 +123,8 @@ const SCHEMA: &[&str] = &[
         description    TEXT NOT NULL DEFAULT '',
         description_ts INTEGER NOT NULL DEFAULT 0,
         birth_cert     TEXT,
-        contact_policy TEXT NOT NULL DEFAULT 'open'
+        contact_policy TEXT NOT NULL DEFAULT 'open',
+        client_session TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,6 +518,7 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         description_ts: r.get::<i64>(15)?,
         birth_cert: r.get::<Option<String>>(16).ok().flatten(),
         contact_policy: r.get::<String>(17).unwrap_or_else(|_| "open".to_string()),
+        client_session: r.get::<String>(18).unwrap_or_default(),
     })
 }
 
@@ -744,6 +747,23 @@ impl LibsqlStore {
                 )
                 .await
                 .context("adding birth_cert column")?;
+            }
+            // Migration (WL-084): launcher-session key for collision-proof
+            // identity. '' == unknown, matching `Peer::client_session`'s empty
+            // default (mirrors the sqlite migrate). Constant DDL, idempotent.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='client_session'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN client_session TEXT NOT NULL DEFAULT ''",
+                    (),
+                )
+                .await
+                .context("adding client_session column")?;
             }
             // Migration (P5): the wake-hook watermark table. Tracks the last
             // unread message id that triggered a block for each reader. Created
@@ -2146,6 +2166,7 @@ impl Store for LibsqlStore {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
@@ -2155,6 +2176,8 @@ impl Store for LibsqlStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // WL-084: bound the launcher-session key like a tag (mirrors sqlite).
+        let client_session = sanitize_tag(client_session, MAX_IDENT);
         let circle = if crate::model::circle_valid(circle) {
             circle.to_string()
         } else {
@@ -2189,8 +2212,8 @@ impl Store for LibsqlStore {
                         None => mint_birth_cert()?,
                     };
                     tx.execute(
-                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert, client_session)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                         params(vec![
                             name.into(),
                             mux.into(),
@@ -2205,16 +2228,19 @@ impl Store for LibsqlStore {
                             worktree_id.into(),
                             circle.into(),
                             new_cert.clone().into(),
+                            client_session.clone().into(),
                         ]),
                     )
                     .await?;
                     new_cert
                 }
                 Some(None) => {
+                    // client_session preserve-on-empty (mirrors sqlite; trait doc).
                     let new_cert = mint_birth_cert()?;
                     tx.execute(
-                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
-                         WHERE name=?13",
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12,
+                                          client_session = CASE WHEN ?13 = '' THEN client_session ELSE ?13 END
+                         WHERE name=?14",
                         params(vec![
                             mux.into(),
                             target.into(),
@@ -2228,6 +2254,7 @@ impl Store for LibsqlStore {
                             worktree_id.into(),
                             circle.into(),
                             new_cert.clone().into(),
+                            client_session.clone().into(),
                             name.into(),
                         ]),
                     )
@@ -2242,9 +2269,11 @@ impl Store for LibsqlStore {
                     } else {
                         anyhow::bail!("peer '{name}' already registered; provide --cert to re-register");
                     }
+                    // client_session preserve-on-empty (mirrors sqlite; trait doc).
                     tx.execute(
-                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
-                         WHERE name=?12",
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11,
+                                          client_session = CASE WHEN ?12 = '' THEN client_session ELSE ?12 END
+                         WHERE name=?13",
                         params(vec![
                             mux.into(),
                             target.into(),
@@ -2257,6 +2286,7 @@ impl Store for LibsqlStore {
                             branch.into(),
                             worktree_id.into(),
                             circle.into(),
+                            client_session.clone().into(),
                             name.into(),
                         ]),
                     )
@@ -2266,6 +2296,29 @@ impl Store for LibsqlStore {
             };
             tx.commit().await?;
             Ok(cert)
+        })
+    }
+
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        if client_session.is_empty() {
+            return Ok(None);
+        }
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE client_session=?1 ORDER BY last_seen DESC LIMIT 1",
+                    params(vec![client_session.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => {
+                    let mut p = row_to_peer(&r)?;
+                    crate::model::expire_description(&mut p, now());
+                    Ok(Some(p))
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -2293,7 +2346,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -2316,7 +2369,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -2372,7 +2425,7 @@ impl Store for LibsqlStore {
             let holders: Vec<Peer> = {
                 let mut it = tx
                     .query(
-                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
                         (),
                     )
                     .await?;
@@ -2431,7 +2484,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
                     (),
                 )
                 .await?;
@@ -4915,6 +4968,78 @@ mod tests {
         LibsqlStore::open(&cfg).unwrap()
     }
 
+    /// WL-084 (dual-backend parity): mirror of the sqlite backend's
+    /// `client_session_roundtrips_and_preserves_on_empty` — the launcher-session
+    /// key roundtrips, '' preserves, a non-empty key overwrites, and
+    /// `get_peer_by_client_session` never matches the empty key.
+    #[test]
+    fn client_session_roundtrips_and_preserves_on_empty_libsql() {
+        let s = mem();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%1",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            None,
+            "sid-A",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-A");
+        assert_eq!(
+            s.get_peer_by_client_session("sid-A").unwrap().unwrap().name,
+            "a"
+        );
+        let cert = s.get_birth_cert("a").unwrap();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%2",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_peer("a").unwrap().unwrap().client_session,
+            "sid-A",
+            "'' must mean preserve, not wipe"
+        );
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%3",
+            "",
+            Some("/x"),
+            Some(12),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "sid-B",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-B");
+        assert!(s.get_peer_by_client_session("sid-A").unwrap().is_none());
+        s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
+        assert!(s.get_peer_by_client_session("").unwrap().is_none());
+    }
+
     /// WL-047 (dual-backend parity): byte-identical mirror of the sqlite backend's
     /// `register_peer_full_binds_supplied_cert_else_mints` — the libsql new-peer
     /// INSERT must honor a SUPPLIED birth cert (persist verbatim) and mint when None.
@@ -4938,6 +5063,7 @@ mod tests {
                 "",
                 "default",
                 Some(&cert),
+                "",
             )
             .unwrap();
         assert_eq!(returned, cert, "register returns the supplied cert");
@@ -4949,7 +5075,7 @@ mod tests {
         // None path (backward-compat): a fresh peer mints its own distinct cert.
         let minted = s
             .register_peer_full(
-                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
             )
             .unwrap();
         assert!(check_birth_cert(&minted).is_ok(), "minted cert is valid");
@@ -6017,6 +6143,7 @@ mod tests {
                 "(main)",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -6042,6 +6169,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -6129,6 +6257,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
@@ -6203,7 +6332,7 @@ mod tests {
         let s = mem();
         let cert = s
             .register_peer_full(
-                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None, "",
             )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
@@ -6222,6 +6351,7 @@ mod tests {
             "",
             "team-a",
             Some(&cert),
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -6237,11 +6367,11 @@ mod tests {
     fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         assert!(matches!(
@@ -6277,7 +6407,7 @@ mod tests {
     fn orchestrator_status_present_and_absent() {
         let s = mem();
         s.register_peer_full(
-            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
@@ -6374,6 +6504,7 @@ mod tests {
             "wt-9",
             "default",
             None,
+            "",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -6428,6 +6559,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -6449,6 +6581,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -6472,6 +6605,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -6494,6 +6628,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -6536,6 +6671,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let local = s.get_peer("local").unwrap().unwrap();
@@ -6543,7 +6679,7 @@ mod tests {
 
         // same-host + null pid + recent => AliveLocal (TTL fallback).
         s.register_peer_full(
-            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None,
+            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None, "",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -6564,6 +6700,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -6583,6 +6720,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let empty = s.get_peer("empty").unwrap().unwrap();
@@ -6610,6 +6748,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -6689,6 +6828,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         }
@@ -6707,7 +6847,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
         );
         assert!(
             wr.is_err(),
@@ -6785,6 +6925,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
             rw.send("seed", "seed", None, "hi", None, None).unwrap();
@@ -6822,7 +6963,7 @@ mod tests {
         assert_trapped(
             "register_peer_full",
             ro.register_peer_full(
-                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .map(|_| ()),
         );
@@ -6874,7 +7015,7 @@ mod tests {
         };
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .unwrap();
         {
@@ -6886,7 +7027,7 @@ mod tests {
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
                 )
                 .unwrap();
         }
@@ -7775,6 +7916,7 @@ mod tests {
             "wt",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();
@@ -7982,6 +8124,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         assert_eq!(
             s.peer_liveness(&p).unwrap(),

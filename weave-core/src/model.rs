@@ -1679,6 +1679,27 @@ pub struct Peer {
     /// Additive + backward-compatible: pre-existing rows read back as "open".
     #[serde(default = "default_contact_policy")]
     pub contact_policy: String,
+    /// Launcher-session key (WL-084): the coding-agent host's per-session id
+    /// (e.g. the Claude Code hook payload's `session_id`), captured at hook
+    /// registration so every hook event of one session resolves to the SAME
+    /// row even when the alias was auto-uniquified. `""` == unknown (legacy
+    /// row / host without a session id). Additive + backward-compatible: DBs
+    /// created before the `client_session` column migration read back as
+    /// `""`, and `#[serde(default)]` keeps older JSON payloads deserializable.
+    #[serde(default)]
+    pub client_session: String,
+}
+
+/// Deterministic collision suffix for auto-uniquified session names (WL-084):
+/// `base-<n>`, truncating `base` on a char boundary so the whole result stays
+/// within `max_chars` (the store's identity cap). Pure — the uniquify LOOP
+/// (probe candidate rows, classify, pick) lives with the hook glue; this owns
+/// only the name arithmetic.
+pub fn suffixed_name(base: &str, n: u32, max_chars: usize) -> String {
+    let suffix = format!("-{n}");
+    let budget = max_chars.saturating_sub(suffix.chars().count()).max(1);
+    let head: String = base.chars().take(budget).collect();
+    format!("{head}{suffix}")
 }
 
 /// Daemon-tier liveness classification (v0.2 presence seam).  Three tiers:
@@ -2083,6 +2104,27 @@ mod tests {
                 "alias {alias:?} missing from broadcast_sql()"
             );
         }
+    }
+
+    /// WL-084 `suffixed_name`: appends `-N`, truncates the base on a char
+    /// boundary so the result respects the identity cap, and survives
+    /// multibyte bases and degenerate caps without panicking.
+    #[test]
+    fn suffixed_name_appends_and_truncates_on_char_boundary() {
+        assert_eq!(suffixed_name("proj", 2, 128), "proj-2");
+        // Over-cap ASCII base: result is exactly `max` chars and keeps the suffix.
+        let long = "x".repeat(130);
+        let out = suffixed_name(&long, 12, 128);
+        assert_eq!(out.chars().count(), 128);
+        assert!(out.ends_with("-12"));
+        // Multibyte base truncates on CHAR boundaries (never mid-codepoint).
+        let uni = "ä".repeat(130);
+        let out = suffixed_name(&uni, 3, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with("-3"));
+        assert!(out.is_char_boundary(out.len()));
+        // Degenerate cap: at least one base char is always kept.
+        assert_eq!(suffixed_name("abc", 4, 1), "a-4");
     }
 
     /// The lifecycle machine permits ONLY the three legal forward edges; every
@@ -2651,6 +2693,7 @@ mod tests {
             description_ts: ts,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         }
     }
 
