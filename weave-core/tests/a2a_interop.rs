@@ -53,8 +53,7 @@ fn sample_intent() -> Intent {
 #[test]
 fn intent_serializes_to_a2a_message_object() {
     let intent = sample_intent();
-    let v: serde_json::Value =
-        serde_json::to_value(&intent).expect("Intent serializes to JSON");
+    let v: serde_json::Value = serde_json::to_value(&intent).expect("Intent serializes to JSON");
 
     // A2A v1.0 Message discriminator + role.
     assert_eq!(
@@ -125,7 +124,10 @@ fn a2a_message_deserializes_into_intent() {
     );
 
     let intent = parsed.unwrap();
-    assert_eq!(intent.from, "alice", "A2A-2: A2A metadata.from -> Intent.from");
+    assert_eq!(
+        intent.from, "alice",
+        "A2A-2: A2A metadata.from -> Intent.from"
+    );
     assert_eq!(intent.to, "bob", "A2A-2: A2A metadata.to -> Intent.to");
     assert_eq!(
         intent.body, "build is green",
@@ -150,8 +152,7 @@ fn a2a_message_deserializes_into_intent() {
 #[test]
 fn intent_frames_as_a2a_jsonrpc_request() {
     let intent = sample_intent();
-    let v: serde_json::Value =
-        serde_json::to_value(&intent).expect("Intent serializes to JSON");
+    let v: serde_json::Value = serde_json::to_value(&intent).expect("Intent serializes to JSON");
 
     assert_eq!(
         v.get("jsonrpc").and_then(|j| j.as_str()),
@@ -164,7 +165,9 @@ fn intent_frames_as_a2a_jsonrpc_request() {
         "A2A-3: outbound A2A frame must use method=\"message/send\""
     );
     assert!(
-        v.pointer("/params/message").map(|m| m.is_object()).unwrap_or(false),
+        v.pointer("/params/message")
+            .map(|m| m.is_object())
+            .unwrap_or(false),
         "A2A-3: A2A JSON-RPC request must wrap the Message under params.message"
     );
 }
