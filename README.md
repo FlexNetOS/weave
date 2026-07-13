@@ -191,10 +191,14 @@ agree even when six teammates share one checkout.
 
 `weave attach` captures the current pane and upserts **your own** peer row, so a
 session that started outside a mux (or before `weave setup`) becomes injectable
-without a restart. `weave connect --to <peer>` reports a capability verdict —
-`live` (a nudge can be delivered now), `registered but not alive` (queued for the
-recipient's next turn), or `not injectable` — and is **not** an error when a peer
-can't be live-nudged: its messages still arrive via the store on its next drain.
+without a restart. The one-shot CLI tracks its nearest long-lived client ancestor
+(or TTL presence when no ancestor can be resolved), never the exiting `attach`
+process itself. `weave connect --to <peer>` reports a capability verdict — `live`
+(a nudge can be delivered now), `live transport unavailable` (the mux executable
+is missing, untrusted, unlaunchable, or its probe times out), `registered but not
+alive` (queued for the recipient's next turn), or `not injectable` — and is **not**
+an error when a peer can't be live-nudged: its messages still arrive via the store
+on its next drain.
 
 `weave scan` is the "who's around, and where?" view. It first re-captures **your
 own** session's git tags and presence (owner-only — it never re-registers a
@@ -377,8 +381,9 @@ configured pulls and commits eligible intents in the same call.
 
 `weave_attach` adopts the calling session into the store without a restart (re-captures the
 current pane and upserts the caller's own peer row only). `weave_connect` reports the same
-live / registered-but-not-alive / not-injectable verdict as the CLI; only a non-existent
-peer is an error, so a queued delivery is reported with `isError:false`.
+live / transport-unavailable / registered-but-not-alive / not-injectable verdict as the
+CLI; only a non-existent peer is an error, so a queued delivery is reported with
+`isError:false`.
 
 `weave_scan` mirrors `weave scan`: it refreshes the **caller's own** row tags
 (owner-only-writes — never a foreign row), then returns the federated peer listing
@@ -637,7 +642,10 @@ self-registration. Kill is exact where the mux can address a pane, **coarse**
 Spawn is gated by two layers: the child program (`argv[0]`) must resolve inside
 weave's trusted directories, and the cwd must fall under the spawn allowlist
 (`spawn_allowed_dirs` / `WEAVE_SPAWN_DIRS`) — deny-by-default for the MCP/remote
-surface, warn-but-proceed for the operator-local CLI.
+surface, warn-but-proceed for the operator-local CLI. Trusted user tool roots
+include `$HOME/.cargo/bin`, `$HOME/.local/bin`, and both
+`$HOME/.nix-profile/{bin,toolbin}`; candidates must be executable regular files.
+`WEAVE_MUX_DIR` remains the explicit override for any other installation root.
 
 ## Human surfaces (`--features surfaces`)
 

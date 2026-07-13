@@ -257,11 +257,13 @@ takes no `inject` dependency).
 ### `inject.rs` — native injector
 
 The `Mux` enum, `Target { mux, id }`, environment detection, the pure
-per-mux command tables, and the runner. Detailed in §3. Also exposes the pure
-`capability(&Target) -> Capability` verdict (`Live` / `RegisteredNotAlive` /
-`NotInjectable`) composed from `injectable()` + the liveness probe — this is what
-`weave connect` / `weave_connect` report (§4). It adds no new spawn path: the
-probe is the existing fail-open `target_alive` and the verdict is a pure value.
+per-mux command tables, and the runner. Detailed in §3. Also exposes the
+`capability(&Target) -> Capability` verdict (`Live` / `TransportUnavailable` /
+`RegisteredNotAlive` / `NotInjectable`) composed from `injectable()`, trusted mux
+resolution, and the liveness probe — this is what `weave connect` /
+`weave_connect` report (§4). It adds no new spawn path: a bounded probe separates
+missing/unlaunchable transport from pane absence, while pane liveness retains the
+existing fail-open `target_alive` semantics.
 
 ### `mcp.rs` — MCP server
 
@@ -721,18 +723,23 @@ row **by session key first**, so a uniquified session drains its own inbox
 assigned name is announced on SessionStart stdout (context injection) and
 best-effort exported as `WEAVE_SESSION` via `$CLAUDE_ENV_FILE`; the MCP
 server lazily re-pins a guessed default to the row owned by its own client
-process. Presence stores the first **long-lived ancestor** of the hook
-process (`store::client_pid`, `/proc` walk, `WEAVE_CLIENT_PID` override) —
-never the hook's own dying pid.
+process. Presence stores the first **long-lived ancestor** of hook and one-shot
+CLI `attach` processes (`store::client_pid`, `/proc` walk, `WEAVE_CLIENT_PID`
+override) — never the dying helper process itself.
 
 **Connect handshake.** Before sending, a caller can probe reachability with
 `weave connect --to <peer>` / `weave_connect`. It looks up the peer, builds a
-`Target`, and reports the pure `inject::capability()` verdict — `Live`,
-`RegisteredNotAlive`, or `NotInjectable`. This **reuses the existing injector**
-(no new injector, no new spawn path): the verdict is computed from `injectable()`
-plus the fail-open liveness probe. A not-alive or non-injectable verdict is **not
-an error** — those messages still arrive via the recipient's next store drain;
-only a non-existent peer is an error.
+`Target`, and reports the `inject::capability()` verdict — `Live`,
+`TransportUnavailable`, `RegisteredNotAlive`, or `NotInjectable`. This **reuses
+the existing injector** (no new injector, no new spawn path): the verdict is
+computed from `injectable()`, trusted mux resolution, and a bounded read-only
+launch/liveness probe. An unavailable, not-alive, or non-injectable verdict is
+**not an error** — those messages still arrive via the recipient's next store
+drain; only a non-existent peer is an error. Trusted resolution requires an
+executable regular file (not merely `is_file()`), and `Live` additionally requires
+the current process to launch the probe successfully. Diagnostics keep the dimensions orthogonal:
+`TransportUnavailable` means `reachable=false` while pane liveness stays fail-open
+rather than being falsely classified absent.
 
 Send path (MCP `weave_send`, mirrored by the `weave send` CLI):
 

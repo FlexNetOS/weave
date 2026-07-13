@@ -3514,7 +3514,7 @@ fn peer_diagnostics(
         registered: true,
         process_expected,
         process_alive,
-        pane_alive: matches!(capability, inject::Capability::Live),
+        pane_alive: capability.pane_not_known_absent(),
         injectable: target.injectable(),
         reachable: matches!(capability, inject::Capability::Live),
         responsive_recently,
@@ -3524,6 +3524,7 @@ fn peer_diagnostics(
         stale_reason: peer_stale_reason(p, liveness, process_expected, process_alive, now_ts),
         inject_probe: match capability {
             inject::Capability::Live => "live",
+            inject::Capability::TransportUnavailable => "transport_unavailable",
             inject::Capability::RegisteredNotAlive => "absent",
             inject::Capability::NotInjectable => "not_injectable",
         },
@@ -3590,6 +3591,7 @@ fn peer_status_token_from_dimensions(
     }
     match capability {
         inject::Capability::Live => "reachable",
+        inject::Capability::TransportUnavailable => "transport-unavailable",
         inject::Capability::RegisteredNotAlive => "dead",
         inject::Capability::NotInjectable => {
             if matches!(liveness, store::Liveness::Stale) {
@@ -7752,9 +7754,12 @@ fn main() -> Result<()> {
                     .map(|p| p.to_string_lossy().into_owned())
             });
             // Idempotent upsert (ON CONFLICT(name) DO UPDATE) under our own identity.
-            // Capture this process's PID + host so the adopted peer reflects real
-            // liveness (the whole point of zero-restart attach), plus the git tags.
+            // Track the nearest long-lived client ancestor, never this one-shot
+            // `weave attach` subprocess (it exits immediately and would make the
+            // newly adopted peer read stale on the very next command). A failed
+            // ancestry walk degrades to TTL presence via `None`.
             let tags = git_tags_for(cwd_val.as_deref());
+            let client_pid = store::client_pid();
             // If no --cert provided, try to reuse the stored cert so re-attach is
             // seamless for the peer owner (the common case).
             let stored_cert = store.get_birth_cert(&me)?;
@@ -7765,7 +7770,7 @@ fn main() -> Result<()> {
                 &t.id,
                 &t.socket,
                 cwd_val.as_deref(),
-                Some(std::process::id() as i64),
+                client_pid,
                 &config::this_host(),
                 &tags.repo,
                 &tags.branch,
@@ -7801,6 +7806,15 @@ fn main() -> Result<()> {
                         "connect '{to}': live [{}] {} — a live nudge can be delivered now",
                         t.mux.as_str(),
                         t.id
+                    );
+                }
+                inject::Capability::TransportUnavailable => {
+                    println!(
+                        "connect '{to}': live transport unavailable [{}] {} — {} could not be launched/probed from a trusted directory; \
+                         durable delivery remains queued and arrives on the recipient's next inbox drain",
+                        t.mux.as_str(),
+                        t.id,
+                        t.mux.binary()
                     );
                 }
                 inject::Capability::RegisteredNotAlive => {

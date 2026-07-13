@@ -1016,7 +1016,7 @@ fn resolve_trusted_program(prog: &str) -> Option<std::path::PathBuf> {
         // by directory, not by the symlink's destination. (On many distros a trusted
         // `/usr/bin/foo` is itself a symlink into `/usr/lib/...`; following it would
         // wrongly reject a legitimately trusted binary.)
-        if !p.is_file() {
+        if !is_executable_file(p) {
             return None;
         }
         let parent = std::fs::canonicalize(p.parent()?).ok()?;
@@ -1185,6 +1185,64 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetProbe {
+    Alive,
+    Absent,
+    TransportUnavailable,
+}
+
+/// Run the read-only mux probe and retain the distinction that the legacy bool
+/// [`target_alive`] intentionally erases: a missing/unlaunchable/timed-out local
+/// transport is not evidence that the pane is absent, but it also cannot support a
+/// [`Capability::Live`] promise.
+fn target_probe(target: &Target) -> TargetProbe {
+    if !target.injectable() {
+        // `target_alive` has always been advisory/fail-open for targets that cannot
+        // be injected. `capability` classifies this case before consulting the probe.
+        return TargetProbe::Alive;
+    }
+    let bin = target.mux.binary();
+    if !have(bin) {
+        return TargetProbe::TransportUnavailable;
+    }
+    let Some(cmd) = liveness_probe(target) else {
+        // Backends without a pane-existence query still need a real launchability
+        // check. `--version` is read-only; a non-zero exit still proves the OS
+        // launched the trusted program, while spawn/timeout failure cannot promise
+        // live transport.
+        let version = argv(&[bin, "--version"]);
+        return match run_capture(&version, INJECT_TIMEOUT) {
+            Ok(_) => TargetProbe::Alive,
+            Err(_) => TargetProbe::TransportUnavailable,
+        };
+    };
+    match target.mux {
+        Mux::Tmux => match run_bounded(&cmd, INJECT_TIMEOUT) {
+            Ok(true) => TargetProbe::Alive,
+            Ok(false) => TargetProbe::Absent,
+            Err(_) => TargetProbe::TransportUnavailable,
+        },
+        Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
+            match run_capture(&cmd, INJECT_TIMEOUT) {
+                Ok(Some(out)) => {
+                    if id_present(target.mux, &out, target.id.as_str()) {
+                        TargetProbe::Alive
+                    } else {
+                        TargetProbe::Absent
+                    }
+                }
+                // The program launched but returned no usable listing: preserve the
+                // historical fail-open pane verdict. A launch/timeout error is a
+                // transport failure and must not become `Capability::Live`.
+                Ok(None) => TargetProbe::Alive,
+                Err(_) => TargetProbe::TransportUnavailable,
+            }
+        }
+        Mux::Screen | Mux::ITerm2 | Mux::None => unreachable!("handled above"),
+    }
+}
+
 /// Best-effort liveness pre-check: is `target`'s pane/session still around?
 ///
 /// Used *opportunistically* — a `true` (or "no probe available") means "go
@@ -1194,49 +1252,32 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
 /// a missing mux binary, a probe error, or a timeout all return `true` so we
 /// never suppress a delivery just because the probe itself was unavailable.
 pub fn target_alive(target: &Target) -> bool {
-    let Some(cmd) = liveness_probe(target) else {
-        // No probe for this backend — don't gate; let inject try.
-        return true;
-    };
-    let bin = target.mux.binary();
-    if !have(bin) {
-        // Can't probe ⇒ don't suppress; inject() will surface a real error.
-        return true;
-    }
-    match target.mux {
-        // Exit-status probes: 0 ⇒ alive, non-zero ⇒ gone, error/timeout ⇒ assume alive.
-        Mux::Tmux => run_bounded(&cmd, INJECT_TIMEOUT).unwrap_or(true),
-        // Stdout-scan probes: the id must appear in the listing to count as alive,
-        // but any spawn/timeout failure leaves us unsure ⇒ assume alive. We match on
-        // a token/field boundary, never a raw substring, so an id like "2" does not
-        // spuriously match "12", a column header, or a timestamp digit run.
-        Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
-            match run_capture(&cmd, INJECT_TIMEOUT) {
-                Ok(Some(out)) => id_present(target.mux, &out, target.id.as_str()),
-                // Ran but produced nothing usable, or could not be run: don't gate.
-                Ok(None) | Err(_) => true,
-            }
-        }
-        // Unreachable (liveness_probe returned None for these), but be explicit.
-        Mux::Screen | Mux::ITerm2 | Mux::None => true,
-    }
+    !matches!(target_probe(target), TargetProbe::Absent)
 }
 
 /// The delivery capability of a target, as a structured verdict for the `connect`
-/// handshake. Composed purely from the existing [`Target::injectable`] and
-/// [`target_alive`] checks — it adds NO new injector or spawn path.
+/// handshake. Composed from [`Target::injectable`], trusted mux resolution, and
+/// the same bounded read-only probe used by [`target_alive`] — it adds NO new
+/// injector or spawn path.
 ///
 /// The verdict is advisory and degrades gracefully: only [`Capability::Live`]
-/// promises a live nudge; the other two are NOT errors. A registered-but-not-alive
-/// or non-injectable peer still receives every message via the store on its next
-/// hook drain, matching weave's degrade-to-store contract. Because `target_alive`
-/// is fail-open, a probe that cannot run yields `Live` (assume reachable, try) —
-/// never a false `RegisteredNotAlive`.
+/// promises a live nudge; the other verdicts are NOT errors. A transport-unavailable,
+/// registered-but-not-alive, or non-injectable peer still receives every message
+/// via the store on its next hook drain, matching weave's degrade-to-store contract.
+/// A missing, unlaunchable, or timed-out trusted mux executable is reported
+/// separately: injection cannot be promised in that state, so claiming `Live`
+/// would be dishonest. Once the binary launches, inconclusive pane liveness
+/// remains fail-open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     /// Injectable (real mux + valid-looking id) and the liveness probe did not
     /// report the pane/session as gone ⇒ a live nudge can be pushed now.
     Live,
+    /// The target is structurally injectable, but weave cannot resolve or launch
+    /// the mux executable from its trusted directories. Live transport cannot be
+    /// promised until the operator installs/trusts a working mux (for example via
+    /// `WEAVE_MUX_DIR`).
+    TransportUnavailable,
     /// Injectable, but the liveness probe confidently reported the target absent
     /// ⇒ skip the live nudge, deliver via the store on next turn.
     RegisteredNotAlive,
@@ -1244,15 +1285,45 @@ pub enum Capability {
     NotInjectable,
 }
 
-/// Pure capability verdict for `target`, composed from [`Target::injectable`] +
-/// [`target_alive`]. Pure (the only side effect is `target_alive`'s read-only,
-/// fail-open probe) so it is unit-testable and safe to call before deciding
-/// whether to knock or queue.
-pub fn capability(target: &Target) -> Capability {
-    if !target.injectable() {
-        return Capability::NotInjectable;
+impl Capability {
+    /// Whether the pane/session is not confidently known absent. Transport
+    /// availability is deliberately orthogonal: a missing local mux executable
+    /// prevents reachability but says nothing about whether the pane exists, so
+    /// `TransportUnavailable` preserves the injector's fail-open pane verdict.
+    pub fn pane_not_known_absent(self) -> bool {
+        matches!(self, Self::Live | Self::TransportUnavailable)
     }
-    if target_alive(target) {
+}
+
+/// Capability verdict for `target`, composed from [`Target::injectable`], trusted
+/// mux availability, and the same bounded probe as [`target_alive`]. Safe to call
+/// before deciding whether to knock or queue; the only side effects are filesystem
+/// presence checks and a read-only, fail-open liveness/launch probe.
+pub fn capability(target: &Target) -> Capability {
+    let injectable = target.injectable();
+    if !injectable {
+        return capability_from_facts(false, false, false);
+    }
+    match target_probe(target) {
+        TargetProbe::Alive => capability_from_facts(true, true, true),
+        TargetProbe::Absent => capability_from_facts(true, true, false),
+        TargetProbe::TransportUnavailable => capability_from_facts(true, false, false),
+    }
+}
+
+/// Pure truth table beneath [`capability`]. Keeping filesystem/probe facts as
+/// parameters makes the honesty invariant exhaustive and platform-independent in
+/// unit tests: a missing mux transport can never map to [`Capability::Live`].
+fn capability_from_facts(
+    injectable: bool,
+    transport_available: bool,
+    target_is_alive: bool,
+) -> Capability {
+    if !injectable {
+        Capability::NotInjectable
+    } else if !transport_available {
+        Capability::TransportUnavailable
+    } else if target_is_alive {
         Capability::Live
     } else {
         Capability::RegisteredNotAlive
@@ -1355,7 +1426,9 @@ fn json_has_id(out: &str, want: i64) -> Option<bool> {
 /// system/user-tool dirs.
 ///
 /// Precedence: `WEAVE_MUX_DIR` entries come **first**, ahead of the hardcoded
-/// system dirs (`/usr/bin`, …) and the `$HOME/...` tool dirs. `resolve_trusted`
+/// system dirs (`/usr/bin`, …) and the `$HOME/...` tool dirs. The user tool set
+/// includes both `.nix-profile/bin` and LifeOS/Nix-style `.nix-profile/toolbin`.
+/// `resolve_trusted`
 /// returns the first dir that contains the binary, so an explicit opt-in dir wins
 /// over an ambient same-named system binary. This is intentional: a user who sets
 /// `WEAVE_MUX_DIR` is vouching for that dir and means "use *this* mux", and it is
@@ -1379,6 +1452,7 @@ fn trusted_dirs() -> Vec<std::path::PathBuf> {
         v.push(h.join(".cargo/bin"));
         v.push(h.join(".local/bin"));
         v.push(h.join(".nix-profile/bin"));
+        v.push(h.join(".nix-profile/toolbin"));
     }
     v
 }
@@ -1391,7 +1465,30 @@ pub fn resolve_trusted(bin: &str) -> Option<std::path::PathBuf> {
     trusted_dirs()
         .into_iter()
         .map(|d| d.join(bin))
-        .find(|p| p.is_file())
+        .find(|p| is_executable_file(p))
+}
+
+/// A trusted-command candidate must be a regular file with at least one executable
+/// mode bit. This is deliberately only a cheap resolution filter: Unix permission
+/// classes, ACLs, mount flags, and executable format still affect the current
+/// process. [`capability`] therefore performs a real bounded read-only launch/probe
+/// before it can promise [`Capability::Live`].
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Is `bin` available as a TRUSTED absolute path (not just anywhere on $PATH)?
@@ -1655,7 +1752,8 @@ pub trait Injector {
     /// Inject `body` into `target` using the chosen nudge mode.
     fn inject_mode(&self, target: &Target, body: &str, mode: Nudge) -> anyhow::Result<bool>;
 
-    /// Describe how live the target is (live / registered-but-not-alive / not injectable).
+    /// Describe the target transport (live / transport-unavailable /
+    /// registered-but-not-alive / not-injectable).
     fn capability(&self, target: &Target) -> Capability;
 
     /// Check whether a named binary exists on PATH (via `resolve_trusted`).
@@ -2236,20 +2334,16 @@ mod tests {
         assert!(target_alive(&Target::none()));
     }
 
-    /// Truth table for the pure `capability()` verdict, composed from
-    /// `injectable()` + `target_alive()`. We assert every combination that is
-    /// deterministic without a live mux on the runner:
+    /// Truth table for the pure facts beneath `capability()`. This proves every
+    /// combination without depending on which mux programs happen to be installed
+    /// on the test runner:
     ///
     /// - `mux=none`  ⇒ NotInjectable (not injectable, regardless of id).
     /// - injectable + empty id ⇒ NotInjectable (empty id is not injectable).
-    /// - injectable + unprobed backend ⇒ Live (fail-open: `target_alive` has no
-    ///   probe for `screen`, so it returns true ⇒ verdict Live, never a false
-    ///   `RegisteredNotAlive`). This is the load-bearing fail-open case the plan
-    ///   calls out; it mirrors `target_alive_is_open_for_unprobed_backends`.
-    ///
-    /// The confident-`RegisteredNotAlive` branch requires a probe that runs and
-    /// reports the target *absent*; that needs a (fake) mux and is covered
-    /// end-to-end by the `connect` fake-mux integration test, not here.
+    /// - injectable + unavailable transport ⇒ TransportUnavailable, never Live;
+    /// - injectable + available transport + fail-open/alive probe ⇒ Live;
+    /// - injectable + available transport + confidently absent probe ⇒
+    ///   RegisteredNotAlive.
     #[test]
     fn capability_truth_table() {
         // Non-injectable: mux=none ⇒ NotInjectable.
@@ -2260,19 +2354,96 @@ mod tests {
             Capability::NotInjectable,
             "empty id ⇒ not injectable ⇒ NotInjectable"
         );
-        // Injectable + unprobed backend (screen has no liveness probe) ⇒ fail-open
-        // to Live, never RegisteredNotAlive.
-        let screen = t(Mux::Screen, "1234.pts-0.host");
-        assert!(screen.injectable());
-        assert!(
-            target_alive(&screen),
-            "screen has no probe ⇒ target_alive fail-open true"
+        assert_eq!(
+            capability_from_facts(true, false, true),
+            Capability::TransportUnavailable,
+            "a missing trusted mux binary can never promise Live"
         );
         assert_eq!(
-            capability(&screen),
+            capability_from_facts(true, true, true),
             Capability::Live,
-            "injectable + fail-open alive ⇒ Live"
+            "available transport + fail-open/alive probe ⇒ Live"
         );
+        assert_eq!(
+            capability_from_facts(true, true, false),
+            Capability::RegisteredNotAlive,
+            "available transport + confident absence ⇒ RegisteredNotAlive"
+        );
+        assert!(Capability::Live.pane_not_known_absent());
+        assert!(Capability::TransportUnavailable.pane_not_known_absent());
+        assert!(!Capability::RegisteredNotAlive.pane_not_known_absent());
+        assert!(!Capability::NotInjectable.pane_not_known_absent());
+    }
+
+    /// Trusted resolution rejects a mode-0644 lookalike, while capability goes one
+    /// step further and refuses `Live` when metadata passes the candidate filter but
+    /// the current process cannot actually launch the program.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_resolution_and_actual_launchability_are_distinct() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!("weave-nonexec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create trusted test dir");
+        let program = dir.join("weave-nonexec-mux");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write test program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod non-executable");
+        let _mux = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_MUX_DIR",
+            dir.to_str().expect("utf8 temp path"),
+        );
+
+        assert!(!have("weave-nonexec-mux"));
+        assert!(resolve_trusted_program(program.to_str().unwrap()).is_none());
+
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+        assert!(have("weave-nonexec-mux"));
+        assert_eq!(
+            resolve_trusted_program(program.to_str().unwrap()),
+            Some(program.clone())
+        );
+
+        // Executable metadata alone is insufficient: a missing shebang interpreter
+        // makes launch fail for every effective uid, including root-run CI.
+        // Capability must report the transport failure, while the legacy
+        // pane-existence bool remains fail-open.
+        let screen = dir.join("screen");
+        let missing_interpreter = dir.join("weave-definitely-missing-interpreter");
+        assert!(!missing_interpreter.exists());
+        std::fs::write(&screen, format!("#!{}\n", missing_interpreter.display()))
+            .expect("write unlaunchable fake screen");
+        std::fs::set_permissions(&screen, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+        assert!(have("screen"), "candidate filter sees an execute bit");
+        let target = t(Mux::Screen, "1234.pts-0.host");
+        assert_eq!(capability(&target), Capability::TransportUnavailable);
+        assert!(target_alive(&target), "pane liveness remains fail-open");
+
+        std::fs::write(&screen, b"#!/bin/sh\nexit 0\n").expect("repair fake screen");
+        assert_eq!(capability(&target), Capability::Live);
+
+        std::fs::remove_file(program).ok();
+        std::fs::remove_file(screen).ok();
+        std::fs::remove_dir(dir).ok();
+    }
+
+    /// Nix profiles in this workspace expose operator tools in `toolbin`, while
+    /// conventional Nix packages use `bin`; both are trusted user-profile roots.
+    #[test]
+    fn nix_profile_bin_and_toolbin_are_trusted() {
+        let _g = weave_core::testenv::lock_env();
+        let _mux = weave_core::testenv::EnvVarGuard::remove("WEAVE_MUX_DIR");
+        let _home = weave_core::testenv::EnvVarGuard::set("HOME", "/tmp/weave-home");
+        let dirs = trusted_dirs();
+        assert!(dirs.contains(&std::path::PathBuf::from(
+            "/tmp/weave-home/.nix-profile/bin"
+        )));
+        assert!(dirs.contains(&std::path::PathBuf::from(
+            "/tmp/weave-home/.nix-profile/toolbin"
+        )));
     }
 
     /// `WEAVE_MUX_DIR` must take precedence over the hardcoded system dirs so an
@@ -2506,7 +2677,14 @@ zippy-brachiosaur [Created 9h 27m 47s ago] (current)
         let target = t(Mux::ITerm2, "x");
         assert!(liveness_probe(&target).is_none());
         assert!(target_alive(&target));
-        assert_eq!(capability(&target), Capability::Live);
+        assert_eq!(
+            capability(&target),
+            if have(target.mux.binary()) {
+                Capability::Live
+            } else {
+                Capability::TransportUnavailable
+            }
+        );
     }
 
     /// the unified lock every critical section is exclusive, so the read always sees

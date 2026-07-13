@@ -157,10 +157,13 @@ fastest layer and carry most of the injector and store coverage.
   never leaks the body; liveness probes shape per backend and are fail-open for
   unprobed backends; and **`id_valid` rejects malicious target ids**
   (`%3; rm -rf /`, `--listen-on=evil`, embedded spaces) — the injector
-  target-validation guard. The pure `capability()` verdict has its own truth table:
-  `mux=none` / empty id ⇒ `NotInjectable`; an injectable + unprobed backend ⇒
-  **fail-open `Live`** (never a false `RegisteredNotAlive`) — the verdict that
-  backs `weave connect` / `weave_connect`.
+  target-validation guard. The capability facts have their own pure truth table:
+  `mux=none` / empty id ⇒ `NotInjectable`; an injectable target with no trusted mux
+  binary ⇒ `TransportUnavailable` (never a false `Live`); with transport available,
+  an unprobed/inconclusive backend remains **fail-open `Live`** — the verdicts that
+  back `weave connect` / `weave_connect`. Trusted resolution tests require
+  executable mode, then prove with a real launch that a metadata-compatible but
+  unlaunchable program still cannot count as live transport.
 
 - **`src/model.rs`** — the broadcast alias set is exposed as both a Rust check
   (`is_broadcast`) and a SQL literal (`BROADCAST_SQL`). A drift guard asserts the

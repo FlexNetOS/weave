@@ -93,6 +93,7 @@ pub fn scrub_env(cmd: &mut Command) {
         "WEAVE_DB",
         "WEAVE_LIBSQL_URL",
         "WEAVE_LIBSQL_AUTH_TOKEN",
+        "WEAVE_MUX_DIR",
         // WL-084 identity inputs — a stray outer value would leak a client
         // pid, a spawn cert, or an env-file path into every hook under test.
         "WEAVE_CLIENT_PID",

@@ -2201,6 +2201,20 @@ fn make_fake_tmux(log_path: &Path) -> std::path::PathBuf {
     dir
 }
 
+/// Install an executable candidate that the kernel deterministically cannot launch
+/// because its shebang interpreter is a sibling path proven absent. This exercises
+/// launch-probe failures without depending on host binaries, uid, or Unix permission
+/// class behavior.
+fn install_unlaunchable_program(dir: &Path, name: &str) {
+    let missing_interpreter = dir.join("weave-definitely-missing-interpreter");
+    assert!(!missing_interpreter.exists());
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!{}\n", missing_interpreter.display()))
+        .expect("write unlaunchable test program");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod unlaunchable test program");
+}
+
 /// Build a `weave` command with the fake-mux dir prepended to PATH so the
 /// injector resolves our script instead of any real tmux.
 fn weave_with_fake_path(
@@ -3081,6 +3095,18 @@ fn attach_flips_no_inject_peer_to_injectable_under_fake_mux() {
     );
     assert_eq!(p_after["mux"], "tmux", "mux re-captured: {p_after}");
     assert_eq!(p_after["target"], "%9", "pane id re-captured: {p_after}");
+    assert_eq!(
+        p_after["alive"].as_bool(),
+        Some(true),
+        "one-shot attach must track its long-lived client ancestor, not its own exited pid: {p_after}"
+    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            p_after["pid"].as_i64(),
+            Some(std::process::id() as i64),
+            "the integration-test parent is the attach subprocess's long-lived client"
+        );
+    }
 }
 
 /// C2 connect verdict strings under a fake mux:
@@ -3142,6 +3168,55 @@ fn connect_cli_verdict_strings() {
     assert!(
         err.contains("no registered peer 'ghost'"),
         "clear not-found error: {err:?}"
+    );
+}
+
+/// A structurally injectable peer is not `live` when its mux executable resolves
+/// but cannot launch. An explicitly trusted, deterministically broken `osascript`
+/// makes this black-box test independent of host-installed programs.
+#[test]
+fn connect_cli_reports_transport_unavailable_when_mux_cannot_launch() {
+    let db = TestDb::new();
+    let (ok, _out, err) = common::run_stdin_full(
+        &db,
+        &["register", "--name", "mac-shaped"],
+        "",
+        None,
+        &[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_SESSION_ID", "w0t0p0:WEAVE-LIVE-TEST"),
+        ],
+    );
+    assert!(ok, "iTerm2-shaped peer registration failed: {err}");
+
+    let empty_home = unique_tmp_dir("connect-missing-transport-home");
+    let fake_dir = unique_tmp_dir("connect-unlaunchable-transport");
+    install_unlaunchable_program(&fake_dir, "osascript");
+    let fake_dir_string = fake_dir.to_string_lossy().into_owned();
+    let (ok, out, err) = common::run_stdin_full(
+        &db,
+        &["connect", "--to", "mac-shaped"],
+        "",
+        None,
+        &[
+            ("HOME", empty_home.to_str().unwrap()),
+            ("WEAVE_MUX_DIR", fake_dir_string.as_str()),
+        ],
+    );
+    assert!(
+        ok,
+        "missing live transport remains a queueable verdict: {err}"
+    );
+    assert!(
+        out.contains("live transport unavailable")
+            && out.contains("osascript could not be launched/probed from a trusted directory")
+            && out.contains("durable delivery remains queued")
+            && out.contains("next inbox drain"),
+        "connect must not promise Live when injection cannot launch its mux: {out:?}"
+    );
+    assert!(
+        !out.contains("a live nudge can be delivered now"),
+        "missing transport must never produce the Live promise: {out:?}"
     );
 }
 
@@ -3381,36 +3456,70 @@ fn mcp_attach_upserts_and_rejects_bad_identity() {
 }
 
 /// `weave_connect` verdicts over MCP:
-/// - to an injectable peer (a `screen` peer, which has no liveness probe so the
-///   fail-open verdict is `Live` regardless of any installed mux) -> "live",
+/// - to an injectable peer backed by an explicit trusted fake mux -> "live",
 ///   `isError=false`;
+/// - to a structurally injectable peer whose mux is unavailable -> queueable
+///   transport-unavailable verdict (a trusted but unlaunchable fake `osascript`);
 /// - to a `mux=none` peer -> "not injectable" + will-queue, `isError=false`
 ///   (graceful, NOT an error);
 /// - to a non-existent peer -> `isError=true` (the only hard failure).
 #[test]
 fn mcp_connect_verdicts_and_failure_path() {
     let db = TestDb::new();
+    let log = common::unique_db().with_extension("mcp-connect-tmuxlog");
+    let fake_dir = make_fake_tmux(&log);
+    install_unlaunchable_program(&fake_dir, "osascript");
 
-    // Seed an injectable screen peer via the CLI (STY -> screen mux, no probe).
-    let (ok, _o, _e) = common::run_stdin_full(
+    // Seed an injectable tmux peer through the explicitly trusted fake mux.
+    let reg = weave_with_fake_path(
         &db,
-        &["register", "--name", "screenpeer"],
-        "",
-        None,
-        &[("STY", "1234.pts-0.host")],
-    );
-    assert!(ok, "register screen peer failed");
+        &fake_dir,
+        &[("TMUX_PANE", "%7")],
+        &["register", "--name", "livepeer"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("register fake tmux peer");
+    assert!(reg.status.success(), "register fake tmux peer failed");
     // And a non-injectable peer.
     run_ok(&db, &["register", "--name", "queued"]);
+    let (ok, _out, err) = common::run_stdin_full(
+        &db,
+        &["register", "--name", "no-transport"],
+        "",
+        None,
+        &[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_SESSION_ID", "w0t0p0:MCP-TRANSPORT-TEST"),
+        ],
+    );
+    assert!(ok, "register unavailable-transport peer failed: {err}");
 
-    let mut mcp = McpServer::spawn(&db);
+    let fake_dir_string = fake_dir.to_string_lossy().into_owned();
+    let empty_home = unique_tmp_dir("mcp-connect-empty-home");
+    let mut mcp = McpServer::spawn_env(
+        &db,
+        &[
+            ("WEAVE_MUX_DIR", fake_dir_string.as_str()),
+            ("HOME", empty_home.to_str().unwrap()),
+        ],
+    );
 
-    // Live verdict (screen is injectable; no probe -> fail-open Live), not an error.
-    let (lerr, ltext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "screenpeer"}));
+    // Live verdict through the trusted fake tmux, not an error.
+    let (lerr, ltext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "livepeer"}));
     assert!(!lerr, "connect to a live peer is not an error: {ltext}");
     assert!(
         ltext.contains("is live"),
         "connect reports live verdict: {ltext:?}"
+    );
+
+    let (uerr, utext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "no-transport"}));
+    assert!(!uerr, "unavailable transport remains queueable: {utext}");
+    assert!(
+        utext.contains("no live transport")
+            && utext.contains("osascript could not be launched/probed from a trusted directory")
+            && utext.contains("next inbox drain"),
+        "MCP must report the explicit unavailable-transport verdict: {utext:?}"
     );
 
     // mux=none peer: not injectable, will queue, isError=false (graceful).

@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased] — fix: make live transport honest on Nix
+
+- Trusted mux/program resolution now includes `$HOME/.nix-profile/toolbin`
+  alongside the conventional Nix profile `bin`, so LifeOS/Nix-installed Zellij
+  can be spawned and injected without an otherwise-redundant `WEAVE_MUX_DIR`.
+  Trusted candidates must also be executable files, and capability now requires a
+  real bounded read-only launch/probe; neither a mode-0644 lookalike nor unusable
+  execute bits can produce a false `Live` verdict before failing at injection.
+- `connect`/doctor capability checks no longer promise `Live` when the mux
+  executable is missing, unlaunchable, or times out; they report
+  `transport_unavailable` and preserve durable next-turn delivery. Pane liveness
+  remains fail-open/orthogonal while transport reachability is false.
+- One-shot CLI `attach` now records the nearest long-lived client ancestor (the
+  same dependency-free `/proc` seam used by hooks), rather than its own exiting
+  subprocess PID, so a newly attached live session is not instantly stale.
+
 ## [Unreleased] — feat: collision-proof per-session identity (WL-084)
 
 - Every agent session now launches with a unique mesh identity. The SessionStart
