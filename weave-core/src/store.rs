@@ -140,8 +140,9 @@ pub trait Store: Send {
     ///   - `birth_cert` arg matches → UPDATEs other fields, returns existing cert.
     ///
     /// **Client session key (WL-084):** `client_session` is the launcher-session
-    /// id (e.g. the Claude Code hook payload's `session_id`), bounded +
-    /// control-stripped at this seam like the git tags. An EMPTY value means
+    /// id (e.g. the Claude Code hook payload's `session_id`), strictly validated
+    /// at this seam. Ownership keys are never lossy-truncated or control-stripped:
+    /// two distinct launcher sessions must remain distinct. An EMPTY value means
     /// "unknown — preserve whatever the row already holds" (so non-hook callers
     /// can never wipe the mapping); a non-empty value overwrites (the new
     /// session owns the row after a legitimate takeover).
@@ -604,6 +605,15 @@ pub trait Store: Send {
     /// path that sets `attempt_id`. `None` ⇒ the job id does not exist.
     #[allow(dead_code)]
     fn claim_job(&self, id: &str, assignee: &str) -> Result<Option<Job>>;
+
+    /// Worker-dispatch claim: atomically transition an eligible `queued` job to
+    /// `running`. Unlike [`Store::claim_job`], this never reclaims an already-
+    /// running job: a stale candidate or concurrent dispatch returns `None`.
+    /// Eligibility is checked in the same guarded update (`assignee` is either
+    /// unset or already equals the worker), so list-then-claim races cannot steal
+    /// a job that was reassigned meanwhile.
+    #[allow(dead_code)]
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>>;
 
     /// P3: apply `patch` to a job, ENFORCING (in the store, so CLI + MCP both
     /// inherit): (1) attempt_id FENCING — if the job is claimed (`attempt_id` set),
@@ -1182,6 +1192,33 @@ pub fn pid_alive(_pid: i64) -> bool {
 /// long-lived process better than the ancestry walk export it explicitly.
 pub const CLIENT_PID_ENV: &str = "WEAVE_CLIENT_PID";
 
+/// Read only the explicit long-lived client PID contract. One-shot CLI commands
+/// use this helper instead of ancestry inference: without an override they store
+/// `NULL` and presence falls back to the heartbeat TTL, never to the PID of a
+/// short-lived helper or an unrelated ancestor.
+pub fn explicit_client_pid() -> Option<i64> {
+    std::env::var(CLIENT_PID_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Validate an optional launcher-session ownership key. Exactly empty is the
+/// explicit "unknown" value; a present key must already be bounded,
+/// control-free, and free of leading/trailing whitespace. Unlike descriptive
+/// tags this is strict and lossless: normalizing a token before storage/lookup
+/// could alias two sessions or let a malformed token claim another row.
+pub fn client_session_key(value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.trim() != value {
+        anyhow::bail!("client session must not contain leading or trailing whitespace.");
+    }
+    check_ident("client session", value)?;
+    Ok(value.to_string())
+}
+
 /// Wrapper `comm` names that die with a single hook/tool invocation and must
 /// never be mistaken for the session's client process. Shells (Claude Code runs
 /// hook commands via `sh -c`-style wrappers), `env`, `timeout`, the `rtk`
@@ -1217,12 +1254,8 @@ pub fn first_longlived_ancestor(chain: &[(i64, String)]) -> Option<i64> {
 /// (validated > 0); non-Linux targets have no dependency-free ancestry walk
 /// and return `None` (TTL presence, matching [`pid_alive`]'s degradation).
 pub fn client_pid() -> Option<i64> {
-    if let Ok(v) = std::env::var(CLIENT_PID_ENV) {
-        if let Ok(pid) = v.trim().parse::<i64>() {
-            if pid > 0 {
-                return Some(pid);
-            }
-        }
+    if let Some(pid) = explicit_client_pid() {
+        return Some(pid);
     }
     first_longlived_ancestor(&proc_ancestry(std::process::id() as i64, 8))
 }
@@ -1382,12 +1415,13 @@ pub enum RegisterConflict {
 ///
 /// Ownership evidence, strongest first:
 /// 1. Launcher-session key match (`client_session`) → [`RegisterConflict::SameSession`].
-/// 2. Same live client pid on this host → `SameSession` (covers a host that
-///    rotates its session id across resume/compact while the client process
-///    survives).
-/// 3. Stale row ([`liveness_from_fields`] — past TTL, or same-host dead pid)
+/// 2. Contradictory nonempty launcher-session keys disable PID fallback: a shared
+///    host process may own several logical sessions and must not collapse them.
+/// 3. When one/both keys are unknown, the same live client pid on this host →
+///    `SameSession` (legacy hosts without session keys retain continuity).
+/// 4. Stale row ([`liveness_from_fields`] — past TTL, or same-host dead pid)
 ///    → [`RegisterConflict::Reusable`].
-/// 4. Anything else is a live foreign session → [`RegisterConflict::LiveOther`].
+/// 5. Anything else is a live foreign session → [`RegisterConflict::LiveOther`].
 ///    A same-host recent row with an UNKNOWN pid reads live-by-TTL, so two
 ///    concurrent pid-less sessions coexist under distinct names rather than
 ///    silently swapping one row (fail toward NOT stealing).
@@ -1401,9 +1435,14 @@ pub fn registration_conflict(
     if !our_client_session.is_empty() && existing.client_session == our_client_session {
         return RegisterConflict::SameSession;
     }
-    if let (Some(theirs), Some(ours)) = (existing.pid, our_client_pid) {
-        if theirs == ours && existing.host == this_host {
-            return RegisterConflict::SameSession;
+    let contradictory_keys = !our_client_session.is_empty()
+        && !existing.client_session.is_empty()
+        && existing.client_session != our_client_session;
+    if !contradictory_keys {
+        if let (Some(theirs), Some(ours)) = (existing.pid, our_client_pid) {
+            if theirs == ours && existing.host == this_host {
+                return RegisterConflict::SameSession;
+            }
         }
     }
     if liveness_for(existing, this_host, now_ts) == Liveness::Stale {
@@ -1676,6 +1715,9 @@ pub fn clamp_limit(limit: i64) -> i64 {
 /// for the error message. Shared by both backends. (P3)
 #[cfg_attr(not(any(feature = "sqlite", feature = "libsql")), allow(dead_code))]
 pub fn check_job_text(label: &str, value: &str) -> Result<()> {
+    if value.contains('\0') {
+        anyhow::bail!("{label} must not contain NUL bytes.");
+    }
     if value.chars().count() > crate::model::MAX_JOB_TEXT {
         anyhow::bail!(
             "{label} is too long ({} chars; max {}).",
@@ -3873,10 +3915,10 @@ impl Store for SqliteStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
-        // WL-084: the launcher-session key is an opaque host token — bound it
-        // like a tag (lossy-but-total; a hostile/garbled id degrades, never
-        // fails registration).
-        let client_session = sanitize_tag(client_session, MAX_IDENT);
+        // WL-084/Cycle B: ownership keys are strict and lossless. A lossy
+        // truncate/control-strip can alias distinct sessions or make the next
+        // hook miss the row it just registered.
+        let client_session = client_session_key(client_session)?;
         // Re-validate the circle at the store seam (defense-in-depth, the
         // check_ident precedent): an invalid value falls back to the default
         // circle rather than being stored raw.
@@ -3968,6 +4010,7 @@ impl Store for SqliteStore {
     }
 
     fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        let client_session = client_session_key(client_session)?;
         if client_session.is_empty() {
             return Ok(None);
         }
@@ -5179,6 +5222,39 @@ impl Store for SqliteStore {
         )?;
         tx.commit()?;
         self.get_job(id)
+    }
+
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>> {
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("assignee", assignee)?;
+        let ts = now();
+        let attempt_id = new_attempt_id(ts);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE jobs SET assignee = ?1, attempt_id = ?2, state = ?3, updated_ts = ?4
+             WHERE id = ?5 AND state = ?6 AND (assignee IS NULL OR assignee = ?1)",
+            params![
+                assignee,
+                attempt_id,
+                JobState::Running.as_str(),
+                ts,
+                id,
+                JobState::Queued.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            Ok(None)
+        } else {
+            // Read the claimed row before commit so a committed transition can
+            // never be followed by a fallible read that loses its fencing token.
+            let claimed =
+                tx.query_row("SELECT * FROM jobs WHERE id = ?1", params![id], row_to_job)?;
+            tx.commit()?;
+            Ok(Some(claimed))
+        }
     }
 
     fn update_job(&self, id: &str, attempt_id: Option<&str>, patch: JobPatch) -> Result<Job> {
@@ -7389,6 +7465,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_client_pid_and_session_key_inputs_are_strict() {
+        let _lock = crate::testenv::lock_env();
+        {
+            let _unset = crate::testenv::EnvVarGuard::remove(CLIENT_PID_ENV);
+            assert_eq!(explicit_client_pid(), None);
+        }
+        for invalid in ["", "0", "-2", "not-a-pid", "9223372036854775808"] {
+            let guard = crate::testenv::EnvVarGuard::set(CLIENT_PID_ENV, invalid);
+            assert_eq!(
+                explicit_client_pid(),
+                None,
+                "invalid explicit client pid {invalid:?} must degrade to TTL"
+            );
+            drop(guard);
+        }
+        {
+            let _valid = crate::testenv::EnvVarGuard::set(CLIENT_PID_ENV, " 42 ");
+            assert_eq!(explicit_client_pid(), Some(42));
+        }
+
+        assert_eq!(client_session_key("").unwrap(), "");
+        assert!(client_session_key("  \t ").is_err());
+        assert!(client_session_key("  sid-A  ").is_err());
+        assert!(client_session_key("sid-A\n").is_err());
+        assert!(client_session_key("sid-A\nraw").is_err());
+        assert!(client_session_key(&"x".repeat(MAX_IDENT)).is_ok());
+        assert!(client_session_key(&"x".repeat(MAX_IDENT + 1)).is_err());
+    }
+
+    #[test]
     fn send_rejects_invalid_idents() {
         let s = mem();
         assert!(
@@ -7614,6 +7720,29 @@ mod tests {
         // The empty key never matches — legacy rows all store ''.
         s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
         assert!(s.get_peer_by_client_session("").unwrap().is_none());
+
+        let oversized = "s".repeat(MAX_IDENT + 1);
+        assert!(s
+            .register_peer_full(
+                "rejected",
+                "tmux",
+                "%5",
+                "",
+                None,
+                Some(13),
+                "h",
+                "",
+                "",
+                "",
+                "default",
+                None,
+                &oversized,
+            )
+            .is_err());
+        assert!(s.get_peer("rejected").unwrap().is_none());
+        assert!(s.get_peer_by_client_session("sid\nraw").is_err());
+        assert!(s.get_peer_by_client_session(" sid-B").is_err());
+        assert!(s.get_peer_by_client_session("sid-B ").is_err());
     }
 
     /// WL-084 conflict classifier matrix (pure; fixed host/clock). Ownership
@@ -7653,14 +7782,32 @@ mod tests {
             registration_conflict(&keyed, "sid-A", None, &this_host, now_ts),
             RegisterConflict::SameSession
         );
-        // 2. Same live client pid on this host → ours (sid rotated on resume).
-        let ours = Peer {
+        // 2. Different non-empty launcher-session keys remain distinct even when
+        // they report the same live PID. The session key is the stronger identity;
+        // PID equality alone must not collapse two launcher sessions.
+        let keyed_other = Peer {
+            client_session: "sid-OLD".into(),
             pid: Some(std::process::id() as i64),
             ..base.clone()
         };
         assert_eq!(
             registration_conflict(
-                &ours,
+                &keyed_other,
+                "sid-NEW",
+                Some(std::process::id() as i64),
+                &this_host,
+                now_ts
+            ),
+            RegisterConflict::LiveOther
+        );
+        // Legacy/unknown session keys still fall back to same-PID continuity.
+        let pid_only = Peer {
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(
+                &pid_only,
                 "sid-NEW",
                 Some(std::process::id() as i64),
                 &this_host,
@@ -10255,6 +10402,86 @@ mod tests {
     }
 
     #[test]
+    fn job_dispatch_claim_is_queued_only_and_preserves_manual_reclaim() {
+        let s = mem();
+        let j = s.create_job("alice", spec("task")).unwrap();
+        let first = s.claim_queued_job(&j.id, "worker").unwrap().unwrap();
+        let first_attempt = first.attempt_id.clone().unwrap();
+        assert_eq!(first.state, JobState::Running);
+
+        assert!(
+            s.claim_queued_job(&j.id, "worker").unwrap().is_none(),
+            "a stale/concurrent dispatch cannot reclaim a running row"
+        );
+        let manual = s.claim_job(&j.id, "recovery").unwrap().unwrap();
+        assert_ne!(manual.attempt_id.as_deref(), Some(first_attempt.as_str()));
+        assert_eq!(manual.assignee.as_deref(), Some("recovery"));
+
+        let assigned = s
+            .create_job(
+                "alice",
+                JobSpec {
+                    title: "assigned elsewhere".into(),
+                    assignee: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s
+            .claim_queued_job(&assigned.id, "worker")
+            .unwrap()
+            .is_none());
+        let unchanged = s.get_job(&assigned.id).unwrap().unwrap();
+        assert_eq!(unchanged.state, JobState::Queued);
+        assert!(unchanged.attempt_id.is_none());
+    }
+
+    #[test]
+    fn concurrent_job_dispatch_claim_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "weave-dispatch-claim-race-{}-{}",
+            std::process::id(),
+            new_attempt_id(now())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let seed = SqliteStore::open(&path).unwrap();
+        let id = seed.create_job("alice", spec("race")).unwrap().id;
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for worker in ["worker-a", "worker-b"] {
+            let path = path.clone();
+            let id = id.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = SqliteStore::open(&path).unwrap();
+                barrier.wait();
+                store.claim_queued_job(&id, worker)
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|job| job.is_some()).count(),
+            1,
+            "the state predicate and transition must be one atomic write"
+        );
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_job(&id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn job_update_lifecycle_with_matching_attempt_succeeds() {
         let s = mem();
         let j = s.create_job("alice", spec("task")).unwrap();
@@ -10457,6 +10684,10 @@ mod tests {
     #[test]
     fn job_caps_and_id_validation_enforced() {
         let s = mem();
+        assert!(
+            s.create_job("alice", spec("bad\0title")).is_err(),
+            "job text must be safe to copy into a runner environment"
+        );
         // Oversized title rejected.
         let big = "x".repeat(crate::model::MAX_JOB_TEXT + 1);
         assert!(s.create_job("alice", spec(&big)).is_err());

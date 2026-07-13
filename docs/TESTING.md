@@ -144,7 +144,7 @@ fastest layer and carry most of the injector and store coverage.
   migration, `is_alive` matrix, and the libSQL `open_readonly` read-only proof)
   are still verified under libSQL.
 
-- **`src/inject.rs`** (23 tests) — `commands_for` / `commands_for_mode` are
+- **`src/inject.rs`** — `commands_for` / `commands_for_mode` are
   **pure** functions returning the exact argv table for each mux, so the entire
   injector shaping layer is asserted byte-for-byte without ever launching a
   terminal: tmux bracketed-paste close (`ESC[201~`) before Enter, zellij CR,
@@ -162,8 +162,14 @@ fastest layer and carry most of the injector and store coverage.
   binary ⇒ `TransportUnavailable` (never a false `Live`); with transport available,
   an unprobed/inconclusive backend remains **fail-open `Live`** — the verdicts that
   back `weave connect` / `weave_connect`. Trusted resolution tests require
-  executable mode, then prove with a real launch that a metadata-compatible but
-  unlaunchable program still cannot count as live transport.
+  a one-component bare command or an absolute file with a canonical direct
+  trusted parent, ignore empty/relative roots and path-shaped relative names,
+  require executable mode, then prove with a real launch that a
+  metadata-compatible but unlaunchable program still cannot count as live
+  transport. Listing tests cover non-zero exits, output beyond the 1 MiB retained
+  prefix, high-volume concurrent draining, in-group helpers, and a detached
+  `setsid` helper that inherits stdout: structured capability stays conservative
+  and the capture deadline never depends on pipe EOF.
 
 - **`src/model.rs`** — the broadcast alias set is exposed as both a Rust check
   (`is_broadcast`) and a SQL literal (`BROADCAST_SQL`). A drift guard asserts the
@@ -280,11 +286,15 @@ Coverage:
   reply→thread→receipts roundtrip.
 
 - **Lifecycle hooks** — the Claude Code integration. `hook session` registers a
-  peer from the payload cwd basename; `hook prompt` drains *and* marks read with
-  an explicit payload identity; `hook stop` is a non-consuming **peek** (two
-  stops re-surface the same message); a *guessed* identity (empty stdin) peeks
-  only and warns; and garbage / unknown events are tolerated (exit 0 with a
-  stderr warning, not a crash).
+  peer from the payload cwd basename; `hook prompt` drains *and* marks read only
+  with explicit config, an exact strict session-key row, or one unique same-host
+  client-PID row; `hook stop` is a non-consuming **peek** (two stops re-surface
+  the same message); a basename guess or ambiguous PID match peeks only and
+  warns. Invalid/control/oversized session keys, payloads over 1 MiB, and an
+  invalid-UTF-8 suffix after a valid prefix cannot register or drain. Oversized
+  PreToolUse JSON emits `deny` while ordinary malformed input retains its tested
+  `defer` policy. Garbage / unknown events are tolerated (exit 0 with a stderr
+  warning, not a crash).
   The optional hook responder path is also covered: with
   `WEAVE_RESPONDER_ON_HOOK=1`, `hook notification` performs a quiet one-shot ACK sweep,
   surfaces through `ask-status`, remains idempotent, and never marks the original
@@ -308,8 +318,13 @@ Coverage:
   carries `pid` / `host` / `alive` (a still-live process reads `alive:true`; a
   recent-but-dead local PID reads `online:false`/`alive:false` on Linux, the
   cfg-guarded A2 path); `weave connect --to` prints the `live` /
-  `not injectable (mux=none)` verdict strings and **exits 0** for a queued
-  (non-injectable) peer, non-zero for a non-existent one.
+  `not injectable (mux=none)` verdict strings and **exits 0** for a
+  non-injectable peer, non-zero for a non-existent one. CLI and MCP connect
+  regressions snapshot the inbox before/after every verdict and prove the probe
+  never queues, drains, marks read, or otherwise mutates it. One-shot
+  register/attach/scan/watch regressions also prove that only an explicit positive
+  `WEAVE_CLIENT_PID` is stored; without it the short-lived command leaves PID
+  unset and liveness falls back to TTL.
 
 - **Daemon lifecycle (CLI + MCP).** `weave daemon start` spawns a background
   heartbeat process; `weave daemon status` reports `running` with the PID;
@@ -635,7 +650,13 @@ complete → result), plus the failure paths (stale attempt → fenced error, un
 not_found, illegal transition, oversized title/JSON → cap error, bad assignee/job id →
 validator error); `tests/security.rs` enforces the text/JSON byte caps, the id validators
 (a metachar id never reaches a bind), the `clamp_limit`-bounded list, and secret-free
-output.
+output. Dispatch-specific tests race the atomic queued-only claim on SQLite and
+libSQL, reject untrusted/unlaunchable runners, oversized argv, invalid job env,
+and unbounded timeouts before claim, then prove every post-claim failure reaches a
+terminal row. Noisy stdout/stderr is drained with bounded retention, stored
+result/error JSON remains capped, timeout cleanup removes the owned process group,
+and a detached `setsid` descendant holding both pipes cannot extend dispatch past
+its own deadline or leave the claimed job `running`.
 
 ### Circles + orchestrator role (P4)
 

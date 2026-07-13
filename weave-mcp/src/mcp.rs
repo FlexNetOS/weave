@@ -2944,26 +2944,26 @@ fn tool_connect(
     let target = Target::from_peer(&peer);
     let msg = match injector.capability(&target) {
         Capability::Live => format!(
-            "Peer '{to}' is live [{}] {} — a live nudge can be delivered now.",
+            "Peer '{to}' is live [{}] {} — this probe sends no message; a future message can be delivered with a live nudge now.",
             target.mux.as_str(),
             target.id
         ),
         Capability::TransportUnavailable => format!(
             "Peer '{to}' has no live transport [{}] {} — {} could not be launched/probed from a trusted directory; \
-             durable delivery remains queued and arrives on the recipient's next inbox drain.",
+             this probe sends no message; a future message remains in the durable store until the recipient's next inbox drain.",
             target.mux.as_str(),
             target.id,
             target.mux.binary()
         ),
         Capability::RegisteredNotAlive => format!(
-            "Peer '{to}' is registered but not alive [{}] {} — delivery will be queued; \
-             recipient drains on next turn.",
+            "Peer '{to}' is registered but not alive [{}] {} — this probe sends no message; \
+             a future message remains in the durable store until the recipient's next inbox drain.",
             target.mux.as_str(),
             target.id
         ),
         Capability::NotInjectable => format!(
-            "Peer '{to}' is not injectable (mux=none) — delivery will be queued; \
-             recipient drains on next turn."
+            "Peer '{to}' is not injectable (mux=none) — this probe sends no message; \
+             a future message remains in the durable store until the recipient's next inbox drain."
         ),
     };
     Ok(msg)
@@ -4403,7 +4403,7 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_connect",
-            "description": "Probe whether a peer can be reached by a live nudge right now, and report the verdict (live / transport-unavailable / registered-but-not-alive / not-injectable). An unavailable, not-alive, or non-injectable peer is NOT an error — its messages are still delivered via the store on its next turn; only a non-existent peer is an error.",
+            "description": "Read-only probe of whether a future message to a peer could receive a live nudge right now; the probe itself sends and queues nothing. Reports live / transport-unavailable / registered-but-not-alive / not-injectable. A non-live verdict is not an error because future messages remain durable in the store; only a non-existent peer is an error.",
             "inputSchema": {"type":"object","properties":{
                 "to":{"type":"string","description":"The peer session name to connect to."}
             },"required":["to"]}
