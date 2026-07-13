@@ -22,6 +22,14 @@ multiplexer is present.
 cargo build --release      # -> target/release/weave
 ```
 
+## Environment configuration
+
+Start from the complete, secret-free [`.env.example`](.env.example). It documents
+every supported environment input, feature gate, authentication boundary, signing
+setup, and intentionally generated-only child variable. Weave does not auto-load
+`.env`; use a trusted secret manager or explicit loader, and never commit the
+resulting local file.
+
 ## Use with your coding agent
 
 `weave setup --provider <claude|codex|gemini|aider>` wires weave into your host's

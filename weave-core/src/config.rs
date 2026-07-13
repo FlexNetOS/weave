@@ -1335,6 +1335,9 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_DB") {
             cfg.db = Some(v);
         }
+        if let Some(v) = nonempty("WEAVE_MUX_PREFERENCE") {
+            cfg.mux_preference = Some(v);
+        }
         if let Some(v) = nonempty("WEAVE_LIBSQL_URL") {
             cfg.libsql_url = Some(v);
         }
@@ -2446,8 +2449,8 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Every setting below is OPTIONAL and shown commented-out with its default.
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
-# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>,
-# WEAVE_LLM_ENDPOINT, WEAVE_LLM_API_KEY, WEAVE_LLM_MODEL,
+# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_MUX_PREFERENCE, WEAVE_PULL_TOKEN,
+# WEAVE_PULL_TOKEN_<LABEL>, WEAVE_LLM_ENDPOINT, WEAVE_LLM_API_KEY, WEAVE_LLM_MODEL,
 # WEAVE_LLM_TIMEOUT_SECS, WEAVE_LLM_MAX_INPUT_CHARS, WEAVE_SPAWN_DIRS,
 # WEAVE_TELEGRAM_TOKEN, WEAVE_TELEGRAM_CHAT_ID, WEAVE_TELEGRAM_IDENTITY,
 # WEAVE_TELEGRAM_RECIPIENT, WEAVE_TELEGRAM_BOT_USERNAME,
@@ -2473,6 +2476,11 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Placeholders: {from} (sender) and {body} (message text). Omit {body} for a
 # quiet \"you have mail\" ping that carries no content.
 # nudge_template = \"[weave] message from {from}: {body} (run weave_inbox to read)\"
+
+# Preferred multiplexer for live injection. Unset/unknown uses auto-detection.
+# Accepted values: tmux, zellij, wezterm, kitty, screen, iterm2. Overridable via
+# WEAVE_MUX_PREFERENCE.
+# mux_preference = \"tmux\"
 
 # Auto-retention: at SessionStart weave opportunistically deletes messages older
 # than this many seconds (best-effort; failures are ignored). Default 2592000
@@ -2735,6 +2743,7 @@ mod tests {
         assert!(cfg.backend.is_none());
         assert!(cfg.db.is_none());
         assert!(cfg.nudge_template.is_none());
+        assert!(cfg.mux_preference.is_none());
         assert!(cfg.libsql_url.is_none());
         assert!(cfg.libsql_auth_token.is_none());
         assert!(cfg.retention_secs.is_none());
@@ -2781,6 +2790,7 @@ mod tests {
             "backend",
             "db",
             "nudge_template",
+            "mux_preference",
             "libsql_url",
             "libsql_auth_token",
             "retention_secs",
@@ -2814,6 +2824,158 @@ mod tests {
                 "template is missing config key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn env_example_documents_runtime_environment_contract() {
+        let example = include_str!("../../.env.example");
+        for key in [
+            // Config overlays and operator-tuned runtime knobs.
+            "WEAVE_SESSION",
+            "WEAVE_CIRCLE",
+            "WEAVE_BACKEND",
+            "WEAVE_DB",
+            "WEAVE_LIBSQL_URL",
+            "WEAVE_LIBSQL_AUTH_TOKEN",
+            "WEAVE_RETENTION_SECS",
+            "WEAVE_MUX_PREFERENCE",
+            "WEAVE_PEER_DBS",
+            "WEAVE_PULL_FROM",
+            "WEAVE_PULL_TOKEN",
+            "WEAVE_PULL_TOKEN_PROD",
+            "WEAVE_PULL_TOKEN_<LABEL>",
+            "WEAVE_PULL_TIMEOUT_MS",
+            "WEAVE_PULL_TIMEOUT_MS_PROD",
+            "WEAVE_PULL_TIMEOUT_MS_<LABEL>",
+            "WEAVE_INJECT_PULLED",
+            "WEAVE_ALLOW_INJECT_FROM",
+            "WEAVE_PUSH_TOKEN",
+            "WEAVE_ADMIN_TOKEN",
+            "WEAVE_STRICT_VERIFY",
+            "WEAVE_TRUST",
+            "WEAVE_REVOKED",
+            "WEAVE_LLM_ENDPOINT",
+            "WEAVE_LLM_API_KEY",
+            "WEAVE_LLM_MODEL",
+            "WEAVE_LLM_TIMEOUT_SECS",
+            "WEAVE_LLM_MAX_INPUT_CHARS",
+            "WEAVE_TELEGRAM_TOKEN",
+            "WEAVE_TELEGRAM_CHAT_ID",
+            "WEAVE_TELEGRAM_IDENTITY",
+            "WEAVE_TELEGRAM_RECIPIENT",
+            "WEAVE_TELEGRAM_BOT_USERNAME",
+            "WEAVE_SLACK_TOKEN",
+            "WEAVE_SLACK_CHANNEL",
+            "WEAVE_SLACK_IDENTITY",
+            "WEAVE_SLACK_RECIPIENT",
+            "WEAVE_BRIDGE_IDENTITY",
+            "WEAVE_BOT_WRITES",
+            "WEAVE_OBSCURA_BIN",
+            "WEAVE_OBSCURA_STEALTH",
+            "WEAVE_OBSCURA_PROXY",
+            "WEAVE_OBSCURA_USER_AGENT",
+            "WEAVE_OBSCURA_TIMEOUT_SECS",
+            "WEAVE_OBSCURA_ALLOW_OPS",
+            "WEAVE_OBSCURA_ALLOW_DOMAINS",
+            "WEAVE_OBSCURA_ALLOW_INTERNAL",
+            "WEAVE_PRETOOLUSE_APPROVER",
+            "WEAVE_PRETOOLUSE_TIMEOUT_SECS",
+            "WEAVE_MCP_EAGER",
+            "WEAVE_NO_CLEAR",
+            "WEAVE_PIDFILE",
+            "WEAVE_DAEMON_HEARTBEAT_SECS",
+            "WEAVE_DAEMON_EVICT_SECS",
+            "WEAVE_DAEMON_EVICT_CUTOFF_SECS",
+            "WEAVE_STOP_WAKE",
+            "WEAVE_RESPONDER_ON_HOOK",
+            "WEAVE_RESPONDER_STATUS",
+            "WEAVE_CLIENT_PID",
+            "WEAVE_BIRTH_CERT",
+            "WEAVE_MUX_DIR",
+            "WEAVE_SPAWN_DIRS",
+            "WEAVE_FXRUN_AGENT",
+            "WEAVE_TEST_TURSO_URL",
+            "WEAVE_TEST_TURSO_TOKEN",
+            // Env generated for hook/runner/harness child processes.
+            "WEAVE_HOOK_EVENT",
+            "WEAVE_HOOK_SENDER",
+            "WEAVE_HOOK_RECIPIENT",
+            "WEAVE_HOOK_SUBJECT",
+            "WEAVE_HOOK_MESSAGE_ID",
+            "WEAVE_HOOK_BODY",
+            "WEAVE_HOOK_PAYLOAD",
+            "WEAVE_JOB_ID",
+            "WEAVE_ATTEMPT_ID",
+            "WEAVE_WORKER",
+            "WEAVE_JOB_TITLE",
+            "WEAVE_JOB_PROMPT",
+            "WEAVE_JOB_DESCRIPTION",
+            "WEAVE_LEASES_JSON",
+            "WEAVE_POLICY_OWNER",
+            "WEAVE_WORKTREE",
+            "WEAVE_BUDGET",
+            "WEAVE_MAX_ITERS",
+            "WEAVE_SLEEP",
+            "WEAVE_MODEL",
+            "WEAVE_AGENT_CMD",
+            "WEAVE_AGENT_MODEL_ARGS",
+            "WEAVE_APPLY",
+            "WEAVE_KIMI_PLAN",
+            "WEAVE_KIMI_REVIEW",
+            "WEAVE_KIMI_CMD",
+            "WEAVE_KIMI_MODEL",
+            "WEAVE_KIMI_SESSION",
+            "WEAVE_KIMI_SESSION_FLAG",
+            "WEAVE_KIMI_EXTRA_ARGS",
+            "WEAVE_FORGE_WORKTREE",
+            "WEAVE_FORGE_TASK",
+            "WEAVE_FORGE_BUDGET",
+            "WEAVE_FORGE_MAX_ITERS",
+            "WEAVE_FORGE_SLEEP",
+            "WEAVE_FORGE_APPLY",
+            // Host, mux, and provider-switch names Weave observes or manages.
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "HOSTNAME",
+            "PATH",
+            "TMPDIR",
+            "NO_COLOR",
+            "TMUX_PANE",
+            "TMUX",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+            "WEZTERM_PANE",
+            "KITTY_WINDOW_ID",
+            "KITTY_LISTEN_ON",
+            "STY",
+            "TERM_PROGRAM",
+            "TERM_SESSION_ID",
+            "CLAUDE_ENV_FILE",
+            "OLLAMA_HOST",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "GEMINI_API_KEY",
+            "GEMINI_MODEL",
+            "GOOGLE_GEMINI_MODEL",
+        ] {
+            let assignment = format!("# {key}=");
+            assert!(
+                example
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&assignment)),
+                ".env.example is missing a commented assignment for {key}"
+            );
+        }
+        assert!(
+            !example.contains("sk-test")
+                && !example.contains("xoxb-")
+                && !example.contains("replace-with-"),
+            ".env.example must use non-secret placeholders, not real-looking fixture values"
+        );
     }
 
     #[test]
@@ -4694,6 +4856,29 @@ bridge_identity = "legacy-file"
     fn mux_preference_roundtrips_via_config() {
         let cfg: Config = toml::from_str(r#"mux_preference = "kitty""#).unwrap();
         assert_eq!(cfg.mux_preference(), Some("kitty"));
+    }
+
+    #[test]
+    fn mux_preference_overlays_from_env() {
+        let _g = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-config-mux-overlay-{}-{}",
+            std::process::id(),
+            crate::model::now()
+        ));
+        let weave_dir = dir.join("weave");
+        std::fs::create_dir_all(&weave_dir).unwrap();
+        std::fs::write(weave_dir.join("config.toml"), r#"mux_preference = "tmux""#).unwrap();
+
+        let _xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        let _mux = crate::testenv::EnvVarGuard::set("WEAVE_MUX_PREFERENCE", "kitty");
+
+        let cfg = Config::load();
+        assert_eq!(cfg.mux_preference(), Some("kitty"));
+
+        drop((_mux, _xdg));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
