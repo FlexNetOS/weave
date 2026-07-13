@@ -305,12 +305,19 @@ pub fn run_stdin_full(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn weave {args:?}: {e}"));
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(stdin.as_bytes())
-        .expect("write child stdin");
+    let mut child_stdin = child.stdin.take().expect("child stdin");
+    if let Err(err) = child_stdin.write_all(stdin.as_bytes()) {
+        // Some negative-path tests intentionally make the child reject input
+        // before the parent finishes a large write. Preserve that child's
+        // stdout, stderr, and exit status for the caller to assert instead of
+        // turning an expected early close into a harness panic.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "write child stdin: {err}"
+        );
+    }
+    drop(child_stdin);
     let out = child.wait_with_output().expect("wait_with_output");
     (
         out.status.success(),
