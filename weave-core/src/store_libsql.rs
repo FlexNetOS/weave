@@ -51,9 +51,8 @@ use crate::store::{
     merge_peer_views, merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject,
     sanitize_tag, store_label, validate_job_patch, validate_job_spec, AskManyOutcome, Origin,
     PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo, SessionView, Store,
-    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_IDENT, MAX_KEYS_PER_IDENT,
-    MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
-    PRESENCE_TTL_SECS,
+    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
+    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -2266,8 +2265,9 @@ impl Store for LibsqlStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
-        // WL-084: bound the launcher-session key like a tag (mirrors sqlite).
-        let client_session = sanitize_tag(client_session, MAX_IDENT);
+        // Ownership keys are strict/lossless (mirrors sqlite); truncating one can
+        // alias distinct sessions or break later lookup.
+        let client_session = crate::store::client_session_key(client_session)?;
         let circle = if crate::model::circle_valid(circle) {
             circle.to_string()
         } else {
@@ -2390,6 +2390,7 @@ impl Store for LibsqlStore {
     }
 
     fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        let client_session = crate::store::client_session_key(client_session)?;
         if client_session.is_empty() {
             return Ok(None);
         }
@@ -3875,6 +3876,51 @@ impl Store for LibsqlStore {
         }
     }
 
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>> {
+        self.guard_writable()?;
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("assignee", assignee)?;
+        let ts = now();
+        let attempt_id = new_attempt_id(ts);
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let changed = tx
+                .execute(
+                    "UPDATE jobs SET assignee = ?1, attempt_id = ?2, state = ?3, updated_ts = ?4 \
+                     WHERE id = ?5 AND state = ?6 AND (assignee IS NULL OR assignee = ?1)",
+                    params(vec![
+                        assignee.into(),
+                        attempt_id.into(),
+                        JobState::Running.as_str().into(),
+                        ts.into(),
+                        id.into(),
+                        JobState::Queued.as_str().into(),
+                    ]),
+                )
+                .await?;
+            if changed == 0 {
+                tx.commit().await?;
+                return Ok::<Option<Job>, anyhow::Error>(None);
+            }
+            // Read the row/token inside the transaction. Once commit succeeds,
+            // the caller already owns the complete claim and cannot lose it to a
+            // separate post-commit read failure.
+            let sql = format!("SELECT {JOB_COLS} FROM jobs WHERE id = ?1");
+            let claimed = {
+                let mut rows = tx.query(&sql, params(vec![id.into()])).await?;
+                rows.next().await?.map(|row| row_to_job(&row)).transpose()?
+            }
+            .ok_or_else(|| anyhow::anyhow!("job '{id}' vanished during dispatch claim"))?;
+            tx.commit().await?;
+            Ok(Some(claimed))
+        })
+    }
+
     fn update_job(&self, id: &str, attempt_id: Option<&str>, patch: JobPatch) -> Result<Job> {
         self.guard_writable()?;
         if !job_id_valid(id) {
@@ -5201,6 +5247,29 @@ mod tests {
         assert!(s.get_peer_by_client_session("sid-A").unwrap().is_none());
         s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
         assert!(s.get_peer_by_client_session("").unwrap().is_none());
+
+        let oversized = "s".repeat(MAX_IDENT + 1);
+        assert!(s
+            .register_peer_full(
+                "rejected",
+                "tmux",
+                "%5",
+                "",
+                None,
+                Some(13),
+                "h",
+                "",
+                "",
+                "",
+                "default",
+                None,
+                &oversized,
+            )
+            .is_err());
+        assert!(s.get_peer("rejected").unwrap().is_none());
+        assert!(s.get_peer_by_client_session("sid\nraw").is_err());
+        assert!(s.get_peer_by_client_session(" sid-B").is_err());
+        assert!(s.get_peer_by_client_session("sid-B ").is_err());
     }
 
     /// WL-047 (dual-backend parity): byte-identical mirror of the sqlite backend's
@@ -7834,6 +7903,105 @@ mod tests {
     }
 
     #[test]
+    fn job_dispatch_claim_is_queued_only_and_preserves_manual_reclaim_libsql() {
+        let s = mem();
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        let first = s.claim_queued_job(&j.id, "worker").unwrap().unwrap();
+        let first_attempt = first.attempt_id.clone().unwrap();
+        assert_eq!(first.state, JobState::Running);
+
+        assert!(
+            s.claim_queued_job(&j.id, "worker").unwrap().is_none(),
+            "a stale/concurrent dispatch cannot reclaim a running row"
+        );
+        let manual = s.claim_job(&j.id, "recovery").unwrap().unwrap();
+        assert_ne!(manual.attempt_id.as_deref(), Some(first_attempt.as_str()));
+        assert_eq!(manual.assignee.as_deref(), Some("recovery"));
+
+        let assigned = s
+            .create_job(
+                "alice",
+                JobSpec {
+                    title: "assigned elsewhere".into(),
+                    assignee: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s
+            .claim_queued_job(&assigned.id, "worker")
+            .unwrap()
+            .is_none());
+        let unchanged = s.get_job(&assigned.id).unwrap().unwrap();
+        assert_eq!(unchanged.state, JobState::Queued);
+        assert!(unchanged.attempt_id.is_none());
+    }
+
+    #[test]
+    fn concurrent_job_dispatch_claim_has_exactly_one_winner_libsql() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-dispatch-claim-race-{}-{}",
+            std::process::id(),
+            crate::model::new_attempt_id(now())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let open = |path: &std::path::Path| {
+            LibsqlStore::open(&Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".into()),
+                ..Config::default()
+            })
+            .unwrap()
+        };
+        let seed = open(&path);
+        let id = seed.create_job("alice", jspec("race")).unwrap().id;
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for worker in ["worker-a", "worker-b"] {
+            let path = path.clone();
+            let id = id.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = LibsqlStore::open(&Config {
+                    db: Some(path.to_string_lossy().into_owned()),
+                    backend: Some("libsql".into()),
+                    ..Config::default()
+                })
+                .unwrap();
+                barrier.wait();
+                store.claim_queued_job(&id, worker)
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|job| job.is_some()).count(),
+            1,
+            "the state predicate and transition must be one atomic write"
+        );
+
+        let store = open(&path);
+        assert_eq!(
+            store.get_job(&id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn job_text_nul_is_rejected_libsql() {
+        let s = mem();
+        assert!(s.create_job("alice", jspec("bad\0title")).is_err());
+    }
+
+    #[test]
     fn job_stale_attempt_is_fenced_libsql() {
         let s = mem();
         let j = s.create_job("alice", jspec("task")).unwrap();
@@ -7953,6 +8121,7 @@ mod tests {
         let ro = LibsqlStore::open_readonly(&path).unwrap();
         assert!(ro.create_job("alice", jspec("nope")).is_err());
         assert!(ro.claim_job(&j.id, "w").is_err());
+        assert!(ro.claim_queued_job(&j.id, "w").is_err());
         assert!(ro.cancel_job(&j.id, "alice", None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

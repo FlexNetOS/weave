@@ -1,28 +1,51 @@
 # Changelog
 
-## [Unreleased] — fix: make live transport honest on Nix
+## [Unreleased] — fix: trusted runtime health and honest capability reporting
 
 - Trusted mux/program resolution now includes `$HOME/.nix-profile/toolbin`
   alongside the conventional Nix profile `bin`, so LifeOS/Nix-installed Zellij
   can be spawned and injected without an otherwise-redundant `WEAVE_MUX_DIR`.
-  Trusted candidates must also be executable files, and capability now requires a
-  real bounded read-only launch/probe; neither a mode-0644 lookalike nor unusable
-  execute bits can produce a false `Live` verdict before failing at injection.
+  Empty/relative roots and path-shaped relative commands are ignored; a bare
+  command resolves from one trusted root, while an absolute command must have
+  that root as its canonical direct parent. Trusted candidates must be executable
+  regular files, and capability now requires a real bounded read-only probe;
+  neither a mode-0644 lookalike nor unusable execute bits can produce a false
+  `Live` verdict before failing at injection.
 - `connect`/doctor capability checks no longer promise `Live` when the mux
-  executable is missing, unlaunchable, or times out; they report
-  `transport_unavailable` and preserve durable next-turn delivery. Pane liveness
-  remains fail-open/orthogonal while transport reachability is false.
-- One-shot CLI `attach` now records the nearest long-lived client ancestor (the
-  same dependency-free `/proc` seam used by hooks), rather than its own exiting
-  subprocess PID, so a newly attached live session is not instantly stale.
+  executable is missing, unlaunchable, exits non-zero, produces a truncated
+  inventory, or times out; they report `transport_unavailable` and preserve
+  durable next-turn delivery. Probe output is bounded and drained concurrently;
+  process-tree cleanup plus an EOF-independent capture stop prevents inherited
+  pipes from extending the probe deadline. Pane liveness remains
+  fail-open/orthogonal while transport reachability is false.
+- `connect` is explicitly read-only in CLI and MCP: it probes and reports only,
+  without queuing a message or mutating inbox state.
+- One-shot `register`, `attach`, `scan`, and `sessions --watch` record only an
+  explicitly supplied positive `WEAVE_CLIENT_PID`; otherwise they use TTL
+  presence rather than persisting the short-lived command's PID.
+- Lifecycle hooks now require an explicit configured identity, strict session-key
+  ownership, or one unique same-host client-PID row before consuming messages or
+  mutating a peer. Guessed basenames are peek-only, hook stdin is capped at 1 MiB,
+  invalid UTF-8 prefixes are discarded, and oversized PreToolUse input produces
+  an explicit deny instead of bypassing the approval decision.
+- Worker dispatch validates its complete execution plan before claiming, uses an
+  atomic queued-only claim on both backends, bounds argv/environment/leases/
+  capture/result payloads, and owns the runner process group. Exit and timeout
+  cleanup is independent of descendant-held pipe EOF; every post-claim failure is
+  fenced into a terminal result instead of leaving a job stuck `running`.
+- The feature-aware CLI/TUI command ledger now includes the `obscura`-gated
+  `web` command, so maximal builds enforce the same help, behavior, docs, status,
+  and risk metadata contract as the default command surface.
 
 ## [Unreleased] — feat: collision-proof per-session identity (WL-084)
 
 - Every agent session now launches with a unique mesh identity. The SessionStart
   hook classifies a same-name registration (`RegisterConflict`): a row owned by
-  THIS launcher session (matching `session_id` key or live client pid) is
-  updated in place; a dead/stale row is reclaimed (name continuity across
-  restarts); a row held by another LIVE session is **never stolen** — the new
+  THIS launcher session (matching `session_id` key, or the same live client PID
+  when one/both session keys are absent) is updated in place; different nonempty
+  keys remain distinct even under one host PID. A dead/stale row is reclaimed
+  (name continuity across restarts); a row held by another LIVE session is
+  **never stolen** — the new
   session registers under a deterministic `name-2`/`name-3` alias instead.
   Pre-WL-084, the second same-basename session silently re-bound the first
   one's pane and stole its messages.

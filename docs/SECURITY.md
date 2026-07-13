@@ -140,28 +140,58 @@ This blocks a crafted id (e.g. `%3; rm -rf /`, `--listen-on=evil`, `a b`) from
 redirecting keystrokes to an arbitrary pane or smuggling extra arguments, even
 though no shell is involved. Asserted in `id_valid_accepts_real_rejects_malicious`.
 
+### Trusted executable resolution
+Every mux, spawn, post-send hook, Obscura, and job-runner launch first resolves
+`argv[0]` without a shell. A bare name must be exactly one normal path component
+and is searched only in the fixed trusted roots. An absolute path is accepted
+only when its canonicalized direct parent is exactly one of those roots. Empty or
+relative `WEAVE_MUX_DIR`/`HOME` roots, path-shaped relative names, deeper
+descendants, non-files, and non-executable candidates are ignored. Ambient
+`$PATH` therefore cannot redirect these launch surfaces.
+
 ### Liveness pre-check (advisory, fail-open)
 Before typing, `target_alive()` runs a cheap read-only probe (`tmux has-session`,
 `zellij list-sessions`, `wezterm cli list`, `kitten @ ls`) so weave does not type
 into a pane that has demonstrably gone away. It is **advisory and fails open**:
 only a confident "absent" skips injection; a missing binary, probe error, or
 timeout all return "alive" so a delivery is never suppressed merely because the
-probe was unavailable.
+probe was unavailable. The structured capability used by `connect`/doctor is
+stricter: a missing/unlaunchable program, non-zero inventory exit, truncated
+inventory, or timeout is `transport_unavailable`, never a false `Live` promise.
+`connect` itself is read-only: it does not send, queue, mark read, or write inbox
+state.
 
 ### Subprocess timeout & bounded retry
 Every mux subprocess runs under a 5-second wall-clock cap (`run_bounded` /
 `run_capture`); on timeout the child is killed and reaped, so a wedged
 tmux/zellij server can never hang weave (critical, because the MCP server serves
-other sessions on the same thread). The first (text-typing) command — the only
-idempotent one, since on failure nothing has been typed — is retried exactly once
-after a short backoff; later submission steps are never retried (the text is
-already in the pane, so a re-run could append a duplicate or stray Enter).
+other sessions on the same thread). Listing output is drained concurrently and
+only a fixed prefix is retained. The probe runs in a fresh process group; cleanup
+kills that owned group, and the reader has an explicit completion signal so even
+a detached helper that inherited stdout cannot extend the wall-clock bound by
+withholding EOF. The first (text-typing) command — the only idempotent one, since
+on failure nothing has been typed — is retried exactly once after a short
+backoff; later submission steps are never retried (the text is already in the
+pane, so a re-run could append a duplicate or stray Enter).
 
 ### Contained side effect
 The worst case of a hostile body on this path is text appearing in another
 session's pane (a UX / prompt-injection concern, §5), not code execution. A failed
 or impossible injection degrades to next-turn hook delivery; it never crashes the
 sender, because the message is **persisted before injection is attempted**.
+
+### Lifecycle-hook identity and input bounds
+Lifecycle hooks accept at most 1 MiB from stdin before JSON parsing. Invalid
+UTF-8 prefixes, oversized payloads, and invalid/oversized session keys are
+discarded before any peer registration or inbox drain. An event may consume
+messages or mutate a peer only when it owns an identity through explicit config,
+an exact launcher session-key row, or one unique same-host client-PID row. A cwd
+basename is a naming hint and remains peek-only outside safe SessionStart
+registration; ambiguous PID ownership is also non-consuming. Oversized
+PreToolUse payloads emit an explicit `deny`, while the pre-existing malformed
+input policy remains a JSON `defer`. One-shot `register`, `attach`, `scan`, and
+`sessions --watch` persist only a positive explicit `WEAVE_CLIENT_PID`; otherwise
+they use TTL liveness rather than recording the short-lived CLI process.
 
 ### Post-send hooks: argv-only, env-only execution (WL-036)
 A configured `[[post_send_hook]]` spawns an **operator-authored** external program
@@ -195,6 +225,20 @@ discipline as the injector and the WL-047 spawn path:
   is built).
 - **Operational footgun.** A hook must not call back into `weave send`/`notify`/`ack`
   for the same event class or it re-fires in a loop; keep hook programs out-of-band.
+
+### Job runner claim and process bounds
+`weave job dispatch` completes deterministic preflight before it mutates a job:
+trusted runner resolution, argv cardinality/element checks, agent and timeout
+bounds, job-derived environment validation, and a bounded lease snapshot. Both
+stores expose one atomic queued-only claim, preventing two dispatchers from
+winning the same row. After claim, the external runner receives fixed argv and
+bounded environment values, runs in a fresh process group, and has a
+`1..=3600`-second deadline. Stdout/stderr drain concurrently with fixed retention
+caps; their readers stop independently of EOF after leader exit/timeout, so a
+detached descendant cannot hold dispatch open. Result/error JSON is capped, the
+owned process tree is cleaned up, and every post-claim launch/capture/recording
+error is terminalized with the matching fencing token (or recovered missing
+attempt) instead of stranding the row in `running`.
 
 ---
 

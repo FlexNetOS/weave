@@ -53,3 +53,25 @@ status: |
   guardian APPROVE. Next cycle after PR delivery: trusted program resolution,
   job liveness, terminal liveness, and attach identity correctness.
 ---
+
+---
+session_started: 2026-07-12
+session_type: MAX all-feature health / forge audit loop
+cycles_this_session: 2
+cycle_budget: owner-directed until all features and Yazelix profile are healthy
+worktree: /home/flexnetos/meta/src/weave/.worktrees/trusted-runtime-health
+branch: fix/trusted-runtime-health
+base: origin/develop @ e6b2517
+last_item: trusted runtime, identity, liveness, and dispatch health — APPROVED, delivering
+last_update: 2026-07-12
+status: |
+  Cycle B completed shared trusted-program resolution, truthful bounded mux
+  probes, explicit-PID presence, exact hook session ownership, raw-byte hook
+  input limits, and atomic dual-backend job dispatch with finite owned runner
+  lifecycles and bounded durable output. The exact final default workspace passed
+  839 tests; maximal SQLite passed 506; maximal libSQL passed 490 with one
+  intentional live-Turso test ignored; strict maximal clippy passed on both
+  backends. Documentation, formatting, dependency inspection, and structural
+  supply-chain policy are green. Independent verifier GREEN and guardian
+  APPROVE. Next cycle after PR delivery: configured bridge health.
+---

@@ -4596,6 +4596,18 @@ const TUI_COMMANDS: &[CommandSurface] = &[
         tui_exposure: "commands pane",
         risk: "file-import-export",
     },
+    #[cfg(feature = "obscura")]
+    CommandSurface {
+        name: "web",
+        domain: "governed web",
+        mcp_decision: "mcp-catalog",
+        status_surface: "web --list / doctor",
+        help_smoke: "integration:help-smoke",
+        behavior_coverage: "integration:obscura-web",
+        docs_surface: "README.md / docs/SECURITY.md",
+        tui_exposure: "commands pane",
+        risk: "external-browser-control",
+    },
     CommandSurface {
         name: "help",
         domain: "docs",
@@ -7309,7 +7321,7 @@ fn main() -> Result<()> {
                     &t.id,
                     &t.socket,
                     cwd_val.as_deref(),
-                    Some(std::process::id() as i64),
+                    store::explicit_client_pid(),
                     &config::this_host(),
                     &tags.repo,
                     &tags.branch,
@@ -7550,7 +7562,7 @@ fn main() -> Result<()> {
                     &t.id,
                     &t.socket,
                     cwd_val.as_deref(),
-                    Some(std::process::id() as i64),
+                    store::explicit_client_pid(),
                     &config::this_host(),
                     &tags.repo,
                     &tags.branch,
@@ -7719,10 +7731,10 @@ fn main() -> Result<()> {
             });
             // Persist the captured kitty control socket (KITTY_LISTEN_ON; empty for
             // every other backend) so a remote sender can reach a `--listen-on`
-            // kitty via `kitten --to <socket>` without re-detecting it. Capture
-            // this process's PID + host so presence reflects real liveness. Tag the
-            // session with its repo/branch/worktree id (best-effort from cwd; a git
-            // failure never sinks registration — empty tags result).
+            // kitty via `kitten --to <socket>` without re-detecting it. A one-shot
+            // CLI must never store its own dying PID or guess an ancestor: only an
+            // explicit WEAVE_CLIENT_PID is authoritative; otherwise presence is
+            // PID-unknown and TTL-based. Tag capture remains best-effort.
             let tags = git_tags_for(cwd_val.as_deref());
             let cert = store.register_peer_full(
                 &me,
@@ -7730,7 +7742,7 @@ fn main() -> Result<()> {
                 &t.id,
                 &t.socket,
                 cwd_val.as_deref(),
-                Some(std::process::id() as i64),
+                store::explicit_client_pid(),
                 &config::this_host(),
                 &tags.repo,
                 &tags.branch,
@@ -7776,12 +7788,10 @@ fn main() -> Result<()> {
                     .map(|p| p.to_string_lossy().into_owned())
             });
             // Idempotent upsert (ON CONFLICT(name) DO UPDATE) under our own identity.
-            // Track the nearest long-lived client ancestor, never this one-shot
-            // `weave attach` subprocess (it exits immediately and would make the
-            // newly adopted peer read stale on the very next command). A failed
-            // ancestry walk degrades to TTL presence via `None`.
+            // This one-shot command accepts only an explicit WEAVE_CLIENT_PID;
+            // otherwise it records no PID and presence degrades safely to TTL.
             let tags = git_tags_for(cwd_val.as_deref());
-            let client_pid = store::client_pid();
+            let client_pid = store::explicit_client_pid();
             // If no --cert provided, try to reuse the stored cert so re-attach is
             // seamless for the peer owner (the common case).
             let stored_cert = store.get_birth_cert(&me)?;
@@ -7825,7 +7835,7 @@ fn main() -> Result<()> {
             match inject::capability(&t) {
                 inject::Capability::Live => {
                     println!(
-                        "connect '{to}': live [{}] {} — a live nudge can be delivered now",
+                        "connect '{to}': live [{}] {} — this probe sends no message; a future message can be delivered with a live nudge now",
                         t.mux.as_str(),
                         t.id
                     );
@@ -7833,7 +7843,7 @@ fn main() -> Result<()> {
                 inject::Capability::TransportUnavailable => {
                     println!(
                         "connect '{to}': live transport unavailable [{}] {} — {} could not be launched/probed from a trusted directory; \
-                         durable delivery remains queued and arrives on the recipient's next inbox drain",
+                         this probe sends no message; a future message remains in the durable store until the recipient's next inbox drain",
                         t.mux.as_str(),
                         t.id,
                         t.mux.binary()
@@ -7842,7 +7852,7 @@ fn main() -> Result<()> {
                 inject::Capability::RegisteredNotAlive => {
                     println!(
                         "connect '{to}': registered but not alive [{}] {} — \
-                         delivery will be queued; recipient drains on next turn",
+                         this probe sends no message; a future message remains in the durable store until the recipient's next inbox drain",
                         t.mux.as_str(),
                         t.id
                     );
@@ -7850,7 +7860,7 @@ fn main() -> Result<()> {
                 inject::Capability::NotInjectable => {
                     println!(
                         "connect '{to}': not injectable (mux=none) — \
-                         delivery will be queued; recipient drains on next turn"
+                         this probe sends no message; a future message remains in the durable store until the recipient's next inbox drain"
                     );
                 }
             }
@@ -9059,6 +9069,16 @@ struct JobDispatchReport {
     job: model::Job,
 }
 
+const MAX_JOB_RUNNER_TIMEOUT_SECS: u64 = 3_600;
+const MAX_JOB_RUNNER_CAPTURE_BYTES: usize = 16_384;
+const MAX_JOB_RUNNER_JSON_FALLBACK_CHARS: usize = 4_096;
+const MAX_DISPATCH_LEASES: i64 = 200;
+
+struct DispatchPreflight {
+    runner_path: PathBuf,
+    timeout: std::time::Duration,
+}
+
 fn dispatch_one_job(
     store: &dyn Store,
     _cfg: &Config,
@@ -9092,59 +9112,53 @@ fn dispatch_one_job(
             .find(|j| j.assignee.is_none())
     };
     let Some(candidate) = candidate else {
-        let now = model::now();
-        return Ok(JobDispatchReport {
-            worker: worker.to_string(),
-            claimed_job_id: String::new(),
-            attempt_id: String::new(),
-            runner: runner.to_string(),
-            exit_code: 0,
-            timed_out: false,
-            job: model::Job {
-                id: String::new(),
-                title: String::new(),
-                description: String::new(),
-                kind: String::new(),
-                state: model::JobState::Unavailable,
-                state_reason: Some("no queued job".into()),
-                phase: None,
-                prompt: None,
-                progress_note: None,
-                progress_events_json: "[]".into(),
-                creator: String::new(),
-                owner: None,
-                assignee: None,
-                circle: None,
-                correlation_id: None,
-                source_kind: None,
-                source_id: None,
-                scope: None,
-                visibility: String::new(),
-                attempt_id: None,
-                deadline_at: None,
-                expires_at: None,
-                result_summary: None,
-                result_json: "{}".into(),
-                error_json: "{}".into(),
-                artifacts_json: "[]".into(),
-                cancel_requested: false,
-                cancel_requested_by: None,
-                cancel_requested_ts: None,
-                cancel_reason: None,
-                opened_ts: now,
-                updated_ts: now,
-                completed_ts: None,
-            },
-        });
+        return Ok(no_job_dispatch_report(worker, runner));
     };
-    let claimed = store
-        .claim_job(&candidate.id, worker)?
-        .ok_or_else(|| anyhow::anyhow!("no job '{}'", candidate.id))?;
-    let attempt = claimed
-        .attempt_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("claimed job '{}' did not mint attempt_id", claimed.id))?;
-    let started = store.update_job(
+
+    // Everything that can fail deterministically must do so before the durable
+    // queued -> running transition. This also revalidates legacy rows written
+    // before the store's NUL guard existed.
+    let preflight = validate_dispatch_options(runner, runner_args, agent.as_deref(), timeout_secs)?;
+    validate_dispatch_job_env(&candidate)?;
+    let leases_json = bounded_leases_json(store.list_leases(MAX_DISPATCH_LEASES)?)?;
+
+    let Some(claimed) = store.claim_queued_job(&candidate.id, worker)? else {
+        // Another dispatcher/cancellation/reassignment won after our read. The
+        // guarded store update changed nothing, so this tick honestly did no work.
+        return Ok(no_job_dispatch_report(worker, runner));
+    };
+    let attempt = match claimed.attempt_id.clone() {
+        Some(attempt) => attempt,
+        None => {
+            // `claim_queued_job` implementations mint and return the fencing
+            // token in one transaction. If another Store implementation violates
+            // that contract, reclaim the still-running job to obtain a usable
+            // token before recording the invariant failure as terminal.
+            let recovery = store
+                .claim_job(&claimed.id, worker)
+                .context("recover fencing token after malformed dispatch claim")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "claimed job '{}' vanished while recovering its attempt_id",
+                        claimed.id
+                    )
+                })?;
+            let recovery_attempt = recovery.attempt_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recovery claim for job '{}' also omitted attempt_id",
+                    claimed.id
+                )
+            })?;
+            return terminalize_dispatch_error(
+                store,
+                &claimed.id,
+                Some(recovery_attempt),
+                runner,
+                anyhow::anyhow!("claimed job '{}' did not mint attempt_id", claimed.id),
+            );
+        }
+    };
+    let started = match store.update_job(
         &claimed.id,
         Some(&attempt),
         model::JobPatch {
@@ -9152,9 +9166,20 @@ fn dispatch_one_job(
             progress_note: Some(format!("worker {worker} dispatching via {runner}")),
             ..Default::default()
         },
-    )?;
+    ) {
+        Ok(job) => job,
+        Err(err) => {
+            return terminalize_dispatch_error(
+                store,
+                &claimed.id,
+                Some(&attempt),
+                runner,
+                anyhow::anyhow!("record runner start: {err}"),
+            );
+        }
+    };
     if started.cancel_requested {
-        let job = store.update_job(
+        let job = match store.update_job(
             &started.id,
             Some(&attempt),
             model::JobPatch {
@@ -9164,7 +9189,18 @@ fn dispatch_one_job(
                 progress_note: Some("worker honored pre-run cancellation".into()),
                 ..Default::default()
             },
-        )?;
+        ) {
+            Ok(job) => job,
+            Err(err) => {
+                return terminalize_dispatch_error(
+                    store,
+                    &started.id,
+                    Some(&attempt),
+                    runner,
+                    anyhow::anyhow!("record pre-run cancellation: {err}"),
+                );
+            }
+        };
         return Ok(JobDispatchReport {
             worker: worker.to_string(),
             claimed_job_id: job.id.clone(),
@@ -9176,41 +9212,40 @@ fn dispatch_one_job(
         });
     }
 
-    let leases_json = serde_json::to_string(&store.list_leases(200)?)?;
-    let outcome = run_job_runner(RunnerInvocation {
+    let outcome = match run_job_runner(RunnerInvocation {
         job: &started,
         attempt: &attempt,
         worker,
-        runner,
+        runner_path: &preflight.runner_path,
         runner_args,
-        agent,
-        timeout_secs,
+        agent: agent.as_deref(),
+        timeout: preflight.timeout,
         leases_json: &leases_json,
-    })?;
+    }) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return terminalize_dispatch_error(
+                store,
+                &started.id,
+                Some(&attempt),
+                runner,
+                err.context("runner lifecycle failed"),
+            );
+        }
+    };
     let terminal_state = if outcome.exit_code == 0 && !outcome.timed_out {
         model::JobState::Completed
     } else {
         model::JobState::Failed
     };
-    let result_json = serde_json::json!({
-        "exit_code": outcome.exit_code,
-        "timed_out": outcome.timed_out,
-        "stdout": truncate_chars(&outcome.stdout, 16_384),
-        "stderr": truncate_chars(&outcome.stderr, 16_384),
-    })
-    .to_string();
-    let error_json = serde_json::json!({
-        "exit_code": outcome.exit_code,
-        "timed_out": outcome.timed_out,
-        "stderr": truncate_chars(&outcome.stderr, 16_384),
-    })
-    .to_string();
+    let result_json = runner_result_json(&outcome);
+    let error_json = runner_error_json(&outcome);
     let summary = if outcome.timed_out {
         format!("runner timed out after {timeout_secs}s")
     } else {
         format!("runner exited {}", outcome.exit_code)
     };
-    let job = store.update_job(
+    let job = match store.update_job(
         &started.id,
         Some(&attempt),
         model::JobPatch {
@@ -9227,7 +9262,18 @@ fn dispatch_one_job(
             },
             artifacts_json: None,
         },
-    )?;
+    ) {
+        Ok(job) => job,
+        Err(err) => {
+            return terminalize_dispatch_error(
+                store,
+                &started.id,
+                Some(&attempt),
+                runner,
+                anyhow::anyhow!("record runner outcome: {err}"),
+            );
+        }
+    };
     Ok(JobDispatchReport {
         worker: worker.to_string(),
         claimed_job_id: job.id.clone(),
@@ -9250,10 +9296,10 @@ struct RunnerInvocation<'a> {
     job: &'a model::Job,
     attempt: &'a str,
     worker: &'a str,
-    runner: &'a str,
+    runner_path: &'a std::path::Path,
     runner_args: &'a [String],
-    agent: Option<String>,
-    timeout_secs: u64,
+    agent: Option<&'a str>,
+    timeout: std::time::Duration,
     leases_json: &'a str,
 }
 
@@ -9262,31 +9308,13 @@ fn run_job_runner(inv: RunnerInvocation<'_>) -> Result<RunnerOutcome> {
         job,
         attempt,
         worker,
-        runner,
+        runner_path,
         runner_args,
         agent,
-        timeout_secs,
+        timeout,
         leases_json,
     } = inv;
-    if !inject::spawn_arg_ok(runner) {
-        anyhow::bail!("runner name is too long or contains control/NUL bytes");
-    }
-    for arg in runner_args {
-        if !inject::spawn_arg_ok(arg) {
-            anyhow::bail!("runner argument is too long or contains control/NUL bytes");
-        }
-    }
-    let runner_path = if std::path::Path::new(runner).is_absolute() {
-        let p = std::path::PathBuf::from(runner);
-        if !p.is_file() {
-            anyhow::bail!("runner {:?} is not an executable file", runner);
-        }
-        p
-    } else {
-        inject::resolve_trusted(runner)
-            .ok_or_else(|| anyhow::anyhow!("runner {runner:?} is not in a trusted directory"))?
-    };
-    let mut cmd = std::process::Command::new(&runner_path);
+    let mut cmd = std::process::Command::new(runner_path);
     cmd.args(runner_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -9302,41 +9330,601 @@ fn run_job_runner(inv: RunnerInvocation<'_>) -> Result<RunnerOutcome> {
     if let Some(agent) = agent {
         cmd.env("WEAVE_FXRUN_AGENT", agent);
     }
+    configure_runner_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn runner {runner:?}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+        .with_context(|| format!("spawn runner {:?}", runner_path.display()))?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_and_reap_runner(&mut child);
+        anyhow::bail!("runner stdout pipe was not captured");
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_and_reap_runner(&mut child);
+        anyhow::bail!("runner stderr pipe was not captured");
+    };
+    let mut child = OwnedRunner::new(child, stdout, stderr)?;
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("runner timeout cannot be represented"))?;
     loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(RunnerOutcome {
-                exit_code: output.status.code().unwrap_or(1),
-                timed_out: false,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
+        if let Some(status) = child.child.try_wait()? {
+            // `wait` is idempotent after a successful `try_wait` and makes the
+            // reaping contract explicit. A runner may have forked descendants
+            // that inherited our pipes, so terminate the owned process group even
+            // after its leader exits before joining the drain threads.
+            let status = child.child.wait().unwrap_or(status);
+            terminate_runner_process_group(&mut child.child)
+                .context("terminate runner descendants after leader exit")?;
+            child.reaped = true;
+            return child.into_outcome(status.code().unwrap_or(1), false);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(RunnerOutcome {
-                exit_code: 124,
-                timed_out: true,
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
+            terminate_runner_process_group(&mut child.child)
+                .context("terminate timed-out runner process group")?;
+            child.child.wait().context("reap timed-out runner")?;
+            child.reaped = true;
+            return child.into_outcome(124, true);
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Fixed post-leader grace for draining bytes already in flight. Completion
+/// remains bounded even if an escaped descendant continuously writes the pipe.
+const POST_LEADER_CAPTURE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+enum CaptureRead {
+    Data(usize),
+    Idle,
+    Eof,
+}
+
+/// Pipe reader that periodically yields so capture can observe that the runner
+/// leader finished. Unix uses `poll(2)` to avoid entering a blocking `read` when
+/// a detached descendant inherited the pipe; the fallback keeps other targets
+/// compiling with their ordinary stream semantics.
+trait CancellableCaptureReader: Read + Send + 'static {
+    fn read_when_ready(&mut self, buf: &mut [u8], wait: bool) -> std::io::Result<CaptureRead>;
+}
+
+#[cfg(unix)]
+impl<T> CancellableCaptureReader for T
+where
+    T: Read + std::os::fd::AsRawFd + Send + 'static,
+{
+    fn read_when_ready(&mut self, buf: &mut [u8], wait: bool) -> std::io::Result<CaptureRead> {
+        const POLLIN: std::ffi::c_short = 0x0001;
+        const POLLERR: std::ffi::c_short = 0x0008;
+        const POLLHUP: std::ffi::c_short = 0x0010;
+        const POLLNVAL: std::ffi::c_short = 0x0020;
+
+        #[repr(C)]
+        struct PollFd {
+            fd: std::ffi::c_int,
+            events: std::ffi::c_short,
+            revents: std::ffi::c_short,
+        }
+
+        unsafe extern "C" {
+            #[link_name = "poll"]
+            fn c_poll(fds: *mut PollFd, nfds: usize, timeout: std::ffi::c_int) -> std::ffi::c_int;
+        }
+
+        let mut descriptor = PollFd {
+            fd: self.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = if wait { 20 } else { 0 };
+        // SAFETY: `descriptor` is one initialized `pollfd`, remains live for the
+        // call, and `poll` writes only its `revents` field without retaining it.
+        let ready = unsafe { c_poll(&mut descriptor, 1, timeout_ms) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            return if err.kind() == std::io::ErrorKind::Interrupted {
+                Ok(CaptureRead::Idle)
+            } else {
+                Err(err)
+            };
+        }
+        if ready == 0 {
+            return Ok(CaptureRead::Idle);
+        }
+        if descriptor.revents & POLLNVAL != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "capture pipe descriptor is invalid",
+            ));
+        }
+        if descriptor.revents & (POLLIN | POLLERR | POLLHUP) == 0 {
+            return Ok(CaptureRead::Idle);
+        }
+        match Read::read(self, buf) {
+            Ok(0) => Ok(CaptureRead::Eof),
+            Ok(n) => Ok(CaptureRead::Data(n)),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(CaptureRead::Idle)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl<T> CancellableCaptureReader for T
+where
+    T: Read + Send + 'static,
+{
+    fn read_when_ready(&mut self, buf: &mut [u8], _wait: bool) -> std::io::Result<CaptureRead> {
+        match Read::read(self, buf)? {
+            0 => Ok(CaptureRead::Eof),
+            n => Ok(CaptureRead::Data(n)),
+        }
+    }
+}
+
+struct OwnedRunner {
+    child: std::process::Child,
+    stdout: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+    stderr: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+    leader_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reaped: bool,
+}
+
+impl OwnedRunner {
+    fn new(
+        mut child: std::process::Child,
+        stdout: std::process::ChildStdout,
+        stderr: std::process::ChildStderr,
+    ) -> Result<Self> {
+        use std::sync::atomic::Ordering;
+
+        let leader_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout =
+            match spawn_capture_drain(stdout, "stdout", std::sync::Arc::clone(&leader_finished)) {
+                Ok(reader) => reader,
+                Err(err) => {
+                    kill_and_reap_runner(&mut child);
+                    return Err(err).context("start runner stdout drain");
+                }
+            };
+        let stderr =
+            match spawn_capture_drain(stderr, "stderr", std::sync::Arc::clone(&leader_finished)) {
+                Ok(reader) => reader,
+                Err(err) => {
+                    kill_and_reap_runner(&mut child);
+                    leader_finished.store(true, Ordering::Release);
+                    let _ = stdout.join();
+                    return Err(err).context("start runner stderr drain");
+                }
+            };
+        Ok(Self {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            leader_finished,
+            reaped: false,
+        })
+    }
+
+    fn into_outcome(mut self, exit_code: i32, timed_out: bool) -> Result<RunnerOutcome> {
+        use std::sync::atomic::Ordering;
+
+        self.leader_finished.store(true, Ordering::Release);
+        let stdout = join_capture(self.stdout.take(), "stdout")?;
+        let stderr = join_capture(self.stderr.take(), "stderr")?;
+        Ok(RunnerOutcome {
+            exit_code,
+            timed_out,
+            stdout: capture_text(stdout),
+            stderr: capture_text(stderr),
+        })
+    }
+}
+
+impl Drop for OwnedRunner {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        if !self.reaped {
+            kill_and_reap_runner(&mut self.child);
+            self.reaped = true;
+        }
+        self.leader_finished.store(true, Ordering::Release);
+        if let Some(reader) = self.stdout.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_runner_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // Group id 0 asks the child to become leader of a fresh process group before
+    // exec. Descendants inherit it, giving timeout/error cleanup one owned tree.
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_runner_process_group(_cmd: &mut std::process::Command) {}
+
+#[cfg(unix)]
+fn terminate_runner_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    const SIGKILL: std::ffi::c_int = 9;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        #[link_name = "kill"]
+        fn c_kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    let pgid = i32::try_from(child.id())
+        .map_err(|_| std::io::Error::other("runner pid does not fit process-group id"))?;
+    // SAFETY: `pgid` is the positive OS pid returned for our child; negating it
+    // addresses the fresh process group configured immediately above. SIGKILL has
+    // no pointer arguments or memory ownership contract.
+    if unsafe { c_kill(-pgid, SIGKILL) } == 0 {
+        return Ok(());
+    }
+
+    let group_error = std::io::Error::last_os_error();
+    // ESRCH means the leader and every descendant already exited. Try the direct
+    // handle as a defensive fallback in case a platform ignored process_group(0).
+    match child.kill() {
+        Ok(()) => {
+            if group_error.raw_os_error() == Some(ESRCH) {
+                Ok(())
+            } else {
+                Err(group_error)
+            }
+        }
+        Err(direct_error)
+            if group_error.raw_os_error() == Some(ESRCH)
+                && matches!(
+                    direct_error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(group_error),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_runner_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    // Non-Unix std exposes no process-group primitive. The direct child remains
+    // owned/reaped; Unix (the supported production/CI runtime) gets tree cleanup.
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn kill_and_reap_runner(child: &mut std::process::Child) {
+    let _ = terminate_runner_process_group(child);
+    // Defensive direct-child fallback if group setup/termination was unavailable.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_capture_drain<R>(
+    mut reader: R,
+    stream: &str,
+    leader_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>
+where
+    R: CancellableCaptureReader,
+{
+    std::thread::Builder::new()
+        .name(format!("weave-job-{stream}-drain"))
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+
+            let mut retained = Vec::with_capacity(MAX_JOB_RUNNER_CAPTURE_BYTES);
+            let mut truncated = false;
+            let mut buf = [0_u8; 8_192];
+            let mut finish_observed = None;
+            loop {
+                let finishing = leader_finished.load(Ordering::Acquire);
+                if finishing {
+                    let observed = finish_observed.get_or_insert_with(std::time::Instant::now);
+                    if observed.elapsed() >= POST_LEADER_CAPTURE_GRACE {
+                        break;
+                    }
+                }
+                match reader.read_when_ready(&mut buf, !finishing)? {
+                    CaptureRead::Data(read) => {
+                        let remaining = MAX_JOB_RUNNER_CAPTURE_BYTES.saturating_sub(retained.len());
+                        let keep = remaining.min(read);
+                        retained.extend_from_slice(&buf[..keep]);
+                        truncated |= keep < read;
+                        if finishing && truncated {
+                            break;
+                        }
+                    }
+                    CaptureRead::Idle if finishing => break,
+                    CaptureRead::Idle => {}
+                    CaptureRead::Eof => break,
+                }
+            }
+            Ok(BoundedCapture {
+                bytes: retained,
+                truncated,
+            })
+        })
+}
+
+fn join_capture(
+    reader: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+    stream: &str,
+) -> Result<BoundedCapture> {
+    reader
+        .ok_or_else(|| anyhow::anyhow!("runner {stream} reader missing"))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("runner {stream} reader panicked"))?
+        .with_context(|| format!("drain runner {stream}"))
+}
+
+fn capture_text(capture: BoundedCapture) -> String {
+    let text = String::from_utf8_lossy(&capture.bytes);
+    if capture.truncated {
+        truncate_chars(&text, MAX_JOB_RUNNER_CAPTURE_BYTES, true)
+    } else {
+        truncate_chars(&text, MAX_JOB_RUNNER_CAPTURE_BYTES, false)
+    }
+}
+
+fn truncate_chars(s: &str, max: usize, mark: bool) -> String {
+    let marker = "…[truncated]";
+    let count = s.chars().count();
+    if count <= max && !mark {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
-    out.push_str("…[truncated]");
+    if max == 0 {
+        return String::new();
+    }
+    let marker_chars = marker.chars().count().min(max);
+    let keep = max.saturating_sub(marker_chars);
+    let mut out: String = s.chars().take(keep).collect();
+    out.extend(marker.chars().take(marker_chars));
     out
+}
+
+fn validate_dispatch_options(
+    runner: &str,
+    runner_args: &[String],
+    agent: Option<&str>,
+    timeout_secs: u64,
+) -> Result<DispatchPreflight> {
+    if !inject::spawn_arg_ok(runner) {
+        anyhow::bail!("runner name is too long or contains control/NUL bytes");
+    }
+    let argv_len = runner_args
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("runner argv count overflow"))?;
+    if argv_len > inject::MAX_SPAWN_ARGS {
+        anyhow::bail!(
+            "runner command has {argv_len} argv elements (max {})",
+            inject::MAX_SPAWN_ARGS
+        );
+    }
+    for arg in runner_args {
+        if !inject::spawn_arg_ok(arg) {
+            anyhow::bail!("runner argument is too long or contains control/NUL bytes");
+        }
+    }
+    if let Some(agent) = agent {
+        store::check_ident("agent", agent)?;
+    }
+    if !(1..=MAX_JOB_RUNNER_TIMEOUT_SECS).contains(&timeout_secs) {
+        anyhow::bail!("runner timeout must be between 1 and {MAX_JOB_RUNNER_TIMEOUT_SECS} seconds");
+    }
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("runner timeout cannot be represented"))?;
+    let runner_path = inject::resolve_trusted_program(runner)
+        .ok_or_else(|| anyhow::anyhow!("runner {runner:?} is not in a trusted directory"))?;
+    Ok(DispatchPreflight {
+        runner_path,
+        timeout,
+    })
+}
+
+fn validate_dispatch_job_env(job: &model::Job) -> Result<()> {
+    if !model::job_id_valid(&job.id) {
+        anyhow::bail!("queued job has an invalid id");
+    }
+    store::check_job_text("job title", &job.title)?;
+    store::check_job_text("job description", &job.description)?;
+    if let Some(prompt) = job.prompt.as_deref() {
+        store::check_job_text("job prompt", prompt)?;
+    }
+    Ok(())
+}
+
+fn bounded_leases_json(leases: Vec<model::Lease>) -> Result<String> {
+    let mut kept = Vec::new();
+    let mut snapshot = "[]".to_string();
+    for lease in leases {
+        if !model::lease_resource_valid(&lease.resource) {
+            anyhow::bail!("lease snapshot contains an invalid resource");
+        }
+        store::check_ident("lease holder", &lease.holder)?;
+        if lease.note.len() > model::MAX_LEASE_NOTE_LEN {
+            anyhow::bail!(
+                "lease snapshot note exceeds {} bytes",
+                model::MAX_LEASE_NOTE_LEN
+            );
+        }
+        kept.push(lease);
+        let candidate = serde_json::to_string(&kept)?;
+        if candidate.len() > model::MAX_JOB_JSON {
+            kept.pop();
+            break;
+        }
+        snapshot = candidate;
+    }
+    Ok(snapshot)
+}
+
+fn runner_result_json(outcome: &RunnerOutcome) -> String {
+    let full = serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+    })
+    .to_string();
+    if full.len() <= model::MAX_JOB_JSON {
+        return full;
+    }
+    let bounded = serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stdout": truncate_chars(&outcome.stdout, MAX_JOB_RUNNER_JSON_FALLBACK_CHARS, true),
+        "stderr": truncate_chars(&outcome.stderr, MAX_JOB_RUNNER_JSON_FALLBACK_CHARS, true),
+        "capture_truncated_for_json": true,
+    })
+    .to_string();
+    if bounded.len() <= model::MAX_JOB_JSON {
+        bounded
+    } else {
+        serde_json::json!({
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "capture_truncated_for_json": true,
+        })
+        .to_string()
+    }
+}
+
+fn runner_error_json(outcome: &RunnerOutcome) -> String {
+    let full = serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stderr": outcome.stderr,
+    })
+    .to_string();
+    if full.len() <= model::MAX_JOB_JSON {
+        return full;
+    }
+    serde_json::json!({
+        "exit_code": outcome.exit_code,
+        "timed_out": outcome.timed_out,
+        "stderr": truncate_chars(
+            &outcome.stderr,
+            MAX_JOB_RUNNER_JSON_FALLBACK_CHARS,
+            true,
+        ),
+        "capture_truncated_for_json": true,
+    })
+    .to_string()
+}
+
+fn terminalize_dispatch_error<T>(
+    store: &dyn Store,
+    job_id: &str,
+    attempt: Option<&str>,
+    runner: &str,
+    error: anyhow::Error,
+) -> Result<T> {
+    let raw_detail = error.to_string();
+    let detail = truncate_chars(&raw_detail, 512, raw_detail.chars().count() > 512);
+    let summary = format!("runner dispatch failed: {detail}");
+    let error_json = serde_json::json!({
+        "runner": runner,
+        "error": detail,
+    })
+    .to_string();
+    match store.update_job(
+        job_id,
+        attempt,
+        model::JobPatch {
+            state: Some(model::JobState::Failed),
+            state_reason: Some(summary.clone()),
+            phase: Some("runner_failed".into()),
+            progress_note: Some(summary.clone()),
+            result_summary: Some(summary),
+            error_json: Some(error_json),
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => Err(error),
+        Err(terminal_err) => Err(error.context(format!(
+            "also failed to terminalize claimed job {job_id}: {terminal_err}"
+        ))),
+    }
+}
+
+fn no_job_dispatch_report(worker: &str, runner: &str) -> JobDispatchReport {
+    let now = model::now();
+    JobDispatchReport {
+        worker: worker.to_string(),
+        claimed_job_id: String::new(),
+        attempt_id: String::new(),
+        runner: runner.to_string(),
+        exit_code: 0,
+        timed_out: false,
+        job: model::Job {
+            id: String::new(),
+            title: String::new(),
+            description: String::new(),
+            kind: String::new(),
+            state: model::JobState::Unavailable,
+            state_reason: Some("no queued job".into()),
+            phase: None,
+            prompt: None,
+            progress_note: None,
+            progress_events_json: "[]".into(),
+            creator: String::new(),
+            owner: None,
+            assignee: None,
+            circle: None,
+            correlation_id: None,
+            source_kind: None,
+            source_id: None,
+            scope: None,
+            visibility: String::new(),
+            attempt_id: None,
+            deadline_at: None,
+            expires_at: None,
+            result_summary: None,
+            result_json: "{}".into(),
+            error_json: "{}".into(),
+            artifacts_json: "[]".into(),
+            cancel_requested: false,
+            cancel_requested_by: None,
+            cancel_requested_ts: None,
+            cancel_reason: None,
+            opened_ts: now,
+            updated_ts: now,
+            completed_ts: None,
+        },
+    }
 }
 
 /// One-line human summary of a [`model::Job`] for the CLI listings/show.
@@ -9862,11 +10450,59 @@ fn run_hook_responder_best_effort(store: &dyn Store, cfg: &Config, me: &str, eve
 /// is one indexed row lookup) while comfortably covering real fleets.
 const MAX_UNIQUIFY_TRIES: u32 = 16;
 
-fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
-    let mut buf = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        eprintln!("[weave] hook stdin read error: {e}");
+/// Maximum lifecycle-hook JSON accepted on stdin. Hooks need only bounded routing
+/// metadata (`cwd`, `session_id`, tool fields); an unbounded payload must not make
+/// a one-shot hook allocate without limit before it can enforce identity safety.
+const MAX_HOOK_INPUT_BYTES: usize = 1_048_576;
+
+/// Resolve one peer row owned by a client PID on this host. PID fallback is used
+/// only when a host supplies no launcher-session key, and only on a unique match;
+/// ambiguity fails closed toward a non-consuming peek.
+fn unique_client_pid_peer(store: &dyn Store, pid: Option<i64>, host: &str) -> Option<String> {
+    let pid = pid?;
+    let mut matches = store
+        .list_peers()
+        .ok()?
+        .into_iter()
+        .filter(|peer| peer.pid == Some(pid) && peer.host == host);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
     }
+    Some(first.name)
+}
+
+fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) -> Result<()> {
+    // Read bounded bytes first. A multibyte sequence split exactly at the cap
+    // must still classify as oversized before UTF-8 decoding.
+    let mut raw = Vec::with_capacity(MAX_HOOK_INPUT_BYTES + 1);
+    let mut stdin = std::io::stdin().take((MAX_HOOK_INPUT_BYTES + 1) as u64);
+    let input_read_failed = match stdin.read_to_end(&mut raw) {
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!("[weave] hook stdin read error: {e}");
+            true
+        }
+    };
+    let input_oversized = raw.len() > MAX_HOOK_INPUT_BYTES;
+    if input_oversized {
+        eprintln!(
+            "[weave] hook payload exceeds {MAX_HOOK_INPUT_BYTES} bytes; refusing its identity fields"
+        );
+    }
+    let mut input_decode_failed = false;
+    let buf = if input_read_failed || input_oversized {
+        String::new()
+    } else {
+        match String::from_utf8(raw) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!("[weave] hook stdin UTF-8 decode error: {err}");
+                input_decode_failed = true;
+                String::new()
+            }
+        }
+    };
     // Track whether the payload actually parsed: a garbled/empty payload means we
     // cannot trust `cwd` for identity, and must not guess one for a read-marking
     // drain (which would consume another session's inbox).
@@ -9881,22 +10517,50 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             }
         }
     };
+    // PreToolUse is its own approval protocol. Route it before session-key
+    // handling so its pure-JSON contract remains intact. An oversized payload is
+    // different from ordinary malformed input: accepting an unbounded suffix as
+    // a reason to defer would let size alone bypass this gate, so emit an explicit
+    // deny without consulting any truncated identity/tool fields. Ordinary
+    // malformed input retains the existing defer policy in the decision core.
+    if event == "pretooluse" {
+        if input_oversized {
+            return emit_pretooluse(
+                "deny",
+                "weave: PreToolUse payload exceeded the bounded input limit",
+            );
+        }
+        return handle_pretooluse_hook(store, cfg, &v, payload_ok);
+    }
+    if input_oversized || input_read_failed || input_decode_failed {
+        // Other lifecycle hooks have no safe identity to act on. Do not register,
+        // pull, display, mark read, or mutate a guessed peer.
+        return Ok(());
+    }
+
     let cwd = v.get("cwd").and_then(|x| x.as_str());
     // WL-084: the host's per-session id — Claude Code sends `session_id` in
-    // EVERY hook payload. Empty for hosts that send none; every WL-084 path
-    // degrades to the pre-WL-084 behavior on empty.
-    let sid = v
-        .get("session_id")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .unwrap_or("");
+    // EVERY hook payload. Empty for hosts that send none; those hosts may recover
+    // ownership through one unique same-host client-PID row, otherwise lifecycle
+    // inbox handling is non-consuming.
+    let raw_sid = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    let sid = match store::client_session_key(raw_sid) {
+        Ok(sid) => sid,
+        Err(err) => {
+            eprintln!("[weave] invalid hook session_id; refusing lifecycle action: {err}");
+            return Ok(());
+        }
+    };
     let mut me = resolve_me(None, cwd, cfg);
 
-    // An identity is "explicit" (trustworthy) when it comes from config/$WEAVE_SESSION
-    // or from a `cwd` the payload actually supplied — NOT from basename(current_dir()),
-    // which in a hook is not guaranteed to be the project dir.
+    // An identity is trustworthy when explicitly configured or resolved back to
+    // one row owned by this launcher session/PID. A payload cwd is only a naming
+    // hint; two live sessions may share its basename, so it cannot authorize a
+    // read-marking drain by itself.
     let cfg_explicit = cfg.session.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-    let mut explicit_identity = cfg_explicit || (payload_ok && cwd.is_some());
+    let mut explicit_identity = cfg_explicit;
+    let client_pid = store::client_pid();
+    let this_host = config::this_host();
     // WL-084: a peer row keyed to THIS launcher session overrides any cwd
     // guess — it is the name this session actually registered under (possibly
     // auto-uniquified at SessionStart), so a same-basename sibling session can
@@ -9906,9 +10570,15 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
     // authoritative (config or own-row) — only a pure basename guess may be
     // auto-uniquified by the `session` arm below.
     let mut name_is_pinned = cfg_explicit;
-    if !cfg_explicit && !sid.is_empty() {
-        if let Ok(Some(row)) = store.get_peer_by_client_session(sid) {
-            me = row.name;
+    if !cfg_explicit {
+        if !sid.is_empty() {
+            if let Ok(Some(row)) = store.get_peer_by_client_session(&sid) {
+                me = row.name;
+                explicit_identity = true;
+                name_is_pinned = true;
+            }
+        } else if let Some(name) = unique_client_pid_peer(store, client_pid, &this_host) {
+            me = name;
             explicit_identity = true;
             name_is_pinned = true;
         }
@@ -9934,8 +10604,6 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // every hook-registered peer read `process_dead` moments after
             // SessionStart. `None` (walk failed / non-Linux) falls back to TTL
             // presence, the same degradation as an unknown pid.
-            let client_pid = store::client_pid();
-            let this_host = config::this_host();
             // SessionStart re-fires on every restart, so an already-registered
             // peer holds a minted cert. Mirror `attach`: fall back to our OWN
             // stored cert so re-registration is idempotent for the peer owner
@@ -9946,7 +10614,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // register_peer_full, and a brand-new peer still mints fresh.
             //
             // WL-084: that stored-cert fallback is safe ONLY for a name we own
-            // (config/$WEAVE_SESSION, or our own session-keyed row) or a
+            // (config/$WEAVE_SESSION, or our own session-key/PID-resolved row) or a
             // dead/stale row (name continuity across restarts). For a GUESSED
             // basename colliding with another LIVE session's row it was the
             // silent-takeover bug: the second session re-bound the first one's
@@ -9960,7 +10628,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                     None => (me.clone(), env_cert.clone()),
                     Some(existing) => match store::registration_conflict(
                         &existing,
-                        sid,
+                        &sid,
                         client_pid,
                         &this_host,
                         model::now(),
@@ -9984,7 +10652,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                                     }
                                     Some(row) => match store::registration_conflict(
                                         &row,
-                                        sid,
+                                        &sid,
                                         client_pid,
                                         &this_host,
                                         model::now(),
@@ -10037,7 +10705,7 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
                 &tags.worktree_id,
                 &cfg.circle(),
                 supplied_cert.as_deref(),
-                sid,
+                &sid,
             )?;
             if reg_name != me {
                 eprintln!(
@@ -10118,9 +10786,11 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             // Tier-2: opportunistically pull cross-store intents into the local
             // inbox BEFORE draining, so a freshly-pulled message is delivered in
             // this same turn. Best-effort: a pull failure never sinks the drain.
-            try_pull(store, cfg, &me);
-            if event == "prompt" && explicit_identity {
-                run_hook_responder_best_effort(store, cfg, &me, event);
+            if explicit_identity {
+                try_pull(store, cfg, &me);
+                if event == "prompt" {
+                    run_hook_responder_best_effort(store, cfg, &me, event);
+                }
             }
             let is_wake_stop = event == "stop"
                 && (wake_flag || std::env::var("WEAVE_STOP_WAKE").ok().as_deref() == Some("1"));
@@ -10197,10 +10867,12 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
             } else {
                 model::TurnState::Idle
             };
-            set_turn_state_best_effort(store, &me, next);
+            if explicit_identity {
+                set_turn_state_best_effort(store, &me, next);
+            }
             // WL-014: remind the recipient of any open asks on every prompt.
             // WL-015: render open asks as actionable prompts.
-            if event == "prompt" {
+            if event == "prompt" && explicit_identity {
                 nudge_open_asks(store, &me);
                 render_open_asks(store, &me);
                 // WL-016: daemon-free schedule tick. Best-effort: a tick failure must
@@ -10249,19 +10921,8 @@ fn handle_hook(store: &dyn Store, cfg: &Config, event: &str, wake_flag: bool) ->
         "notification" => {
             if explicit_identity {
                 run_hook_responder_best_effort(store, cfg, &me, event);
+                set_turn_state_best_effort(store, &me, model::TurnState::AwaitingInput);
             }
-            set_turn_state_best_effort(store, &me, model::TurnState::AwaitingInput);
-        }
-        // WL-055: PreToolUse approval gate. Distinct codepath (`handle_pretooluse_hook`)
-        // because the contract differs from the other hooks: it reads its OWN stdin
-        // JSON shape (`tool_name`/`tool_input`), emits a `hookSpecificOutput`
-        // permission decision to stdout as PURE JSON, and must FAIL CLOSED (deny) on
-        // any ambiguity for a dangerous tool. We re-route here BEFORE this arm's
-        // `me`/inbox handling so the PreToolUse drain never marks an inbox read.
-        "pretooluse" => {
-            // The generic `handle_hook` body above already consumed stdin into `v`;
-            // pass the parsed payload + parse-ok flag straight through.
-            return handle_pretooluse_hook(store, cfg, &v, payload_ok);
         }
         other => eprintln!("[weave] unknown hook event: {other}"),
     }
@@ -10563,6 +11224,118 @@ mod tests {
     /// reads `Stale` regardless of host. Kept local to the tests; not load-bearing
     /// elsewhere.
     const STALE_OFFSET: i64 = 1_000;
+
+    fn dispatch_unit_store(tag: &str) -> (Box<dyn Store>, Config, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-dispatch-unit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dispatch test dir");
+        let path = dir.join("weave.db");
+        let cfg = Config {
+            backend: Some(if cfg!(feature = "libsql") {
+                "libsql".to_string()
+            } else {
+                "sqlite".to_string()
+            }),
+            db: Some(path.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let store = open_store(&cfg).expect("open dispatch test store");
+        (store, cfg, dir)
+    }
+
+    /// The optional agent becomes an environment value for the runner. A NUL is
+    /// rejected before claim rather than surfacing from `Command::spawn` after the
+    /// durable job has already transitioned to `running`.
+    #[test]
+    fn dispatch_rejects_agent_env_nul_before_claim() {
+        let (store, cfg, dir) = dispatch_unit_store("agent-nul");
+        let job = store
+            .create_job(
+                "lead",
+                model::JobSpec {
+                    title: "reject agent env NUL".to_string(),
+                    assignee: Some("worker".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create queued job");
+        let result = dispatch_one_job(
+            store.as_ref(),
+            &cfg,
+            "worker",
+            "true",
+            &[],
+            Some("bad\0agent".to_string()),
+            30,
+        );
+        assert!(result.is_err(), "NUL-bearing agent must be rejected");
+        let after = store
+            .get_job(&job.id)
+            .expect("read job")
+            .expect("job remains present");
+        assert_eq!(
+            after.state,
+            model::JobState::Queued,
+            "agent/env validation must happen before claim: {after:?}"
+        );
+        assert!(
+            after.attempt_id.is_none(),
+            "rejected agent must not mint a claim token: {after:?}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dispatch_revalidates_legacy_job_environment_text() {
+        let mut job = no_job_dispatch_report("worker", "true").job;
+        job.id = model::new_job_id(model::now());
+        job.state = model::JobState::Queued;
+        job.title = "legacy\0title".into();
+        assert!(
+            validate_dispatch_job_env(&job).is_err(),
+            "a legacy row that predates the store write guard must fail preflight"
+        );
+    }
+
+    #[test]
+    fn dispatch_json_helpers_enforce_post_escape_byte_cap() {
+        let controls = "\u{1}\u{2}\u{3}\u{4}".repeat(MAX_JOB_RUNNER_CAPTURE_BYTES / 2);
+        let outcome = RunnerOutcome {
+            exit_code: 7,
+            timed_out: false,
+            stdout: controls.clone(),
+            stderr: controls,
+        };
+        let result = runner_result_json(&outcome);
+        let error = runner_error_json(&outcome);
+        assert!(result.len() <= model::MAX_JOB_JSON);
+        assert!(error.len() <= model::MAX_JOB_JSON);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(&error).is_ok());
+    }
+
+    #[test]
+    fn dispatch_lease_snapshot_is_valid_json_within_env_bound() {
+        let leases = (0..200)
+            .map(|n| model::Lease {
+                resource: format!("resource-{n}"),
+                holder: "worker".into(),
+                acquired: 1,
+                expires: 2,
+                note: "x".repeat(model::MAX_LEASE_NOTE_LEN),
+            })
+            .collect();
+        let snapshot = bounded_leases_json(leases).unwrap();
+        assert!(snapshot.len() <= model::MAX_JOB_JSON);
+        assert!(serde_json::from_str::<Vec<model::Lease>>(&snapshot).is_ok());
+    }
 
     /// Build a same-host (`h1`), null-pid dashboard row. `alive` maps to the TTL
     /// recency field: alive ⇒ `last_seen == now` (recent ⇒ `AliveLocal`, ttl), dead

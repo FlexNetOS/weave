@@ -178,27 +178,35 @@ weave pull --me envctl               # pull + commit intents from your pull_from
 Identity resolution: `--from/--me/--name` > `$WEAVE_SESSION` > basename of cwd.
 Send `--to all` (or `*`) to broadcast; read state is tracked per-reader.
 
-**Every session gets a unique identity (WL-084).** Hooks resolve identity as
-config > *session-key row* > basename guess: the SessionStart hook stores the
-host's per-session id (Claude Code `session_id`) on the peer row, and a guessed
-basename that collides with another **live** session auto-registers as
+**Every session gets a unique identity (WL-084).** Hooks resolve an owned row as
+explicit config > exact *session-key row* > one unique same-host client-PID row.
+The cwd basename is only a naming hint: SessionStart may register it, but another
+event may only peek under a basename guess and cannot mark messages read or
+mutate that guessed row. SessionStart stores the host's strict, bounded
+per-session id (Claude Code `session_id`) on the peer row, and a guessed basename
+that collides with another **live** session auto-registers as
 `name-2`/`name-3` instead of stealing the row (a dead row is still reclaimed, so
-restarting in the same directory keeps its name). The hook announces the
-assigned name into the session's context and exports `WEAVE_SESSION` via
-`$CLAUDE_ENV_FILE` (best-effort), and the MCP server re-pins its default
-identity to the row owned by its own client process — so hooks, MCP, and CLI
-agree even when six teammates share one checkout.
+restarting in the same directory keeps its name). Hook input is capped at 1 MiB;
+invalid UTF-8, an invalid session key, or an oversized lifecycle payload cannot
+register or drain a peer. The hook announces the assigned name into the
+session's context and exports `WEAVE_SESSION` via `$CLAUDE_ENV_FILE`
+(best-effort), and the MCP server re-pins its guessed default identity to its own
+client-process row — so hooks, MCP, and CLI agree even when several sessions
+share one checkout.
 
 `weave attach` captures the current pane and upserts **your own** peer row, so a
 session that started outside a mux (or before `weave setup`) becomes injectable
-without a restart. The one-shot CLI tracks its nearest long-lived client ancestor
-(or TTL presence when no ancestor can be resolved), never the exiting `attach`
-process itself. `weave connect --to <peer>` reports a capability verdict — `live`
+without a restart. One-shot `register`, `attach`, `scan`, and `sessions --watch`
+store a PID only when the launcher explicitly supplies a positive
+`WEAVE_CLIENT_PID`; otherwise they use TTL presence and never record their own
+short-lived CLI PID. `weave connect --to <peer>` is a read-only capability probe:
+it does not send, queue, mark read, or mutate either inbox. It reports — `live`
 (a nudge can be delivered now), `live transport unavailable` (the mux executable
-is missing, untrusted, unlaunchable, or its probe times out), `registered but not
-alive` (queued for the recipient's next turn), or `not injectable` — and is **not**
-an error when a peer can't be live-nudged: its messages still arrive via the store
-on its next drain.
+is missing, untrusted, unlaunchable, returns a failed inventory, produces an
+inconclusive bounded inventory, or its probe times out), `registered but not
+alive`, or `not injectable`. A non-live verdict is **not** an error; a later
+`send`/`notify` remains durable and can arrive from the store on the peer's next
+drain.
 
 `weave scan` is the "who's around, and where?" view. It first re-captures **your
 own** session's git tags and presence (owner-only — it never re-registers a
@@ -382,8 +390,8 @@ configured pulls and commits eligible intents in the same call.
 `weave_attach` adopts the calling session into the store without a restart (re-captures the
 current pane and upserts the caller's own peer row only). `weave_connect` reports the same
 live / transport-unavailable / registered-but-not-alive / not-injectable verdict as the
-CLI; only a non-existent peer is an error, so a queued delivery is reported with
-`isError:false`.
+CLI without sending or queuing anything; only a non-existent peer is an error, so a
+non-live capability verdict is reported with `isError:false`.
 
 `weave_scan` mirrors `weave scan`: it refreshes the **caller's own** row tags
 (owner-only-writes — never a foreign row), then returns the federated peer listing
@@ -496,14 +504,21 @@ and **local-mesh** only.
   it **mints a fresh `attempt_id`** (the fencing token), assigns the job to the
   worker, and moves it to `running`. The worker captures the printed `attempt_id`.
 - **Dispatch** (`weave job dispatch --as <worker> --runner flexnetos_runner`) is
-  the CLI worker loop unit. It auto-selects an assigned queued job (or an
-  unassigned queued job), claims it, passes `WEAVE_JOB_ID`, `WEAVE_ATTEMPT_ID`,
-  `WEAVE_JOB_PROMPT`, `WEAVE_POLICY_OWNER=weave`, and optional
-  `WEAVE_FXRUN_AGENT` to the external runner. It also passes
-  `WEAVE_LEASES_JSON` so the execution plane can honor the current advisory
-  lease snapshot, then records completed/failed result JSON and progress notes
-  with the matching `attempt_id`. Weave coordinates and records;
-  `flexnetos_runner` or another trusted runner executes.
+  the CLI worker loop unit. Before claiming, it resolves the runner from the
+  trusted-program set and validates the complete runner argv, agent, timeout
+  (`1..=3600` seconds), job-derived environment, and bounded lease snapshot.
+  It then auto-selects an assigned queued job (or an unassigned queued job) and
+  performs one atomic queued-only claim, so competing workers cannot both win.
+  It passes `WEAVE_JOB_ID`, `WEAVE_ATTEMPT_ID`, `WEAVE_JOB_PROMPT`,
+  `WEAVE_POLICY_OWNER=weave`, optional `WEAVE_FXRUN_AGENT`, and bounded
+  `WEAVE_LEASES_JSON` to the external runner. Stdout/stderr are drained
+  concurrently with fixed retention caps; the runner executes in an owned
+  process group, and exit/timeout/error cleanup cannot wait indefinitely on a
+  descendant that inherited its pipes. Stored result/error JSON is capped. Once
+  a claim exists, launch, capture, and recording failures are fenced into a
+  terminal failed result (including recovery when an attempt row is missing)
+  instead of leaving the job stranded in `running`. Weave coordinates and
+  records; `flexnetos_runner` or another trusted runner executes.
 - **Update** (`weave job update` / `weave_job_update`) drives the lifecycle
   forward — state, phase, an append-only progress note, and the terminal
   `result` / `error` / `artifacts` (all **TEXT JSON**). Once a job is claimed,
@@ -646,6 +661,11 @@ surface, warn-but-proceed for the operator-local CLI. Trusted user tool roots
 include `$HOME/.cargo/bin`, `$HOME/.local/bin`, and both
 `$HOME/.nix-profile/{bin,toolbin}`; candidates must be executable regular files.
 `WEAVE_MUX_DIR` remains the explicit override for any other installation root.
+Empty or relative `WEAVE_MUX_DIR`/`HOME` roots are ignored. A bare program must
+be one normal path component and is searched only in those roots; an absolute
+program is accepted only when its canonicalized direct parent is exactly a
+trusted root. Path-shaped relative names and deeper absolute descendants are
+rejected rather than interpreted through ambient `$PATH`.
 
 ## Thread summaries (`--features llm`)
 

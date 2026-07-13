@@ -180,10 +180,13 @@ weave receipts --id 42                  # who has read message #42, and when
 weave watch --me envctl                 # tail inbox, peeking, until Ctrl-C
 ```
 
-Identity resolution everywhere: **explicit flag (`--from`/`--me`/`--name`) >
-config `session` / `$WEAVE_SESSION` > basename of the current directory.** The
-basename is a *guess* and never marks mail read (so it can't consume another
-session's inbox). `--to all` (or `*`, `everyone`, `broadcast`) fans out to every
+Operator CLI identity defaults are: **explicit flag
+(`--from`/`--me`/`--name`) > config `session` / `$WEAVE_SESSION` > basename of
+the current directory.** An operator-invoked `weave inbox` marks read unless
+`--peek` is supplied. Automatic lifecycle hooks additionally resolve exact
+launcher session-key ownership or one unique same-host client-PID row; only
+their unowned basename guess is forced to peek so it cannot consume another
+session's inbox. `--to all` (or `*`, `everyone`, `broadcast`) fans out to every
 reader; read state is tracked per reader.
 
 Point-to-point recipient resolution also accepts the stable `session_id` shown by
