@@ -290,8 +290,29 @@ const SCHEMA: &[&str] = &[
         text        TEXT NOT NULL,
         model       TEXT NOT NULL DEFAULT '',
         created_ts  INTEGER NOT NULL,
-        refreshed_ts INTEGER NOT NULL
+        refreshed_ts INTEGER NOT NULL,
+        generation  INTEGER NOT NULL DEFAULT -1
     )",
+    "CREATE TABLE IF NOT EXISTS summary_state (
+        singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+        generation INTEGER NOT NULL
+    )",
+    "INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0)",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+     AFTER INSERT ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+     AFTER UPDATE ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+     AFTER DELETE ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -1149,12 +1170,72 @@ impl LibsqlStore {
                     text        TEXT NOT NULL,
                     model       TEXT NOT NULL DEFAULT '',
                     created_ts  INTEGER NOT NULL,
-                    refreshed_ts INTEGER NOT NULL
+                    refreshed_ts INTEGER NOT NULL,
+                    generation  INTEGER NOT NULL DEFAULT -1
                 )",
                 (),
             )
             .await
             .context("creating summaries table")?;
+            let mut summary_columns = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('summaries') WHERE name='generation'",
+                    (),
+                )
+                .await?;
+            if summary_columns.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE summaries
+                     ADD COLUMN generation INTEGER NOT NULL DEFAULT -1",
+                    (),
+                )
+                .await
+                .context("adding summaries.generation column")?;
+            }
+            drop(summary_columns);
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS summary_state (
+                    singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    generation INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating summary generation state")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0)",
+                (),
+            )
+            .await
+            .context("initializing summary generation state")?;
+            for (ddl, context) in [
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+                     AFTER INSERT ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-insert invalidation trigger",
+                ),
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+                     AFTER UPDATE ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-update invalidation trigger",
+                ),
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+                     AFTER DELETE ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-delete invalidation trigger",
+                ),
+            ] {
+                conn.execute(ddl, ()).await.context(context)?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1904,6 +1985,7 @@ impl Store for LibsqlStore {
                     None => 0,
                 }
             };
+            tx.execute("DELETE FROM summaries", ()).await?;
             tx.execute("DELETE FROM messages", ()).await?;
             tx.execute("DELETE FROM reads", ()).await?;
             tx.execute("DELETE FROM wake_acks", ()).await?;
@@ -1964,7 +2046,8 @@ impl Store for LibsqlStore {
                 params(vec![cutoff.into()]),
             )
             .await?;
-            tx.execute(
+            let retention_deleted = tx
+                .execute(
                 "DELETE FROM messages WHERE ts < ?1",
                 params(vec![cutoff.into()]),
             )
@@ -1979,11 +2062,18 @@ impl Store for LibsqlStore {
                 params(vec![expiry_cut.into()]),
             )
             .await?;
-            tx.execute(
-                "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
-                params(vec![expiry_cut.into()]),
-            )
-            .await?;
+            let expiry_deleted = tx
+                .execute(
+                    "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                    params(vec![expiry_cut.into()]),
+                )
+                .await?;
+            // A summary represents the whole thread, so any removed root or
+            // reply invalidates every cache entry. Keep invalidation atomic with
+            // message deletion; the returned count remains `n` above.
+            if retention_deleted > 0 || expiry_deleted > 0 {
+                tx.execute("DELETE FROM summaries", ()).await?;
+            }
             // P6: prune the delivery trace by the SAME cutoff so it is bounded by the
             // existing retention pass (no new sweeper). Mirrors SqliteStore::gc.
             tx.execute(
@@ -4599,6 +4689,9 @@ impl Store for LibsqlStore {
                     params(vec![now.into()]),
                 )
                 .await?;
+            if n > 0 {
+                tx.execute("DELETE FROM summaries", ()).await?;
+            }
             tx.commit().await?;
             Ok::<_, anyhow::Error>(n as usize)
         })
@@ -4788,16 +4881,20 @@ impl Store for LibsqlStore {
     }
 
     fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
+        self.guard_writable()?;
         let ts = now();
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO summaries
+                         (root_id, text, model, created_ts, refreshed_ts, generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5,
+                             (SELECT generation FROM summary_state WHERE singleton = 1))
                  ON CONFLICT(root_id) DO UPDATE SET
                      text = excluded.text,
                      model = excluded.model,
-                     refreshed_ts = excluded.refreshed_ts",
+                     refreshed_ts = excluded.refreshed_ts,
+                     generation = excluded.generation",
                     params(vec![
                         root_id.into(),
                         text.into(),
@@ -4811,13 +4908,78 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn summary_generation(&self) -> Result<i64> {
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT generation FROM summary_state WHERE singleton = 1",
+                    (),
+                )
+                .await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("summary generation state is missing"))?;
+            Ok::<_, anyhow::Error>(row.get::<i64>(0)?)
+        })
+    }
+
+    fn store_summary_if_generation(
+        &self,
+        root_id: i64,
+        text: &str,
+        model: &str,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        let ts = now();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO summaries
+                         (root_id, text, model, created_ts, refreshed_ts, generation)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                     WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1)
+                       AND EXISTS (
+                           SELECT 1 FROM summary_state
+                           WHERE singleton = 1 AND generation = ?6
+                       )
+                     ON CONFLICT(root_id) DO UPDATE SET
+                         text = excluded.text,
+                         model = excluded.model,
+                         refreshed_ts = excluded.refreshed_ts,
+                         generation = excluded.generation",
+                    params(vec![
+                        root_id.into(),
+                        text.into(),
+                        model.into(),
+                        ts.into(),
+                        ts.into(),
+                        expected_generation.into(),
+                    ]),
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(changed > 0)
+        })
+    }
+
     fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
         self.rt.block_on(async {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT root_id, text, model, created_ts, refreshed_ts
-                     FROM summaries WHERE root_id = ?1",
+                    "SELECT s.root_id, s.text, s.model, s.created_ts, s.refreshed_ts
+                     FROM summaries s
+                     JOIN messages m ON m.id = s.root_id
+                     JOIN summary_state state
+                       ON state.singleton = 1 AND state.generation = s.generation
+                     WHERE s.root_id = ?1",
                     params(vec![root_id.into()]),
                 )
                 .await?;
@@ -4836,6 +4998,7 @@ impl Store for LibsqlStore {
     }
 
     fn delete_summary(&self, root_id: i64) -> Result<bool> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             let rows = self
                 .conn
@@ -6974,6 +7137,13 @@ mod tests {
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
         assert_trapped("register_key", ro.register_key("id", "pubkey"));
+        assert_trapped("store_summary", ro.store_summary(1, "summary", "model"));
+        assert_trapped(
+            "store_summary_if_generation",
+            ro.store_summary_if_generation(1, "summary", "model", 0)
+                .map(|_| ()),
+        );
+        assert_trapped("delete_summary", ro.delete_summary(1).map(|_| ()));
 
         // A read still works (the failed writes were no-ops).
         assert_eq!(ro.list_peers().unwrap().len(), 1);
@@ -8360,20 +8530,231 @@ mod tests {
     #[test]
     fn summary_roundtrip_libsql() {
         let s = mem();
-        assert!(s.get_summary(1).unwrap().is_none());
-        s.store_summary(1, "summary text", "gpt-4").unwrap();
-        let sum = s.get_summary(1).unwrap().unwrap();
-        assert_eq!(sum.root_id, 1);
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        assert!(s.get_summary(root).unwrap().is_none());
+        s.store_summary(root, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(root).unwrap().unwrap();
+        assert_eq!(sum.root_id, root);
         assert_eq!(sum.text, "summary text");
         assert_eq!(sum.model, "gpt-4");
         // Upsert refreshes
-        s.store_summary(1, "new text", "gpt-3").unwrap();
-        let sum2 = s.get_summary(1).unwrap().unwrap();
+        s.store_summary(root, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(root).unwrap().unwrap();
         assert_eq!(sum2.text, "new text");
         assert_eq!(sum2.model, "gpt-3");
-        assert!(s.delete_summary(1).unwrap());
-        assert!(!s.delete_summary(1).unwrap());
-        assert!(s.get_summary(1).unwrap().is_none());
+        assert!(s.delete_summary(root).unwrap());
+        assert!(!s.delete_summary(root).unwrap());
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.store_summary(root + 10_000, "orphan", "legacy").unwrap();
+        assert!(
+            s.get_summary(root + 10_000).unwrap().is_none(),
+            "a cache row without a live root message must never surface"
+        );
+    }
+
+    #[test]
+    fn legacy_summary_cache_migrates_fail_closed_and_current_generation_roundtrips_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-summary-legacy-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+
+        let root = {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let root = s.send("a", "b", None, "root", None, None).unwrap();
+            s.rt.block_on(async {
+                for ddl in [
+                    "DROP TRIGGER summaries_generation_message_insert_v1",
+                    "DROP TRIGGER summaries_generation_message_update_v1",
+                    "DROP TRIGGER summaries_generation_message_delete_v1",
+                    "DROP TABLE summaries",
+                    "DROP TABLE summary_state",
+                    "CREATE TABLE summaries (
+                        root_id      INTEGER PRIMARY KEY,
+                        text         TEXT NOT NULL,
+                        model        TEXT NOT NULL DEFAULT '',
+                        created_ts   INTEGER NOT NULL,
+                        refreshed_ts INTEGER NOT NULL
+                    )",
+                ] {
+                    s.conn.execute(ddl, ()).await?;
+                }
+                let ts = now();
+                s.conn
+                    .execute(
+                        "INSERT INTO summaries
+                             (root_id, text, model, created_ts, refreshed_ts)
+                         VALUES (?1, 'legacy cache', 'legacy-model', ?2, ?2)",
+                        params(vec![root.into(), ts.into()]),
+                    )
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+            root
+        };
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let legacy_generation =
+            s.rt.block_on(async {
+                let mut rows = s
+                    .conn
+                    .query(
+                        "SELECT generation FROM summaries WHERE root_id = ?1",
+                        params(vec![root.into()]),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("legacy cache row disappeared"))?;
+                Ok::<i64, anyhow::Error>(row.get(0)?)
+            })
+            .unwrap();
+        assert_eq!(legacy_generation, -1, "legacy cache must migrate stale");
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a pre-generation cache row must fail closed"
+        );
+        let generation = s.summary_generation().unwrap();
+        assert!(s
+            .store_summary_if_generation(root, "current cache", "current-model", generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current cache");
+
+        let before_reply = s.summary_generation().unwrap();
+        s.reply("b", root, "new reply").unwrap();
+        assert!(s.summary_generation().unwrap() > before_reply);
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "migrated invalidation triggers must clear cache on message mutation"
+        );
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_removes_summary_cache_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert_eq!(s.clear_all().unwrap(), 1);
+        assert!(
+            !s.delete_summary(root).unwrap(),
+            "clear_all must delete the underlying cache row"
+        );
+    }
+
+    #[test]
+    fn adding_reply_invalidates_cached_thread_summary_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert!(s.get_summary(root).unwrap().is_some());
+
+        s.reply("b", root, "new reply").unwrap();
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a new descendant makes the cached thread summary stale"
+        );
+    }
+
+    #[test]
+    fn summary_generation_rejects_mutated_or_deleted_snapshots_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        let (initial_rows, initial_generation) =
+            crate::store::summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(initial_rows.len(), 1);
+
+        let reply = s.reply("b", root, "new reply").unwrap();
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", initial_generation)
+                .unwrap(),
+            "a reply inserted during provider work must reject the stale write"
+        );
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.set_message_expiry(reply, now() - 1).unwrap();
+        let before_delete = s.summary_generation().unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 1);
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", before_delete)
+                .unwrap(),
+            "a reply deleted during provider work must reject the stale write"
+        );
+
+        let (current_rows, current_generation) =
+            crate::store::summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(current_rows.len(), 1, "expired reply is never summarized");
+        assert!(s
+            .store_summary_if_generation(root, "current", "model", current_generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current");
+    }
+
+    #[test]
+    fn gc_message_delete_invalidates_the_whole_summary_cache_libsql() {
+        let s = mem();
+        let old_root = s.send("a", "b", None, "old", None, None).unwrap();
+        let live_root = s.send("c", "d", None, "live", None, None).unwrap();
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                    params(vec![old_root.into()]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .unwrap();
+        s.store_summary(old_root, "old cached", "model").unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+
+        assert_eq!(s.gc(3600).unwrap(), 1);
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(old_root).unwrap(),
+            "gc must delete cache rows, not merely hide orphan roots"
+        );
+    }
+
+    #[test]
+    fn expiry_sweep_of_root_or_reply_invalidates_the_whole_summary_cache_libsql() {
+        let s = mem();
+        let live_root = s.send("a", "b", None, "live root", None, None).unwrap();
+        let expired_reply = s.reply("b", live_root, "expired reply").unwrap();
+        let expired_root = s.send("c", "d", None, "expired root", None, None).unwrap();
+        s.set_message_expiry(expired_reply, now() - 5).unwrap();
+        s.set_message_expiry(expired_root, now() - 5).unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+        s.store_summary(expired_root, "expired cached", "model")
+            .unwrap();
+
+        assert_eq!(s.sweep_expired_messages().unwrap(), 2);
+        assert!(
+            s.history("a", None, 100)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == live_root),
+            "the summarized root stays live when only its reply expires"
+        );
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(expired_root).unwrap(),
+            "sweep must delete the underlying orphan cache row"
+        );
     }
 
     // ---- WL-037: supersede on the libsql backend (positional-projection trap)

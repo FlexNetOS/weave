@@ -4791,23 +4791,30 @@ fn tool_catalog() -> Vec<Value> {
             "name": "weave_lease_sweep",
             "description": "Remove all expired leases and return the count swept.",
             "inputSchema": {"type":"object","properties":{},"required":[]}
-        },
-        {
+        }
+    ]);
+    // WL-033: LLM operations exist only when their handlers and HTTP client are
+    // compiled. Keeping them out of the feature-off catalog makes progressive
+    // discovery truthful; direct legacy calls still receive the explicit
+    // feature-off handler error below.
+    #[cfg(feature = "llm")]
+    if let Some(arr) = list.as_array_mut() {
+        arr.push(json!({
             "name": "weave_thread_summarize",
             "description": "Generate or retrieve a cached LLM summary for a message thread. If a cached summary exists and refresh is not requested, it is returned immediately.",
             "inputSchema": {"type":"object","properties":{
                 "root_id":{"type":"integer","description":"The message id at the root of the thread."},
                 "refresh":{"type":"boolean","description":"Force a fresh summary even if a cached one exists."}
             },"required":["root_id"]}
-        },
-        {
+        }));
+        arr.push(json!({
             "name": "weave_summarize_text",
             "description": "Summarize arbitrary text via the configured LLM endpoint. Does not persist the summary.",
             "inputSchema": {"type":"object","properties":{
                 "text":{"type":"string","description":"The text to summarize."}
             },"required":["text"]}
-        }
-    ]);
+        }));
+    }
     // WL-049 / ADR-0002: ONE token-light governed web-access dispatcher (proxies all
     // 35 obscura browser_* ops; per-op schemas fetched on demand via describe). Only
     // present in an `--features obscura` build, so the default tool table is unchanged.
@@ -5677,24 +5684,55 @@ fn tool_thread_summarize(store: &dyn Store, args: &Value) -> Result<String, Stri
     let root_id = args["root_id"]
         .as_i64()
         .ok_or("root_id must be an integer")?;
+    if root_id <= 0 {
+        return Err("root_id must be a positive message id".to_string());
+    }
     let refresh = args["refresh"].as_bool().unwrap_or(false);
-    let summary = if refresh {
-        None
-    } else {
-        store.get_summary(root_id).map_err(|e| e.to_string())?
-    };
-    let text = match summary {
-        Some(s) => s.text,
-        None => {
-            let rows = store.thread(root_id, 200).map_err(|e| e.to_string())?;
-            let _thread_text = rows
-                .iter()
-                .map(|m| format!("{}: {}", m.sender, m.body))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err("LLM summarization not yet available via MCP".to_string());
+    // Cache is the common path and must not require rebuilding the thread or a
+    // configured provider. Refresh explicitly bypasses it; the cached row is not
+    // mutated until a replacement summary succeeds, so a failed refresh retains it.
+    if !refresh {
+        store.sweep_expired_messages().map_err(|e| e.to_string())?;
+        if let Some(summary) = store.get_summary(root_id).map_err(|e| e.to_string())? {
+            return weave_core::llm::normalize_summary_text(&summary.text)
+                .map_err(|e| e.to_string());
         }
-    };
+    }
+    let (rows, generation) = weave_core::store::summary_thread_snapshot(
+        store,
+        root_id,
+        weave_core::store::SUMMARY_THREAD_LIMIT,
+    )
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Err(format!("No thread found for root #{root_id}."));
+    }
+
+    let thread_text = rows
+        .iter()
+        .map(|m| format!("{}: {}", m.sender, m.body))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cfg = weave_core::config::Config::load();
+    let text = weave_core::llm::summarize_text(&cfg, &thread_text).map_err(|e| e.to_string())?;
+    if rows.iter().any(|message| message.expires_at.is_some()) {
+        weave_core::store::validate_ephemeral_summary_completion(store, &rows, generation)
+            .map_err(|e| e.to_string())?;
+        return Ok(text);
+    }
+    // `store_summary` is an internal cache primitive: production writes reach it
+    // only after the shared LLM validator has normalized and bounded the text.
+    if !store
+        .store_summary_if_generation(
+            root_id,
+            &text,
+            weave_core::llm::effective_model(&cfg),
+            generation,
+        )
+        .map_err(|e| e.to_string())?
+    {
+        return Err("thread changed while its summary was being generated; retry".to_string());
+    }
     Ok(text)
 }
 
@@ -5704,8 +5742,16 @@ fn tool_thread_summarize(_store: &dyn Store, _args: &Value) -> Result<String, St
 }
 
 #[cfg(feature = "llm")]
-fn tool_summarize_text(_args: &Value) -> Result<String, String> {
-    Err("weave_summarize_text requires config access not yet wired in MCP".to_string())
+fn tool_summarize_text(args: &Value) -> Result<String, String> {
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("text must be a string")?;
+    if text.trim().is_empty() {
+        return Err("text must be non-empty".to_string());
+    }
+    let cfg = weave_core::config::Config::load();
+    weave_core::llm::summarize_text(&cfg, text).map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "llm"))]
@@ -5974,6 +6020,15 @@ mod tests {
 
     use std::sync::Mutex;
 
+    #[cfg(feature = "llm")]
+    use std::io::{Read, Write};
+    #[cfg(feature = "llm")]
+    use std::net::TcpListener;
+    #[cfg(feature = "llm")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "llm")]
+    use std::sync::Arc;
+
     /// One recorded `spawn` call: the exact arguments the MCP tool threaded down.
     struct SpawnRecord {
         mux: Mux,
@@ -6100,9 +6155,398 @@ mod tests {
         )
     }
 
-    /// `WEAVE_SPAWN_DIRS` is process-global; serialize the env-touching spawn tests so
-    /// parallel cases can't clobber each other's allowlist.
-    static SPAWN_ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(feature = "llm")]
+    fn serve_llm_summaries(
+        summaries: &[&str],
+    ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        serve_llm_summaries_with_deadlines(
+            summaries
+                .iter()
+                .map(|summary| ((*summary).to_string(), None))
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "llm")]
+    fn serve_llm_summaries_with_deadlines(
+        summaries: Vec<(String, Option<i64>)>,
+    ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback LLM fixture");
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_thread = Arc::clone(&requests);
+        let handle = std::thread::spawn(move || {
+            for (summary, not_before) in summaries {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "LLM client did not connect to loopback fixture"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept LLM request: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 2048];
+                let header_end = loop {
+                    let n = stream.read(&mut buf).expect("read LLM request");
+                    assert!(n > 0, "client closed before request headers completed");
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_len {
+                    let n = stream.read(&mut buf).expect("read LLM request body");
+                    assert!(n > 0, "client closed before request body completed");
+                    request.extend_from_slice(&buf[..n]);
+                }
+                requests_thread.fetch_add(1, Ordering::Relaxed);
+                if let Some(not_before) = not_before {
+                    let wait_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while weave_core::model::now() < not_before {
+                        assert!(
+                            std::time::Instant::now() < wait_deadline,
+                            "timed out waiting for deterministic summary expiry"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": summary}}]
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (
+            format!("http://{addr}/v1/chat/completions"),
+            requests,
+            handle,
+        )
+    }
+
+    #[test]
+    fn llm_catalog_ops_follow_the_compile_feature() {
+        let names: Vec<String> = tool_catalog()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
+        #[cfg(feature = "llm")]
+        for name in ["weave_thread_summarize", "weave_summarize_text"] {
+            assert!(names.iter().any(|n| n == name), "missing {name}: {names:?}");
+        }
+        #[cfg(not(feature = "llm"))]
+        for name in ["weave_thread_summarize", "weave_summarize_text"] {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "feature-off catalog advertised {name}: {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_thread_summary_is_cached_with_effective_model() {
+        let _env = weave_core::testenv::lock_env();
+        let (endpoint, requests, server) =
+            serve_llm_summaries(&["thread summary", "refreshed summary"]);
+        let xdg = std::env::temp_dir().join(format!(
+            "weave-mcp-llm-config-{}-{}",
+            std::process::id(),
+            weave_core::model::now()
+        ));
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            xdg.to_string_lossy().as_ref(),
+        );
+        let _endpoint = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_ENDPOINT", &endpoint);
+        let _key = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_API_KEY", "fixture-key");
+        let _model = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_MODEL", "fixture-model");
+        let _timeout = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_TIMEOUT_SECS", "2");
+        let _max = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_MAX_INPUT_CHARS", "100");
+
+        let st = store();
+        let root = st
+            .send("alice", "bob", Some("subject"), "hello", None, None)
+            .unwrap();
+        let inj = RecordingInjector::default();
+        let first = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("first summary calls provider");
+        let second = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("second summary uses cache");
+        let refreshed = call(
+            "weave_thread_summarize",
+            json!({"root_id": root, "refresh": true}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("refresh calls provider again");
+        assert_eq!(first, "thread summary");
+        assert_eq!(second, first);
+        assert_eq!(refreshed, "refreshed summary");
+        server.join().unwrap();
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "cache avoids a second request, explicit refresh makes one"
+        );
+        let cached = st.get_summary(root).unwrap().expect("summary cached");
+        assert_eq!(cached.text, "refreshed summary");
+        assert_eq!(cached.model, "fixture-model");
+
+        drop((_max, _timeout, _model, _key, _endpoint, _xdg));
+        let _ = std::fs::remove_dir_all(xdg);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_failed_refresh_preserves_existing_cache() {
+        let _env = weave_core::testenv::lock_env();
+        let (endpoint, requests, server) = serve_llm_summaries(&["stable summary"]);
+        let xdg = std::env::temp_dir().join(format!(
+            "weave-mcp-llm-refresh-config-{}-{}",
+            std::process::id(),
+            weave_core::model::now()
+        ));
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            xdg.to_string_lossy().as_ref(),
+        );
+        let _endpoint = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_ENDPOINT", &endpoint);
+        let _key = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_API_KEY", "fixture-key");
+        let st = store();
+        let root = st
+            .send("alice", "bob", Some("subject"), "hello", None, None)
+            .unwrap();
+        let inj = RecordingInjector::default();
+        let first = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("initial summary succeeds");
+        assert_eq!(first, "stable summary");
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_endpoint = format!("http://{}/v1/chat/completions", dead.local_addr().unwrap());
+        drop(dead);
+        let _dead_endpoint =
+            weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_ENDPOINT", &dead_endpoint);
+        let err = call(
+            "weave_thread_summarize",
+            json!({"root_id": root, "refresh": true}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(err.contains("sending LLM request"), "refresh error: {err}");
+        let cached = st.get_summary(root).unwrap().expect("old cache retained");
+        assert_eq!(cached.text, "stable summary");
+
+        drop((_key, _endpoint, _xdg));
+        let _ = std::fs::remove_dir_all(xdg);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_text_summary_calls_configured_provider() {
+        let _env = weave_core::testenv::lock_env();
+        let (endpoint, requests, server) = serve_llm_summaries(&["text summary"]);
+        let xdg = std::env::temp_dir().join(format!(
+            "weave-mcp-llm-text-config-{}-{}",
+            std::process::id(),
+            weave_core::model::now()
+        ));
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            xdg.to_string_lossy().as_ref(),
+        );
+        let _endpoint = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_ENDPOINT", &endpoint);
+        let _key = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_API_KEY", "fixture-key");
+        let st = store();
+        let inj = RecordingInjector::default();
+        let out = call(
+            "weave_summarize_text",
+            json!({"text": "some long text"}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("MCP text summary calls provider");
+        assert_eq!(out, "text summary");
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        drop((_key, _endpoint, _xdg));
+        let _ = std::fs::remove_dir_all(xdg);
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_rejects_missing_thread_and_blank_text() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        st.store_summary(999_999, "orphan cache secret", "legacy-model")
+            .unwrap();
+        let thread_err = call(
+            "weave_thread_summarize",
+            json!({"root_id": 999_999}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(
+            thread_err.contains("No thread found"),
+            "clear error: {thread_err}"
+        );
+        assert!(
+            !thread_err.contains("orphan cache secret"),
+            "an orphan cache row must never bypass live-root validation: {thread_err}"
+        );
+        let text_err = call(
+            "weave_summarize_text",
+            json!({"text": "   "}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(text_err.contains("non-empty"), "clear error: {text_err}");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_validates_cached_summaries_before_output() {
+        let st = store();
+        let root = st
+            .send("alice", "bob", Some("subject"), "hello", None, None)
+            .unwrap();
+        let inj = RecordingInjector::default();
+
+        st.store_summary(root, "  cached\n\t summary  ", "legacy-model")
+            .unwrap();
+        let normalized = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .expect("safe legacy cache is normalized");
+        assert_eq!(normalized, "cached summary");
+
+        st.store_summary(root, "safe\u{1b}[31munsafe", "legacy-model")
+            .unwrap();
+        let control_err = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(control_err.contains("control"), "{control_err}");
+        assert!(!control_err.contains("[31munsafe"), "{control_err}");
+
+        st.store_summary(root, &"é".repeat(16_001), "legacy-model")
+            .unwrap();
+        let size_err = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        assert!(size_err.contains("16000"), "{size_err}");
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_mcp_rejects_summary_when_reply_expires_during_provider_call() {
+        let _env = weave_core::testenv::lock_env();
+        let expires_at = weave_core::model::now() + 1;
+        let (endpoint, requests, server) = serve_llm_summaries_with_deadlines(vec![(
+            "must not be emitted or cached".to_string(),
+            Some(expires_at),
+        )]);
+        let xdg = std::env::temp_dir().join(format!(
+            "weave-mcp-llm-expiry-config-{}-{}",
+            std::process::id(),
+            weave_core::model::now()
+        ));
+        std::fs::create_dir_all(&xdg).unwrap();
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            xdg.to_string_lossy().as_ref(),
+        );
+        let _endpoint = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_ENDPOINT", &endpoint);
+        let _key = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_API_KEY", "fixture-key");
+        let _timeout = weave_core::testenv::EnvVarGuard::set("WEAVE_LLM_TIMEOUT_SECS", "3");
+
+        let st = store();
+        let root = st
+            .send("alice", "bob", Some("subject"), "hello", None, None)
+            .unwrap();
+        let reply = st.reply("bob", root, "ephemeral reply").unwrap();
+        st.set_message_expiry(reply, expires_at).unwrap();
+        let inj = RecordingInjector::default();
+        let err = call(
+            "weave_thread_summarize",
+            json!({"root_id": root}),
+            st.as_ref(),
+            &inj,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert!(err.contains("expired"), "clear retry error: {err}");
+        assert!(
+            !err.contains("must not be emitted"),
+            "stale output leaked: {err}"
+        );
+        assert!(st.get_summary(root).unwrap().is_none());
+
+        drop((_timeout, _key, _endpoint, _xdg));
+        let _ = std::fs::remove_dir_all(xdg);
+    }
 
     // ---- WL-049 / ADR-0002 governed web access (weave_web) -------------------
 
@@ -6200,7 +6644,7 @@ mod tests {
         // obscura spawn. Point config discovery at an empty dir (no config.toml) so
         // the policy is genuinely unset, and the obscura bin at a name that does not
         // resolve — proving the deny happens first (a spawn would error differently).
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let empty_cfg = std::env::temp_dir().join(format!("weave-noconf-{}", std::process::id()));
         let _xdg =
             weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
@@ -6224,7 +6668,7 @@ mod tests {
     #[cfg(feature = "obscura")]
     #[test]
     fn weave_web_ssrf_blocked_before_spawn() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-ssrf-{}", std::process::id()));
         let _xdg =
@@ -6250,7 +6694,7 @@ mod tests {
         // An unknown op is refused by the deny-by-default parse gate (even with a
         // wildcard allow-list) BEFORE any obscura spawn — a clean error, never a
         // panic or a spawn of a binary that does not resolve.
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-unk-{}", std::process::id()));
         let _xdg =
@@ -6280,7 +6724,7 @@ mod tests {
         // binary does not resolve to a trusted dir. weave must surface a clean error
         // (binary not found), never a panic. This is the "allowed but obscura-missing"
         // path distinct from deny-by-default.
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-miss-{}", std::process::id()));
         let _xdg =
@@ -6347,11 +6791,14 @@ mod tests {
     /// recorded (name, cert) the runner turns into WEAVE_SESSION / WEAVE_BIRTH_CERT.
     #[test]
     fn spawn_peer_happy_path_records_and_registers() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let allow = std::env::temp_dir().join(format!("weave-spawn-ok-{}", std::process::id()));
         std::fs::create_dir_all(&allow).unwrap();
         let allow_real = std::fs::canonicalize(&allow).unwrap();
-        std::env::set_var("WEAVE_SPAWN_DIRS", &allow_real);
+        let _spawn_dirs = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_SPAWN_DIRS",
+            allow_real.to_string_lossy().as_ref(),
+        );
 
         let st = store();
         let inj = RecordingInjector {
@@ -6390,15 +6837,14 @@ mod tests {
             rec.cert,
             "the registered cert matches the one threaded into the child env"
         );
-        std::env::remove_var("WEAVE_SPAWN_DIRS");
     }
 
     /// Disallowed cwd: with no allowlist (deny-by-default), the spawn is refused as an
     /// Err (isError at the protocol seam) and NO spawn call fires.
     #[test]
     fn spawn_peer_disallowed_cwd_is_error() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("WEAVE_SPAWN_DIRS");
+        let _g = weave_core::testenv::lock_env();
+        let _spawn_dirs = weave_core::testenv::EnvVarGuard::remove("WEAVE_SPAWN_DIRS");
         let st = store();
         let inj = RecordingInjector {
             detect_mux: Mux::Tmux,
@@ -6426,11 +6872,14 @@ mod tests {
     /// Spawning over an already-registered name is refused (Err) before any launch.
     #[test]
     fn spawn_peer_existing_name_is_error() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = weave_core::testenv::lock_env();
         let allow = std::env::temp_dir().join(format!("weave-spawn-dup-{}", std::process::id()));
         std::fs::create_dir_all(&allow).unwrap();
         let allow_real = std::fs::canonicalize(&allow).unwrap();
-        std::env::set_var("WEAVE_SPAWN_DIRS", &allow_real);
+        let _spawn_dirs = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_SPAWN_DIRS",
+            allow_real.to_string_lossy().as_ref(),
+        );
         let st = store();
         st.register_peer_full(
             "taken", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
@@ -6449,7 +6898,6 @@ mod tests {
         .expect_err("cannot spawn over a live peer");
         assert!(err.contains("already registered"), "{err}");
         assert!(inj.spawn_calls.lock().unwrap().is_empty());
-        std::env::remove_var("WEAVE_SPAWN_DIRS");
     }
 
     /// `weave_kill_peer` for an unknown peer ⇒ Err (isError), no kill call.
@@ -6549,17 +6997,13 @@ mod tests {
 
     // ---- WL-050 / ADR-0003 token-light progressive-disclosure MCP -----------
 
-    /// `WEAVE_MCP_EAGER` is process-global; serialize the two tests that mutate it so
-    /// a parallel run can't observe the standing surface mid-flip.
-    static MCP_EAGER_LOCK: Mutex<()> = Mutex::new(());
-
     /// Default (progressive disclosure): the standing `tools/list` surface is exactly
     /// ONE tool — the `weave` meta-tool — not the dozens of flat ops. This is the whole
     /// token-light point: a bounded standing context cost regardless of op count.
     #[test]
     fn progressive_default_surface_is_just_the_meta_tool() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
-        std::env::remove_var("WEAVE_MCP_EAGER");
+        let _g = weave_core::testenv::lock_env();
+        let _eager = weave_core::testenv::EnvVarGuard::remove("WEAVE_MCP_EAGER");
         let listed = tools();
         let arr = listed.as_array().expect("tools() is an array");
         assert_eq!(arr.len(), 1, "standing surface must be a single meta-tool");
@@ -6587,8 +7031,8 @@ mod tests {
     /// or piles on standing dispatchers trips this immediately.
     #[test]
     fn standing_mcp_surface_is_within_token_budget() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
-        std::env::remove_var("WEAVE_MCP_EAGER");
+        let _g = weave_core::testenv::lock_env();
+        let _eager = weave_core::testenv::EnvVarGuard::remove("WEAVE_MCP_EAGER");
         let listed = tools();
         let bytes = serde_json::to_string(&listed)
             .expect("serialize tools")
@@ -6611,11 +7055,10 @@ mod tests {
     /// the catalog — the backward-compatible path for harnesses that require flat tools.
     #[test]
     fn eager_mode_restores_the_full_flat_table() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
-        std::env::set_var("WEAVE_MCP_EAGER", "1");
+        let _g = weave_core::testenv::lock_env();
+        let _eager = weave_core::testenv::EnvVarGuard::set("WEAVE_MCP_EAGER", "1");
         let listed = tools();
         let n = listed.as_array().map(|a| a.len()).unwrap_or(0);
-        std::env::remove_var("WEAVE_MCP_EAGER");
         assert_eq!(
             n,
             tool_catalog().len(),

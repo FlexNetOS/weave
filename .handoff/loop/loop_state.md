@@ -30,3 +30,26 @@ status: |
   pause handoff note .handoff/loop/pause_2026-06-27_reboot.md. Resume with mandatory worktree reap,
   ICM recall, fetch develop, then continue WL-078 without downgrades/removals.
 ---
+
+---
+session_started: 2026-07-12
+session_type: MAX all-feature health / forge audit loop
+cycles_this_session: 1
+cycle_budget: owner-directed until all features and Yazelix profile are healthy
+worktree: /home/flexnetos/meta/src/weave/.worktrees/all-feature-health
+branch: fix/all-feature-health
+base: origin/develop @ 5a43693
+last_item: optional runtime health / LLM functional hardening — APPROVED, delivering
+last_update: 2026-07-12
+status: |
+  Cycle A completed the optional LLM/runtime surface. Default builds retain no
+  HTTP/TLS client; enabled builds use rustls/WebPKI, real CLI/MCP handlers, finite
+  request/response/output bounds, redirect refusal, confidential errors, and a
+  canonical 200-message snapshot. SQLite and libSQL now use generation-safe,
+  root-live, expiry-safe summary caching with additive legacy migrations and
+  atomic conditional writes. Full default/SQLite+LLM/libSQL+LLM suites, maximal
+  MCP matrices, strict clippy, formatting, diff hygiene, dependency-tree checks,
+  and structural supply-chain policy are green. Independent verifier GREEN and
+  guardian APPROVE. Next cycle after PR delivery: trusted program resolution,
+  job liveness, terminal liveness, and attach identity correctness.
+---

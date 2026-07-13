@@ -388,7 +388,7 @@ enum Cmd {
         #[arg(long)]
         summarize: bool,
         /// Force a fresh LLM summary even if a cached one exists.
-        #[arg(long)]
+        #[arg(long, requires = "summarize")]
         refresh: bool,
     },
     /// Summarize arbitrary text via the configured LLM endpoint.
@@ -6768,28 +6768,49 @@ fn main() -> Result<()> {
             summarize: _summarize,
             refresh: _refresh,
         } => {
-            let rows = store.thread(root, limit)?;
+            #[cfg(not(feature = "llm"))]
+            if _summarize {
+                anyhow::bail!("weave was compiled without the llm feature");
+            }
             #[cfg(feature = "llm")]
             if _summarize {
                 let summary = if _refresh {
                     None
                 } else {
+                    store.sweep_expired_messages()?;
                     store.get_summary(root)?
                 };
                 let text = match summary {
-                    Some(s) => s.text,
+                    Some(s) => weave_core::llm::normalize_summary_text(&s.text)?,
                     None => {
+                        let (rows, generation) = weave_core::store::summary_thread_snapshot(
+                            store,
+                            root,
+                            weave_core::store::SUMMARY_THREAD_LIMIT,
+                        )?;
+                        if rows.is_empty() {
+                            anyhow::bail!("No thread found for root #{root}.");
+                        }
                         let thread_text = rows
                             .iter()
                             .map(|m| format!("{}: {}", m.sender, m.body))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let sum = weave_core::llm::summarize_text(&cfg, &thread_text)?;
-                        store.store_summary(
+                        if rows.iter().any(|message| message.expires_at.is_some()) {
+                            weave_core::store::validate_ephemeral_summary_completion(
+                                store, &rows, generation,
+                            )?;
+                        } else if !store.store_summary_if_generation(
                             root,
                             &sum,
-                            cfg.llm_model.as_deref().unwrap_or("unknown"),
-                        )?;
+                            weave_core::llm::effective_model(&cfg),
+                            generation,
+                        )? {
+                            anyhow::bail!(
+                                "thread changed while its summary was being generated; retry"
+                            );
+                        }
                         sum
                     }
                 };
@@ -6805,6 +6826,7 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+            let rows = store.thread(root, limit)?;
             if json {
                 println!(
                     "{}",
