@@ -178,6 +178,39 @@ jobs:
       - name: test (libsql + surfaces)
         run: cargo test --no-default-features --features "libsql surfaces"
 
+  maximal-sqlite:
+    # The installable SQLite profile enables every composable optional surface.
+    # Keep a blocking combined column: pairwise feature jobs cannot catch cfg or
+    # shared-runtime interactions among sign + llm + surfaces + obscura.
+    name: maximal (sqlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (maximal sqlite)
+        run: cargo clippy --workspace --all-targets --features "sign llm surfaces obscura" -- -D warnings
+      - name: test (maximal sqlite)
+        run: cargo test --workspace --features "sign llm surfaces obscura"
+
+  maximal-libsql:
+    # SQLite and libSQL are mutually exclusive, so the alternate backend needs its
+    # own maximal column rather than an impossible `--all-features` build.
+    name: maximal (libsql)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (maximal libsql)
+        run: cargo clippy --workspace --all-targets --no-default-features --features "libsql sign llm surfaces obscura" -- -D warnings
+      - name: test (maximal libsql)
+        run: cargo test --workspace --no-default-features --features "libsql sign llm surfaces obscura"
+
   audit:
     # WL-044: supply-chain advisory gate (this job did not exist before WL-044).
     # cargo-deny scans the dependency graph against the RustSec advisory DB.

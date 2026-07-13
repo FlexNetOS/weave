@@ -44,6 +44,8 @@ compile_error!(
 compile_error!("no storage backend selected: enable `sqlite` (default) or `libsql`.");
 
 mod backup;
+#[cfg(feature = "surfaces")]
+mod bridge;
 mod git;
 mod harness;
 #[cfg(feature = "sqlite")]
@@ -246,21 +248,22 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         body: String,
-        /// Cross-store (Tier-2): deposit the message as an intent in THIS store's
-        /// outbox for a recipient that lives in another store. The recipient pulls
-        /// and commits it on its next drain (next-drain latency). This NEVER writes
-        /// the recipient's store. When omitted, the message is a normal local send.
+        /// Cross-store mode (Tier-2): deposit a directed intent in THIS store's
+        /// outbox. This value is an operator route label; it is not persisted and
+        /// does not select or write a recipient database. The recipient must pull
+        /// this sender store explicitly. When omitted, this is a normal local send.
         #[arg(long)]
         to_store: Option<String>,
-        /// Optional host hint stored on a cross-store intent (advisory; only with
-        /// --to-store). Disambiguates the same recipient name across machines.
+        /// Optional receiving host stored on a cross-store intent (only with
+        /// --to-store). A nonempty value must exactly match the receiver's host;
+        /// empty means any host for the named recipient.
         #[arg(long)]
         to_host: Option<String>,
         /// Skip automatic memory context prefixing for this message.
         #[arg(long)]
         no_memory: bool,
-        /// Idempotency key: if a message with this key already exists, the existing
-        /// message id is returned instead of creating a new row.
+        /// Idempotency key: an exact retry returns the existing message id. Keyed
+        /// bodies are stored verbatim, so automatic memory prefixing is disabled.
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Message priority: low, normal, high, urgent (default normal).
@@ -915,6 +918,10 @@ enum Cmd {
         /// and printed to stderr.
         #[arg(long)]
         token: Option<String>,
+        /// Separate bearer credential for the push-only POST /push endpoint.
+        /// Must differ from --token so a remote sender never gains MCP authority.
+        #[arg(long)]
+        push_token: Option<String>,
         /// Enable dangerous/mutating tools (disabled by default for safety).
         #[arg(long)]
         dangerous: bool,
@@ -947,6 +954,10 @@ enum Cmd {
         /// Bearer token. If omitted, a random token is generated and printed to stderr.
         #[arg(long)]
         token: Option<String>,
+        /// Separate bearer credential for the push-only POST /push endpoint.
+        /// Must differ from the dashboard operator token.
+        #[arg(long)]
+        push_token: Option<String>,
         /// WL-052a: enable the bearer-gated `POST /api` write surface (mutating ops).
         /// Off by default — the dashboard is read-only unless this is set.
         #[arg(long)]
@@ -954,7 +965,7 @@ enum Cmd {
     },
     /// WL-056 / ADR-0005: PUSH a message to a recipient on ANOTHER machine. The
     /// A-initiated dual of a Tier-2 pull: sign the canonical (from,to,body) if keyed,
-    /// then POST the Intent to B's bearer-gated `weave serve --write` endpoint, where
+    /// then POST the Intent to B's separately credentialed push-only endpoint, where
     /// B commits it into its OWN inbox and lights its OWN pane WITHOUT polling.
     /// `--host` is EXPLICIT-ONLY (never auto-resolved from message content — SSRF
     /// avoidance). Body from `--body` or stdin.
@@ -963,10 +974,11 @@ enum Cmd {
         /// Recipient session name on the remote machine.
         #[arg(long)]
         to: String,
-        /// Remote endpoint, `host:port` (or a full `http://host:port`). EXPLICIT-ONLY.
+        /// Remote HTTPS origin. Plain/HTTP host:port is accepted only for loopback.
+        /// EXPLICIT-ONLY.
         #[arg(long)]
         host: String,
-        /// Bearer token for B's endpoint. Falls back to $WEAVE_PUSH_TOKEN, then config.
+        /// Bearer token for B's endpoint. Falls back to $WEAVE_PUSH_TOKEN.
         #[arg(long)]
         token: Option<String>,
         /// Message body. If omitted, the body is read from stdin.
@@ -994,11 +1006,31 @@ enum Cmd {
     /// WL-048: run the Telegram bridge (poll-only): relay between a Telegram chat
     /// and the weave mesh. Token from config/`WEAVE_TELEGRAM_TOKEN`.
     #[cfg(feature = "surfaces")]
-    Telegram,
+    Telegram {
+        /// Show token-free configuration/runtime/pending status without network I/O.
+        #[arg(long, conflicts_with = "check")]
+        status: bool,
+        /// Check Telegram identity and configured-chat access without posting.
+        #[arg(long, conflicts_with = "status")]
+        check: bool,
+        /// Machine-readable output for --status or --check.
+        #[arg(long)]
+        json: bool,
+    },
     /// WL-048: run the Slack bridge (poll-only): relay between a Slack channel and
     /// the weave mesh. Token from config/`WEAVE_SLACK_TOKEN`.
     #[cfg(feature = "surfaces")]
-    Slack,
+    Slack {
+        /// Show token-free configuration/runtime/pending status without network I/O.
+        #[arg(long, conflicts_with = "check")]
+        status: bool,
+        /// Check Slack identity and configured-channel read access, then exit.
+        #[arg(long, conflicts_with = "status")]
+        check: bool,
+        /// Machine-readable output for --status or --check.
+        #[arg(long)]
+        json: bool,
+    },
     /// WL-034: export a mailbox to a single self-contained, offline-openable HTML
     /// file with client-side search (no external assets, no CDN). Exports the
     /// caller's mailbox (sender / recipient / broadcast scope) via `history`, or
@@ -1843,29 +1875,58 @@ fn refresh_presence(store: &dyn Store, name: &str, explicit: bool) {
     }
 }
 
-/// Sign a cross-store intent's canonical `(from,to,body)` with this session's
-/// configured signing key, returning the hex signature for `outbox.sig`. Returns
+/// Sign a cross-store intent's complete semantic tuple with this session's
+/// configured signing key, returning the versioned signature for `outbox.sig`. Returns
 /// `""` when no key is configured or the `sign` feature is not built — in which case
 /// the intent is unsigned and the receiver falls back to the advisory model (or
-/// drops it under `strict_verify`). A signing-key load error is non-fatal: it logs
-/// to stderr and sends unsigned rather than blocking the send. The private key is
-/// never logged here.
+/// drops it under `strict_verify`). A configured key that cannot be loaded fails
+/// closed before enqueue/network I/O; silently downgrading that intent to unsigned
+/// would violate the sender's configured identity posture.
 #[cfg(feature = "sign")]
-fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
+#[allow(clippy::too_many_arguments)]
+fn sign_intent_if_keyed(
+    from: &str,
+    to: &str,
+    to_host: &str,
+    subject: Option<&str>,
+    body: &str,
+    idempotency_key: Option<&str>,
+    priority: &str,
+    ttl: i64,
+) -> anyhow::Result<String> {
     match sign::load_signing_key() {
-        Ok(Some(key)) => sign::sign_intent(&key, from, to, body),
-        Ok(None) => String::new(),
-        Err(e) => {
-            eprintln!("[weave] could not load signing key (sending unsigned): {e}");
-            String::new()
-        }
+        Ok(Some(key)) => Ok(sign::sign_intent_v2(
+            &key,
+            &sign::IntentSignatureFields {
+                from,
+                to,
+                to_host,
+                subject,
+                body,
+                idempotency_key,
+                priority,
+                ttl,
+            },
+        )),
+        Ok(None) => Ok(String::new()),
+        Err(error) => Err(error.context("configured signing key could not be loaded")),
     }
 }
 
 /// Without the `sign` feature, intents are always unsigned (empty `sig`).
 #[cfg(not(feature = "sign"))]
-fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
-    String::new()
+#[allow(clippy::too_many_arguments)]
+fn sign_intent_if_keyed(
+    _from: &str,
+    _to: &str,
+    _to_host: &str,
+    _subject: Option<&str>,
+    _body: &str,
+    _idempotency_key: Option<&str>,
+    _priority: &str,
+    _ttl: i64,
+) -> anyhow::Result<String> {
+    Ok(String::new())
 }
 
 /// WL-056 / ADR-0005: arguments for `weave push` (the cross-machine SEND verb).
@@ -1885,18 +1946,159 @@ struct PushArgs {
     me: Option<String>,
 }
 
+#[cfg(feature = "surfaces")]
+const MAX_PUSH_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Parse the explicit push endpoint and return a credential-free display label.
+/// Only an origin (optionally followed by `/push`) is accepted; userinfo, query,
+/// fragment, and arbitrary path components are rejected before any request.
+#[cfg(feature = "surfaces")]
+fn push_endpoint(raw: &str) -> anyhow::Result<(reqwest::Url, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("push endpoint is empty");
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let mut endpoint = reqwest::Url::parse(&candidate)
+        .map_err(|_| anyhow::anyhow!("push endpoint is not a valid URL"))?;
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        anyhow::bail!("push endpoint must use http or https");
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("push endpoint must include a host"))?;
+    if endpoint.scheme() == "http" {
+        let loopback = matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "localhost."
+        ) || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+        if !loopback {
+            anyhow::bail!("push endpoint must use https unless it is a loopback address");
+        }
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        anyhow::bail!("push endpoint must not include user information");
+    }
+    if endpoint.query().is_some() || endpoint.fragment().is_some() {
+        anyhow::bail!("push endpoint must not include a query or fragment");
+    }
+    let path = endpoint.path().trim_matches('/');
+    if !path.is_empty() && path != "push" {
+        anyhow::bail!("push endpoint path must be empty or /push");
+    }
+    endpoint.set_path("/push");
+    let label = endpoint.origin().ascii_serialization();
+    Ok((endpoint, label))
+}
+
+#[cfg(feature = "surfaces")]
+fn bounded_push_text(text: &str, token: Option<&str>) -> String {
+    let redacted = token.filter(|token| !token.is_empty()).map_or_else(
+        || text.to_string(),
+        |token| text.replace(token, "[redacted]"),
+    );
+    store::sanitize_tag(&redacted, 1_024)
+}
+
+#[cfg(all(feature = "surfaces", test))]
+fn bounded_push_reply_text(value: &serde_json::Value, token: Option<&str>) -> Option<String> {
+    value
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(|content| content.get(0))
+        .and_then(|content| content.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(|text| bounded_push_text(text, token))
+        .filter(|text| !text.is_empty())
+}
+
+#[cfg(feature = "surfaces")]
+fn bounded_push_error_text(value: &serde_json::Value, token: Option<&str>) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(|text| bounded_push_text(text, token))
+        .filter(|text| !text.is_empty())
+}
+
+/// Validate the complete JSON-RPC/MCP response before treating a remote push as
+/// committed. HTTP success alone is not delivery evidence: a proxy or unrelated
+/// endpoint can return arbitrary JSON with a 2xx status.
+#[cfg(feature = "surfaces")]
+fn validated_push_reply(
+    value: &serde_json::Value,
+    token: Option<&str>,
+) -> anyhow::Result<(bool, String)> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("push reply must be a JSON-RPC object"))?;
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        anyhow::bail!("push reply has an invalid JSON-RPC version");
+    }
+    if object.get("id") != Some(&serde_json::Value::from(1)) {
+        anyhow::bail!("push reply has an unexpected JSON-RPC id");
+    }
+    if object.contains_key("result") == object.contains_key("error") {
+        anyhow::bail!("push reply must contain exactly one of result or error");
+    }
+    if object.contains_key("error") {
+        let message = bounded_push_error_text(value, token)
+            .ok_or_else(|| anyhow::anyhow!("push reply contains a malformed JSON-RPC error"))?;
+        return Ok((true, message));
+    }
+
+    let result = object
+        .get("result")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("push reply contains an invalid MCP result"))?;
+    let is_error = result
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("push reply omits the MCP isError flag"))?;
+    let content = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("push reply omits MCP content"))?;
+    let first = content
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("push reply contains no MCP text content"))?;
+    if first.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+        anyhow::bail!("push reply contains invalid MCP content");
+    }
+    let raw = first
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("push reply contains invalid MCP text content"))?;
+    let message = bounded_push_text(raw, token);
+    if message.is_empty() {
+        anyhow::bail!("push reply contains empty MCP text content");
+    }
+    Ok((is_error, message))
+}
+
 /// WL-056 / ADR-0005: PUSH a message to a recipient on ANOTHER machine — the
 /// A-initiated dual of a Tier-2 pull. Resolve `from`, read the body from `--body` or
 /// stdin, sign the canonical `(from,to,body)` if a key is configured (the SAME
 /// `sign_intent_if_keyed` the cross-store send uses), build a JSON-RPC
-/// `tools/call {name:"weave_push",...}`, and POST it to B's `http://<host>/api`
+/// `tools/call {name:"weave_push",...}`, and POST it to B's validated `/push`
 /// endpoint with `Authorization: Bearer <token>`. B verifies + commits into its OWN
 /// inbox and lights its OWN pane (owner-only-writes). A non-200 / B-side error is
 /// surfaced as a CLI error.
 ///
-/// SSRF avoidance: `--host` is EXPLICIT-ONLY — never auto-resolved from message
-/// content. The token comes from `--token` > `$WEAVE_PUSH_TOKEN` > config (the
-/// telegram/slack token-resolution precedent). Reuses the EXISTING blocking+rustls
+/// Endpoint policy: `--host` is EXPLICIT-ONLY, non-loopback origins require HTTPS,
+/// and redirects are disabled so a validated origin cannot bounce the request to
+/// an unvalidated destination. The token comes from `--token` >
+/// `$WEAVE_PUSH_TOKEN`. Reuses the
+/// EXISTING blocking+rustls
 /// `reqwest` client (no new HTTP dep) with a bounded timeout.
 #[cfg(feature = "surfaces")]
 fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::Result<()> {
@@ -1904,6 +2106,14 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
     use std::time::Duration;
 
     let from = resolve_me(args.me, None, cfg);
+    store::check_ident("push sender", &from)?;
+    let to = args.to.trim().to_string();
+    store::check_ident("push recipient", &to)?;
+    if model::is_broadcast(&to) {
+        anyhow::bail!("cross-machine push is directed-only");
+    }
+    let subject = args.subject;
+    store::check_subject(subject.as_deref()).context("invalid push subject")?;
 
     // Body from --body, else stdin (the `summarize`/`hook` stdin precedent).
     let body = match args.body {
@@ -1911,8 +2121,12 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
         None => {
             let mut buf = String::new();
             std::io::stdin()
+                .take((store::MAX_BODY + 1) as u64)
                 .read_to_string(&mut buf)
                 .map_err(|e| anyhow::anyhow!("reading push body from stdin: {e}"))?;
+            if buf.len() > store::MAX_BODY {
+                anyhow::bail!("push body exceeds the {}-byte limit", store::MAX_BODY);
+            }
             buf
         }
     };
@@ -1920,6 +2134,7 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
     if body.is_empty() {
         anyhow::bail!("push body is empty (pass --body or pipe it on stdin)");
     }
+    store::check_body(&body).context("invalid push body")?;
 
     // Token: --token > $WEAVE_PUSH_TOKEN. (The serve/dashboard bearer token is
     // CLI/random, not a config key, so there is no config fallback here.)
@@ -1929,38 +2144,45 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
             .filter(|t| !t.is_empty())
     });
 
-    // Normalize the explicit --host into a full http URL ending in /api. We accept
-    // `host:port`, `http://host:port`, or a trailing /api and converge them. NO
-    // auto-resolution from message content (SSRF avoidance) — `--host` is the only
-    // source of the endpoint.
-    let base = args.host.trim().trim_end_matches('/');
-    let url = if base.starts_with("http://") || base.starts_with("https://") {
-        if base.ends_with("/api") {
-            base.to_string()
-        } else {
-            format!("{base}/api")
-        }
-    } else if base.ends_with("/api") {
-        format!("http://{base}")
-    } else {
-        format!("http://{base}/api")
-    };
+    let (url, endpoint_label) = push_endpoint(&args.host)?;
 
-    // Sign the canonical (from,to,body) if keyed (reuse the cross-store signer).
-    let sig = sign_intent_if_keyed(&from, &args.to, &body);
-
-    // Always populate the idempotency key (so a retried POST never double-commits on
-    // B). If the caller didn't supply one, synthesize a stable key from (from,body)
-    // via an FNV-1a digest — no rand/hash crate (weave is dependency-light).
+    // Always populate the idempotency key. An omitted key means a new intentional
+    // push invocation, so mint a fresh value; callers retrying an uncertain POST
+    // must reuse an explicit key.
     let idempotency_key = args
         .idempotency_key
         .filter(|k| !k.is_empty())
-        .unwrap_or_else(|| synth_push_key(&from, &body));
+        .unwrap_or_else(model::mint_trace_id);
+    if !model::idempotency_key_valid(&idempotency_key) {
+        anyhow::bail!("push idempotency key is invalid or too long");
+    }
+    let priority = model::MessagePriority::parse(args.priority.as_deref().unwrap_or("normal"))
+        .as_str()
+        .to_string();
+    let to_host = args.to_host.as_deref().unwrap_or("").trim().to_string();
+    store::check_host(&to_host)?;
+    let ttl = args.ttl.unwrap_or(0);
+    if ttl != 0 && !model::ttl_valid(ttl) {
+        anyhow::bail!(
+            "push ttl must be between 1 and {} seconds",
+            model::MAX_MSG_TTL_SECS
+        );
+    }
+    let sig = sign_intent_if_keyed(
+        &from,
+        &to,
+        &to_host,
+        subject.as_deref(),
+        &body,
+        Some(&idempotency_key),
+        &priority,
+        ttl,
+    )?;
 
     // Build the weave_push arguments object (the Intent wire form).
     let mut push_args = serde_json::Map::new();
     push_args.insert("from".into(), serde_json::Value::from(from.clone()));
-    push_args.insert("to".into(), serde_json::Value::from(args.to.clone()));
+    push_args.insert("to".into(), serde_json::Value::from(to));
     push_args.insert("body".into(), serde_json::Value::from(body));
     push_args.insert(
         "idempotency_key".into(),
@@ -1969,17 +2191,15 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
     if !sig.is_empty() {
         push_args.insert("sig".into(), serde_json::Value::from(sig));
     }
-    if let Some(s) = args.subject.filter(|s| !s.is_empty()) {
+    if let Some(s) = subject {
         push_args.insert("subject".into(), serde_json::Value::from(s));
     }
-    if let Some(h) = args.to_host.filter(|s| !s.is_empty()) {
-        push_args.insert("to_host".into(), serde_json::Value::from(h));
+    if !to_host.is_empty() {
+        push_args.insert("to_host".into(), serde_json::Value::from(to_host));
     }
-    if let Some(p) = args.priority.filter(|s| !s.is_empty()) {
-        push_args.insert("priority".into(), serde_json::Value::from(p));
-    }
-    if let Some(t) = args.ttl {
-        push_args.insert("ttl".into(), serde_json::Value::from(t));
+    push_args.insert("priority".into(), serde_json::Value::from(priority));
+    if ttl != 0 {
+        push_args.insert("ttl".into(), serde_json::Value::from(ttl));
     }
 
     let rpc = serde_json::json!({
@@ -1993,58 +2213,44 @@ fn push_to_remote(_store: &dyn Store, cfg: &Config, args: PushArgs) -> anyhow::R
     // llm) — NO new HTTP dep. Bounded timeout so a dead endpoint cannot hang the CLI.
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))?;
-    let mut req = client.post(&url).json(&rpc);
+    let mut req = client.post(url).json(&rpc);
     if let Some(t) = &token {
         req = req.bearer_auth(t);
     }
     let resp = req
         .send()
-        .map_err(|e| anyhow::anyhow!("POST {url} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("push request to {endpoint_label} failed: {e}"))?;
     let status = resp.status();
-    let text = resp.text().unwrap_or_default();
+    let mut bytes = Vec::with_capacity(MAX_PUSH_RESPONSE_BYTES.min(8 * 1024));
+    resp.take((MAX_PUSH_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading push response from {endpoint_label}: {e}"))?;
+    if bytes.len() > MAX_PUSH_RESPONSE_BYTES {
+        anyhow::bail!(
+            "push response from {endpoint_label} exceeds the {MAX_PUSH_RESPONSE_BYTES}-byte limit"
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("push endpoint {endpoint_label} returned invalid JSON"))?;
     if !status.is_success() {
-        anyhow::bail!("push rejected by '{url}': HTTP {status}: {text}");
-    }
-    // The body is the JSON-RPC reply; surface B's tool result. A tool-level error
-    // (isError:true) is reported as a CLI error so the operator sees a rejected push.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        if let Some(err) = v.get("error") {
-            anyhow::bail!("push rejected by '{url}': {err}");
+        if let Some(message) = bounded_push_error_text(&value, token.as_deref()) {
+            anyhow::bail!("push rejected by {endpoint_label}: HTTP {status}: {message}");
         }
-        let result = &v["result"];
-        let is_error = result
-            .get("isError")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false);
-        let msg = result
-            .get("content")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or(&text);
-        if is_error {
-            anyhow::bail!("push rejected by '{url}': {msg}");
-        }
-        println!("{msg}");
-    } else {
-        println!("{text}");
+        anyhow::bail!("push rejected by {endpoint_label}: HTTP {status}");
     }
+    // The body must be the matching JSON-RPC/MCP reply. A generic JSON 2xx is
+    // not proof that the destination committed the intent.
+    let (is_error, message) = validated_push_reply(&value, token.as_deref()).map_err(|error| {
+        anyhow::anyhow!("push endpoint {endpoint_label} returned an invalid reply: {error}")
+    })?;
+    if is_error {
+        anyhow::bail!("push rejected by {endpoint_label}: {message}");
+    }
+    println!("{message}");
     Ok(())
-}
-
-/// FNV-1a digest helper for a synthetic push idempotency key — mirrors the
-/// receive-side `synth_push_idempotency_key` so a keyless push from the CLI is keyed
-/// identically (no rand/hash crate).
-#[cfg(feature = "surfaces")]
-fn synth_push_key(from: &str, body: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in body.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("push:{from}:{h:x}")
 }
 
 /// Best-effort Tier-2 pull: commit any cross-store intents addressed to `me` from
@@ -3017,6 +3223,8 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
     let db_is_default = db == db_default;
     #[cfg(feature = "sqlite")]
     let provider_switch_status = provider_switch::status(None);
+    #[cfg(feature = "surfaces")]
+    let bridge_status = bridge::bridge_statuses_json(store, cfg)?;
     if json {
         let mut report = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -3062,6 +3270,10 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
         #[cfg(feature = "sqlite")]
         if let Some(obj) = report.as_object_mut() {
             obj.insert("provider_switch".into(), provider_switch_status);
+        }
+        #[cfg(feature = "surfaces")]
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("bridges".into(), bridge_status);
         }
         // Signed-identity summary (counts + local fingerprint only, secret-free):
         // surfaces the trust/revocation policy and this session's own fingerprint so
@@ -3236,6 +3448,17 @@ fn doctor(store: &dyn Store, cfg: &Config, json: bool) -> Result<()> {
             .join(", ");
         println!("  peer status:    {status_summary}");
         println!("  claude on PATH: {}", if claude { "yes" } else { "no" });
+        #[cfg(feature = "surfaces")]
+        {
+            let telegram =
+                bridge::bridge_status_snapshot(store, cfg, model::BridgePlatform::Telegram)?;
+            let slack = bridge::bridge_status_snapshot(store, cfg, model::BridgePlatform::Slack)?;
+            println!(
+                "  bot bridge:     {}",
+                bridge::bridge_status_line(&telegram)
+            );
+            println!("  bot bridge:     {}", bridge::bridge_status_line(&slack));
+        }
         #[cfg(feature = "sqlite")]
         {
             let present = provider_switch_status
@@ -4533,10 +4756,10 @@ const TUI_COMMANDS: &[CommandSurface] = &[
         name: "telegram",
         domain: "bot",
         mcp_decision: "feature-gated-bot-surface",
-        status_surface: "bot poll log / doctor",
+        status_surface: "--status / --check / doctor / dashboard",
         help_smoke: "integration:help-smoke",
-        behavior_coverage: "feature:surfaces-bot",
-        docs_surface: "feature-gated help",
+        behavior_coverage: "unit:bridge-transport / integration:bridge-status",
+        docs_surface: "README.md / docs/OPERATIONS.md",
         tui_exposure: "commands pane",
         risk: "bot-bridge",
     },
@@ -4545,10 +4768,10 @@ const TUI_COMMANDS: &[CommandSurface] = &[
         name: "slack",
         domain: "bot",
         mcp_decision: "feature-gated-bot-surface",
-        status_surface: "bot poll log / doctor",
+        status_surface: "--status / --check / doctor / dashboard",
         help_smoke: "integration:help-smoke",
-        behavior_coverage: "feature:surfaces-bot",
-        docs_surface: "feature-gated help",
+        behavior_coverage: "unit:bridge-transport / integration:bridge-status",
+        docs_surface: "README.md / docs/OPERATIONS.md",
         tui_exposure: "commands pane",
         risk: "bot-bridge",
     },
@@ -6033,7 +6256,8 @@ fn main() -> Result<()> {
         } => {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
-            let body = maybe_prefix_body(&cfg, &from, &body, no_memory);
+            let body =
+                maybe_prefix_body(&cfg, &from, &body, no_memory || idempotency_key.is_some());
             let trace_id = model::mint_trace_id();
             // WL-038: validate the ephemeral TTL once at the CLI seam (the
             // --priority/lease-ttl precedent) before any store write.
@@ -6052,6 +6276,15 @@ fn main() -> Result<()> {
                 // authorization is the receiver's (its pull_from allowlist). No
                 // local inbox row, no inject — A cannot reach the recipient's pane.
                 Some(store_path) => {
+                    let route_label = store_path.trim();
+                    if route_label.is_empty()
+                        || route_label.chars().count() > 256
+                        || route_label.chars().any(char::is_control)
+                    {
+                        anyhow::bail!(
+                            "--to-store must be a nonempty control-free route label (max 256 characters)"
+                        );
+                    }
                     if model::is_broadcast(&to) {
                         anyhow::bail!(
                             "cross-store broadcast is not supported; send to a named recipient \
@@ -6067,54 +6300,77 @@ fn main() -> Result<()> {
                              (supersede targets a message in this store, not a cross-store intent)."
                         );
                     }
-                    let host = to_host.as_deref().unwrap_or("");
+                    let host = to_host.as_deref().unwrap_or("").trim();
+                    let canonical_priority =
+                        model::MessagePriority::parse(priority.as_deref().unwrap_or("normal"))
+                            .as_str()
+                            .to_string();
+                    let effective_key =
+                        idempotency_key.clone().unwrap_or_else(model::mint_trace_id);
                     // Signed identity (2d): if a local signing key is configured,
                     // sign the canonical (from,to,body,created) so the receiver can
                     // verify `from` is unforgeable. `created` is the enqueue time we
                     // bind into the row; we sign the SAME value the store stamps so
                     // verification matches. Without the `sign` feature this is "".
-                    let sig = sign_intent_if_keyed(&from, &to, &body);
-                    let id = store.enqueue_intent(
+                    let sig = sign_intent_if_keyed(
+                        &from,
+                        &to,
+                        host,
+                        subject.as_deref(),
+                        &body,
+                        Some(&effective_key),
+                        &canonical_priority,
+                        ttl.unwrap_or(0),
+                    )?;
+                    let (id, created) = store.enqueue_intent_idempotent(
                         &to,
                         host,
                         &from,
                         subject.as_deref(),
                         &body,
                         &sig,
-                        idempotency_key.as_deref(),
+                        Some(&effective_key),
                         Some(&trace_id),
-                        priority.as_deref(),
+                        Some(&canonical_priority),
                         ttl.unwrap_or(0),
                     )?;
-                    println!("queued intent #{id} for '{to}' @ {store_path} (delivered on their next drain)");
+                    if !created {
+                        println!(
+                            "queued intent #{id} for '{to}' \
+                             (cross-store idempotent replay; no duplicate hook)"
+                        );
+                        return Ok(());
+                    }
+                    println!(
+                        "queued intent #{id} for '{to}' \
+                         (cross-store; delivered when the recipient drains this sender store)"
+                    );
                 }
                 None => {
+                    if to_host.is_some() {
+                        anyhow::bail!("--to-host requires --to-store");
+                    }
                     let to = store::resolve_point_recipient(store, &to)?;
-                    let mid = store.send(
+                    let (mid, created) = store.send_configured_idempotent(
                         &from,
                         &to,
                         subject.as_deref(),
                         &body,
                         idempotency_key.as_deref(),
                         Some(&trace_id),
+                        priority.as_deref(),
+                        supersedes,
+                        ttl.unwrap_or(0),
+                        false,
                     )?;
-                    if let Some(p) = priority {
-                        let _ = store.set_message_priority(mid, &p);
+                    if !created {
+                        println!(
+                            "sent #{mid}: {from} -> {to} \
+                             (idempotent replay; no duplicate nudge or hook)"
+                        );
+                        return Ok(());
                     }
-                    // WL-038: post-stamp the ephemeral expiry (the priority post-stamp
-                    // precedent). `ttl` is already cap-validated above.
-                    if let Some(t) = ttl {
-                        let _ =
-                            store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
-                    }
-                    // WL-037: post-stamp the supersede link (the priority post-stamp
-                    // precedent). Authorization + id existence are enforced in
-                    // `Store::supersede`; a bad id bails with a clear message.
                     if let Some(old) = supersedes {
-                        if old <= 0 {
-                            anyhow::bail!("--supersedes must be a positive message id.");
-                        }
-                        store.supersede(&from, old, mid)?;
                         println!("sent #{mid}: {from} -> {to} (supersedes #{old})");
                     } else {
                         println!("sent #{mid}: {from} -> {to}");
@@ -6164,24 +6420,21 @@ fn main() -> Result<()> {
             let (from, explicit) = resolve_me_explicit(from, None, &cfg);
             refresh_presence(store, &from, explicit);
             let trace_id = model::mint_trace_id();
-            let mid = store.send(
+            let (mid, created) = store.send_configured_idempotent(
                 &from,
                 &to,
                 subject.as_deref(),
                 &body,
                 idempotency_key.as_deref(),
                 Some(&trace_id),
+                priority.as_deref(),
+                None,
+                0,
+                dedup_idle,
             )?;
-            if let Some(p) = priority {
-                let _ = store.set_message_priority(mid, &p);
-            }
-            // WL-039: opt-in idle-notification dedup. Stamp this ping idle and
-            // auto-supersede this sender's prior UNREAD idle pings to `to` so a
-            // pile of "still waiting" pings collapses to just the latest. Post-send
-            // (mirrors the WL-037 `--supersedes` post-stamp); best-effort — a dedup
-            // failure must not sink the notify the recipient already received.
-            if dedup_idle {
-                let _ = store.supersede_prior_idle(&from, &to, mid);
+            if !created {
+                println!("notified '{to}' (#{mid}, idempotent replay; no duplicate nudge or hook)");
+                return Ok(());
             }
             // Trace + nudge (best-effort trace, no store→inject edge). The honest
             // verdict is derived from the SAME inject result that drove the trace, so
@@ -8063,9 +8316,22 @@ fn main() -> Result<()> {
             port,
             bind,
             token,
+            push_token,
             dangerous,
         } => {
-            let token = token.unwrap_or_default();
+            if token.is_none() && !weave_mcp::http::is_loopback_bind(&bind) {
+                anyhow::bail!(
+                    "refusing to bind a routable address without a bearer token (bind='{bind}'); pass --token or bind 127.0.0.1"
+                );
+            }
+            let token = match token {
+                Some(token) => token,
+                None => {
+                    let token = store::mint_birth_cert()?;
+                    eprintln!("[weave] serve bearer token: {token}");
+                    token
+                }
+            };
             let extra_dbs = cfg.peer_db_sources();
             let pull = mcp::PullConsent {
                 from: cfg.pull_from_sources(),
@@ -8074,19 +8340,22 @@ fn main() -> Result<()> {
                 policy: verify_policy(&cfg),
             };
             let nudge_tpl = cfg.nudge_template().map(str::to_owned);
+            let injector = RealInjector {
+                preferred_mux: parse_mux_preference(&cfg),
+            };
+            let cfg_for_factory = cfg.clone();
             weave_mcp::serve_http(
-                store,
                 cfg.session.clone(),
                 nudge_tpl.as_deref(),
                 extra_dbs,
                 pull,
-                &RealInjector {
-                    preferred_mux: parse_mux_preference(&cfg),
-                },
+                &injector,
                 &bind,
                 port,
                 &token,
+                push_token.as_deref(),
                 dangerous,
+                move || open_store(&cfg_for_factory),
             )?;
         }
 
@@ -8134,8 +8403,14 @@ fn main() -> Result<()> {
             port,
             bind,
             token,
+            push_token,
             write,
         } => {
+            if token.is_none() && !weave_mcp::http::is_loopback_bind(&bind) {
+                anyhow::bail!(
+                    "refusing to bind a routable address without a bearer token (bind='{bind}'); pass --token or bind 127.0.0.1"
+                );
+            }
             // Reuse WL-022 bearer auth: generate a random token if none given and
             // print it to stderr (never stdout — MCP stdout discipline), like Serve.
             let token = match token {
@@ -8164,6 +8439,7 @@ fn main() -> Result<()> {
                 &bind,
                 port,
                 &token,
+                push_token.as_deref(),
                 write,
                 me_default,
                 &injector,
@@ -8203,13 +8479,69 @@ fn main() -> Result<()> {
         }
 
         #[cfg(feature = "surfaces")]
-        Cmd::Telegram => {
-            telegram::run(store, &cfg)?;
+        Cmd::Telegram {
+            status,
+            check,
+            json,
+        } => {
+            if status {
+                let snapshot =
+                    bridge::bridge_status_snapshot(store, &cfg, model::BridgePlatform::Telegram)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else {
+                    println!("{}", bridge::bridge_status_line(&snapshot));
+                }
+            } else if check {
+                let result = telegram::check(&cfg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "telegram check: ok identity={} scope={}",
+                        result.external_identity.as_deref().unwrap_or("-"),
+                        result.external_scope.as_deref().unwrap_or("-")
+                    );
+                }
+            } else {
+                if json {
+                    anyhow::bail!("--json requires --status or --check");
+                }
+                telegram::run(store, &cfg)?;
+            }
         }
 
         #[cfg(feature = "surfaces")]
-        Cmd::Slack => {
-            slack::run(store, &cfg)?;
+        Cmd::Slack {
+            status,
+            check,
+            json,
+        } => {
+            if status {
+                let snapshot =
+                    bridge::bridge_status_snapshot(store, &cfg, model::BridgePlatform::Slack)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else {
+                    println!("{}", bridge::bridge_status_line(&snapshot));
+                }
+            } else if check {
+                let result = slack::check(&cfg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "slack check: ok identity={} scope={}",
+                        result.external_identity.as_deref().unwrap_or("-"),
+                        result.external_scope.as_deref().unwrap_or("-")
+                    );
+                }
+            } else {
+                if json {
+                    anyhow::bail!("--json requires --status or --check");
+                }
+                slack::run(store, &cfg)?;
+            }
         }
 
         #[cfg(feature = "obscura")]
@@ -11209,6 +11541,96 @@ fn wake_reason(msg: &model::Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "surfaces")]
+    #[test]
+    fn push_endpoint_is_origin_only_and_reply_text_is_bounded() {
+        let (endpoint, label) = push_endpoint("https://example.test:8443").unwrap();
+        assert_eq!(endpoint.as_str(), "https://example.test:8443/push");
+        assert_eq!(label, "https://example.test:8443");
+        assert!(push_endpoint("example.test:8443").is_err());
+        assert!(push_endpoint("http://example.test:8443").is_err());
+        assert_eq!(
+            push_endpoint("127.0.0.1:8443").unwrap().0.as_str(),
+            "http://127.0.0.1:8443/push"
+        );
+        assert_eq!(
+            push_endpoint("http://[::1]:8443").unwrap().0.as_str(),
+            "http://[::1]:8443/push"
+        );
+        assert!(push_endpoint("https://user:secret@example.test/api").is_err());
+        assert!(push_endpoint("https://example.test/push?token=secret").is_err());
+        assert!(push_endpoint("https://example.test/push#fragment").is_err());
+        assert!(push_endpoint("https://example.test/other").is_err());
+        assert!(push_endpoint("file:///tmp/socket").is_err());
+
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": false,
+                "content": [{"type":"text", "text":"ok\nwith\u{0007}controls"}]
+            }
+        });
+        let rendered = bounded_push_reply_text(&value, Some("with")).unwrap();
+        assert_eq!(rendered, "ok[redacted]controls");
+        assert!(rendered.chars().all(|ch| !ch.is_control()));
+        assert_eq!(
+            validated_push_reply(&value, Some("with")).unwrap(),
+            (false, "ok[redacted]controls".to_string())
+        );
+
+        for malformed in [
+            serde_json::json!({"result": {"isError": false, "content": [{"type":"text", "text":"ok"}]}}),
+            serde_json::json!({"jsonrpc":"1.0", "id":1, "result": {"isError": false, "content": [{"type":"text", "text":"ok"}]}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":2, "result": {"isError": false, "content": [{"type":"text", "text":"ok"}]}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": null}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {"isError": "false", "content": [{"type":"text", "text":"ok"}]}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {"isError": false, "content": []}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {"isError": false, "content": [{"type":"image", "text":"ok"}]}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {"isError": false, "content": [{"type":"text", "text":""}]}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result": {}, "error":{"message":"no"}}),
+        ] {
+            assert!(
+                validated_push_reply(&malformed, None).is_err(),
+                "{malformed}"
+            );
+        }
+
+        let rejected = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": "token-secret denied"}
+        });
+        assert_eq!(
+            validated_push_reply(&rejected, Some("token-secret")).unwrap(),
+            (true, "[redacted] denied".to_string())
+        );
+    }
+
+    #[cfg(feature = "sign")]
+    #[test]
+    fn corrupt_configured_signing_key_fails_closed() {
+        let _env = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-corrupt-signing-key-{}-{}",
+            std::process::id(),
+            model::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            dir.to_string_lossy().as_ref(),
+        );
+        let path = sign::key_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not-a-private-key").unwrap();
+        let error = sign_intent_if_keyed("a", "b", "", None, "body", Some("event:k"), "normal", 0)
+            .expect_err("a configured corrupt key must never downgrade to unsigned");
+        assert!(error.to_string().contains("configured signing key"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A fixed clock for every render test: frame contents must be deterministic, so
     /// `now` is always passed in — never `model::now()`. (2021-01-01T00:00:00Z.)

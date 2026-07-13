@@ -16,7 +16,7 @@ multi-surface parity) is checked against.
 | **CLI** (`weave <subcmd>`) | default | **zero** (pay per invocation) | agents (token-bound) + humans | the reference surface — every command carries an MCP decision |
 | **MCP** (`weave mcp`) | default | bounded (`weave` meta-tool, WL-050/051) | agents that speak MCP | full catalog where appropriate; intentional CLI-only decisions are ledgered |
 | **Dashboard** (`weave dashboard`, HTTP/SSE) | `--features surfaces` | n/a (out-of-band) | humans (browser) | **read-only v1** (WL-048) |
-| **Bots** (`weave telegram` / `weave slack`) | `--features surfaces` | n/a (out-of-band) | humans (chat) | relay + command grammar (WL-048/WL-073) |
+| **Bots** (`weave telegram` / `weave slack`) | `--features surfaces` | n/a (out-of-band) | humans (chat) | durable at-least-once relay + command grammar + status (WL-048/WL-073) |
 
 Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 
@@ -24,7 +24,10 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 
 | Capability domain | CLI | MCP | Dashboard | Bots | Notes |
 |---|:--:|:--:|:--:|:--:|---|
-| **Messaging** (send / notify / reply / broadcast) | ✅ | ✅ | ❌ | ◐ | Bots: inbound human→agent relay + outbound notify, plus gated `/send` and `/reply` via shared dispatcher. Broadcast/notify forms remain agent-surface only. Dashboard: read-only (no send form polish → **WL-052a**). |
+| **Messaging** (send / notify / reply / broadcast) | ✅ | ✅ | ❌ | ◐ | Bots: inbound human→agent relay + outbound notify, plus gated `/send` and `/reply` via shared dispatcher. Broadcast/notify forms remain agent-surface only. Keyed writes store bodies verbatim (no dynamic memory prefix) on every shared-handler path. Dashboard: read-only (no send form polish → **WL-052a**). |
+| **Cross-store pull** (outbox / pull) | ✅ | ✅ | — | — | `to_store` is a non-persisted operator route label, not a recipient-DB selector; nonempty `to_host` is enforced. Pull progress is scoped to source+recipient+receiver-host, with conservative warning/skip behavior for ambiguous legacy keyless rows. |
+| **Cross-machine push** (`surfaces`) | ✅ | ✅ | ◐ | — | CLI sends; catalog `weave_push` is the bearer-gated dashboard write receiver, not a standing tool. The wire key is required; CLI omission mints a fresh invocation key, explicit reuse is the retry contract. HTTPS is required outside loopback and responses are bounded. |
+| **Signed intent semantics** (`sign`) | ✅ | ✅ | ◐ | — | New `v2:` signatures bind the full semantic tuple except attempt-local trace. Receivers retain unprefixed v1 verification for queued rows; rollout is receiver-first. Dashboard participates only as the push receiver through the shared commit policy. |
 | **Read views** (inbox / history / search / thread / receipts / delivery / outbox) | ✅ | ✅ | ◐ | ◐ | Dashboard renders presence + recent activity (SSE); per-message views are **WL-052a**. Bots answer `/inbox`; richer readback remains future polish. |
 | **Asks** (ask / answer / ack / asks / ask-get / ask-many / broadcast-ask) | ✅ | ✅ | ❌ | ◐ | Bots support gated `/ask` + `/answer` through the shared dispatcher; ack/ask-many/broadcast-ask remain agent-surface commands. |
 | **Peers & presence** (peers / sessions / scan / register / attach / connect / doctor) | ✅ | ✅ | ◐ | ◐ | Dashboard shows the presence grid; bots answer `/peers` and `/sessions`. |
@@ -40,8 +43,8 @@ Legend: ✅ reachable · ◐ partial · ❌ not yet · — n/a for this surface.
 | **Summarize** (text / thread, LLM) | ✅ | ✅ | ❌ | ❌ | `--features llm`. |
 | **Admin** (setup / uninstall / clear / gc / config) | ✅ | ◐ | — | — | Some admin ops are CLI-only by design (host wiring, retention). **Multi-provider host wiring (WL-042, casr parity):** `weave setup --provider <claude\|codex\|gemini\|aider>` wires weave into each host's own config file with the same never-clobber-foreign, idempotent, read-back-verified merge. Provider mechanism status: claude ✅ confirmed · codex ◐ partially confirmed (`notify`→drain) · gemini ◐ scaffold-with-caveat (hook key unconfirmed) · aider ◐ scaffold-with-caveat (limited hook surface). CLI-only by design (no new standing MCP tool/token). |
 | **Backup / restore** (atm-core, WL-035) | ✅ | — | — | — | CLI-only by design (host-local file I/O on a consistent snapshot); MCP does not expose it. |
-| **Session export/import** (casr, WL-040) | ✅ | ❌ | — | — | CLI-only by design (host-local file I/O); logical JSON interchange (messages + memory), distinct from the WL-035 binary backup. MCP exposure is a catalog-only follow-up if ever needed (no new standing tool). See `FORMAT-session-export.md`. |
-| **Supersede** (atm-core, WL-037) | ✅ | ✅ | ❌ | ❌ | `weave send --supersedes` / `weave_send {supersedes}` (zero standing-token cost — a `weave_send` property, not a new tool). |
+| **Session export/import** (casr, WL-040) | ✅ | ❌ | — | — | CLI-only by design (host-local file I/O); schema-v2 logical JSON preserves configured send tuples, effective priority/successor state, asks/groups, and memory while reminting local ids/timestamps. MCP exposure is a catalog-only follow-up if ever needed (no new standing tool). See `FORMAT-session-export.md`. |
+| **Supersede** (atm-core, WL-037) | ✅ | ✅ | ❌ | ❌ | `weave send --supersedes` / `weave_send {supersedes}`; predecessor and successor must stay on the same sender+recipient route (zero standing-token cost — a `weave_send` property, not a new tool). |
 | **Post-send hooks** (atm-core, WL-036) | ✅ | ✅ | — | — | Operator config (`[[post_send_hook]]`); fires on send/notify/ack from both agent surfaces. No new standing MCP tool. |
 
 ### The headline result
@@ -76,6 +79,13 @@ gap is never mistaken for "covered":
   `/reply`, by dispatching through the **same** `dispatch_request` handler as MCP/CLI. Read commands
   run in safe mode; write commands require `WEAVE_BOT_WRITES=1` and then pass the same dangerous-tool
   gate. Pure parser/mapper/formatter, unit-tested.
+- **Bridge runtime health.** Each platform has a distinct configured weave identity
+  and explicit, different internal recipient, fenced route-bound cursor/heartbeat
+  state, explicit runtime-presence/stale posture, deferred
+  one-row acknowledgement after confirmed remote acceptance, and token-free
+  `--status` / `--check` / doctor / dashboard diagnostics. Telegram filters one chat;
+  Slack uses exact timestamps and bounded cursor pagination. Hermetic transport tests
+  run without live credentials on SQLite and libSQL.
 - **Design law for both:** a human surface must call the **same** capability handler as CLI/MCP —
   parity is achieved by *routing to one implementation*, not by re-implementing per surface. That
   is what keeps this matrix honest and the behavior identical everywhere.

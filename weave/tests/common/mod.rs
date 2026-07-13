@@ -45,11 +45,14 @@ pub fn unique_db() -> PathBuf {
 /// A test-scoped temp DB that cleans up its sqlite files on drop.
 pub struct TestDb {
     pub path: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl TestDb {
     pub fn new() -> Self {
-        TestDb { path: unique_db() }
+        let path = unique_db();
+        let config_dir = path.with_extension("xdg-empty");
+        TestDb { path, config_dir }
     }
 
     /// The DB path as a string, for `.env("WEAVE_DB", ...)`.
@@ -155,6 +158,7 @@ impl Drop for TestDb {
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(format!("{base}{suffix}"));
         }
+        let _ = std::fs::remove_dir_all(&self.config_dir);
     }
 }
 
@@ -167,6 +171,7 @@ pub fn weave_cmd(db: &TestDb, args: &[&str]) -> Command {
     cmd.args(args);
     scrub_env(&mut cmd);
     cmd.env("WEAVE_DB", db.path_str());
+    cmd.env("XDG_CONFIG_HOME", &db.config_dir);
     cmd
 }
 
@@ -183,6 +188,20 @@ pub fn scrub_env(cmd: &mut Command) {
         "WEAVE_LLM_MODEL",
         "WEAVE_LLM_TIMEOUT_SECS",
         "WEAVE_LLM_MAX_INPUT_CHARS",
+        // Human-chat bridge inputs must never leak from the developer's live
+        // session into a black-box test. In particular, status tests need a
+        // genuinely unconfigured baseline and no test may contact a live chat.
+        "WEAVE_TELEGRAM_TOKEN",
+        "WEAVE_TELEGRAM_CHAT_ID",
+        "WEAVE_TELEGRAM_IDENTITY",
+        "WEAVE_TELEGRAM_RECIPIENT",
+        "WEAVE_TELEGRAM_BOT_USERNAME",
+        "WEAVE_SLACK_TOKEN",
+        "WEAVE_SLACK_CHANNEL",
+        "WEAVE_SLACK_IDENTITY",
+        "WEAVE_SLACK_RECIPIENT",
+        "WEAVE_BRIDGE_IDENTITY",
+        "WEAVE_BOT_WRITES",
         "WEAVE_MUX_DIR",
         // WL-084 identity inputs — a stray outer value would leak a client
         // pid, a spawn cert, or an env-file path into every hook under test.
@@ -200,11 +219,10 @@ pub fn scrub_env(cmd: &mut Command) {
     ] {
         cmd.env_remove(k);
     }
-    // Point config discovery at an empty dir so no real config.toml is read.
-    cmd.env(
-        "XDG_CONFIG_HOME",
-        std::env::temp_dir().join("weave-it-noconfig"),
-    );
+    // Point config discovery at a fresh, non-existent path. `weave_cmd` replaces
+    // this with its TestDb-owned path so any command that creates config is also
+    // cleaned on drop; direct scrub_env callers still get collision-free isolation.
+    cmd.env("XDG_CONFIG_HOME", unique_db().with_extension("xdg-empty"));
 }
 
 /// Run a `weave` subcommand to completion and capture stdout/stderr as UTF-8.

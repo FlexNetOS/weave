@@ -52,6 +52,20 @@ cargo test --all-targets
 CI additionally gates `cargo fmt --all --check` and
 `cargo clippy --all-targets -- -D warnings` (see `.github/workflows/ci.yml`).
 
+### Hermetic Telegram/Slack bridge coverage
+
+Bridge tests never require credentials and never call a live chat endpoint. Fake
+single-iteration transports cover bounded response reads, non-2xx and
+application-level rejection, retry without pre-drain, Telegram chat filtering and
+post-handle cursor movement, Slack exact timestamp ordering and pagination, and
+restart idempotency. Status tests distinguish never-started, active/degraded, and
+stale runtime posture and expose heartbeat state. Store tests mirror exact one-row
+acknowledgement, fenced runtime claim/update/release, and the atomic Telegram
+cursor-plus-exact-snapshot receipt transaction on SQLite and libSQL, including
+rollback on an ineligible row and durability across reopen. Black-box tests use a temporary
+`WEAVE_DB`, scrub every bridge-related `WEAVE_*` variable inherited from the parent,
+and exercise only network-free `--status`, doctor, MCP doctor, and dashboard paths.
+
 ## 1. Unit tests (in-process)
 
 These live next to the code they cover and need no subprocess. They are the
@@ -1180,20 +1194,23 @@ done:
      drift check that it is absent from the default shippable graph.
 9. **Performance-sensitive path → consider a criterion bench** so regressions are
    visible.
-10. **Before pushing**, the full gate is: `cargo fmt --all --check`,
-    `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, the
-    libSQL clippy/build/**test** column, and — when the crypto path is touched —
-    the `sign` and `libsql sign` columns
-    (`cargo clippy --all-targets --features sign -- -D warnings` /
-    `cargo test --features sign`, and the same with
-    `--no-default-features --features "libsql sign"`).
+10. **Before pushing**, the full gate is: `cargo fmt --all --check`, the default and
+    libSQL checks, and both maximal composable feature matrices. SQLite and libSQL
+    are mutually exclusive, so `--all-features` is intentionally invalid:
 
-    CI mirrors this exactly. The GitHub Actions workflow (`.github/workflows/ci.yml`)
-    runs six jobs — `rustfmt`, `clippy`, `test` (default sqlite), `build (libsql
-    backend)` (now clippy **+ build + test** for the libSQL backend), `sign` (sqlite
-    + `sign`: clippy + test), and `libsql + sign` (clippy + build + test). The
-    optional crypto path is therefore gated in CI on **both** backends, not just
-    locally, so a `sign`-only regression cannot merge unnoticed.
+    ```bash
+    cargo clippy --workspace --all-targets --features "sign llm surfaces obscura" -- -D warnings
+    cargo test --workspace --features "sign llm surfaces obscura"
+    cargo clippy --workspace --all-targets --no-default-features \
+      --features "libsql sign llm surfaces obscura" -- -D warnings
+    cargo test --workspace --no-default-features \
+      --features "libsql sign llm surfaces obscura"
+    ```
+
+    CI keeps the focused default/libSQL/sign/surfaces columns for diagnostic
+    precision and adds blocking `maximal (sqlite)` and `maximal (libsql)` columns.
+    Those combined columns cover feature interactions that pairwise jobs cannot,
+    including the shared LLM/Obscura environment lock and surface/signing seams.
 
 ### Supply-chain advisory gate (WL-075)
 

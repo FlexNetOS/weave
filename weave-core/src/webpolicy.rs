@@ -20,6 +20,8 @@ use crate::config::Config;
 /// `MAX_BODY`-class caps elsewhere: an attacker-influenceable arg must never be
 /// unbounded before it is forwarded to the obscura child.
 pub const MAX_WEB_ARG_LEN: usize = crate::store::MAX_BODY;
+pub const MAX_WEB_ARGS_BYTES: usize = crate::store::MAX_BODY * 4;
+pub const MAX_WEB_ARG_DEPTH: usize = 32;
 
 /// The 35 `browser_*` operations exposed by `obscura mcp` (verified against
 /// `obscura/crates/obscura-mcp/src/lib.rs` `handle_tool_call`). The dispatcher
@@ -73,7 +75,8 @@ pub const WEB_OPS: &[&str] = &[
 
 /// The subset of [`WEB_OPS`] that carry a URL weave must SSRF-validate before
 /// forwarding. (Other ops act on the already-loaded page and carry no new URL.)
-const URL_BEARING_OPS: &[&str] = &["navigate"];
+const URL_BEARING_OPS: &[&str] = &["navigate", "tab_new"];
+const URL_REQUIRED_OPS: &[&str] = &["navigate"];
 
 /// A validated, known web operation. Construction goes through [`WebOp::parse`],
 /// which rejects unknown/typo'd op names (the first deny-by-default gate).
@@ -107,6 +110,10 @@ impl WebOp {
     pub fn is_url_bearing(&self) -> bool {
         URL_BEARING_OPS.contains(&self.0.as_str())
     }
+
+    fn requires_url(&self) -> bool {
+        URL_REQUIRED_OPS.contains(&self.0.as_str())
+    }
 }
 
 /// The reason a web op was refused, for a clean (non-panicking) error message.
@@ -124,6 +131,8 @@ pub enum Denied {
     DomainNotAllowed(String),
     /// An argument value exceeded [`MAX_WEB_ARG_LEN`].
     ArgTooLong(String),
+    /// An argument contains control characters or the aggregate JSON is unsafe.
+    UnsafeArg(String),
 }
 
 impl Denied {
@@ -138,15 +147,14 @@ impl Denied {
                  Add it to obscura_allow_ops (or WEAVE_OBSCURA_ALLOW_OPS), or use \"*\"."
             ),
             Denied::MissingUrl => "this web op requires a 'url' argument.".to_string(),
-            Denied::UnsafeUrl(why) => {
-                format!("refusing to navigate: {why} (SSRF guard; set obscura_allow_internal=true to override).")
-            }
+            Denied::UnsafeUrl(why) => format!("refusing web URL: {why}."),
             Denied::DomainNotAllowed(host) => {
                 format!("host {host:?} is not in obscura_allow_domains (or WEAVE_OBSCURA_ALLOW_DOMAINS). Add it, or use \"*\" to allow all public hosts (internal hosts stay SSRF-blocked).")
             }
             Denied::ArgTooLong(k) => {
                 format!("web argument {k:?} is too long (max {MAX_WEB_ARG_LEN} bytes).")
             }
+            Denied::UnsafeArg(why) => format!("invalid web arguments: {why}."),
         }
     }
 }
@@ -191,8 +199,11 @@ impl WebPolicy {
             return Err(Denied::OpNotAllowed(op.name().to_string()));
         }
         if op.is_url_bearing() {
-            let url = url.ok_or(Denied::MissingUrl)?;
-            self.check_url(url)?;
+            match url {
+                Some(url) => self.check_url(url)?,
+                None if op.requires_url() => return Err(Denied::MissingUrl),
+                None => {}
+            }
         }
         Ok(op)
     }
@@ -203,11 +214,26 @@ impl WebPolicy {
         if url.len() > MAX_WEB_ARG_LEN {
             return Err(Denied::ArgTooLong("url".to_string()));
         }
-        let host = url_host(url)
+        if url.chars().any(char::is_control) {
+            return Err(Denied::UnsafeUrl(
+                "not a valid control-free http(s) URL".to_string(),
+            ));
+        }
+        let parsed = url::Url::parse(url)
+            .ok()
+            .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
             .ok_or_else(|| Denied::UnsafeUrl("not a valid http(s) URL".to_string()))?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Denied::UnsafeUrl(
+                "embedded URL credentials are not accepted".to_string(),
+            ));
+        }
+        let host = canonical_url_host(&parsed)
+            .ok_or_else(|| Denied::UnsafeUrl("URL has no host".to_string()))?;
         if !self.allow_internal && host_is_internal(&host) {
             return Err(Denied::UnsafeUrl(format!(
-                "{host:?} is an internal/loopback/private host"
+                "{host:?} is an internal/loopback/private host; set \
+                 obscura_allow_internal=true only for an intentional internal target"
             )));
         }
         if !self.allow_domains.is_empty() && !self.domain_allowed(&host) {
@@ -241,40 +267,73 @@ pub fn check_arg(key: &str, value: &str) -> Result<(), Denied> {
     if value.len() > MAX_WEB_ARG_LEN {
         return Err(Denied::ArgTooLong(key.to_string()));
     }
+    if value.chars().any(char::is_control) {
+        return Err(Denied::UnsafeArg(format!(
+            "argument {key:?} contains control characters"
+        )));
+    }
     Ok(())
 }
 
-/// Extract the lowercased host from an `http`/`https` URL string. Pure — no DNS,
-/// no network. Returns `None` for anything that is not a plausible http(s) URL with
-/// a host. Mirrors the deliberately-simple `model::pr_url_valid` style: weave only
-/// needs the host to run the SSRF check; obscura does the real navigation.
+/// Validate the complete opaque argument object before it is serialized into a
+/// child-process frame. This covers nested strings, aggregate encoded size, and
+/// nesting depth rather than checking only top-level scalar values.
+pub fn check_args(value: &serde_json::Value) -> Result<(), Denied> {
+    if !value.is_object() {
+        return Err(Denied::UnsafeArg(
+            "the operation arguments must be a JSON object".to_string(),
+        ));
+    }
+    let encoded = serde_json::to_vec(value)
+        .map_err(|_| Denied::UnsafeArg("arguments could not be encoded".to_string()))?;
+    if encoded.len() > MAX_WEB_ARGS_BYTES {
+        return Err(Denied::UnsafeArg(format!(
+            "encoded arguments exceed the {MAX_WEB_ARGS_BYTES}-byte limit"
+        )));
+    }
+    let mut pending = vec![(value, 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_WEB_ARG_DEPTH {
+            return Err(Denied::UnsafeArg(format!(
+                "argument nesting exceeds {MAX_WEB_ARG_DEPTH} levels"
+            )));
+        }
+        match node {
+            serde_json::Value::String(text) => check_arg("nested", text)?,
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    check_arg("key", key)?;
+                    pending.push((value, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Extract the canonical lowercased host using the same WHATWG URL parser family
+/// used by the downstream browser seam. This avoids authority differentials for
+/// backslashes, percent-encoded hosts, userinfo, and non-canonical IP spellings.
 pub fn url_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    // Authority is everything up to the first '/', '?' or '#'.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
+    if url.chars().any(char::is_control) {
         return None;
     }
-    // Strip optional userinfo (`user:pass@host`) — keep only the host:port part.
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    // Strip a :port suffix. For an IPv6 literal `[::1]:80`, keep the bracketed part.
-    let host = if let Some(stripped) = hostport.strip_prefix('[') {
-        // IPv6 literal: take up to the closing ']'.
-        stripped.split(']').next().unwrap_or(stripped).to_string()
-    } else {
-        hostport
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
-            .to_string()
-    };
-    let host = host.trim().to_ascii_lowercase();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    canonical_url_host(&parsed)
+}
+
+fn canonical_url_host(parsed: &url::Url) -> Option<String> {
+    match parsed.host()? {
+        url::Host::Domain(domain) => Some(domain.to_ascii_lowercase()),
+        url::Host::Ipv4(address) => Some(address.to_string()),
+        url::Host::Ipv6(address) => Some(address.to_string()),
     }
 }
 
@@ -321,21 +380,6 @@ pub fn host_is_internal(host: &str) -> bool {
     // since a literal IP bypasses domain allow-listing).
     if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
         let _ = ipv4_is_internal(v4); // classification kept for clarity
-        return true;
-    }
-    // Fail-closed on obfuscated IP literals. A real browser canonicalizes non-dotted
-    // numeric authorities — decimal (`2130706433`), hex (`0x7f000001`, `0x7f.0.0.1`),
-    // octal (`017700000001`), and dotted forms with hex/octal octets — back to an IPv4
-    // address (e.g. 127.0.0.1), but `Ipv4Addr::parse` above accepts ONLY canonical
-    // dotted-decimal, so these slip through as "not an IP". Any authority composed
-    // solely of `[0-9a-fA-FxX.]` that did NOT parse as a standard dotted-decimal IPv4
-    // can only be such an obfuscated IP literal — treat it as a bare-IP literal, which
-    // the policy denies by default (same intent as the dotted-decimal branch above).
-    if !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '.')
-    {
         return true;
     }
     false
@@ -421,6 +465,19 @@ mod tests {
     }
 
     #[test]
+    fn tab_new_validates_an_optional_url() {
+        let p = policy(&["tab_new"], &["allowed.example"], false);
+        assert!(p.decide("tab_new", None).is_ok());
+        assert!(p
+            .decide("tab_new", Some("https://allowed.example/page"))
+            .is_ok());
+        assert!(matches!(
+            p.decide("tab_new", Some("http://127.0.0.1/")).unwrap_err(),
+            Denied::UnsafeUrl(_)
+        ));
+    }
+
+    #[test]
     fn ssrf_blocks_localhost_and_loopback() {
         let p = policy(&["navigate"], &[], false);
         for bad in [
@@ -475,8 +532,8 @@ mod tests {
     #[test]
     fn ssrf_blocks_encoded_loopback_forms() {
         // Alternate encodings of 127.0.0.1 / loopback that a browser canonicalizes to
-        // the same internal address but a naive dotted-decimal parse misses. Each MUST
-        // be classified internal (denied) — guardian round-2 SSRF hardening.
+        // the same internal address but a naive dotted-decimal parse misses. Drive
+        // them through the browser-compatible URL parser before classification.
         for host in [
             "2130706433",   // decimal 127.0.0.1
             "0x7f000001",   // hex 127.0.0.1
@@ -485,9 +542,10 @@ mod tests {
             "localhost.",   // trailing-dot FQDN
             "127.0.0.1.",   // trailing-dot dotted-decimal
         ] {
+            let canonical = url_host(&format!("http://{host}/")).expect("valid URL authority");
             assert!(
-                host_is_internal(host),
-                "{host:?} is an encoded loopback and must be denied"
+                host_is_internal(&canonical),
+                "{host:?} canonicalized to {canonical:?} and must be denied"
             );
         }
     }
@@ -533,6 +591,31 @@ mod tests {
     }
 
     #[test]
+    fn url_parser_differentials_fail_closed_for_every_url_bearing_op() {
+        let p = policy(&["navigate", "tab_new"], &["allowed.example"], false);
+        for op in ["navigate", "tab_new"] {
+            // WHATWG treats a backslash as a path separator for special schemes;
+            // the actual authority is evil.example, not the text after `@`.
+            assert_eq!(
+                p.decide(op, Some("http://evil.example\\@allowed.example/"))
+                    .unwrap_err(),
+                Denied::DomainNotAllowed("evil.example".to_string()),
+                "{op} must use browser-compatible URL parsing"
+            );
+            // Percent-encoded host text must never bypass the loopback guard.
+            assert!(matches!(
+                p.decide(op, Some("http://%31%32%37.0.0.1/")).unwrap_err(),
+                Denied::UnsafeUrl(_)
+            ));
+            assert!(matches!(
+                p.decide(op, Some("https://user:secret@allowed.example/"))
+                    .unwrap_err(),
+                Denied::UnsafeUrl(_)
+            ));
+        }
+    }
+
+    #[test]
     fn ssrf_allows_public_host() {
         let p = policy(&["navigate"], &[], false);
         assert!(p
@@ -541,6 +624,8 @@ mod tests {
         assert!(p
             .decide("navigate", Some("https://sub.example.com:443/x?y=1#z"))
             .is_ok());
+        assert!(p.decide("navigate", Some("https://dead.be/face")).is_ok());
+        assert!(p.decide("navigate", Some("https://face.de/")).is_ok());
     }
 
     #[test]
@@ -600,6 +685,40 @@ mod tests {
             check_arg("text", &big).unwrap_err(),
             Denied::ArgTooLong("text".to_string())
         );
+    }
+
+    #[test]
+    fn complete_arg_validation_covers_nested_controls_size_and_depth() {
+        assert!(check_args(&serde_json::json!({
+            "form": {"fields": [{"value": "normal text"}]}
+        }))
+        .is_ok());
+
+        let controlled = serde_json::json!({"form": {"value": "line\nbreak"}});
+        assert!(matches!(
+            check_args(&controlled).unwrap_err(),
+            Denied::UnsafeArg(_)
+        ));
+
+        let chunk = "x".repeat(MAX_WEB_ARG_LEN);
+        let aggregate = serde_json::json!({"items": vec![chunk; 5]});
+        assert!(matches!(
+            check_args(&aggregate).unwrap_err(),
+            Denied::UnsafeArg(_)
+        ));
+
+        let mut nested = serde_json::json!("leaf");
+        for _ in 0..=MAX_WEB_ARG_DEPTH {
+            nested = serde_json::json!({"child": nested});
+        }
+        assert!(matches!(
+            check_args(&nested).unwrap_err(),
+            Denied::UnsafeArg(_)
+        ));
+        assert!(matches!(
+            check_args(&serde_json::json!(["not", "an", "object"])).unwrap_err(),
+            Denied::UnsafeArg(_)
+        ));
     }
 
     #[test]

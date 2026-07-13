@@ -3006,6 +3006,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -3023,6 +3024,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "url",
  "weave-core",
  "weave-inject",
 ]

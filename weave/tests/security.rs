@@ -4401,6 +4401,244 @@ fn write_import_file(envelope_json: &str) -> std::path::PathBuf {
     p
 }
 
+fn assert_memory_import_rejected_before_message_write(
+    memory: serde_json::Value,
+    expected_error: &str,
+) {
+    let db = TestDb::new();
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{
+            "id": 1, "ts": 0, "sender": "alice", "recipient": "bob",
+            "body": "must remain uncommitted"
+        }],
+        "asks": [], "ask_groups": [], "memory": [memory]
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "invalid memory must reject the whole import");
+    assert!(
+        err.contains(expected_error),
+        "expected memory validation error containing {expected_error:?}: {err}"
+    );
+
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let v: serde_json::Value = serde_json::from_str(&inbox).expect("inbox json");
+    assert_eq!(
+        v["messages"].as_array().map(Vec::len),
+        Some(0),
+        "memory validation must happen before the otherwise-valid message write: {inbox}"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+fn assert_ask_import_rejected_before_message_write(
+    messages: serde_json::Value,
+    asks: serde_json::Value,
+    groups: serde_json::Value,
+    expected_error: &str,
+) {
+    let db = TestDb::new();
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 0,
+        "messages": messages, "asks": asks, "ask_groups": groups, "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "invalid ask relations must reject the whole import");
+    assert!(
+        err.contains(expected_error),
+        "expected ask validation error containing {expected_error:?}: {err}"
+    );
+    for recipient in ["bob", "carol"] {
+        let inbox = run_ok(&db, &["inbox", "--me", recipient, "--json", "--peek"]);
+        let inbox: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+        assert_eq!(
+            inbox["messages"].as_array().map(Vec::len),
+            Some(0),
+            "ask relation validation must precede every message write"
+        );
+    }
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn session_import_preflights_memory_key_before_any_message_write() {
+    assert_memory_import_rejected_before_message_write(
+        serde_json::json!({
+            "scope_kind": "global", "scope_name": "", "key": "../x",
+            "title": "Valid title", "tags": ["valid_tag"], "body": "valid body"
+        }),
+        "path traversal",
+    );
+}
+
+#[test]
+fn session_import_rejects_lossy_memory_title_tags_and_scope_names() {
+    let oversized_title = "t".repeat(257);
+    let too_many_tags: Vec<String> = (0..17).map(|i| format!("tag{i}")).collect();
+    let cases = [
+        (
+            serde_json::json!({
+                "scope_kind": "global", "scope_name": "", "key": "key",
+                "title": oversized_title, "tags": [], "body": "body"
+            }),
+            "title is too long",
+        ),
+        (
+            serde_json::json!({
+                "scope_kind": "global", "scope_name": "", "key": "key",
+                "title": "Title", "tags": too_many_tags, "body": "body"
+            }),
+            "memory tags exceeds",
+        ),
+        (
+            serde_json::json!({
+                "scope_kind": "global", "scope_name": "", "key": "key",
+                "title": "Title", "tags": ["would be filtered"], "body": "body"
+            }),
+            "memory tags must be",
+        ),
+        (
+            serde_json::json!({
+                "scope_kind": "project", "scope_name": "../team", "key": "key",
+                "title": "Title", "tags": [], "body": "body"
+            }),
+            "scope name must be",
+        ),
+        (
+            serde_json::json!({
+                "scope_kind": "global", "scope_name": "not-empty", "key": "key",
+                "title": "Title", "tags": [], "body": "body"
+            }),
+            "empty scope_name",
+        ),
+    ];
+
+    for (memory, expected_error) in cases {
+        assert_memory_import_rejected_before_message_write(memory, expected_error);
+    }
+}
+
+#[test]
+fn session_import_rejects_identity_remap_that_collapses_distinct_actor() {
+    let mut base = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{
+            "id": 1, "ts": 1, "sender": "alice", "recipient": "bob", "body": "q"
+        }],
+        "asks": [{
+            "id": "ask_1_1", "question_msg_id": 1,
+            "asker": "alice", "askee": "bob", "state": "open",
+            "kind": "free_text", "opened_ts": 1, "updated_ts": 1
+        }],
+        "ask_groups": [], "memory": []
+    });
+    let mut cases = Vec::new();
+    for path in [
+        ("messages", 0, "sender"),
+        ("messages", 0, "recipient"),
+        ("asks", 0, "asker"),
+        ("asks", 0, "askee"),
+    ] {
+        let mut envelope = base.clone();
+        envelope[path.0][path.1][path.2] = serde_json::json!("taken");
+        cases.push(envelope);
+    }
+    base["ask_groups"] = serde_json::json!([{
+        "parent_id": "askm_1_1", "asker": "taken", "body": "group",
+        "opened_ts": 1, "target_count": 1
+    }]);
+    cases.push(base);
+
+    for envelope in cases {
+        let db = TestDb::new();
+        let file = write_import_file(&envelope.to_string());
+        let (ok, _out, error) = run(
+            &db,
+            &[
+                "session",
+                "import",
+                "--in",
+                file.to_str().unwrap(),
+                "--as",
+                "taken",
+            ],
+        );
+        assert!(!ok, "an actor-collapsing remap must fail");
+        assert!(
+            error.contains("collides with a distinct source actor"),
+            "{error}"
+        );
+        let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+        let inbox: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+        assert_eq!(inbox["messages"].as_array().map(Vec::len), Some(0));
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+#[test]
+fn session_import_rejects_duplicate_memory_target_before_message_write() {
+    let db = TestDb::new();
+    let entry = serde_json::json!({
+        "scope_kind": "global", "scope_name": "", "key": "same",
+        "title": "Same", "tags": [], "body": "body"
+    });
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 0,
+        "messages": [{
+            "id": 1, "ts": 1, "sender": "alice", "recipient": "bob",
+            "body": "must not commit"
+        }],
+        "asks": [], "ask_groups": [], "memory": [entry.clone(), entry]
+    })
+    .to_string();
+    let file = write_import_file(&json);
+    let (ok, _out, error) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok);
+    assert!(error.contains("duplicate memory key"), "{error}");
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let inbox: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    assert_eq!(inbox["messages"].as_array().map(Vec::len), Some(0));
+    let _ = std::fs::remove_file(file);
+}
+
 #[test]
 fn session_import_rejects_oversized_body() {
     let db = TestDb::new();
@@ -4438,6 +4676,35 @@ fn session_import_rejects_oversized_body() {
         "nothing partial-written: {inbox}"
     );
     let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_oversized_file_from_metadata_before_parsing() {
+    let db = TestDb::new();
+    let file = unique_session_file_sec();
+    let oversized = std::fs::File::create(&file).expect("create sparse import file");
+    oversized
+        .set_len(256 * 1024 * 1024 + 1)
+        .expect("size sparse import beyond the hard cap");
+    drop(oversized);
+
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "an oversized import must be rejected");
+    assert!(
+        err.contains("session import file is too large") && err.contains("268435456"),
+        "the bounded-read error must name the cap: {err}"
+    );
+    let _ = std::fs::remove_file(file);
 }
 
 #[test]
@@ -4565,6 +4832,182 @@ fn session_import_skips_dangling_ask_reference() {
         "no broken ask row inserted: {asks}"
     );
     let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_skips_transitive_dangling_ask_chain_in_real_and_dry_run() {
+    let db = TestDb::new();
+    let json = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 0,
+        "messages": [
+            {"id": 1, "ts": 1, "sender": "alice", "recipient": "bob", "body": "child q"},
+            {"id": 2, "ts": 2, "sender": "alice", "recipient": "bob", "body": "grandchild q"},
+            {"id": 3, "ts": 4, "sender": "alice", "recipient": "carol", "body": "independent q"}
+        ],
+        "asks": [
+            {"id": "ask_999_1", "question_msg_id": 999, "asker": "alice", "askee": "bob",
+             "state": "open", "kind": "free_text", "opened_ts": 1, "updated_ts": 1},
+            {"id": "ask_1_2", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+             "state": "open", "kind": "free_text", "reply_to": "ask_999_1",
+             "opened_ts": 2, "updated_ts": 2},
+            {"id": "ask_2_3", "question_msg_id": 2, "asker": "alice", "askee": "bob",
+             "state": "open", "kind": "free_text", "reply_to": "ask_1_2",
+             "opened_ts": 3, "updated_ts": 3},
+            {"id": "ask_3_4", "question_msg_id": 3, "asker": "alice", "askee": "carol",
+             "state": "open", "kind": "free_text", "opened_ts": 4, "updated_ts": 4}
+        ],
+        "ask_groups": [], "memory": []
+    })
+    .to_string();
+    let file = write_import_file(&json);
+
+    let dry = run_ok(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        dry.contains("1 ask(s)"),
+        "only the independent ask is reconstructable: {dry}"
+    );
+    assert!(
+        dry.contains("3 dangling ask(s) would be skipped"),
+        "dry-run must propagate an absent ancestor through the chain: {dry}"
+    );
+
+    let imported = run_ok(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        imported.contains("1 ask(s) replayed") && imported.contains("3 dangling skipped"),
+        "real import must match dry-run reconstructability: {imported}"
+    );
+    let asks = run_ok(&db, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let asks: serde_json::Value = serde_json::from_str(&asks).unwrap();
+    let rows = asks["asks"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "no descendant may retain a dangling reply_to"
+    );
+    assert_eq!(rows[0]["askee"], "carol");
+    assert!(rows[0]["reply_to"].is_null());
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn session_import_preflights_ask_lifecycle_message_alias_and_answer_links() {
+    let question = serde_json::json!({
+        "id": 1, "ts": 10, "sender": "alice", "recipient": "bob",
+        "subject": "topic", "body": "question"
+    });
+    let answer = serde_json::json!({
+        "id": 2, "ts": 20, "sender": "bob", "recipient": "alice",
+        "subject": "Re: topic", "body": "answer", "in_reply_to": 1
+    });
+
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([question.clone(), answer.clone()]),
+        serde_json::json!([{
+            "id": "ask_1_1", "question_msg_id": 1, "answer_msg_id": 2,
+            "asker": "alice", "askee": "bob", "subject": "topic",
+            "state": "open", "kind": "free_text", "opened_ts": 10, "updated_ts": 10
+        }]),
+        serde_json::json!([]),
+        "open ask has incoherent lifecycle",
+    );
+
+    let mut detached_answer = answer.clone();
+    detached_answer["in_reply_to"] = serde_json::Value::Null;
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([question.clone(), detached_answer]),
+        serde_json::json!([{
+            "id": "ask_1_2", "question_msg_id": 1, "answer_msg_id": 2,
+            "asker": "alice", "askee": "bob", "subject": "topic",
+            "state": "answered", "kind": "free_text", "opened_ts": 10, "updated_ts": 20
+        }]),
+        serde_json::json!([]),
+        "answer does not reply to its question",
+    );
+
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([question]),
+        serde_json::json!([
+            {"id": "ask_1_3", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+             "subject": "topic", "state": "open", "kind": "free_text",
+             "opened_ts": 10, "updated_ts": 10},
+            {"id": "ask_1_4", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+             "subject": "topic", "state": "open", "kind": "free_text",
+             "opened_ts": 10, "updated_ts": 10}
+        ]),
+        serde_json::json!([]),
+        "is claimed as question",
+    );
+}
+
+#[test]
+fn session_import_preflights_ask_group_closure_and_coherence() {
+    let q1 = serde_json::json!({
+        "id": 1, "ts": 10, "sender": "alice", "recipient": "bob",
+        "subject": "poll", "body": "choose"
+    });
+    let q2 = serde_json::json!({
+        "id": 2, "ts": 10, "sender": "alice", "recipient": "bob",
+        "subject": "poll", "body": "choose"
+    });
+    let child1 = serde_json::json!({
+        "id": "ask_1_5", "question_msg_id": 1, "asker": "alice", "askee": "bob",
+        "subject": "poll", "state": "open", "kind": "free_text",
+        "opened_ts": 10, "updated_ts": 10, "parent_id": "askm_10_1"
+    });
+    let child2 = serde_json::json!({
+        "id": "ask_2_6", "question_msg_id": 2, "asker": "alice", "askee": "bob",
+        "subject": "poll", "state": "open", "kind": "free_text",
+        "opened_ts": 10, "updated_ts": 10, "parent_id": "askm_10_1"
+    });
+    let group = serde_json::json!({
+        "parent_id": "askm_10_1", "asker": "alice", "subject": "poll",
+        "body": "choose", "opened_ts": 10, "target_count": 2
+    });
+
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([q1.clone()]),
+        serde_json::json!([child1.clone()]),
+        serde_json::json!([]),
+        "missing ask group",
+    );
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([q1.clone(), q2.clone()]),
+        serde_json::json!([child1.clone(), child2]),
+        serde_json::json!([group.clone()]),
+        "duplicate askee",
+    );
+
+    let mut mismatched = child1;
+    mismatched["kind"] = serde_json::json!("choice");
+    mismatched["options"] = serde_json::json!("yes\nno");
+    assert_ask_import_rejected_before_message_write(
+        serde_json::json!([q1]),
+        serde_json::json!([mismatched]),
+        serde_json::json!([group]),
+        "incoherent with its ask group",
+    );
 }
 
 #[test]
@@ -4770,6 +5213,48 @@ fn session_export_refuses_to_overwrite_without_force() {
     );
     assert_eq!(std::fs::read(&file).unwrap(), b"preexisting");
     let _ = std::fs::remove_file(&file);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_export_uses_private_exclusive_temp_without_following_legacy_symlink() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let db = TestDb::new();
+    let dir = unique_session_file_sec().with_extension("dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = dir.join("export.json");
+    let sentinel = dir.join("sentinel");
+    std::fs::write(&sentinel, b"must remain unchanged").unwrap();
+    let legacy_temp = dir.join(format!(".weave-session.{}.tmp", std::process::id()));
+    symlink(&sentinel, &legacy_temp).unwrap();
+
+    run_ok(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            output.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"must remain unchanged",
+        "export must never remove or follow a pre-created sibling symlink"
+    );
+    let mode = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "portable session contents must be owner-only");
+    assert!(
+        std::fs::symlink_metadata(&legacy_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "unowned legacy temp path must remain untouched"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -5031,6 +5516,43 @@ done
         dir
     }
 
+    /// Write a fake child that records the exact inherited policy-sensitive
+    /// environment and argv before speaking enough MCP for one successful call.
+    fn make_env_probe_obscura() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = common::unique_db().with_extension("obscurabin-env");
+        std::fs::create_dir_all(&dir).expect("create env-probe obscura dir");
+        let marker = dir.join("CHILD_ENV_AND_ARGV");
+        let script = dir.join("obscura");
+        let body = r#"#!/bin/sh
+printf 'ambient_private=%s\nsecret=%s\nweave_policy=%s\ntmpdir=%s\nargs=%s\n' \
+  "${OBSCURA_ALLOW_PRIVATE_NETWORK-unset}" \
+  "${WEAVE_TEST_CHILD_SECRET-unset}" \
+  "${WEAVE_OBSCURA_ALLOW_OPS-unset}" \
+  "${TMPDIR-unset}" \
+  "$*" > "@MARKER@"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"obscura-mcp"}}}\n' "$id" ;;
+    *'notifications/initialized'*) : ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"env-probe-ok"}]}}\n' "$id" ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"x"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("@MARKER@", &marker.to_string_lossy());
+        std::fs::write(&script, body).expect("write env-probe obscura");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat env-probe obscura")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod env-probe obscura");
+        (dir, marker)
+    }
+
     fn web_cmd(db: &TestDb, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = common::weave_cmd(db, args);
         cmd.env("WEAVE_MUX_DIR", dir);
@@ -5058,6 +5580,52 @@ done
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    #[test]
+    fn web_child_scrubs_ambient_policy_and_credentials() {
+        for allow_internal in [false, true] {
+            let db = TestDb::new();
+            let (dir, marker) = make_env_probe_obscura();
+            let url = if allow_internal {
+                "http://127.0.0.1"
+            } else {
+                "https://example.com"
+            };
+            let mut cmd = web_cmd(&db, &dir, &["web", "navigate", "--url", url]);
+            cmd.env("WEAVE_SESSION", "tester")
+                .env("WEAVE_OBSCURA_ALLOW_OPS", "navigate")
+                .env(
+                    "WEAVE_OBSCURA_ALLOW_INTERNAL",
+                    if allow_internal { "1" } else { "0" },
+                )
+                // These parent values must not reach or govern the child.
+                .env("OBSCURA_ALLOW_PRIVATE_NETWORK", "1")
+                .env("WEAVE_TEST_CHILD_SECRET", "do-not-inherit")
+                .env("TMPDIR", &dir);
+            let out = cmd
+                .stdin(Stdio::null())
+                .output()
+                .expect("run env-probe web call");
+            assert!(
+                out.status.success(),
+                "env-probe call failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let probe = std::fs::read_to_string(&marker).expect("read child env probe");
+            assert!(probe.contains("ambient_private=unset"), "{probe}");
+            assert!(probe.contains("secret=unset"), "{probe}");
+            assert!(probe.contains("weave_policy=unset"), "{probe}");
+            assert!(
+                probe.contains(&format!("tmpdir={}", dir.display())),
+                "{probe}"
+            );
+            assert_eq!(
+                probe.contains("--allow-private-network"),
+                allow_internal,
+                "private-network argv did not match weave policy: {probe}"
+            );
+        }
     }
 
     /// Deny-by-default holds under an adversarial action value.
@@ -5123,8 +5691,8 @@ done
             );
             assert!(!ok, "{url} must be refused");
             assert!(
-                err.contains("SSRF guard"),
-                "expected SSRF refusal for {url}, got: {err}"
+                err.contains("internal/loopback/private host"),
+                "expected internal-host refusal for {url}, got: {err}"
             );
         }
     }

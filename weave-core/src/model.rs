@@ -6,11 +6,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Recipient aliases that mean "deliver to every session". Single source of truth.
 pub const BROADCAST: &[&str] = &["all", "*", "everyone", "broadcast"];
 
+/// Hard upper bound on an identity label (sender, recipient, or peer name).
+/// This is a model invariant shared by configuration and both store backends.
+pub const MAX_IDENT: usize = 128;
+
+/// Validate the common identity shape without depending on a persistence layer.
+pub fn validate_ident(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty."));
+    }
+    let chars = value.chars().count();
+    if chars > MAX_IDENT {
+        return Err(format!(
+            "{label} is too long ({chars} chars; max {MAX_IDENT})."
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} must not contain control characters."));
+    }
+    Ok(())
+}
+
 /// WL-039: the [`Message::kind`] marker for an idle/notification "still waiting"
 /// ping. Set **only** on the notify dedup path; the `supersede_prior_idle` query
 /// scopes the auto-supersede to `kind = KIND_IDLE` so dedup can never touch a real
 /// message. An internal enum literal, never user-supplied text.
 pub const KIND_IDLE: &str = "idle";
+
+/// Internal provenance marker for a plain message restored from a portable
+/// session document that did not carry a configured-send request tuple. The
+/// marker keeps such a row distinct from a locally configured send with the
+/// same visible fields and idempotency key, while allowing the import to stamp
+/// its effective priority atomically and replay safely after the store reopens.
+pub const KIND_SESSION_PLAIN: &str = "session_plain";
 
 /// SQL fragment for the broadcast set, e.g. `('all','*','everyone','broadcast')`,
 /// interpolated into the `recipient IN {bc}` delivery/unread/history filters.
@@ -193,15 +221,27 @@ pub struct Message {
     pub expires_at: Option<i64>,
     /// WL-039: message kind marker. `None`/`"normal"` (the default) is an ordinary
     /// message; [`KIND_IDLE`] marks an idle/notification "still waiting" ping set
-    /// **only** on the notify dedup path. The marker exists so idle-notification
-    /// dedup (`Store::supersede_prior_idle`) can ever fire ONLY on idle pings and
-    /// never on real content — it scopes the supersede `UPDATE` to `kind='idle'`.
-    /// `kind` is an internal enum literal, never free user text. Additive +
-    /// backward-compatible: pre-existing rows (and DBs created before the `kind`
-    /// column migration) read back as `None`. `#[serde(default)]` keeps older JSON
+    /// **only** on the notify dedup path, and [`KIND_SESSION_PLAIN`] marks a plain
+    /// portable-session restore whose original configured request tuple was not
+    /// available. Idle dedup scopes its supersede `UPDATE` to `kind='idle'`, so
+    /// neither ordinary content nor session-restored content can be swept. `kind`
+    /// is an internal enum literal, never free user text. Additive + backward-
+    /// compatible: pre-existing rows (and DBs created before the `kind` column
+    /// migration) read back as `None`. `#[serde(default)]` keeps older JSON
     /// payloads (which omit the field) deserializable.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Replay-critical request metadata for a configured top-level send. These
+    /// fields are internal persistence state, not part of the public message JSON
+    /// contract; session export uses them to preserve exact retry semantics.
+    #[serde(skip, default)]
+    pub request_priority: Option<String>,
+    #[serde(skip, default)]
+    pub request_ttl: Option<i64>,
+    #[serde(skip, default)]
+    pub request_supersedes: Option<i64>,
+    #[serde(skip, default)]
+    pub request_dedup_idle: Option<bool>,
 }
 
 /// A cross-store delivery **intent** (Tier-2). An intent is an owner-written row
@@ -1782,8 +1822,9 @@ impl DeliveryRefKind {
 /// (inject + hook-drain; no websocket/broker) onto a repowire-style stage vocabulary:
 /// `Queued` (persisted, awaiting nudge/drain) → `Injected` / `InjectFailed` /
 /// `NotInjectable` (the caller-side live-nudge outcome) → `Drained` (consumed in a
-/// recipient turn). Stored as TEXT (`delivery_log.stage`); validated through this
-/// enum. Pure value type — DAG layer `model`.
+/// recipient turn), or `Relayed` / `RelayFailed` for an optional human-chat bridge's
+/// external handoff result. Stored as TEXT (`delivery_log.stage`); validated through
+/// this enum. Pure value type — DAG layer `model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStage {
@@ -1792,6 +1833,8 @@ pub enum DeliveryStage {
     InjectFailed,
     NotInjectable,
     Drained,
+    Relayed,
+    RelayFailed,
 }
 
 impl DeliveryStage {
@@ -1803,6 +1846,8 @@ impl DeliveryStage {
             DeliveryStage::InjectFailed => "inject_failed",
             DeliveryStage::NotInjectable => "not_injectable",
             DeliveryStage::Drained => "drained",
+            DeliveryStage::Relayed => "relayed",
+            DeliveryStage::RelayFailed => "relay_failed",
         }
     }
 
@@ -1816,6 +1861,8 @@ impl DeliveryStage {
             "inject_failed" => Ok(DeliveryStage::InjectFailed),
             "not_injectable" => Ok(DeliveryStage::NotInjectable),
             "drained" => Ok(DeliveryStage::Drained),
+            "relayed" => Ok(DeliveryStage::Relayed),
+            "relay_failed" => Ok(DeliveryStage::RelayFailed),
             other => Err(format!("unknown delivery stage '{other}'")),
         }
     }
@@ -1833,6 +1880,341 @@ pub enum DeliveryOutcome {
     Ok,
     Fail,
     AmbiguousTarget,
+}
+
+/// Optional human-chat bridge implementations known to the core runtime-state
+/// store. Keeping this as an enum (rather than caller-provided TEXT) gives the
+/// per-platform singleton row an exact, bounded key and prevents spelling drift
+/// between the Telegram and Slack loops, doctor, and dashboard surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgePlatform {
+    Telegram,
+    Slack,
+}
+
+impl BridgePlatform {
+    pub const ALL: [Self; 2] = [Self::Telegram, Self::Slack];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Telegram => "telegram",
+            Self::Slack => "slack",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "telegram" => Ok(Self::Telegram),
+            "slack" => Ok(Self::Slack),
+            other => Err(format!("unknown bridge platform '{other}'")),
+        }
+    }
+}
+
+/// Coarse token-free lifecycle state for one bridge process. Detailed failure
+/// information is separately bounded and classified on [`BridgeRuntimeState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeRuntimeStatus {
+    Starting,
+    Running,
+    Degraded,
+    Stopped,
+}
+
+impl BridgeRuntimeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "degraded" => Ok(Self::Degraded),
+            "stopped" => Ok(Self::Stopped),
+            other => Err(format!("unknown bridge runtime status '{other}'")),
+        }
+    }
+}
+
+/// Store-seam caps for opaque bridge cursor/fencing data and token-free
+/// diagnostics. These values are intentionally far above real Telegram/Slack
+/// values while keeping every persisted/read-back field bounded.
+pub const MAX_BRIDGE_CURSOR_LEN: usize = 2_048;
+pub const MAX_BRIDGE_OWNER_ID_LEN: usize = 128;
+pub const MAX_BRIDGE_ERROR_CLASS_LEN: usize = 64;
+pub const MAX_BRIDGE_ERROR_LEN: usize = 512;
+pub const MAX_BRIDGE_ROUTE_FIELD_LEN: usize = 256;
+pub const MAX_BRIDGE_POSITION_LEN: usize = 128;
+pub const MAX_BRIDGE_CONTINUATION_LEN: usize = 1_024;
+/// Durable Slack catch-up staging is bounded independently in rows and bytes.
+/// The row cap bounds index/metadata growth; the byte cap bounds provider text
+/// retained while walking backwards to the globally-oldest unseen event.
+pub const MAX_BRIDGE_STAGED_EVENTS: i64 = 10_000;
+pub const MAX_BRIDGE_STAGED_TEXT_BYTES: usize = 1_048_576;
+pub const MAX_BRIDGE_STAGED_TOTAL_BYTES: i64 = 64 * 1_048_576;
+pub const MAX_BRIDGE_STAGE_BATCH: usize = 100;
+/// A runtime heartbeat newer than this is considered active by every status
+/// surface. Kept in core so CLI, MCP, and dashboard cannot silently drift.
+pub const BRIDGE_ACTIVE_TTL_SECS: i64 = 90;
+
+/// Token-free persisted progress envelope shared by every chat bridge. Route
+/// identity + scope bind a cursor to the external account/conversation that
+/// produced it, preventing a changed token/channel/chat from reusing an
+/// incompatible position. `continuation` supports bounded paginated traversal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeCursorEnvelope {
+    pub external_identity: String,
+    pub external_scope: String,
+    pub position: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+/// One minimal, token-free provider event retained during a bounded bridge
+/// history traversal. `order_key` is provider-normalized so both SQL backends can
+/// select the globally oldest event without parsing provider timestamps. Ignored
+/// provider events carry `sender = text = None`; normal human events carry both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeStagedEvent {
+    pub position: String,
+    pub order_key: String,
+    pub sender: Option<String>,
+    pub text: Option<String>,
+}
+
+impl BridgeStagedEvent {
+    pub fn validate(&self) -> Result<(), String> {
+        BridgeCursorEnvelope::validate_field(
+            "staged position",
+            &self.position,
+            MAX_BRIDGE_POSITION_LEN,
+            false,
+        )?;
+        BridgeCursorEnvelope::validate_field(
+            "staged order key",
+            &self.order_key,
+            MAX_BRIDGE_POSITION_LEN,
+            false,
+        )?;
+        match (&self.sender, &self.text) {
+            (None, None) => Ok(()),
+            (Some(sender), Some(text)) => {
+                if sender.is_empty() || sender.chars().count() > 64 {
+                    return Err("bridge staged sender is invalid".to_string());
+                }
+                if sender.chars().any(char::is_control) {
+                    return Err(
+                        "bridge staged sender must not contain control characters".to_string()
+                    );
+                }
+                if text.is_empty() {
+                    return Err("bridge staged text must not be empty".to_string());
+                }
+                if text.len() > MAX_BRIDGE_STAGED_TEXT_BYTES {
+                    return Err("bridge staged text is too large".to_string());
+                }
+                Ok(())
+            }
+            _ => Err("bridge staged sender and text must be present together".to_string()),
+        }
+    }
+}
+
+impl BridgeCursorEnvelope {
+    fn validate_field(
+        label: &str,
+        value: &str,
+        max: usize,
+        allow_empty: bool,
+    ) -> Result<(), String> {
+        if !allow_empty && value.is_empty() {
+            return Err(format!("bridge cursor {label} must not be empty"));
+        }
+        if value.chars().count() > max {
+            return Err(format!("bridge cursor {label} is too long"));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!(
+                "bridge cursor {label} must not contain control characters"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        Self::validate_field(
+            "external identity",
+            &self.external_identity,
+            MAX_BRIDGE_ROUTE_FIELD_LEN,
+            false,
+        )?;
+        Self::validate_field(
+            "external scope",
+            &self.external_scope,
+            MAX_BRIDGE_ROUTE_FIELD_LEN,
+            false,
+        )?;
+        Self::validate_field("position", &self.position, MAX_BRIDGE_POSITION_LEN, true)?;
+        if let Some(continuation) = &self.continuation {
+            Self::validate_field(
+                "continuation",
+                continuation,
+                MAX_BRIDGE_CONTINUATION_LEN,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<String, String> {
+        self.validate()?;
+        let encoded = serde_json::to_string(self)
+            .map_err(|_| "bridge cursor could not be encoded".to_string())?;
+        if encoded.chars().count() > MAX_BRIDGE_CURSOR_LEN {
+            return Err("bridge cursor envelope is too long".to_string());
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &str) -> Result<Option<Self>, String> {
+        if encoded.is_empty() {
+            return Ok(None);
+        }
+        if encoded.chars().count() > MAX_BRIDGE_CURSOR_LEN || encoded.chars().any(char::is_control)
+        {
+            return Err("bridge cursor envelope is invalid".to_string());
+        }
+        let envelope: Self = serde_json::from_str(encoded)
+            .map_err(|_| "bridge cursor envelope is invalid".to_string())?;
+        envelope.validate()?;
+        Ok(Some(envelope))
+    }
+
+    pub fn route_matches(&self, external_identity: &str, external_scope: &str) -> bool {
+        self.external_identity == external_identity && self.external_scope == external_scope
+    }
+}
+
+/// Persisted, token-free runtime status for exactly one [`BridgePlatform`]. The
+/// opaque `owner_id` is a write-fencing credential: callers need it for fenced
+/// updates, but diagnostics must never reveal it. Accordingly Serialize omits it
+/// and the manual Debug implementation redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeRuntimeState {
+    pub platform: BridgePlatform,
+    pub identity: String,
+    pub recipient: String,
+    #[serde(skip_serializing, default)]
+    pub cursor: String,
+    #[serde(skip, default)]
+    pub owner_id: String,
+    pub owner_pid: Option<i64>,
+    pub owner_host: String,
+    pub heartbeat_ts: i64,
+    pub status: BridgeRuntimeStatus,
+    pub last_poll_ts: i64,
+    pub last_success_ts: i64,
+    pub last_delivery_ts: i64,
+    pub last_error_class: String,
+    #[serde(skip_serializing, default)]
+    pub last_error: String,
+}
+
+impl std::fmt::Debug for BridgeRuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeRuntimeState")
+            .field("platform", &self.platform)
+            .field("identity", &self.identity)
+            .field("recipient", &self.recipient)
+            .field(
+                "cursor",
+                &if self.cursor.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "owner_id",
+                &if self.owner_id.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("owner_pid", &self.owner_pid)
+            .field("owner_host", &self.owner_host)
+            .field("heartbeat_ts", &self.heartbeat_ts)
+            .field("status", &self.status)
+            .field("last_poll_ts", &self.last_poll_ts)
+            .field("last_success_ts", &self.last_success_ts)
+            .field("last_delivery_ts", &self.last_delivery_ts)
+            .field("last_error_class", &self.last_error_class)
+            .field(
+                "last_error",
+                &if self.last_error.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
+}
+
+impl BridgeRuntimeState {
+    /// Whether this row represents a currently owned runtime whose heartbeat is
+    /// still inside the shared activity window. Reused by every diagnostic
+    /// surface so stale classification cannot drift between CLI, MCP, and HTTP.
+    pub fn is_active_at(&self, observed_at: i64) -> bool {
+        !self.owner_host.is_empty()
+            && self.heartbeat_ts > 0
+            && observed_at.saturating_sub(self.heartbeat_ts) <= BRIDGE_ACTIVE_TTL_SECS
+            && self.status != BridgeRuntimeStatus::Stopped
+    }
+
+    /// Whether a non-stopped owner row exists but no longer qualifies as active.
+    /// A released row is intentionally not stale; it is a clean inactive state.
+    pub fn is_stale_at(&self, observed_at: i64) -> bool {
+        self.status != BridgeRuntimeStatus::Stopped
+            && !self.owner_host.is_empty()
+            && !self.is_active_at(observed_at)
+    }
+}
+
+/// How a fenced heartbeat/update should treat the persisted classified error.
+/// `Keep` supports heartbeat-only refreshes; `Clear` is used after recovery;
+/// `Set` records a bounded one-line class/detail pair without any credential.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BridgeRuntimeErrorUpdate {
+    #[default]
+    Keep,
+    Clear,
+    Set {
+        class: String,
+        message: String,
+    },
+}
+
+/// Fenced bridge heartbeat/update patch. Every `Some(timestamp)` is monotonic at
+/// the store seam (older values cannot move a last-seen timestamp backwards).
+/// An otherwise-empty patch is valid and refreshes only the owner heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BridgeRuntimeUpdate {
+    pub cursor: Option<String>,
+    pub status: Option<BridgeRuntimeStatus>,
+    pub last_poll_ts: Option<i64>,
+    pub last_success_ts: Option<i64>,
+    pub last_delivery_ts: Option<i64>,
+    pub error: BridgeRuntimeErrorUpdate,
 }
 
 impl DeliveryOutcome {
@@ -2173,11 +2555,132 @@ mod tests {
             DeliveryStage::InjectFailed,
             DeliveryStage::NotInjectable,
             DeliveryStage::Drained,
+            DeliveryStage::Relayed,
+            DeliveryStage::RelayFailed,
         ] {
             assert_eq!(DeliveryStage::from_str(s.as_str()), Ok(s));
         }
         assert!(DeliveryStage::from_str("bogus").is_err());
         assert!(DeliveryStage::from_str("").is_err());
+    }
+
+    #[test]
+    fn bridge_platform_and_status_roundtrip() {
+        for platform in BridgePlatform::ALL {
+            assert_eq!(BridgePlatform::from_str(platform.as_str()), Ok(platform));
+        }
+        assert!(BridgePlatform::from_str("discord").is_err());
+        for status in [
+            BridgeRuntimeStatus::Starting,
+            BridgeRuntimeStatus::Running,
+            BridgeRuntimeStatus::Degraded,
+            BridgeRuntimeStatus::Stopped,
+        ] {
+            assert_eq!(BridgeRuntimeStatus::from_str(status.as_str()), Ok(status));
+        }
+        assert!(BridgeRuntimeStatus::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn bridge_cursor_envelope_roundtrips_and_binds_external_route() {
+        let envelope = BridgeCursorEnvelope {
+            external_identity: "bot-42".to_string(),
+            external_scope: "channel-7".to_string(),
+            position: "1712345678.000009".to_string(),
+            continuation: Some("cursor-next".to_string()),
+        };
+        let encoded = envelope.encode().expect("encode cursor envelope");
+        assert!(encoded.chars().count() <= MAX_BRIDGE_CURSOR_LEN);
+        let decoded = BridgeCursorEnvelope::decode(&encoded)
+            .expect("decode cursor envelope")
+            .expect("nonempty envelope");
+        assert_eq!(decoded, envelope);
+        assert!(decoded.route_matches("bot-42", "channel-7"));
+        assert!(!decoded.route_matches("bot-42", "other-channel"));
+        assert_eq!(BridgeCursorEnvelope::decode("").unwrap(), None);
+
+        let invalid = BridgeCursorEnvelope {
+            external_identity: "bot\n42".to_string(),
+            ..envelope.clone()
+        };
+        assert!(invalid.encode().is_err());
+        let too_long = BridgeCursorEnvelope {
+            continuation: Some("x".repeat(MAX_BRIDGE_CONTINUATION_LEN + 1)),
+            ..envelope
+        };
+        assert!(too_long.encode().is_err());
+        assert!(BridgeCursorEnvelope::decode("legacy-bare-cursor").is_err());
+    }
+
+    #[test]
+    fn bridge_runtime_owner_id_is_opaque_in_debug_and_json() {
+        let state = BridgeRuntimeState {
+            platform: BridgePlatform::Telegram,
+            identity: "telegram".to_string(),
+            recipient: "operator".to_string(),
+            cursor: "CURSOR_CANARY".to_string(),
+            owner_id: "opaque-owner-value".to_string(),
+            owner_pid: Some(123),
+            owner_host: "host-a".to_string(),
+            heartbeat_ts: 10,
+            status: BridgeRuntimeStatus::Running,
+            last_poll_ts: 9,
+            last_success_ts: 8,
+            last_delivery_ts: 7,
+            last_error_class: String::new(),
+            last_error: "ERROR_CANARY".to_string(),
+        };
+        let debug = format!("{state:?}");
+        assert!(!debug.contains("opaque-owner-value"), "{debug}");
+        assert!(!debug.contains("CURSOR_CANARY"), "{debug}");
+        assert!(!debug.contains("ERROR_CANARY"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("opaque-owner-value"), "{json}");
+        assert!(!json.contains("owner_id"), "{json}");
+        assert!(!json.contains("CURSOR_CANARY"), "{json}");
+        assert!(!json.contains("ERROR_CANARY"), "{json}");
+        let public: BridgeRuntimeState = serde_json::from_str(&json).unwrap();
+        assert!(public.owner_id.is_empty());
+        assert!(public.cursor.is_empty());
+        assert!(public.last_error.is_empty());
+        assert_eq!(public.is_active_at(10), state.is_active_at(10));
+    }
+
+    #[test]
+    fn bridge_runtime_activity_and_staleness_are_exact() {
+        let mut state = BridgeRuntimeState {
+            platform: BridgePlatform::Telegram,
+            identity: "telegram".into(),
+            recipient: "agent".into(),
+            cursor: String::new(),
+            owner_id: "owner".into(),
+            owner_pid: Some(7),
+            owner_host: "host".into(),
+            heartbeat_ts: 1_000,
+            status: BridgeRuntimeStatus::Running,
+            last_poll_ts: 0,
+            last_success_ts: 0,
+            last_delivery_ts: 0,
+            last_error_class: String::new(),
+            last_error: String::new(),
+        };
+        assert!(state.is_active_at(1_000 + BRIDGE_ACTIVE_TTL_SECS));
+        assert!(!state.is_stale_at(1_000 + BRIDGE_ACTIVE_TTL_SECS));
+        assert!(!state.is_active_at(1_001 + BRIDGE_ACTIVE_TTL_SECS));
+        assert!(state.is_stale_at(1_001 + BRIDGE_ACTIVE_TTL_SECS));
+
+        state.owner_pid = None;
+        assert!(
+            state.is_active_at(1_000),
+            "owner pid is optional; the required, release-cleared host is the public ownership marker"
+        );
+
+        state.status = BridgeRuntimeStatus::Stopped;
+        state.owner_id.clear();
+        state.owner_pid = None;
+        assert!(!state.is_active_at(i64::MAX));
+        assert!(!state.is_stale_at(i64::MAX));
     }
 
     /// `DeliveryOutcome` round-trips; unknown is a clean error.

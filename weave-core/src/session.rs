@@ -20,12 +20,18 @@
 //!
 //! An imported document is **untrusted external input**. This module's
 //! [`from_json`] validates the format magic + schema version and is tolerant of
-//! unknown fields (`#[serde(default)]`, the established additive pattern), but it
-//! does NOT enforce business caps — the bin-layer import handler bounds every
-//! field (`check_ident`, `MAX_BODY`, id-shape) BEFORE any value reaches the store.
-//! Treat the structs here as a parser, not a trust boundary.
+//! unknown fields (`#[serde(default)]`, the established additive pattern). It also
+//! bounds every repeated collection while serde walks it, preventing tiny JSON
+//! records from causing unbounded heap growth. The bin-layer import handler still
+//! bounds every individual field (`check_ident`, `MAX_BODY`, id-shape) BEFORE any
+//! value reaches the store. Treat the structs here as a parser, not the complete
+//! trust boundary.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::marker::PhantomData;
+
+use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Format discriminator / magic. A document whose `weave_session_export` value is
 /// not exactly this is rejected by [`from_json`] — it is not a weave session
@@ -39,7 +45,115 @@ pub const FORMAT_TAG: u32 = 1;
 /// weave never chokes on a newer-but-compatible export, and a newer weave can read
 /// an older one. A document with a HIGHER schema version than this build knows is
 /// rejected (forward-compat guard — we will not silently drop data we cannot model).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Hard collection bounds at the parser seam. The normal export paths already
+/// read at most the Store's 10k row cap; applying the same bound while serde is
+/// walking an untrusted sequence prevents a small-record JSON array from turning
+/// the 256 MiB byte allowance into millions of heap allocations.
+pub const MAX_SESSION_MESSAGES: usize = 10_000;
+pub const MAX_SESSION_ASKS: usize = 10_000;
+pub const MAX_SESSION_ASK_GROUPS: usize = 10_000;
+pub const MAX_SESSION_MEMORY_ENTRIES: usize = 10_000;
+pub const MAX_SESSION_MEMORY_TAGS: usize = 16;
+
+struct BoundedVecVisitor<T> {
+    field: &'static str,
+    limit: usize,
+    marker: PhantomData<T>,
+}
+
+impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "an array of at most {} session {}",
+            self.limit, self.field
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence.size_hint().is_some_and(|size| size > self.limit) {
+            return Err(de::Error::custom(format_args!(
+                "session {} exceeds {} entries",
+                self.field, self.limit
+            )));
+        }
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(self.limit));
+        while values.len() < self.limit {
+            match sequence.next_element()? {
+                Some(value) => values.push(value),
+                None => return Ok(values),
+            }
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom(format_args!(
+                "session {} exceeds {} entries",
+                self.field, self.limit
+            )));
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    field: &'static str,
+    limit: usize,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        field,
+        limit,
+        marker: PhantomData,
+    })
+}
+
+fn deserialize_messages<'de, D>(deserializer: D) -> Result<Vec<ExportedMessage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, "messages", MAX_SESSION_MESSAGES)
+}
+
+fn deserialize_asks<'de, D>(deserializer: D) -> Result<Vec<ExportedAsk>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, "asks", MAX_SESSION_ASKS)
+}
+
+fn deserialize_ask_groups<'de, D>(deserializer: D) -> Result<Vec<ExportedAskGroup>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, "ask groups", MAX_SESSION_ASK_GROUPS)
+}
+
+fn deserialize_memory<'de, D>(deserializer: D) -> Result<Vec<ExportedMemory>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, "memory entries", MAX_SESSION_MEMORY_ENTRIES)
+}
+
+fn deserialize_memory_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, "memory tags", MAX_SESSION_MEMORY_TAGS)
+}
 
 /// The canonical interchange envelope. Field order here is the stable key order of
 /// the emitted JSON (serde preserves struct field declaration order), so two
@@ -55,25 +169,25 @@ pub struct SessionExport {
     /// UNIX-seconds wall clock at export time (advisory).
     pub exported_at: i64,
     /// The portable message set (the core payload; imported via `Store::send`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_messages")]
     pub messages: Vec<ExportedMessage>,
     /// The tracked-ask threads, replayed faithfully on import via
     /// [`crate::store::Store::import_ask`] (WL-040b): each ask is re-materialized in
     /// its exported `AskState` (open / answered / acked) with its message links
     /// remapped to the freshly re-minted local ids. `#[serde(default)]` keeps an
     /// older document that omits the block deserializable.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_asks")]
     pub asks: Vec<ExportedAsk>,
     /// The ask-many PARENT anchor rows (P2 broadcast-ask groups), replayed before
     /// the child asks that reference them so `parent_id` linkage survives the import
     /// (WL-040b). `#[serde(default)]` keeps an older document that omits the block
     /// deserializable.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_ask_groups")]
     pub ask_groups: Vec<ExportedAskGroup>,
     /// The mesh memory entries (filesystem-backed scoped memory; full round-trip).
     /// `#[serde(default)]` keeps an older document that omits the block
     /// deserializable.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_memory")]
     pub memory: Vec<ExportedMemory>,
 }
 
@@ -92,12 +206,41 @@ pub struct ExportedMessage {
     #[serde(default)]
     pub subject: Option<String>,
     pub body: String,
+    /// Source parent row for a threaded reply. Remapped to the target parent id
+    /// before insertion; `None` denotes a top-level message.
+    #[serde(default)]
+    pub in_reply_to: Option<i64>,
+    /// Original relative TTL request for a reply. Zero means permanent. Kept
+    /// separate from `configured_send` because replies use their own atomic Store
+    /// operation and derive recipient/subject from the remapped parent.
+    #[serde(default)]
+    pub reply_ttl: i64,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub trace_id: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Effective successor link in the source snapshot. Restored only after all
+    /// messages are remapped, so idle-collapse state is reconstructed without
+    /// sweeping unrelated rows already present in the target store.
+    #[serde(default)]
+    pub superseded_by: Option<i64>,
+    /// Replay-critical request tuple for a configured top-level send. Absent in
+    /// schema-v1 documents and for message kinds that are reconstructed through a
+    /// different operation (tracked ask/answer and replies).
+    #[serde(default)]
+    pub configured_send: Option<ExportedConfiguredSend>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedConfiguredSend {
+    pub priority: String,
+    pub ttl: i64,
+    #[serde(default)]
+    pub supersedes: Option<i64>,
+    #[serde(default)]
+    pub dedup_idle: bool,
 }
 
 /// One tracked ask, replayed faithfully on import (WL-040b) via the dual-backend
@@ -178,7 +321,7 @@ pub struct ExportedMemory {
     pub key: String,
     #[serde(default)]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_memory_tags")]
     pub tags: Vec<String>,
     #[serde(default)]
     pub body: String,
@@ -217,8 +360,9 @@ pub fn to_json(export: &SessionExport) -> anyhow::Result<String> {
 /// Parse + validate an interchange document. Rejects a wrong/missing format magic
 /// and a `schema_version` greater than this build's [`SCHEMA_VERSION`]
 /// (forward-compat guard). Unknown extra fields are ignored (additive tolerance).
-/// This validates ONLY the format frame — per-field business caps are enforced by
-/// the bin-layer import handler before any value reaches the store.
+/// This validates the format frame and parser-time collection caps. Per-field
+/// business caps are enforced by the bin-layer import handler before any value
+/// reaches the store.
 pub fn from_json(s: &str) -> anyhow::Result<SessionExport> {
     let export: SessionExport = serde_json::from_str(s)
         .map_err(|e| anyhow::anyhow!("not a valid weave session export (parse error: {e})"))?;
@@ -239,26 +383,24 @@ pub fn from_json(s: &str) -> anyhow::Result<SessionExport> {
     Ok(export)
 }
 
-/// Deterministic synthetic idempotency key for a keyless legacy message:
-/// `wl040:<source_identity>:<source_id>`. Re-importing the same document twice
-/// collides on this key (the existing global-unique dedup makes the second import a
-/// no-op), so import stays idempotent even for messages that carried no key in the
-/// source store. Bounded `[A-Za-z0-9_:]`, well under `MAX_IDEMPOTENCY_KEY_LEN`; the
-/// identity is sanitized to that alphabet so a hostile source identity cannot smuggle
-/// a metachar into the synthesized key.
+/// Deterministic synthetic idempotency key for a keyless legacy message. The exact
+/// source identity is hashed into two independently seeded FNV-1a lanes rather than
+/// sanitized or truncated: distinct identities therefore cannot alias merely
+/// because punctuation or a long shared prefix differs. Re-importing the same
+/// document twice still yields the same bounded, identifier-safe key.
 pub fn synth_idempotency_key(source_identity: &str, source_id: i64) -> String {
-    let ident: String = source_identity
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect();
-    format!("wl040:{ident}:{source_id}")
+    fn lane(seed: u64, identity: &[u8]) -> u64 {
+        let mut hash = seed;
+        for byte in identity {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    let first = lane(0xcbf29ce484222325, source_identity.as_bytes());
+    let second = lane(0x84222325cbf29ce4, source_identity.as_bytes());
+    format!("wl040:{first:016x}{second:016x}:{source_id}")
 }
 
 #[cfg(test)]
@@ -273,15 +415,26 @@ mod tests {
             recipient: "bob".into(),
             subject: Some("hi".into()),
             body: format!("body {id}"),
+            in_reply_to: None,
+            reply_ttl: 0,
             idempotency_key: key.map(|s| s.to_string()),
             trace_id: Some("trace_1".into()),
             priority: Some("normal".into()),
+            superseded_by: None,
+            configured_send: None,
         }
     }
 
     #[test]
     fn round_trip_preserves_messages() {
-        let msgs = vec![sample_msg(1, Some("k1")), sample_msg(2, None)];
+        let mut configured = sample_msg(1, Some("k1"));
+        configured.configured_send = Some(ExportedConfiguredSend {
+            priority: "urgent".into(),
+            ttl: 600,
+            supersedes: None,
+            dedup_idle: false,
+        });
+        let msgs = vec![configured, sample_msg(2, None)];
         let env = serialize_session("alice", 12345, msgs.clone(), vec![], vec![], vec![]);
         let json = to_json(&env).unwrap();
         let back = from_json(&json).unwrap();
@@ -289,6 +442,17 @@ mod tests {
         assert_eq!(back.exported_at, 12345);
         assert_eq!(back.messages, msgs);
         assert_eq!(back, env);
+    }
+
+    #[test]
+    fn schema_v1_message_defaults_configured_send_to_none() {
+        let json = format!(
+            r#"{{"weave_session_export":{FORMAT_TAG},"schema_version":1,"identity":"a","exported_at":0,"messages":[{{"id":1,"ts":1,"sender":"a","recipient":"b","body":"x","priority":"urgent"}}]}}"#
+        );
+        let env = from_json(&json).unwrap();
+        assert_eq!(env.messages.len(), 1);
+        assert_eq!(env.messages[0].priority.as_deref(), Some("urgent"));
+        assert!(env.messages[0].configured_send.is_none());
     }
 
     #[test]
@@ -400,23 +564,84 @@ mod tests {
     }
 
     #[test]
+    fn from_json_rejects_oversized_record_arrays_while_parsing() {
+        let cases = [
+            (
+                "messages",
+                r#"{"id":1,"ts":1,"sender":"a","recipient":"b","body":"x"}"#,
+                MAX_SESSION_MESSAGES,
+            ),
+            (
+                "asks",
+                r#"{"id":"ask_1_1","question_msg_id":1,"asker":"a","askee":"b","state":"open","opened_ts":1,"updated_ts":1}"#,
+                MAX_SESSION_ASKS,
+            ),
+            (
+                "ask_groups",
+                r#"{"parent_id":"askm_1_1","asker":"a","body":"x","opened_ts":1,"target_count":1}"#,
+                MAX_SESSION_ASK_GROUPS,
+            ),
+            (
+                "memory",
+                r#"{"scope_kind":"global","key":"k"}"#,
+                MAX_SESSION_MEMORY_ENTRIES,
+            ),
+        ];
+        for (field, record, limit) in cases {
+            let records = std::iter::repeat_n(record, limit + 1)
+                .collect::<Vec<_>>()
+                .join(",");
+            let json = format!(
+                r#"{{"weave_session_export":{FORMAT_TAG},"schema_version":{SCHEMA_VERSION},"identity":"a","exported_at":0,"{field}":[{records}]}}"#
+            );
+            let error = from_json(&json).unwrap_err().to_string();
+            assert!(error.contains("exceeds"), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn from_json_bounds_nested_memory_tags() {
+        let tags = std::iter::repeat_n(r#""tag""#, MAX_SESSION_MEMORY_TAGS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"weave_session_export":{FORMAT_TAG},"schema_version":{SCHEMA_VERSION},"identity":"a","exported_at":0,"memory":[{{"scope_kind":"global","key":"k","tags":[{tags}]}}]}}"#
+        );
+        assert!(from_json(&json)
+            .unwrap_err()
+            .to_string()
+            .contains("memory tags exceeds"));
+    }
+
+    #[test]
     fn synth_key_is_deterministic_and_bounded() {
         let a = synth_idempotency_key("alice", 42);
         let b = synth_idempotency_key("alice", 42);
         assert_eq!(a, b);
-        assert_eq!(a, "wl040:alice:42");
         assert!(a.len() <= crate::model::MAX_IDEMPOTENCY_KEY_LEN);
         assert!(crate::model::idempotency_key_valid(&a));
     }
 
     #[test]
-    fn synth_key_sanitizes_hostile_identity() {
+    fn synth_key_hashes_identity_to_safe_alphabet() {
         let k = synth_idempotency_key("a; DROP TABLE messages;--", 1);
-        // Metachars are replaced with '_', so the key stays in the safe alphabet.
         assert!(k
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':'));
         assert!(crate::model::idempotency_key_valid(&k));
+    }
+
+    #[test]
+    fn synth_key_does_not_alias_punctuation_or_long_prefixes() {
+        assert_ne!(
+            synth_idempotency_key("a-b", 1),
+            synth_idempotency_key("a_b", 1)
+        );
+        let prefix = "a".repeat(64);
+        assert_ne!(
+            synth_idempotency_key(&format!("{prefix}x"), 1),
+            synth_idempotency_key(&format!("{prefix}y"), 1)
+        );
     }
 
     #[test]

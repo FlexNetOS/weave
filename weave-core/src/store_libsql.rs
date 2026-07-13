@@ -40,19 +40,23 @@ use crate::model::{
     ask_id_valid, ask_many_id_valid, attempt_id_valid, classify_ask_many, is_broadcast,
     job_id_valid, new_ask_id, new_ask_many_id, new_attempt_id, new_job_id, new_review_id, now,
     permission_status, pr_url_valid, Ask, AskGroup, AskKind, AskManyChildView, AskManyResult,
-    AskRole, AskState, ClaimOutcome, DeliveryTrace, Intent, Job, JobFilter, JobPatch,
-    JobResultView, JobSpec, JobState, Lease, Message, OrchestratorStatus, Peer, PermissionStatus,
-    ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind, BROADCAST_SQL,
-    MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS, MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
+    AskRole, AskState, BridgePlatform, BridgeRuntimeErrorUpdate, BridgeRuntimeState,
+    BridgeRuntimeStatus, BridgeRuntimeUpdate, BridgeStagedEvent, ClaimOutcome, DeliveryTrace,
+    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Lease, Message,
+    OrchestratorStatus, Peer, PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter,
+    Schedule, ScheduleKind, BROADCAST_SQL, MAX_CRON_EXPR_LEN, MAX_DELIVERY_ROWS,
+    MAX_REVIEW_IDENT_LEN, MAX_REVIEW_TITLE_LEN,
 };
 use crate::store::{
     append_progress_event, canonical_source, check_birth_cert, check_body, check_host, check_ident,
-    check_job_text, clamp_field, clamp_limit, commit_pulled, is_alive, job_result_view,
-    merge_peer_views, merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject,
-    sanitize_tag, store_label, validate_job_patch, validate_job_spec, AskManyOutcome, Origin,
-    PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo, SessionView, Store,
-    VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT, MAX_PULL_PER_DRAIN,
-    MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN, PRESENCE_TTL_SECS,
+    check_job_text, clamp_field, clamp_limit, is_alive, job_result_view, merge_peer_views,
+    merge_session_views, mint_birth_cert, remote_scheme_host, reply_subject, sanitize_tag,
+    store_label, validate_bridge_claim, validate_bridge_inbox_completion, validate_bridge_owner_id,
+    validate_bridge_staging, validate_bridge_update, validate_job_patch, validate_job_spec,
+    AskManyOutcome, Origin, PeerView, Pulled, RevocationEvent, RevocationKind, SessionInfo,
+    SessionView, Store, VerifyPolicy, MAX_ASK_MANY_TARGETS, MAX_BRANCH_LEN, MAX_KEYS_PER_IDENT,
+    MAX_PULL_PER_DRAIN, MAX_REPO_LEN, MAX_REVOCATIONS_LIST, MAX_SESSIONS, MAX_WORKTREE_LEN,
+    PRESENCE_TTL_SECS,
 };
 use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database, OpenFlags, Value};
@@ -92,7 +96,11 @@ const SCHEMA: &[&str] = &[
         priority        TEXT NOT NULL DEFAULT 'normal',
         superseded_by   INTEGER,
         expires_at      INTEGER,
-        kind            TEXT
+        kind            TEXT,
+        request_priority TEXT,
+        request_ttl     INTEGER,
+        request_supersedes INTEGER,
+        request_dedup_idle INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS reads (
         message_id INTEGER NOT NULL,
@@ -168,6 +176,8 @@ const SCHEMA: &[&str] = &[
         asker           TEXT NOT NULL,
         askee           TEXT NOT NULL,
         subject         TEXT,
+        request_subject TEXT,
+        request_subject_provided INTEGER,
         state           TEXT NOT NULL,
         kind            TEXT NOT NULL DEFAULT 'free_text',
         options         TEXT,
@@ -237,7 +247,39 @@ const SCHEMA: &[&str] = &[
         ts        INTEGER NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_delivery_log_exact ON delivery_log(ref_id, ref_kind, to_peer, stage, outcome)",
     "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
+    // Token-free, exactly-one-row-per-platform bridge runtime state.
+    "CREATE TABLE IF NOT EXISTS bridge_runtime (
+        platform         TEXT PRIMARY KEY,
+        identity         TEXT NOT NULL,
+        recipient        TEXT NOT NULL,
+        cursor           TEXT NOT NULL DEFAULT '',
+        owner_id         TEXT NOT NULL DEFAULT '',
+        owner_pid        INTEGER,
+        owner_host       TEXT NOT NULL DEFAULT '',
+        heartbeat_ts     INTEGER NOT NULL DEFAULT 0,
+        status           TEXT NOT NULL DEFAULT 'stopped',
+        last_poll_ts     INTEGER NOT NULL DEFAULT 0,
+        last_success_ts  INTEGER NOT NULL DEFAULT 0,
+        last_delivery_ts INTEGER NOT NULL DEFAULT 0,
+        last_error_class TEXT NOT NULL DEFAULT '',
+        last_error       TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE TABLE IF NOT EXISTS bridge_staged_events (
+        platform          TEXT NOT NULL,
+        external_identity TEXT NOT NULL,
+        external_scope    TEXT NOT NULL,
+        position          TEXT NOT NULL,
+        order_key         TEXT NOT NULL,
+        sender            TEXT,
+        text              TEXT,
+        PRIMARY KEY (platform, external_identity, external_scope, position)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_bridge_staged_route_order
+        ON bridge_staged_events(
+            platform, external_identity, external_scope, order_key, position
+        )",
     // presence (v0.2 daemon): per-peer heartbeat tracking
     "CREATE TABLE IF NOT EXISTS presence (
         name         TEXT PRIMARY KEY,
@@ -389,7 +431,88 @@ fn row_to_message(r: &libsql::Row) -> Result<Message> {
         // WL-039: positional index 12 — EVERY explicit projection feeding this
         // mapper MUST list `kind` as the trailing (13th) column.
         kind: r.get::<Option<String>>(12).ok().flatten(),
+        request_priority: r.get::<Option<String>>(13).ok().flatten(),
+        request_ttl: r.get::<Option<i64>>(14).ok().flatten(),
+        request_supersedes: r.get::<Option<i64>>(15).ok().flatten(),
+        request_dedup_idle: r
+            .get::<Option<i64>>(16)
+            .ok()
+            .flatten()
+            .map(|value| value != 0),
     })
+}
+
+const BRIDGE_RUNTIME_COLS: &str = "platform, identity, recipient, cursor, owner_id, owner_pid, \
+     owner_host, heartbeat_ts, status, last_poll_ts, last_success_ts, last_delivery_ts, \
+     last_error_class, last_error";
+
+fn row_to_bridge_runtime(r: &libsql::Row) -> Result<BridgeRuntimeState> {
+    let platform = BridgePlatform::from_str(&r.get::<String>(0)?).map_err(anyhow::Error::msg)?;
+    let status = BridgeRuntimeStatus::from_str(&r.get::<String>(8)?).map_err(anyhow::Error::msg)?;
+    Ok(BridgeRuntimeState {
+        platform,
+        identity: r.get::<String>(1)?,
+        recipient: r.get::<String>(2)?,
+        cursor: r.get::<String>(3)?,
+        owner_id: r.get::<String>(4)?,
+        owner_pid: r.get::<Option<i64>>(5)?,
+        owner_host: r.get::<String>(6)?,
+        heartbeat_ts: r.get::<i64>(7)?,
+        status,
+        last_poll_ts: r.get::<i64>(9)?,
+        last_success_ts: r.get::<i64>(10)?,
+        last_delivery_ts: r.get::<i64>(11)?,
+        last_error_class: r.get::<String>(12)?,
+        last_error: r.get::<String>(13)?,
+    })
+}
+
+async fn update_bridge_runtime_tx_libsql(
+    tx: &libsql::Transaction,
+    platform: BridgePlatform,
+    owner_id: &str,
+    update: &BridgeRuntimeUpdate,
+) -> Result<u64> {
+    let (error_mode, error_class, error_message): (i64, Option<&str>, Option<&str>) =
+        match &update.error {
+            BridgeRuntimeErrorUpdate::Keep => (0, None, None),
+            BridgeRuntimeErrorUpdate::Clear => (1, None, None),
+            BridgeRuntimeErrorUpdate::Set { class, message } => {
+                (2, Some(class.as_str()), Some(message.as_str()))
+            }
+        };
+    Ok(tx
+        .execute(
+            "UPDATE bridge_runtime SET
+                cursor = COALESCE(?3, cursor),
+                status = COALESCE(?4, status),
+                last_poll_ts = CASE
+                    WHEN ?5 IS NULL OR ?5 <= last_poll_ts THEN last_poll_ts ELSE ?5 END,
+                last_success_ts = CASE
+                    WHEN ?6 IS NULL OR ?6 <= last_success_ts THEN last_success_ts ELSE ?6 END,
+                last_delivery_ts = CASE
+                    WHEN ?7 IS NULL OR ?7 <= last_delivery_ts THEN last_delivery_ts ELSE ?7 END,
+                last_error_class = CASE ?8
+                    WHEN 1 THEN '' WHEN 2 THEN ?9 ELSE last_error_class END,
+                last_error = CASE ?8
+                    WHEN 1 THEN '' WHEN 2 THEN ?10 ELSE last_error END,
+                heartbeat_ts = ?11
+             WHERE platform = ?1 AND owner_id = ?2",
+            params(vec![
+                platform.as_str().into(),
+                owner_id.into(),
+                update.cursor.as_deref().into(),
+                update.status.map(BridgeRuntimeStatus::as_str).into(),
+                update.last_poll_ts.into(),
+                update.last_success_ts.into(),
+                update.last_delivery_ts.into(),
+                error_mode.into(),
+                error_class.into(),
+                error_message.into(),
+                now().into(),
+            ]),
+        )
+        .await?)
 }
 
 /// Convert an `outbox` row into our owned `Intent`. Column order matches the
@@ -441,6 +564,176 @@ fn row_to_ask(r: &libsql::Row) -> Result<Ask> {
         // last so positional index 14 is always present.
         parent_id: r.get::<Option<String>>(14)?,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_import_ask_relations_libsql(
+    tx: &libsql::Transaction,
+    existing_id: Option<&str>,
+    question_msg_id: i64,
+    answer_msg_id: Option<i64>,
+    asker: &str,
+    askee: &str,
+    subject: Option<&str>,
+    kind: AskKind,
+    options: Option<&str>,
+    reply_to: Option<&str>,
+    opened_ts: i64,
+    parent_id: Option<&str>,
+) -> Result<()> {
+    let mut rows = tx
+        .query(
+            "SELECT COUNT(*) FROM asks
+              WHERE id != COALESCE(?3, '')
+                AND (question_msg_id = ?1 OR answer_msg_id = ?1
+                     OR (?2 IS NOT NULL AND (question_msg_id = ?2 OR answer_msg_id = ?2)))",
+            params(vec![
+                question_msg_id.into(),
+                answer_msg_id.into(),
+                existing_id.map(str::to_string).into(),
+            ]),
+        )
+        .await?;
+    let alias_count = rows.next().await?.map_or(Ok(0), |row| row.get::<i64>(0))?;
+    drop(rows);
+    if alias_count != 0 {
+        anyhow::bail!("imported ask message is already claimed by another ask");
+    }
+
+    let mut rows = tx
+        .query(
+            "SELECT sender, recipient, subject, body, in_reply_to
+               FROM messages WHERE id = ?1",
+            params(vec![question_msg_id.into()]),
+        )
+        .await?;
+    let row = rows.next().await?.ok_or_else(|| {
+        anyhow::anyhow!("imported ask question message #{question_msg_id} is missing")
+    })?;
+    let question_sender = row.get::<String>(0)?;
+    let question_recipient = row.get::<String>(1)?;
+    let question_subject = row.get::<Option<String>>(2)?;
+    let question_body = row.get::<String>(3)?;
+    let question_parent = row.get::<Option<i64>>(4)?;
+    drop(rows);
+    if question_sender != asker || question_recipient != askee {
+        anyhow::bail!("imported ask question route does not match asker/askee");
+    }
+    if question_subject.as_deref() != subject {
+        anyhow::bail!("imported ask subject does not match its question message");
+    }
+    if let Some(parent_ask_id) = reply_to {
+        let mut rows = tx
+            .query(
+                "SELECT asker, askee, state, question_msg_id, answer_msg_id, updated_ts, closed_ts
+                   FROM asks WHERE id = ?1",
+                params(vec![parent_ask_id.into()]),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("imported ask reply_to '{parent_ask_id}' is missing"))?;
+        let parent_asker = row.get::<String>(0)?;
+        let parent_askee = row.get::<String>(1)?;
+        let parent_state = row.get::<String>(2)?;
+        let parent_question = row.get::<i64>(3)?;
+        let parent_answer = row.get::<Option<i64>>(4)?;
+        let parent_updated = row.get::<i64>(5)?;
+        let parent_closed = row.get::<Option<i64>>(6)?;
+        drop(rows);
+        let same_pair = (parent_asker == asker && parent_askee == askee)
+            || (parent_asker == askee && parent_askee == asker);
+        if !same_pair || parent_state != AskState::Acked.as_str() {
+            anyhow::bail!("imported chained ask has an incoherent parent");
+        }
+        if question_parent != Some(parent_answer.unwrap_or(parent_question)) {
+            anyhow::bail!("imported chained ask question does not link to its parent thread");
+        }
+        if parent_updated > opened_ts || parent_closed.is_none_or(|closed| closed > opened_ts) {
+            anyhow::bail!("imported chained ask timestamps precede its parent closure");
+        }
+    } else if question_parent.is_some() {
+        anyhow::bail!("imported root ask question cannot carry in_reply_to");
+    }
+
+    if let Some(answer_id) = answer_msg_id {
+        let mut rows = tx
+            .query(
+                "SELECT sender, recipient, subject, in_reply_to
+                   FROM messages WHERE id = ?1",
+                params(vec![answer_id.into()]),
+            )
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| {
+            anyhow::anyhow!("imported ask answer message #{answer_id} is missing")
+        })?;
+        let answer_sender = row.get::<String>(0)?;
+        let answer_recipient = row.get::<String>(1)?;
+        let answer_subject = row.get::<Option<String>>(2)?;
+        let answer_parent = row.get::<Option<i64>>(3)?;
+        drop(rows);
+        if answer_sender != askee
+            || answer_recipient != asker
+            || answer_parent != Some(question_msg_id)
+            || answer_subject != reply_subject(subject)
+        {
+            anyhow::bail!("imported ask answer is incoherent with its question");
+        }
+    }
+
+    if let Some(group_id) = parent_id {
+        let mut rows = tx
+            .query(
+                "SELECT asker, subject, body, opened_ts, target_count
+                   FROM ask_groups WHERE parent_id = ?1",
+                params(vec![group_id.into()]),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("imported ask group '{group_id}' is missing"))?;
+        let group_asker = row.get::<String>(0)?;
+        let group_subject = row.get::<Option<String>>(1)?;
+        let group_body = row.get::<String>(2)?;
+        let group_opened = row.get::<i64>(3)?;
+        let group_target_count = row.get::<i64>(4)?;
+        drop(rows);
+        if group_asker != asker
+            || group_subject.as_deref() != subject
+            || group_body != question_body
+            || group_opened != opened_ts
+            || kind != AskKind::FreeText
+            || options.is_some()
+            || reply_to.is_some()
+            || question_parent.is_some()
+        {
+            anyhow::bail!("imported ask is incoherent with its ask group");
+        }
+        let mut rows = tx
+            .query(
+                "SELECT COUNT(*), SUM(CASE WHEN askee = ?2 THEN 1 ELSE 0 END)
+                   FROM asks WHERE parent_id = ?1 AND id != COALESCE(?3, '')",
+                params(vec![
+                    group_id.into(),
+                    askee.into(),
+                    existing_id.map(str::to_string).into(),
+                ]),
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("failed to count imported ask group children"))?;
+        let child_count = row.get::<i64>(0)?;
+        let same_askee = row.get::<Option<i64>>(1)?.unwrap_or(0);
+        drop(rows);
+        if same_askee != 0 || child_count >= group_target_count {
+            anyhow::bail!("imported ask group child set exceeds its target closure");
+        }
+    }
+    Ok(())
 }
 
 /// The canonical `jobs` column projection (positional), shared by every job SELECT
@@ -911,6 +1204,32 @@ impl LibsqlStore {
                     .await
                     .context("adding asks.options column")?;
             }
+            let mut request_subject_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') WHERE name='request_subject'",
+                    (),
+                )
+                .await?;
+            if request_subject_it.next().await?.is_none() {
+                conn.execute("ALTER TABLE asks ADD COLUMN request_subject TEXT", ())
+                    .await
+                    .context("adding asks.request_subject column")?;
+            }
+            let mut request_subject_provided_it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('asks') \
+                     WHERE name='request_subject_provided'",
+                    (),
+                )
+                .await?;
+            if request_subject_provided_it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE asks ADD COLUMN request_subject_provided INTEGER",
+                    (),
+                )
+                .await
+                .context("adding asks.request_subject_provided column")?;
+            }
             // Migration (P2): the ask-many PARENT anchor table. Created via SCHEMA above
             // for a fresh DB; also created idempotently here for a DB that predates
             // ask-many (mirrors SqliteStore::migrate). Inert plain data in every build;
@@ -1003,12 +1322,61 @@ impl LibsqlStore {
             .context("creating delivery_log table")?;
             for idx in [
                 "CREATE INDEX IF NOT EXISTS idx_delivery_log_ref ON delivery_log(ref_id, ref_kind)",
+                "CREATE INDEX IF NOT EXISTS idx_delivery_log_exact ON delivery_log(ref_id, ref_kind, to_peer, stage, outcome)",
                 "CREATE INDEX IF NOT EXISTS idx_delivery_log_ts ON delivery_log(ts)",
             ] {
                 conn.execute(idx, ())
                     .await
                     .context("creating delivery_log index")?;
             }
+            // Migration-safe, token-free bridge ownership/cursor state. The
+            // platform primary key is the exact singleton boundary; no provider
+            // credential is stored in this table.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bridge_runtime (
+                    platform         TEXT PRIMARY KEY,
+                    identity         TEXT NOT NULL,
+                    recipient        TEXT NOT NULL,
+                    cursor           TEXT NOT NULL DEFAULT '',
+                    owner_id         TEXT NOT NULL DEFAULT '',
+                    owner_pid        INTEGER,
+                    owner_host       TEXT NOT NULL DEFAULT '',
+                    heartbeat_ts     INTEGER NOT NULL DEFAULT 0,
+                    status           TEXT NOT NULL DEFAULT 'stopped',
+                    last_poll_ts     INTEGER NOT NULL DEFAULT 0,
+                    last_success_ts  INTEGER NOT NULL DEFAULT 0,
+                    last_delivery_ts INTEGER NOT NULL DEFAULT 0,
+                    last_error_class TEXT NOT NULL DEFAULT '',
+                    last_error       TEXT NOT NULL DEFAULT ''
+                )",
+                (),
+            )
+            .await
+            .context("creating bridge_runtime table")?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bridge_staged_events (
+                    platform          TEXT NOT NULL,
+                    external_identity TEXT NOT NULL,
+                    external_scope    TEXT NOT NULL,
+                    position          TEXT NOT NULL,
+                    order_key         TEXT NOT NULL,
+                    sender            TEXT,
+                    text              TEXT,
+                    PRIMARY KEY (platform, external_identity, external_scope, position)
+                )",
+                (),
+            )
+            .await
+            .context("creating bridge_staged_events table")?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bridge_staged_route_order
+                    ON bridge_staged_events(
+                        platform, external_identity, external_scope, order_key, position
+                    )",
+                (),
+            )
+            .await
+            .context("creating bridge_staged_events index")?;
             // Migration (v0.2): presence table for daemon heartbeats. Created via
             // SCHEMA above for a fresh DB; also created idempotently here for a DB
             // that predates it. Constant DDL — no user data interpolated.
@@ -1102,6 +1470,88 @@ impl LibsqlStore {
             )
             .await
             .context("creating idempotency_key unique index")?;
+            // This backfill deliberately runs after the WL-026 column migration
+            // above. Genuine pre-WL-026 stores already have `messages` but not
+            // `messages.idempotency_key`; referencing it while migrating `asks`
+            // would make those stores fail to open before the additive column step.
+            conn.execute(
+                "UPDATE asks
+                    SET request_subject = subject,
+                        request_subject_provided = 1
+                  WHERE request_subject_provided IS NULL
+                    AND question_msg_id IN (
+                        SELECT id FROM messages WHERE idempotency_key IS NOT NULL
+                    )",
+                (),
+            )
+            .await
+            .context("backfilling keyed ask request subjects")?;
+            // V2 signatures bind idempotency_key. Fail closed before the legacy
+            // collision cleanup can null a signed row's key and make its wire
+            // semantics unverifiable.
+            let mut signed_collisions = conn
+                .query(
+                    "SELECT o.id
+                       FROM outbox o
+                      WHERE substr(o.sig, 1, 3) = 'v2:'
+                        AND (
+                            o.idempotency_key IS NULL
+                            OR (
+                                EXISTS (
+                                    SELECT 1 FROM messages m
+                                     WHERE m.idempotency_key = o.idempotency_key
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM outbox earlier
+                                     WHERE earlier.idempotency_key = o.idempotency_key
+                                       AND earlier.id < o.id
+                                )
+                            )
+                        )
+                      ORDER BY o.id ASC LIMIT 1",
+                    (),
+                )
+                .await
+                .context("checking signed v2 idempotency collisions")?;
+            if let Some(row) = signed_collisions.next().await? {
+                let id = row.get::<i64>(0)?;
+                anyhow::bail!(
+                    "refusing idempotency migration: signed v2 outbox row #{id} has a missing or \
+                     colliding key; its signature binds that key, so back up and repair the row offline \
+                     without editing the key independently of its signature"
+                );
+            }
+            drop(signed_collisions);
+            conn.execute(
+                "UPDATE outbox SET idempotency_key = NULL
+                 WHERE idempotency_key IS NOT NULL
+                   AND idempotency_key IN (
+                       SELECT idempotency_key FROM messages
+                       WHERE idempotency_key IS NOT NULL
+                   )",
+                (),
+            )
+            .await
+            .context("normalizing cross-route idempotency key collisions")?;
+            conn.execute(
+                "UPDATE outbox SET idempotency_key = NULL
+                 WHERE idempotency_key IS NOT NULL
+                   AND id NOT IN (
+                       SELECT MIN(id) FROM outbox
+                       WHERE idempotency_key IS NOT NULL
+                       GROUP BY idempotency_key
+                   )",
+                (),
+            )
+            .await
+            .context("normalizing legacy duplicate outbox idempotency keys")?;
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_idempotency_key
+                 ON outbox(idempotency_key)",
+                (),
+            )
+            .await
+            .context("creating outbox idempotency_key unique index")?;
             // WL-028: FTS5 full-text search on messages.
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -1144,12 +1594,63 @@ impl LibsqlStore {
                 // WL-039: idle-notification marker. Nullable (NULL == ordinary
                 // message), no DEFAULT; set to 'idle' only on the notify dedup path.
                 ("messages", "kind", "ALTER TABLE messages ADD COLUMN kind TEXT"),
+                ("messages", "request_supersedes", "ALTER TABLE messages ADD COLUMN request_supersedes INTEGER"),
+                ("messages", "request_priority", "ALTER TABLE messages ADD COLUMN request_priority TEXT"),
+                ("messages", "request_ttl", "ALTER TABLE messages ADD COLUMN request_ttl INTEGER"),
+                ("messages", "request_dedup_idle", "ALTER TABLE messages ADD COLUMN request_dedup_idle INTEGER"),
             ] {
                 let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'");
                 let mut it = conn.query(&probe, ()).await?;
                 if it.next().await?.is_none() {
                     conn.execute(ddl, ()).await.with_context(|| format!("adding {table}.{col} column"))?;
                 }
+            }
+            for (sql, context) in [
+                (
+                    "UPDATE messages AS old
+                        SET superseded_by = NULL
+                      WHERE superseded_by IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM messages AS new
+                             WHERE new.id = old.superseded_by
+                               AND new.id > old.id
+                               AND new.sender = old.sender
+                               AND new.recipient = old.recipient
+                        )",
+                    "normalizing legacy successor routes",
+                ),
+                (
+                    "UPDATE messages SET request_priority = priority
+                     WHERE idempotency_key IS NOT NULL AND request_priority IS NULL",
+                    "backfilling configured-send priority metadata",
+                ),
+                (
+                    "UPDATE messages SET request_ttl = CASE
+                         WHEN expires_at IS NULL THEN 0
+                         ELSE MAX(expires_at - ts, 0)
+                     END
+                     WHERE idempotency_key IS NOT NULL AND request_ttl IS NULL",
+                    "backfilling configured-send ttl metadata",
+                ),
+                (
+                    "UPDATE messages SET request_supersedes = CASE
+                         WHEN kind = 'idle' THEN 0
+                         ELSE COALESCE((
+                             SELECT MIN(old.id) FROM messages old
+                             WHERE old.superseded_by = messages.id
+                         ), 0)
+                     END
+                     WHERE idempotency_key IS NOT NULL AND request_supersedes IS NULL",
+                    "backfilling configured-send predecessor metadata",
+                ),
+                (
+                    "UPDATE messages
+                     SET request_dedup_idle = CASE WHEN kind = 'idle' THEN 1 ELSE 0 END
+                     WHERE idempotency_key IS NOT NULL AND request_dedup_idle IS NULL",
+                    "backfilling configured-send idle metadata",
+                ),
+            ] {
+                conn.execute(sql, ()).await.context(context)?;
             }
             // WL-032: per-peer contact policies.
             let probe = "SELECT 1 FROM pragma_table_info('peers') WHERE name='contact_policy'";
@@ -1556,7 +2057,12 @@ pub fn pull_from_store(
                 continue;
             }
         };
-        let since = local.pull_cursor_get(&source)?;
+        let cursor_key =
+            crate::store::pull_cursor_scope_key(&source, me, &crate::config::this_host());
+        let scoped_cursor = local.pull_cursor_get(&cursor_key)?;
+        let legacy = local.pull_cursor_get(&source)?;
+        let legacy_keyless_cutoff = (legacy > scoped_cursor).then_some(legacy);
+        let since = scoped_cursor;
         let intents = match foreign.list_outbox(me, since, MAX_PULL_PER_DRAIN) {
             Ok(v) => v,
             Err(e) => {
@@ -1565,9 +2071,24 @@ pub fn pull_from_store(
                 continue;
             }
         };
-        let n = commit_pulled(local, me, &source, policy, intents)?;
-        out.committed += n;
-        if n > 0 {
+        let outcome = crate::store::commit_pulled_outcome(
+            local,
+            me,
+            &source,
+            policy,
+            intents,
+            legacy_keyless_cutoff,
+        )?;
+        out.committed += outcome.committed;
+        if outcome.legacy_keyless_skipped > 0 {
+            eprintln!(
+                "[weave] pull route '{me}' skipped {} ambiguous legacy keyless intent(s) \
+                 from '{label}' while preserving at-most-once delivery; keyed legacy rows \
+                 were reconciled automatically",
+                outcome.legacy_keyless_skipped
+            );
+        }
+        if outcome.committed > 0 {
             out.committed_sources.push(src.clone());
         }
     }
@@ -1596,7 +2117,7 @@ impl Store for LibsqlStore {
         "libsql"
     }
 
-    fn send(
+    fn send_configured_idempotent_mode(
         &self,
         sender: &str,
         recipient: &str,
@@ -1604,10 +2125,18 @@ impl Store for LibsqlStore {
         body: &str,
         idempotency_key: Option<&str>,
         trace_id: Option<&str>,
-    ) -> Result<i64> {
+        priority: Option<&str>,
+        effective_priority: Option<&str>,
+        supersedes: Option<i64>,
+        ttl: i64,
+        dedup_idle: bool,
+        record_request_tuple: bool,
+        apply_dedup_effects: bool,
+    ) -> Result<(i64, bool)> {
         self.guard_writable()?;
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
+        crate::store::check_subject(subject)?;
         check_body(body)?;
         if let Some(key) = idempotency_key {
             if !crate::model::idempotency_key_valid(key) {
@@ -1619,35 +2148,240 @@ impl Store for LibsqlStore {
                 anyhow::bail!("trace_id is invalid or too long.");
             }
         }
+        if ttl != 0 && !crate::model::ttl_valid(ttl) {
+            anyhow::bail!(
+                "ttl must be 0 or between 1 and {} seconds.",
+                crate::model::MAX_MSG_TTL_SECS
+            );
+        }
+        if supersedes.is_some_and(|id| id <= 0) {
+            anyhow::bail!("supersedes must be a positive message id.");
+        }
+        if dedup_idle && supersedes.is_some() {
+            anyhow::bail!("dedup_idle and supersedes cannot be combined.");
+        }
+        if !record_request_tuple
+            && (priority.is_some()
+                || effective_priority.is_none()
+                || supersedes.is_some()
+                || ttl != 0
+                || dedup_idle)
+        {
+            anyhow::bail!("plain session restore carries only effective priority.");
+        }
+        let request_priority = crate::model::MessagePriority::parse(priority.unwrap_or("normal"));
+        let request_priority = request_priority.as_str().to_string();
+        let effective_priority = crate::model::MessagePriority::parse(
+            effective_priority.unwrap_or(request_priority.as_str()),
+        );
+        let effective_priority = effective_priority.as_str().to_string();
         self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             if let Some(key) = idempotency_key {
-                let mut it = self
-                    .conn
+                let mut outbox = tx
                     .query(
-                        "SELECT id FROM messages WHERE idempotency_key = ?1",
+                        "SELECT id FROM outbox WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if outbox.next().await?.is_some() {
+                    anyhow::bail!(
+                        "idempotency key is already associated with a cross-store intent."
+                    );
+                }
+                drop(outbox);
+                let mut it = tx
+                    .query(
+                        "SELECT m.id, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
+                                EXISTS(SELECT 1 FROM asks a
+                                       WHERE a.question_msg_id = m.id OR a.answer_msg_id = m.id),
+                                m.priority, m.request_priority, m.request_ttl,
+                                m.request_supersedes, m.request_dedup_idle, m.kind
+                         FROM messages m WHERE m.idempotency_key = ?1",
                         params(vec![key.into()]),
                     )
                     .await?;
                 if let Some(r) = it.next().await? {
-                    return Ok(r.get::<i64>(0)?);
+                    let id = r.get::<i64>(0)?;
+                    let request_matches = if record_request_tuple {
+                        r.get::<Option<String>>(8)?.as_deref() == Some(request_priority.as_str())
+                            && r.get::<Option<i64>>(9)? == Some(ttl)
+                            && r.get::<Option<i64>>(10)? == Some(supersedes.unwrap_or(0))
+                            && r.get::<Option<i64>>(11)? == Some(i64::from(dedup_idle))
+                    } else {
+                        r.get::<Option<String>>(8)?.as_deref() == Some(effective_priority.as_str())
+                            && r.get::<Option<i64>>(9)? == Some(0)
+                            && r.get::<Option<i64>>(10)? == Some(0)
+                            && r.get::<Option<i64>>(11)? == Some(0)
+                    };
+                    let expected_kind = if record_request_tuple {
+                        dedup_idle.then_some(crate::model::KIND_IDLE)
+                    } else {
+                        Some(crate::model::KIND_SESSION_PLAIN)
+                    };
+                    let same = r.get::<String>(1)? == sender
+                        && r.get::<String>(2)? == recipient
+                        && r.get::<Option<String>>(3)?.as_deref() == subject
+                        && r.get::<String>(4)? == body
+                        && r.get::<Option<i64>>(5)?.is_none()
+                        && r.get::<i64>(6)? == 0
+                        && r.get::<String>(7)? == effective_priority
+                        && r.get::<Option<String>>(12)?.as_deref() == expected_kind
+                        && request_matches;
+                    drop(it);
+                    if same {
+                        return Ok((id, false));
+                    }
+                    anyhow::bail!(
+                        "idempotency key is already associated with a different message."
+                    );
+                }
+                drop(it);
+            }
+            if let Some(old_id) = supersedes {
+                let mut rows = tx
+                    .query(
+                        "SELECT sender, recipient FROM messages WHERE id = ?1",
+                        params(vec![old_id.into()]),
+                    )
+                    .await?;
+                let old_sender = match rows.next().await? {
+                    Some(row) => {
+                        let old_sender = row.get::<String>(0)?;
+                        let old_recipient = row.get::<String>(1)?;
+                        if old_recipient != recipient {
+                            anyhow::bail!(
+                                "cannot supersede: #{old_id} was addressed to a different recipient"
+                            );
+                        }
+                        old_sender
+                    }
+                    None => anyhow::bail!("cannot supersede: message #{old_id} does not exist"),
+                };
+                drop(rows);
+                if old_sender != sender {
+                    anyhow::bail!(
+                        "cannot supersede: #{old_id} was sent by '{old_sender}', not '{sender}'"
+                    );
                 }
             }
-            self.conn
-                .execute(
-                    "INSERT INTO messages (ts, sender, recipient, subject, body, idempotency_key, trace_id) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            let ts = now();
+            let expires_at = (ttl > 0).then(|| crate::model::expiry_from_ttl(ts, ttl));
+            let (
+                kind,
+                stored_request_priority,
+                stored_request_ttl,
+                stored_request_supersedes,
+                stored_request_dedup_idle,
+            ) = if record_request_tuple {
+                (
+                    dedup_idle.then_some(crate::model::KIND_IDLE.to_string()),
+                    Some(request_priority.clone()),
+                    Some(ttl),
+                    Some(supersedes.unwrap_or(0)),
+                    Some(i64::from(dedup_idle)),
+                )
+            } else {
+                (
+                    Some(crate::model::KIND_SESSION_PLAIN.to_string()),
+                    Some(effective_priority.clone()),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                )
+            };
+            tx.execute(
+                "INSERT INTO messages
+                        (ts, sender, recipient, subject, body, idempotency_key, trace_id,
+                         priority, expires_at, request_priority, request_ttl,
+                         request_supersedes, request_dedup_idle, kind) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params(vec![
+                    ts.into(),
+                    sender.into(),
+                    recipient.into(),
+                    subject.map(|s| s.to_string()).into(),
+                    body.into(),
+                    idempotency_key.map(|s| s.to_string()).into(),
+                    trace_id.map(|s| s.to_string()).into(),
+                    effective_priority.into(),
+                    expires_at.into(),
+                    stored_request_priority.into(),
+                    stored_request_ttl.into(),
+                    stored_request_supersedes.into(),
+                    stored_request_dedup_idle.into(),
+                    kind.into(),
+                ]),
+            )
+            .await?;
+            let id = self.conn.last_insert_rowid();
+            if let Some(old_id) = supersedes {
+                tx.execute(
+                    "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+                    params(vec![old_id.into(), id.into()]),
+                )
+                .await?;
+            }
+            if dedup_idle && apply_dedup_effects {
+                tx.execute(
+                    "UPDATE messages SET superseded_by = ?1
+                     WHERE sender = ?2 AND recipient = ?3
+                       AND kind = ?4
+                       AND superseded_by IS NULL
+                       AND id <> ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reads r
+                           WHERE r.message_id = messages.id AND r.reader = ?3
+                       )",
                     params(vec![
-                        now().into(),
+                        id.into(),
                         sender.into(),
                         recipient.into(),
-                        subject.map(|s| s.to_string()).into(),
-                        body.into(),
-                        idempotency_key.map(|s| s.to_string()).into(),
-                        trace_id.map(|s| s.to_string()).into(),
+                        crate::model::KIND_IDLE.into(),
                     ]),
                 )
                 .await?;
-            Ok(self.conn.last_insert_rowid())
+            }
+            tx.commit().await?;
+            Ok((id, true))
+        })
+    }
+
+    fn message_by_idempotency_key(&self, key: &str) -> Result<Option<Message>> {
+        if !crate::model::idempotency_key_valid(key) {
+            anyhow::bail!("idempotency_key is invalid or too long.");
+        }
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to,
+                            idempotency_key, trace_id, priority, superseded_by, expires_at, kind,
+                            request_priority, request_ttl, request_supersedes, request_dedup_idle
+                     FROM messages WHERE idempotency_key = ?1",
+                    params(vec![key.into()]),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(row_to_message(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn message_exists(&self, id: i64) -> Result<bool> {
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM messages WHERE id = ?1",
+                    params(vec![id.into()]),
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
         })
     }
 
@@ -1674,7 +2408,7 @@ impl Store for LibsqlStore {
             // expired-but-not-yet-swept rows (the SqliteStore mirror).
             let sql = if include_read {
                 format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind, request_priority, request_ttl, request_supersedes, request_dedup_idle FROM messages
                      WHERE (recipient = ?1 OR recipient IN {bc}) AND sender != ?1
                        AND superseded_by IS NULL
                        AND (expires_at IS NULL OR expires_at > ?3)
@@ -1728,6 +2462,75 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn unread_count(&self, me: &str) -> Result<i64> {
+        check_ident("reader", me)?;
+        self.rt.block_on(self.unread_count_async(me))
+    }
+
+    fn mark_message_read(&self, me: &str, message_id: i64) -> Result<bool> {
+        self.guard_writable()?;
+        check_ident("reader", me)?;
+        if message_id <= 0 {
+            return Ok(false);
+        }
+        let cutoff = now();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let eligible_sql = format!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages
+                    WHERE id = ?2
+                      AND (recipient = ?1 OR recipient IN {bc})
+                      AND sender != ?1
+                      AND superseded_by IS NULL
+                      AND (expires_at IS NULL OR expires_at > ?3)
+                )",
+                bc = BROADCAST_SQL
+            );
+            let eligible = {
+                let mut rows = tx
+                    .query(
+                        &eligible_sql,
+                        params(vec![me.into(), message_id.into(), cutoff.into()]),
+                    )
+                    .await?;
+                let eligible = rows
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                drop(rows);
+                eligible
+            };
+            if !eligible {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            let insert_sql = format!(
+                "INSERT OR IGNORE INTO reads (message_id, reader, ts)
+                 SELECT id, ?1, ?3 FROM messages
+                 WHERE id = ?2
+                   AND (recipient = ?1 OR recipient IN {bc})
+                   AND sender != ?1
+                   AND superseded_by IS NULL
+                   AND (expires_at IS NULL OR expires_at > ?3)",
+                bc = BROADCAST_SQL
+            );
+            tx.execute(
+                &insert_sql,
+                params(vec![me.into(), message_id.into(), cutoff.into()]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
     fn history(&self, me: &str, peer: Option<&str>, limit: i64) -> Result<Vec<Message>> {
         // WL-038: opportunistic sweep so history never surfaces an expired row.
         let _ = self.sweep_expired_messages();
@@ -1737,7 +2540,7 @@ impl Store for LibsqlStore {
             let mut rows: Vec<Message> = Vec::new();
             if let Some(p) = peer {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind, request_priority, request_ttl, request_supersedes, request_dedup_idle FROM messages
                      WHERE ((sender = ?1 AND (recipient = ?2 OR recipient IN {bc}))
                         OR (sender = ?2 AND (recipient = ?1 OR recipient IN {bc})))
                        AND (expires_at IS NULL OR expires_at > ?4)
@@ -1756,7 +2559,7 @@ impl Store for LibsqlStore {
                 }
             } else {
                 let sql = format!(
-                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+                    "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind, request_priority, request_ttl, request_supersedes, request_dedup_idle FROM messages
                      WHERE (sender = ?1 OR recipient = ?1 OR recipient IN {bc})
                        AND (expires_at IS NULL OR expires_at > ?3)
                      ORDER BY id DESC LIMIT ?2",
@@ -1781,7 +2584,7 @@ impl Store for LibsqlStore {
         let limit = clamp_limit(limit);
         let now_cut = now();
         self.rt.block_on(async {
-            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages
+            let sql = "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind, request_priority, request_ttl, request_supersedes, request_dedup_idle FROM messages
                  WHERE (expires_at IS NULL OR expires_at > ?2)
                  ORDER BY id DESC LIMIT ?1";
             let mut it = self
@@ -1985,6 +2788,8 @@ impl Store for LibsqlStore {
                 }
             };
             tx.execute("DELETE FROM summaries", ()).await?;
+            tx.execute("DELETE FROM asks", ()).await?;
+            tx.execute("DELETE FROM ask_groups", ()).await?;
             tx.execute("DELETE FROM messages", ()).await?;
             tx.execute("DELETE FROM reads", ()).await?;
             tx.execute("DELETE FROM wake_acks", ()).await?;
@@ -2040,6 +2845,59 @@ impl Store for LibsqlStore {
                     None => 0,
                 }
             };
+            // Clear only the effective public link before deleting its target;
+            // request_supersedes remains as private keyed-replay metadata.
+            let expiry_cut = now();
+            tx.execute(
+                "UPDATE asks SET reply_to = NULL
+                  WHERE reply_to IN (
+                        SELECT id FROM asks
+                         WHERE question_msg_id IN (
+                                   SELECT id FROM messages
+                                    WHERE ts < ?1 OR (expires_at IS NOT NULL AND expires_at <= ?2))
+                            OR answer_msg_id IN (
+                                   SELECT id FROM messages
+                                    WHERE ts < ?1 OR (expires_at IS NOT NULL AND expires_at <= ?2))
+                  )",
+                params(vec![cutoff.into(), expiry_cut.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM asks
+                  WHERE question_msg_id IN (
+                            SELECT id FROM messages
+                             WHERE ts < ?1 OR (expires_at IS NOT NULL AND expires_at <= ?2))
+                     OR answer_msg_id IN (
+                            SELECT id FROM messages
+                             WHERE ts < ?1 OR (expires_at IS NOT NULL AND expires_at <= ?2))",
+                params(vec![cutoff.into(), expiry_cut.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM ask_groups
+                  WHERE NOT EXISTS (SELECT 1 FROM asks WHERE asks.parent_id = ask_groups.parent_id)",
+                (),
+            )
+            .await?;
+            tx.execute(
+                "UPDATE messages SET in_reply_to = NULL
+                  WHERE in_reply_to IN (
+                        SELECT id FROM messages
+                         WHERE ts < ?1 OR (expires_at IS NOT NULL AND expires_at <= ?2)
+                  )",
+                params(vec![cutoff.into(), expiry_cut.into()]),
+            )
+            .await?;
+            tx.execute(
+                "UPDATE messages SET superseded_by = NULL
+                  WHERE superseded_by IN (
+                        SELECT id FROM messages
+                         WHERE ts < ?1
+                            OR (expires_at IS NOT NULL AND expires_at <= ?2)
+                  )",
+                params(vec![cutoff.into(), expiry_cut.into()]),
+            )
+            .await?;
             tx.execute(
                 "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
                 params(vec![cutoff.into()]),
@@ -2054,7 +2912,6 @@ impl Store for LibsqlStore {
             // WL-038: fold the ephemeral expiry into the SAME gc pass — delete expired
             // messages (and their reads) even if `ts >= cutoff` (delete-on-sweep),
             // mirroring SqliteStore::gc.
-            let expiry_cut = now();
             tx.execute(
                 "DELETE FROM reads WHERE message_id IN
                     (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
@@ -2129,19 +2986,85 @@ impl Store for LibsqlStore {
         })
     }
 
-    fn reply(&self, sender: &str, in_reply_to: i64, body: &str) -> Result<i64> {
-        // Atomic override of the trait default (which does send() +
-        // set_in_reply_to() in two round-trips): resolve the parent and INSERT a
-        // single row carrying in_reply_to, all inside ONE IMMEDIATE transaction
-        // so the parent cannot vanish mid-reply. Mirrors SqliteStore::reply.
+    #[allow(clippy::too_many_arguments)]
+    fn reply_configured_idempotent(
+        &self,
+        sender: &str,
+        in_reply_to: i64,
+        body: &str,
+        idempotency_key: Option<&str>,
+        priority: Option<&str>,
+        ttl: i64,
+        subject_override: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        // Resolve the parent, check an exact replay, and INSERT a single row
+        // carrying in_reply_to inside ONE IMMEDIATE transaction.
         self.guard_writable()?;
         check_ident("sender", sender)?;
         check_body(body)?;
+        crate::store::check_subject(subject_override)?;
+        if idempotency_key.is_some_and(|key| !crate::model::idempotency_key_valid(key)) {
+            anyhow::bail!("idempotency_key is invalid or too long.");
+        }
+        if ttl != 0 && !crate::model::ttl_valid(ttl) {
+            anyhow::bail!(
+                "ttl must be 0 or between 1 and {} seconds.",
+                crate::model::MAX_MSG_TTL_SECS
+            );
+        }
+        let priority = crate::model::MessagePriority::parse(priority.unwrap_or("normal"));
+        let priority = priority.as_str().to_string();
         self.rt.block_on(async {
             let tx = self
                 .conn
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
+
+            if let Some(key) = idempotency_key {
+                let mut outbox = tx
+                    .query(
+                        "SELECT id FROM outbox WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if outbox.next().await?.is_some() {
+                    anyhow::bail!(
+                        "idempotency key is already associated with a cross-store intent."
+                    );
+                }
+                drop(outbox);
+                let mut rows = tx
+                    .query(
+                        "SELECT m.id, m.sender, m.recipient, m.subject, m.body, m.in_reply_to,
+                                EXISTS(SELECT 1 FROM asks a
+                                       WHERE a.question_msg_id = m.id OR a.answer_msg_id = m.id),
+                                m.priority, m.request_priority, m.request_ttl
+                         FROM messages m WHERE m.idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    let id = row.get::<i64>(0)?;
+                    let old_subject = row.get::<Option<String>>(3)?;
+                    let same = row.get::<String>(1)? == sender
+                        && row.get::<String>(4)? == body
+                        && row.get::<Option<i64>>(5)? == Some(in_reply_to)
+                        && subject_override
+                            .is_none_or(|subject| old_subject.as_deref() == Some(subject))
+                        && row.get::<i64>(6)? == 0
+                        && row.get::<String>(7)? == priority
+                        && row.get::<Option<String>>(8)?.as_deref() == Some(priority.as_str())
+                        && row.get::<Option<i64>>(9)? == Some(ttl);
+                    drop(rows);
+                    if same {
+                        return Ok((id, false));
+                    }
+                    anyhow::bail!(
+                        "idempotency key is already associated with a different message."
+                    );
+                }
+                drop(rows);
+            }
 
             // Parent lookup inside the transaction so it shares the snapshot with
             // the insert below.
@@ -2164,25 +3087,39 @@ impl Store for LibsqlStore {
                 } else {
                     psender
                 };
-                (recipient, reply_subject(psubject.as_deref()))
+                (
+                    recipient,
+                    subject_override
+                        .map(str::to_string)
+                        .or_else(|| reply_subject(psubject.as_deref())),
+                )
             };
 
+            let ts = now();
+            let expires_at = (ttl > 0).then(|| crate::model::expiry_from_ttl(ts, ttl));
             tx.execute(
-                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO messages
+                    (ts, sender, recipient, subject, body, in_reply_to, idempotency_key,
+                     priority, expires_at, request_priority, request_ttl) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params(vec![
-                    now().into(),
+                    ts.into(),
                     sender.into(),
                     recipient.into(),
                     subject.into(),
                     body.into(),
                     in_reply_to.into(),
+                    idempotency_key.map(str::to_string).into(),
+                    priority.clone().into(),
+                    expires_at.into(),
+                    priority.into(),
+                    ttl.into(),
                 ]),
             )
             .await?;
             let id = self.conn.last_insert_rowid();
             tx.commit().await?;
-            Ok(id)
+            Ok((id, true))
         })
     }
 
@@ -2636,7 +3573,7 @@ impl Store for LibsqlStore {
         })
     }
 
-    fn enqueue_intent(
+    fn enqueue_intent_idempotent(
         &self,
         to: &str,
         to_host: &str,
@@ -2648,17 +3585,99 @@ impl Store for LibsqlStore {
         trace_id: Option<&str>,
         priority: Option<&str>,
         ttl: i64,
-    ) -> Result<i64> {
+    ) -> Result<(i64, bool)> {
         self.guard_writable()?;
         check_ident("recipient", to)?;
         check_ident("sender", from)?;
+        crate::store::check_subject(subject)?;
+        let to_host = to_host.trim();
         check_host(to_host)?;
         check_body(body)?;
-        let p = priority.unwrap_or("normal").to_string();
-        // WL-038: carry the *relative* ttl; `<= 0` normalizes to 0 (no TTL).
-        let ttl = ttl.max(0);
+        if idempotency_key.is_some_and(|key| !crate::model::idempotency_key_valid(key)) {
+            anyhow::bail!("idempotency_key is invalid or too long.");
+        }
+        if trace_id.is_some_and(|id| !crate::model::trace_id_valid(id)) {
+            anyhow::bail!("trace_id is invalid or too long.");
+        }
+        let p = crate::model::MessagePriority::parse(priority.unwrap_or("normal"))
+            .as_str()
+            .to_string();
+        if ttl != 0 && !crate::model::ttl_valid(ttl) {
+            anyhow::bail!(
+                "ttl must be 0 or between 1 and {} seconds.",
+                crate::model::MAX_MSG_TTL_SECS
+            );
+        }
         self.rt.block_on(async {
-            self.conn
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            if let Some(key) = idempotency_key {
+                let mut messages = tx
+                    .query(
+                        "SELECT id FROM messages WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if messages.next().await?.is_some() {
+                    anyhow::bail!(
+                        "idempotency key is already associated with a local message."
+                    );
+                }
+                drop(messages);
+                let replay = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT id, to_peer, to_host, from_peer, subject, body, sig,
+                                    priority, ttl
+                             FROM outbox WHERE idempotency_key = ?1",
+                            params(vec![key.into()]),
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => Some((
+                            row.get::<i64>(0)?,
+                            row.get::<String>(1)?,
+                            row.get::<String>(2)?,
+                            row.get::<String>(3)?,
+                            row.get::<Option<String>>(4)?,
+                            row.get::<String>(5)?,
+                            row.get::<String>(6)?,
+                            row.get::<String>(7)?,
+                            row.get::<i64>(8)?,
+                        )),
+                        None => None,
+                    }
+                };
+                if let Some((
+                    id,
+                    old_to,
+                    old_host,
+                    old_from,
+                    old_subject,
+                    old_body,
+                    _old_sig,
+                    old_priority,
+                    old_ttl,
+                )) = replay
+                {
+                    if old_to == to
+                        && old_host == to_host
+                        && old_from == from
+                        && old_subject.as_deref() == subject
+                        && old_body == body
+                        && old_priority == p
+                        && old_ttl == ttl
+                    {
+                        return Ok((id, false));
+                    }
+                    anyhow::bail!(
+                        "idempotency key is already associated with a different intent."
+                    );
+                }
+            }
+            tx
                 .execute(
                     "INSERT INTO outbox (ts, to_peer, to_host, from_peer, subject, body, sig, idempotency_key, trace_id, priority, ttl) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -2677,7 +3696,9 @@ impl Store for LibsqlStore {
                     ]),
                 )
                 .await?;
-            Ok(self.conn.last_insert_rowid())
+            let id = self.conn.last_insert_rowid();
+            tx.commit().await?;
+            Ok((id, true))
         })
     }
 
@@ -2743,7 +3764,8 @@ impl Store for LibsqlStore {
             self.conn
                 .execute(
                     "INSERT INTO pull_cursor (source, last_id) VALUES (?1, ?2) \
-                     ON CONFLICT(source) DO UPDATE SET last_id = ?2",
+                     ON CONFLICT(source) DO UPDATE \
+                     SET last_id = MAX(pull_cursor.last_id, excluded.last_id)",
                     params(vec![source.into(), last_id.into()]),
                 )
                 .await?;
@@ -2935,7 +3957,7 @@ impl Store for LibsqlStore {
         })
     }
 
-    fn ask(
+    fn ask_idempotent(
         &self,
         asker: &str,
         askee: &str,
@@ -2944,11 +3966,16 @@ impl Store for LibsqlStore {
         kind: AskKind,
         options: Option<&str>,
         reply_to: Option<&str>,
-    ) -> Result<(String, i64)> {
+        idempotency_key: Option<&str>,
+    ) -> Result<(String, i64, bool)> {
         self.guard_writable()?;
         check_ident("asker", asker)?;
         check_ident("askee", askee)?;
+        crate::store::check_subject(subject)?;
         check_body(body)?;
+        if let Some(options) = options {
+            check_body(options)?;
+        }
         if is_broadcast(askee) {
             anyhow::bail!(
                 "tracked ask is point-to-point; a broadcast askee is not supported (P1)."
@@ -2959,6 +3986,9 @@ impl Store for LibsqlStore {
                 anyhow::bail!("invalid reply_to correlation id.");
             }
         }
+        if idempotency_key.is_some_and(|key| !crate::model::idempotency_key_valid(key)) {
+            anyhow::bail!("idempotency_key is invalid or too long.");
+        }
         let ts = now();
         let subject_owned = subject.map(|s| s.to_string());
         let reply_to_owned = reply_to.map(|s| s.to_string());
@@ -2967,6 +3997,92 @@ impl Store for LibsqlStore {
                 .conn
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
+
+            if let Some(key) = idempotency_key {
+                let mut outbox = tx
+                    .query(
+                        "SELECT id FROM outbox WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if outbox.next().await?.is_some() {
+                    anyhow::bail!(
+                        "idempotency key is already associated with a cross-store intent."
+                    );
+                }
+                drop(outbox);
+                let keyed_message = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT id, sender, recipient, subject, body, in_reply_to
+                             FROM messages WHERE idempotency_key = ?1",
+                            params(vec![key.into()]),
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => Some((
+                            row.get::<i64>(0)?,
+                            row.get::<String>(1)?,
+                            row.get::<String>(2)?,
+                            row.get::<Option<String>>(3)?,
+                            row.get::<String>(4)?,
+                            row.get::<Option<i64>>(5)?,
+                        )),
+                        None => None,
+                    }
+                };
+                if let Some((qid, old_asker, old_askee, _old_subject, old_body, _old_parent)) =
+                    keyed_message
+                {
+                    let tracked = {
+                        let mut rows = tx
+                            .query(
+                                "SELECT id, kind, options, reply_to,
+                                        request_subject, request_subject_provided
+                                 FROM asks WHERE question_msg_id = ?1",
+                                params(vec![qid.into()]),
+                            )
+                            .await?;
+                        match rows.next().await? {
+                            Some(row) => Some((
+                                row.get::<String>(0)?,
+                                row.get::<String>(1)?,
+                                row.get::<Option<String>>(2)?,
+                                row.get::<Option<String>>(3)?,
+                                row.get::<Option<String>>(4)?,
+                                row.get::<Option<i64>>(5)?,
+                            )),
+                            None => None,
+                        }
+                    };
+                    if let Some((
+                        id,
+                        old_kind,
+                        old_options,
+                        old_reply_to,
+                        request_subject,
+                        request_subject_provided,
+                    )) = tracked
+                    {
+                        let subject_matches = request_subject_provided
+                            == Some(i64::from(subject.is_some()))
+                            && request_subject.as_deref() == subject;
+                        if old_asker == asker
+                            && old_askee == askee
+                            && subject_matches
+                            && old_body == body
+                            && old_kind == kind.as_str()
+                            && old_options.as_deref() == options
+                            && old_reply_to.as_deref() == reply_to
+                        {
+                            return Ok((id, qid, false));
+                        }
+                    }
+                    anyhow::bail!(
+                        "idempotency key is already associated with a different message."
+                    );
+                }
+            }
 
             // When chaining, load + close the prior thread and link the new question.
             let (in_reply_to, subject_final): (Option<i64>, Option<String>) =
@@ -3035,8 +4151,9 @@ impl Store for LibsqlStore {
                 };
 
             tx.execute(
-                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO messages
+                    (ts, sender, recipient, subject, body, in_reply_to, idempotency_key) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params(vec![
                     ts.into(),
                     asker.into(),
@@ -3044,6 +4161,7 @@ impl Store for LibsqlStore {
                     subject_final.clone().into(),
                     body.into(),
                     in_reply_to.into(),
+                    idempotency_key.map(str::to_string).into(),
                 ]),
             )
             .await?;
@@ -3053,15 +4171,19 @@ impl Store for LibsqlStore {
             // children share this insert shape with a non-NULL parent_id.
             tx.execute(
                 "INSERT INTO asks \
-                    (id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
-                     options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10, NULL, NULL)",
+                    (id, question_msg_id, answer_msg_id, asker, askee, subject, \
+                     request_subject, request_subject_provided, state, kind, options, reply_to, \
+                     close_note, opened_ts, updated_ts, closed_ts, parent_id) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
+                         NULL, ?12, ?12, NULL, NULL)",
                 params(vec![
                     id.clone().into(),
                     question_msg_id.into(),
                     asker.into(),
                     askee.into(),
                     subject_final.into(),
+                    subject_owned.clone().into(),
+                    i64::from(subject_owned.is_some()).into(),
                     AskState::Open.as_str().into(),
                     kind.as_str().into(),
                     options.into(),
@@ -3071,16 +4193,25 @@ impl Store for LibsqlStore {
             )
             .await?;
             tx.commit().await?;
-            Ok((id, question_msg_id))
+            Ok((id, question_msg_id, true))
         })
     }
 
-    fn answer(&self, responder: &str, correlation_id: &str, body: &str) -> Result<i64> {
+    fn answer_idempotent(
+        &self,
+        responder: &str,
+        correlation_id: &str,
+        body: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<(i64, bool)> {
         self.guard_writable()?;
         check_ident("responder", responder)?;
         check_body(body)?;
         if !ask_id_valid(correlation_id) {
             anyhow::bail!("invalid correlation id.");
+        }
+        if idempotency_key.is_some_and(|key| !crate::model::idempotency_key_valid(key)) {
+            anyhow::bail!("idempotency_key is invalid or too long.");
         }
         let ts = now();
         self.rt.block_on(async {
@@ -3088,10 +4219,25 @@ impl Store for LibsqlStore {
                 .conn
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
-            let (asker, askee, state, question_msg_id) = {
+            if let Some(key) = idempotency_key {
+                let mut outbox = tx
+                    .query(
+                        "SELECT id FROM outbox WHERE idempotency_key = ?1",
+                        params(vec![key.into()]),
+                    )
+                    .await?;
+                if outbox.next().await?.is_some() {
+                    anyhow::bail!(
+                        "idempotency key is already associated with a cross-store intent."
+                    );
+                }
+                drop(outbox);
+            }
+            let (asker, askee, state, question_msg_id, existing_answer_id) = {
                 let mut rows = tx
                     .query(
-                        "SELECT asker, askee, state, question_msg_id FROM asks WHERE id = ?1",
+                        "SELECT asker, askee, state, question_msg_id, answer_msg_id
+                         FROM asks WHERE id = ?1",
                         params(vec![correlation_id.into()]),
                     )
                     .await?;
@@ -3104,10 +4250,45 @@ impl Store for LibsqlStore {
                     row.get::<String>(1)?,
                     row.get::<String>(2)?,
                     row.get::<i64>(3)?,
+                    row.get::<Option<i64>>(4)?,
                 )
             };
             if responder != askee {
                 anyhow::bail!("only the askee '{askee}' can answer ask '{correlation_id}'.");
+            }
+            if let Some(key) = idempotency_key {
+                let replay = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT id, sender, recipient, body, in_reply_to
+                             FROM messages WHERE idempotency_key = ?1",
+                            params(vec![key.into()]),
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => Some((
+                            row.get::<i64>(0)?,
+                            row.get::<String>(1)?,
+                            row.get::<String>(2)?,
+                            row.get::<String>(3)?,
+                            row.get::<Option<i64>>(4)?,
+                        )),
+                        None => None,
+                    }
+                };
+                if let Some((id, old_responder, old_recipient, old_body, old_parent)) = replay {
+                    if existing_answer_id == Some(id)
+                        && old_responder == responder
+                        && old_recipient == asker
+                        && old_body == body
+                        && old_parent == Some(question_msg_id)
+                    {
+                        return Ok((id, false));
+                    }
+                    anyhow::bail!(
+                        "idempotency key is already associated with a different message."
+                    );
+                }
             }
             let state = AskState::from_str(&state).map_err(|m| anyhow::anyhow!(m))?;
             if !state.can_transition(AskState::Answered) {
@@ -3130,8 +4311,9 @@ impl Store for LibsqlStore {
             };
             let subject = reply_subject(parent_subject.as_deref());
             tx.execute(
-                "INSERT INTO messages (ts, sender, recipient, subject, body, in_reply_to) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO messages
+                    (ts, sender, recipient, subject, body, in_reply_to, idempotency_key) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params(vec![
                     ts.into(),
                     responder.into(),
@@ -3139,6 +4321,7 @@ impl Store for LibsqlStore {
                     subject.into(),
                     body.into(),
                     question_msg_id.into(),
+                    idempotency_key.map(str::to_string).into(),
                 ]),
             )
             .await?;
@@ -3154,7 +4337,7 @@ impl Store for LibsqlStore {
             )
             .await?;
             tx.commit().await?;
-            Ok(answer_msg_id)
+            Ok((answer_msg_id, true))
         })
     }
 
@@ -3292,6 +4475,31 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn list_ask_group_children(&self, parent_id: &str) -> Result<Vec<Ask>> {
+        if !ask_many_id_valid(parent_id) {
+            anyhow::bail!("invalid ask-many parent id.");
+        }
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+                       FROM asks WHERE parent_id = ?1 ORDER BY rowid ASC LIMIT ?2",
+                    params(vec![
+                        parent_id.into(),
+                        (crate::store::MAX_ASK_MANY_TARGETS as i64 + 1).into(),
+                    ]),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(row_to_ask(&row)?);
+            }
+            Ok(out)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn import_ask(
         &self,
@@ -3311,10 +4519,89 @@ impl Store for LibsqlStore {
         closed_ts: Option<i64>,
         parent_id: Option<&str>,
     ) -> Result<bool> {
+        let source_timestamps = self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT ts FROM messages WHERE id = ?1",
+                    params(vec![question_msg_id.into()]),
+                )
+                .await?;
+            let question = rows
+                .next()
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("imported ask question message #{question_msg_id} is missing")
+                })?
+                .get::<i64>(0)?;
+            drop(rows);
+            let answer = match answer_msg_id {
+                Some(answer_id) => {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT ts FROM messages WHERE id = ?1",
+                            params(vec![answer_id.into()]),
+                        )
+                        .await?;
+                    let answer = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("imported ask answer message #{answer_id} is missing")
+                        })?
+                        .get::<i64>(0)?;
+                    Some(answer)
+                }
+                None => None,
+            };
+            Ok::<_, anyhow::Error>(crate::store::ImportedAskSourceTimestamps { question, answer })
+        })?;
+        self.import_ask_with_source_timestamps(
+            id,
+            question_msg_id,
+            answer_msg_id,
+            asker,
+            askee,
+            subject,
+            state,
+            kind,
+            options,
+            reply_to,
+            close_note,
+            source_timestamps,
+            opened_ts,
+            updated_ts,
+            closed_ts,
+            parent_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_ask_with_source_timestamps(
+        &self,
+        id: &str,
+        question_msg_id: i64,
+        answer_msg_id: Option<i64>,
+        asker: &str,
+        askee: &str,
+        subject: Option<&str>,
+        state: AskState,
+        kind: AskKind,
+        options: Option<&str>,
+        reply_to: Option<&str>,
+        close_note: Option<&str>,
+        source_timestamps: crate::store::ImportedAskSourceTimestamps,
+        opened_ts: i64,
+        updated_ts: i64,
+        closed_ts: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Result<bool> {
         self.guard_writable()?;
         // Defense-in-depth re-validation at the store seam (mirrors the sqlite impl).
         check_ident("asker", asker)?;
         check_ident("askee", askee)?;
+        crate::store::check_subject(subject)?;
         if !ask_id_valid(id) {
             anyhow::bail!("invalid imported ask id.");
         }
@@ -3334,6 +4621,22 @@ impl Store for LibsqlStore {
                 anyhow::bail!("invalid imported parent_id.");
             }
         }
+        crate::store::validate_imported_ask_lifecycle(
+            question_msg_id,
+            answer_msg_id,
+            state,
+            close_note,
+            opened_ts,
+            updated_ts,
+            closed_ts,
+        )?;
+        crate::store::validate_imported_ask_source_timestamps(
+            answer_msg_id,
+            state,
+            source_timestamps,
+            opened_ts,
+            updated_ts,
+        )?;
         // Owned copies for the async move.
         let id = id.to_string();
         let asker = asker.to_string();
@@ -3352,8 +4655,9 @@ impl Store for LibsqlStore {
             // source ask id is meaningless across instances (mirrors the sqlite impl).
             let mut probe = tx
                 .query(
-                    "SELECT COUNT(*) FROM asks WHERE asker = ?1 AND askee = ?2 \
-                     AND question_msg_id = ?3",
+                    "SELECT id, question_msg_id, answer_msg_id, asker, askee, subject, state, kind, \
+                            options, reply_to, close_note, opened_ts, updated_ts, closed_ts, parent_id \
+                     FROM asks WHERE asker = ?1 AND askee = ?2 AND question_msg_id = ?3",
                     params(vec![
                         asker.clone().into(),
                         askee.clone().into(),
@@ -3361,11 +4665,45 @@ impl Store for LibsqlStore {
                     ]),
                 )
                 .await?;
-            let existing: i64 = match probe.next().await? {
-                Some(r) => r.get::<i64>(0)?,
-                None => 0,
+            let existing = match probe.next().await? {
+                Some(row) => Some(row_to_ask(&row)?),
+                None => None,
             };
-            if existing > 0 {
+            drop(probe);
+            if let Some(existing) = existing.as_ref() {
+                if existing.answer_msg_id != answer_msg_id
+                    || existing.subject.as_deref() != subject.as_deref()
+                    || existing.state != state
+                    || existing.kind != kind
+                    || existing.options.as_deref() != options.as_deref()
+                    || existing.reply_to.as_deref() != reply_to.as_deref()
+                    || existing.close_note.as_deref() != close_note.as_deref()
+                    || existing.opened_ts != opened_ts
+                    || existing.updated_ts != updated_ts
+                    || existing.closed_ts != closed_ts
+                    || existing.parent_id.as_deref() != parent_id.as_deref()
+                {
+                    anyhow::bail!(
+                        "imported ask thread belongs to different content or lifecycle state"
+                    );
+                }
+            }
+            validate_import_ask_relations_libsql(
+                &tx,
+                existing.as_ref().map(|ask| ask.id.as_str()),
+                question_msg_id,
+                answer_msg_id,
+                &asker,
+                &askee,
+                subject.as_deref(),
+                kind,
+                options.as_deref(),
+                reply_to.as_deref(),
+                opened_ts,
+                parent_id.as_deref(),
+            )
+            .await?;
+            if existing.is_some() {
                 tx.commit().await?;
                 return Ok(false);
             }
@@ -3416,9 +4754,13 @@ impl Store for LibsqlStore {
             anyhow::bail!("invalid imported ask-many parent id.");
         }
         check_ident("asker", asker)?;
+        crate::store::check_subject(subject)?;
         check_body(body)?;
-        if let Some(s) = subject {
-            check_body(s)?;
+        if !(1..=crate::store::MAX_ASK_MANY_TARGETS as i64).contains(&target_count) {
+            anyhow::bail!(
+                "imported ask-many target_count must be between 1 and {}.",
+                crate::store::MAX_ASK_MANY_TARGETS
+            );
         }
         let parent_id = parent_id.to_string();
         let asker = asker.to_string();
@@ -3431,15 +4773,33 @@ impl Store for LibsqlStore {
                 .await?;
             let mut probe = tx
                 .query(
-                    "SELECT COUNT(*) FROM ask_groups WHERE parent_id = ?1",
+                    "SELECT asker, subject, body, opened_ts, target_count
+                       FROM ask_groups WHERE parent_id = ?1",
                     params(vec![parent_id.clone().into()]),
                 )
                 .await?;
-            let existing: i64 = match probe.next().await? {
-                Some(r) => r.get::<i64>(0)?,
-                None => 0,
+            let existing = match probe.next().await? {
+                Some(r) => Some((
+                    r.get::<String>(0)?,
+                    r.get::<Option<String>>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<i64>(3)?,
+                    r.get::<i64>(4)?,
+                )),
+                None => None,
             };
-            if existing > 0 {
+            drop(probe);
+            if let Some((old_asker, old_subject, old_body, old_opened_ts, old_target_count)) =
+                existing
+            {
+                if old_asker != asker
+                    || old_subject.as_deref() != subject.as_deref()
+                    || old_body != body
+                    || old_opened_ts != opened_ts
+                    || old_target_count != target_count
+                {
+                    anyhow::bail!("imported ask-many parent id belongs to different content");
+                }
                 tx.commit().await?;
                 return Ok(false);
             }
@@ -3508,12 +4868,10 @@ impl Store for LibsqlStore {
         // insert, mirroring every other write method (the first statement).
         self.guard_writable()?;
         check_ident("asker", asker)?;
+        crate::store::check_subject(subject)?;
         check_body(body)?;
         if is_broadcast(asker) {
             anyhow::bail!("the ask-many asker must be a concrete peer, not a broadcast alias.");
-        }
-        if let Some(s) = subject {
-            check_body(s)?;
         }
         // De-dup the requested peer list (order-preserving); this is the canonical
         // post-dedup target_count.
@@ -4174,6 +5532,638 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn has_delivery(
+        &self,
+        ref_id: i64,
+        ref_kind: &str,
+        to_peer: &str,
+        stage: &str,
+        outcome: &str,
+    ) -> Result<bool> {
+        if ref_id <= 0 {
+            return Ok(false);
+        }
+        self.block_on_bounded(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM delivery_log
+                        WHERE ref_id = ?1 AND ref_kind = ?2 AND to_peer = ?3
+                          AND stage = ?4 AND outcome = ?5
+                    )",
+                    params(vec![
+                        ref_id.into(),
+                        ref_kind.into(),
+                        to_peer.into(),
+                        stage.into(),
+                        outcome.into(),
+                    ]),
+                )
+                .await?;
+            Ok(rows
+                .next()
+                .await?
+                .map(|row| row.get::<i64>(0))
+                .transpose()?
+                .unwrap_or(0)
+                != 0)
+        })
+    }
+
+    fn claim_bridge_runtime(
+        &self,
+        platform: BridgePlatform,
+        identity: &str,
+        recipient: &str,
+        owner_id: &str,
+        owner_pid: Option<i64>,
+        owner_host: &str,
+        stale_before: i64,
+    ) -> Result<Option<BridgeRuntimeState>> {
+        self.guard_writable()?;
+        validate_bridge_claim(
+            identity,
+            recipient,
+            owner_id,
+            owner_pid,
+            owner_host,
+            stale_before,
+        )?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let existing: Option<(String, i64)> = {
+                let mut rows = tx
+                    .query(
+                        "SELECT owner_id, heartbeat_ts FROM bridge_runtime WHERE platform = ?1",
+                        params(vec![platform.as_str().into()]),
+                    )
+                    .await?;
+                let existing = rows
+                    .next()
+                    .await?
+                    .map(|row| -> Result<(String, i64)> {
+                        Ok((row.get::<String>(0)?, row.get::<i64>(1)?))
+                    })
+                    .transpose()?;
+                drop(rows);
+                existing
+            };
+            let may_claim = match &existing {
+                None => true,
+                Some((current_owner, heartbeat)) => {
+                    current_owner.is_empty()
+                        || current_owner == owner_id
+                        || *heartbeat < stale_before
+                }
+            };
+            if !may_claim {
+                tx.commit().await?;
+                return Ok(None);
+            }
+            let heartbeat = now();
+            let claim_params = || {
+                params(vec![
+                    platform.as_str().into(),
+                    identity.into(),
+                    recipient.into(),
+                    owner_id.into(),
+                    owner_pid.into(),
+                    owner_host.into(),
+                    heartbeat.into(),
+                ])
+            };
+            if existing.is_none() {
+                tx.execute(
+                    "INSERT INTO bridge_runtime (
+                        platform, identity, recipient, owner_id, owner_pid, owner_host,
+                        heartbeat_ts, status
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'starting')",
+                    claim_params(),
+                )
+                .await?;
+            } else {
+                tx.execute(
+                    "UPDATE bridge_runtime SET
+                        identity = ?2, recipient = ?3, owner_id = ?4, owner_pid = ?5,
+                        owner_host = ?6, heartbeat_ts = ?7, status = 'starting',
+                        last_error_class = '', last_error = ''
+                     WHERE platform = ?1",
+                    claim_params(),
+                )
+                .await?;
+            }
+            let state = {
+                let sql =
+                    format!("SELECT {BRIDGE_RUNTIME_COLS} FROM bridge_runtime WHERE platform = ?1");
+                let mut rows = tx
+                    .query(&sql, params(vec![platform.as_str().into()]))
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("claimed bridge runtime row disappeared"))?;
+                let state = row_to_bridge_runtime(&row)?;
+                drop(rows);
+                state
+            };
+            tx.commit().await?;
+            Ok(Some(state))
+        })
+    }
+
+    fn update_bridge_runtime(
+        &self,
+        platform: BridgePlatform,
+        owner_id: &str,
+        update: &BridgeRuntimeUpdate,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        validate_bridge_update(update)?;
+        let (error_mode, error_class, error_message): (i64, Option<&str>, Option<&str>) =
+            match &update.error {
+                BridgeRuntimeErrorUpdate::Keep => (0, None, None),
+                BridgeRuntimeErrorUpdate::Clear => (1, None, None),
+                BridgeRuntimeErrorUpdate::Set { class, message } => {
+                    (2, Some(class.as_str()), Some(message.as_str()))
+                }
+            };
+        let heartbeat = now();
+        self.rt.block_on(async {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE bridge_runtime SET
+                        cursor = COALESCE(?3, cursor),
+                        status = COALESCE(?4, status),
+                        last_poll_ts = CASE
+                            WHEN ?5 IS NULL OR ?5 <= last_poll_ts THEN last_poll_ts ELSE ?5 END,
+                        last_success_ts = CASE
+                            WHEN ?6 IS NULL OR ?6 <= last_success_ts THEN last_success_ts ELSE ?6 END,
+                        last_delivery_ts = CASE
+                            WHEN ?7 IS NULL OR ?7 <= last_delivery_ts THEN last_delivery_ts ELSE ?7 END,
+                        last_error_class = CASE ?8
+                            WHEN 1 THEN '' WHEN 2 THEN ?9 ELSE last_error_class END,
+                        last_error = CASE ?8
+                            WHEN 1 THEN '' WHEN 2 THEN ?10 ELSE last_error END,
+                        heartbeat_ts = ?11
+                     WHERE platform = ?1 AND owner_id = ?2",
+                    params(vec![
+                        platform.as_str().into(),
+                        owner_id.into(),
+                        update.cursor.as_deref().into(),
+                        update.status.map(BridgeRuntimeStatus::as_str).into(),
+                        update.last_poll_ts.into(),
+                        update.last_success_ts.into(),
+                        update.last_delivery_ts.into(),
+                        error_mode.into(),
+                        error_class.into(),
+                        error_message.into(),
+                        heartbeat.into(),
+                    ]),
+                )
+                .await?;
+            Ok(changed == 1)
+        })
+    }
+
+    fn complete_bridge_inbox_snapshot(
+        &self,
+        platform: BridgePlatform,
+        owner_id: &str,
+        reader: &str,
+        message_ids: &[i64],
+        update: &BridgeRuntimeUpdate,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        validate_bridge_inbox_completion(reader, message_ids, update)?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let owns = {
+                let mut rows = tx
+                    .query(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM bridge_runtime
+                             WHERE platform = ?1 AND owner_id = ?2
+                        )",
+                        params(vec![platform.as_str().into(), owner_id.into()]),
+                    )
+                    .await?;
+                let owns = rows
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                drop(rows);
+                owns
+            };
+            if !owns {
+                tx.commit().await?;
+                return Ok(false);
+            }
+
+            let cutoff = now();
+            let eligible_sql = format!(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages
+                     WHERE id = ?2
+                       AND (recipient = ?1 OR recipient IN {bc})
+                       AND sender != ?1
+                       AND superseded_by IS NULL
+                       AND (expires_at IS NULL OR expires_at > ?3)
+                )",
+                bc = BROADCAST_SQL
+            );
+            let insert_sql = format!(
+                "INSERT OR IGNORE INTO reads (message_id, reader, ts)
+                 SELECT id, ?1, ?3 FROM messages
+                  WHERE id = ?2
+                    AND (recipient = ?1 OR recipient IN {bc})
+                    AND sender != ?1
+                    AND superseded_by IS NULL
+                    AND (expires_at IS NULL OR expires_at > ?3)",
+                bc = BROADCAST_SQL
+            );
+            for message_id in message_ids {
+                let eligible = {
+                    let mut rows = tx
+                        .query(
+                            &eligible_sql,
+                            params(vec![reader.into(), (*message_id).into(), cutoff.into()]),
+                        )
+                        .await?;
+                    let eligible = rows
+                        .next()
+                        .await?
+                        .map(|row| row.get::<i64>(0))
+                        .transpose()?
+                        .unwrap_or(0)
+                        != 0;
+                    drop(rows);
+                    eligible
+                };
+                if !eligible {
+                    anyhow::bail!(
+                        "bridge inbox snapshot row #{message_id} is no longer eligible for its reader."
+                    );
+                }
+                tx.execute(
+                    &insert_sql,
+                    params(vec![reader.into(), (*message_id).into(), cutoff.into()]),
+                )
+                .await?;
+            }
+            if update_bridge_runtime_tx_libsql(&tx, platform, owner_id, update).await? != 1 {
+                anyhow::bail!("bridge runtime ownership changed during inbox completion.");
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn prepare_bridge_staging(
+        &self,
+        platform: BridgePlatform,
+        owner_id: &str,
+        external_identity: &str,
+        external_scope: &str,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        validate_bridge_staging(external_identity, external_scope, &[])?;
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let owns = {
+                let mut rows = tx
+                    .query(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM bridge_runtime
+                             WHERE platform = ?1 AND owner_id = ?2
+                        )",
+                        params(vec![platform.as_str().into(), owner_id.into()]),
+                    )
+                    .await?;
+                let owns = rows
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                drop(rows);
+                owns
+            };
+            if !owns {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            tx.execute(
+                "DELETE FROM bridge_staged_events
+                  WHERE platform = ?1
+                    AND (external_identity != ?2 OR external_scope != ?3)",
+                params(vec![
+                    platform.as_str().into(),
+                    external_identity.into(),
+                    external_scope.into(),
+                ]),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn stage_bridge_events(
+        &self,
+        platform: BridgePlatform,
+        owner_id: &str,
+        external_identity: &str,
+        external_scope: &str,
+        events: &[BridgeStagedEvent],
+        update: &BridgeRuntimeUpdate,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        validate_bridge_staging(external_identity, external_scope, events)?;
+        validate_bridge_update(update)?;
+        if update.cursor.is_none() {
+            anyhow::bail!("staging bridge events requires a cursor update.");
+        }
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let owns = {
+                let mut rows = tx
+                    .query(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM bridge_runtime
+                             WHERE platform = ?1 AND owner_id = ?2
+                        )",
+                        params(vec![platform.as_str().into(), owner_id.into()]),
+                    )
+                    .await?;
+                let owns = rows
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                drop(rows);
+                owns
+            };
+            if !owns {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            for event in events {
+                tx.execute(
+                    "INSERT INTO bridge_staged_events (
+                        platform, external_identity, external_scope, position,
+                        order_key, sender, text
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(platform, external_identity, external_scope, position)
+                     DO NOTHING",
+                    params(vec![
+                        platform.as_str().into(),
+                        external_identity.into(),
+                        external_scope.into(),
+                        event.position.as_str().into(),
+                        event.order_key.as_str().into(),
+                        event.sender.as_deref().into(),
+                        event.text.as_deref().into(),
+                    ]),
+                )
+                .await?;
+            }
+            let (row_count, text_bytes) = {
+                let mut rows = tx
+                    .query(
+                        "SELECT COUNT(*),
+                                COALESCE(SUM(length(CAST(COALESCE(text, '') AS BLOB))), 0)
+                           FROM bridge_staged_events
+                          WHERE platform = ?1
+                            AND external_identity = ?2 AND external_scope = ?3",
+                        params(vec![
+                            platform.as_str().into(),
+                            external_identity.into(),
+                            external_scope.into(),
+                        ]),
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    anyhow::anyhow!("bridge staging bounds query returned no row")
+                })?;
+                let counts = (row.get::<i64>(0)?, row.get::<i64>(1)?);
+                drop(rows);
+                counts
+            };
+            if row_count > crate::model::MAX_BRIDGE_STAGED_EVENTS
+                || text_bytes > crate::model::MAX_BRIDGE_STAGED_TOTAL_BYTES
+            {
+                anyhow::bail!("bridge staged-event backlog exceeded its durable bound.");
+            }
+            if update_bridge_runtime_tx_libsql(&tx, platform, owner_id, update).await? != 1 {
+                anyhow::bail!("bridge runtime ownership changed during staged page commit.");
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn peek_bridge_staged_event(
+        &self,
+        platform: BridgePlatform,
+        external_identity: &str,
+        external_scope: &str,
+    ) -> Result<Option<BridgeStagedEvent>> {
+        validate_bridge_staging(external_identity, external_scope, &[])?;
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT position, order_key, sender, text
+                       FROM bridge_staged_events
+                      WHERE platform = ?1
+                        AND external_identity = ?2 AND external_scope = ?3
+                      ORDER BY order_key ASC, position ASC
+                      LIMIT 1",
+                    params(vec![
+                        platform.as_str().into(),
+                        external_identity.into(),
+                        external_scope.into(),
+                    ]),
+                )
+                .await?;
+            let event = rows
+                .next()
+                .await?
+                .map(|row| -> Result<BridgeStagedEvent> {
+                    Ok(BridgeStagedEvent {
+                        position: row.get::<String>(0)?,
+                        order_key: row.get::<String>(1)?,
+                        sender: row.get::<Option<String>>(2)?,
+                        text: row.get::<Option<String>>(3)?,
+                    })
+                })
+                .transpose()?;
+            drop(rows);
+            if let Some(event) = &event {
+                event.validate().map_err(anyhow::Error::msg)?;
+            }
+            Ok(event)
+        })
+    }
+
+    fn complete_bridge_staged_event(
+        &self,
+        platform: BridgePlatform,
+        owner_id: &str,
+        external_identity: &str,
+        external_scope: &str,
+        position: &str,
+        update: &BridgeRuntimeUpdate,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        validate_bridge_staging(
+            external_identity,
+            external_scope,
+            &[BridgeStagedEvent {
+                position: position.to_string(),
+                order_key: position.to_string(),
+                sender: None,
+                text: None,
+            }],
+        )?;
+        validate_bridge_update(update)?;
+        if update.cursor.is_none() {
+            anyhow::bail!("completing a staged bridge event requires a cursor update.");
+        }
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let owns = {
+                let mut rows = tx
+                    .query(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM bridge_runtime
+                             WHERE platform = ?1 AND owner_id = ?2
+                        )",
+                        params(vec![platform.as_str().into(), owner_id.into()]),
+                    )
+                    .await?;
+                let owns = rows
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                drop(rows);
+                owns
+            };
+            if !owns {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            let removed = tx
+                .execute(
+                    "DELETE FROM bridge_staged_events
+                      WHERE platform = ?1 AND external_identity = ?2
+                        AND external_scope = ?3 AND position = ?4",
+                    params(vec![
+                        platform.as_str().into(),
+                        external_identity.into(),
+                        external_scope.into(),
+                        position.into(),
+                    ]),
+                )
+                .await?;
+            if removed != 1 {
+                anyhow::bail!("staged bridge event disappeared before completion.");
+            }
+            if update_bridge_runtime_tx_libsql(&tx, platform, owner_id, update).await? != 1 {
+                anyhow::bail!("bridge runtime ownership changed during staged event completion.");
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn release_bridge_runtime(&self, platform: BridgePlatform, owner_id: &str) -> Result<bool> {
+        self.guard_writable()?;
+        validate_bridge_owner_id(owner_id)?;
+        let heartbeat = now();
+        self.rt.block_on(async {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE bridge_runtime SET
+                        owner_id = '', owner_pid = NULL, owner_host = '',
+                        heartbeat_ts = ?3, status = 'stopped'
+                     WHERE platform = ?1 AND owner_id = ?2",
+                    params(vec![
+                        platform.as_str().into(),
+                        owner_id.into(),
+                        heartbeat.into(),
+                    ]),
+                )
+                .await?;
+            Ok(changed == 1)
+        })
+    }
+
+    fn bridge_runtime_status(
+        &self,
+        platform: BridgePlatform,
+    ) -> Result<Option<BridgeRuntimeState>> {
+        self.rt.block_on(async {
+            let sql =
+                format!("SELECT {BRIDGE_RUNTIME_COLS} FROM bridge_runtime WHERE platform = ?1");
+            let mut rows = self
+                .conn
+                .query(&sql, params(vec![platform.as_str().into()]))
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| row_to_bridge_runtime(&row))
+                .transpose()
+        })
+    }
+
+    fn list_bridge_runtime_statuses(&self) -> Result<Vec<BridgeRuntimeState>> {
+        self.rt.block_on(async {
+            let sql = format!(
+                "SELECT {BRIDGE_RUNTIME_COLS} FROM bridge_runtime
+                 ORDER BY CASE platform WHEN 'telegram' THEN 0 WHEN 'slack' THEN 1 ELSE 2 END"
+            );
+            let mut rows = self.conn.query(&sql, ()).await?;
+            let mut states = Vec::new();
+            while let Some(row) = rows.next().await? {
+                states.push(row_to_bridge_runtime(&row)?);
+            }
+            Ok(states)
+        })
+    }
+
     fn heartbeat(&self, name: &str, host: &str, pid: Option<i64>) -> Result<()> {
         check_ident("peer name", name)?;
         let ts = crate::model::now();
@@ -4243,6 +6233,7 @@ impl Store for LibsqlStore {
         self.guard_writable()?;
         check_ident("sender", sender)?;
         check_ident("recipient", recipient)?;
+        crate::store::check_subject(subject)?;
         check_body(body)?;
         if cron_expr.len() > MAX_CRON_EXPR_LEN {
             anyhow::bail!(
@@ -4724,6 +6715,51 @@ impl Store for LibsqlStore {
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
             tx.execute(
+                "UPDATE asks SET reply_to = NULL
+                  WHERE reply_to IN (
+                        SELECT id FROM asks
+                         WHERE question_msg_id IN (
+                                   SELECT id FROM messages
+                                    WHERE expires_at IS NOT NULL AND expires_at <= ?1)
+                            OR answer_msg_id IN (
+                                   SELECT id FROM messages
+                                    WHERE expires_at IS NOT NULL AND expires_at <= ?1)
+                  )",
+                params(vec![now.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM asks
+                  WHERE question_msg_id IN (
+                            SELECT id FROM messages
+                             WHERE expires_at IS NOT NULL AND expires_at <= ?1)
+                     OR answer_msg_id IN (
+                            SELECT id FROM messages
+                             WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+                params(vec![now.into()]),
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM ask_groups
+                  WHERE NOT EXISTS (SELECT 1 FROM asks WHERE asks.parent_id = ask_groups.parent_id)",
+                (),
+            )
+            .await?;
+            tx.execute(
+                "UPDATE messages SET in_reply_to = NULL
+                  WHERE in_reply_to IN
+                        (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+                params(vec![now.into()]),
+            )
+            .await?;
+            tx.execute(
+                "UPDATE messages SET superseded_by = NULL
+                  WHERE superseded_by IN
+                        (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
+                params(vec![now.into()]),
+            )
+            .await?;
+            tx.execute(
                 "DELETE FROM reads WHERE message_id IN
                     (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
                 params(vec![now.into()]),
@@ -4745,31 +6781,40 @@ impl Store for LibsqlStore {
 
     fn supersede(&self, caller: &str, old_id: i64, new_id: i64) -> Result<()> {
         self.guard_writable()?;
+        if new_id <= old_id {
+            anyhow::bail!("cannot supersede: successor id must be newer than predecessor id");
+        }
         self.rt.block_on(async {
-            // Both ids must exist; look up the predecessor's sender for the
-            // authorization check.
-            let mut it = self
+            // Validate both routes and write the link under one writer lock so a
+            // concurrent expiry/retention sweep cannot remove the successor in
+            // the validation-to-update window.
+            let tx = self
                 .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut it = tx
                 .query(
-                    "SELECT sender FROM messages WHERE id = ?1",
+                    "SELECT sender, recipient FROM messages WHERE id = ?1",
                     params(vec![old_id.into()]),
                 )
                 .await?;
-            let old_sender = match it.next().await? {
-                Some(r) => r.get::<String>(0)?,
+            let (old_sender, old_recipient) = match it.next().await? {
+                Some(r) => (r.get::<String>(0)?, r.get::<String>(1)?),
                 None => anyhow::bail!("cannot supersede: message #{old_id} does not exist"),
             };
             drop(it);
-            let mut it = self
-                .conn
+            let mut it = tx
                 .query(
-                    "SELECT 1 FROM messages WHERE id = ?1",
+                    "SELECT sender, recipient FROM messages WHERE id = ?1",
                     params(vec![new_id.into()]),
                 )
                 .await?;
-            if it.next().await?.is_none() {
-                anyhow::bail!("cannot supersede: successor message #{new_id} does not exist");
-            }
+            let (new_sender, new_recipient) = match it.next().await? {
+                Some(r) => (r.get::<String>(0)?, r.get::<String>(1)?),
+                None => {
+                    anyhow::bail!("cannot supersede: successor message #{new_id} does not exist")
+                }
+            };
             drop(it);
             // Authorization: only the ORIGINAL SENDER of old_id may supersede it
             // (best-effort same-identity guard; censorship/DoS protection).
@@ -4778,12 +6823,15 @@ impl Store for LibsqlStore {
                     "cannot supersede: #{old_id} was sent by '{old_sender}', not '{caller}'"
                 );
             }
-            self.conn
-                .execute(
-                    "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
-                    params(vec![old_id.into(), new_id.into()]),
-                )
-                .await?;
+            if new_sender != caller || new_recipient != old_recipient {
+                anyhow::bail!("cannot supersede: successor must use the same sender and recipient");
+            }
+            tx.execute(
+                "UPDATE messages SET superseded_by = ?2 WHERE id = ?1",
+                params(vec![old_id.into(), new_id.into()]),
+            )
+            .await?;
+            tx.commit().await?;
             Ok::<_, anyhow::Error>(())
         })
     }
@@ -4791,6 +6839,28 @@ impl Store for LibsqlStore {
     fn supersede_prior_idle(&self, sender: &str, recipient: &str, new_id: i64) -> Result<usize> {
         self.guard_writable()?;
         self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut routes = tx
+                .query(
+                    "SELECT sender, recipient FROM messages WHERE id = ?1",
+                    params(vec![new_id.into()]),
+                )
+                .await?;
+            let (new_sender, new_recipient) = match routes.next().await? {
+                Some(row) => (row.get::<String>(0)?, row.get::<String>(1)?),
+                None => anyhow::bail!(
+                    "cannot supersede idle messages: successor #{new_id} does not exist"
+                ),
+            };
+            drop(routes);
+            if new_sender != sender || new_recipient != recipient {
+                anyhow::bail!(
+                    "cannot supersede idle messages: successor must use the same sender and recipient"
+                );
+            }
             // Stamp the new ping as idle (scoped to `sender` = self-only authz),
             // then auto-supersede the sender's prior UNREAD idle pings to this
             // recipient. The predicate is the SqliteStore mirror — kind='idle'
@@ -4798,18 +6868,16 @@ impl Store for LibsqlStore {
             // makes an idempotency replay a no-op, superseded_by IS NULL skips
             // chained rows, and the NOT EXISTS clause is the SAME unread
             // definition used by the unread count.
-            self.conn
-                .execute(
-                    "UPDATE messages SET kind = ?3 WHERE id = ?1 AND sender = ?2",
-                    params(vec![
-                        new_id.into(),
-                        sender.into(),
-                        crate::model::KIND_IDLE.into(),
-                    ]),
-                )
-                .await?;
-            let n = self
-                .conn
+            tx.execute(
+                "UPDATE messages SET kind = ?3 WHERE id = ?1 AND sender = ?2",
+                params(vec![
+                    new_id.into(),
+                    sender.into(),
+                    crate::model::KIND_IDLE.into(),
+                ]),
+            )
+            .await?;
+            let n = tx
                 .execute(
                     "UPDATE messages SET superseded_by = ?1
                      WHERE sender = ?2 AND recipient = ?3
@@ -4825,6 +6893,7 @@ impl Store for LibsqlStore {
                     ]),
                 )
                 .await?;
+            tx.commit().await?;
             Ok::<_, anyhow::Error>(n as usize)
         })
     }
@@ -5081,7 +7150,7 @@ async fn unread_count_on(conn: &Connection, me: &str) -> Result<i64> {
 
 async fn peek_oldest_unread_on(conn: &Connection, me: &str) -> Result<Option<Message>> {
     let sql = format!(
-        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind FROM messages m
+        "SELECT id, ts, sender, recipient, subject, body, in_reply_to, idempotency_key, trace_id, priority, superseded_by, expires_at, kind, request_priority, request_ttl, request_supersedes, request_dedup_idle FROM messages m
          WHERE (m.recipient = ?1 OR m.recipient IN {bc}) AND m.sender != ?1
            AND m.superseded_by IS NULL
            AND (m.expires_at IS NULL OR m.expires_at > ?2)
@@ -5175,6 +7244,847 @@ mod tests {
             ..Config::default()
         };
         LibsqlStore::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn keyed_ask_preserves_explicit_subject_shape_after_parent_removal_libsql() {
+        let s = mem();
+        let (root_ask, root_mid) = s
+            .ask(
+                "a",
+                "b",
+                Some("Topic"),
+                "root question",
+                AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
+        let (child_ask, child_mid, created) = s
+            .ask_idempotent(
+                "a",
+                "b",
+                Some("Re: Topic"),
+                "follow-up",
+                AskKind::FreeText,
+                None,
+                Some(&root_ask),
+                Some("event:subject-shape"),
+            )
+            .unwrap();
+        assert!(created);
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    params(vec![root_mid.into()]),
+                )
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(
+            s.ask_idempotent(
+                "a",
+                "b",
+                Some("Re: Topic"),
+                "follow-up",
+                AskKind::FreeText,
+                None,
+                Some(&root_ask),
+                Some("event:subject-shape"),
+            )
+            .unwrap(),
+            (child_ask, child_mid, false)
+        );
+        assert!(s
+            .ask_idempotent(
+                "a",
+                "b",
+                None,
+                "follow-up",
+                AskKind::FreeText,
+                None,
+                Some(&root_ask),
+                Some("event:subject-shape"),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn configured_send_is_atomic_and_replays_request_options_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-configured-send-libsql-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "must roll back",
+                Some("event:configured-invalid-predecessor"),
+                None,
+                Some("urgent"),
+                Some(999_999),
+                3_600,
+                false,
+            )
+            .is_err());
+        assert!(s
+            .message_by_idempotency_key("event:configured-invalid-predecessor")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.total_messages().unwrap(), 0);
+
+        let predecessor = s.send("a", "b", Some("v1"), "first", None, None).unwrap();
+        let alternate = s
+            .send("a", "b", Some("other"), "other", None, None)
+            .unwrap();
+        let (replacement, created) = s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                Some("trace:first"),
+                Some("urgent"),
+                Some(predecessor),
+                3_600,
+                false,
+            )
+            .unwrap();
+        assert!(created);
+        let stored = s
+            .message_by_idempotency_key("event:configured-send")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.priority, "urgent");
+        assert_eq!(
+            stored.expires_at,
+            Some(crate::model::expiry_from_ttl(stored.ts, 3_600))
+        );
+        assert_eq!(superseded_by_of(&s, "b", predecessor), Some(replacement));
+        drop(s);
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        assert_eq!(
+            s.send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                Some("trace:retry"),
+                Some("urgent"),
+                Some(predecessor),
+                3_600,
+                false,
+            )
+            .unwrap(),
+            (replacement, false)
+        );
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                None,
+                Some("high"),
+                Some(predecessor),
+                3_600,
+                false,
+            )
+            .is_err());
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                None,
+                Some("urgent"),
+                Some(predecessor),
+                1_800,
+                false,
+            )
+            .is_err());
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                None,
+                Some("urgent"),
+                Some(alternate),
+                3_600,
+                false,
+            )
+            .is_err());
+        assert_eq!(s.total_messages().unwrap(), 3);
+        assert_eq!(superseded_by_of(&s, "b", predecessor), Some(replacement));
+        assert_eq!(superseded_by_of(&s, "b", alternate), None);
+        s.set_message_expiry(predecessor, now().saturating_sub(1))
+            .unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 1);
+        assert!(!s.message_exists(predecessor).unwrap());
+        assert_eq!(
+            s.send_configured_idempotent(
+                "a",
+                "b",
+                Some("v2"),
+                "replacement",
+                Some("event:configured-send"),
+                Some("trace:after-gc"),
+                Some("urgent"),
+                Some(predecessor),
+                3_600,
+                false,
+            )
+            .unwrap(),
+            (replacement, false),
+            "private request_supersedes metadata survives predecessor GC"
+        );
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_idle_dedup_replay_preserves_first_mutation_libsql() {
+        let s = mem();
+        let (first, first_created) = s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting once",
+                Some("event:configured-idle-1"),
+                None,
+                Some("normal"),
+                None,
+                0,
+                true,
+            )
+            .unwrap();
+        assert!(first_created);
+        let (second, second_created) = s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting again",
+                Some("event:configured-idle-2"),
+                Some("trace:first-idle"),
+                Some("normal"),
+                None,
+                0,
+                true,
+            )
+            .unwrap();
+        assert!(second_created);
+        assert_eq!(superseded_by_of(&s, "b", first), Some(second));
+        assert_eq!(superseded_by_of(&s, "b", second), None);
+        assert_eq!(
+            s.message_by_idempotency_key("event:configured-idle-2")
+                .unwrap()
+                .unwrap()
+                .kind
+                .as_deref(),
+            Some(crate::model::KIND_IDLE)
+        );
+        assert_eq!(
+            s.send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting again",
+                Some("event:configured-idle-2"),
+                Some("trace:retry-idle"),
+                Some("normal"),
+                None,
+                0,
+                true,
+            )
+            .unwrap(),
+            (second, false)
+        );
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting again",
+                Some("event:configured-idle-2"),
+                None,
+                Some("normal"),
+                None,
+                0,
+                false,
+            )
+            .is_err());
+        assert!(s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting again",
+                Some("event:configured-idle-2"),
+                None,
+                Some("normal"),
+                None,
+                60,
+                true,
+            )
+            .is_err());
+        assert_eq!(s.total_messages().unwrap(), 2);
+        assert_eq!(superseded_by_of(&s, "b", first), Some(second));
+        assert_eq!(superseded_by_of(&s, "b", second), None);
+    }
+
+    #[test]
+    fn legacy_v1_idle_metadata_replays_configured_dedup_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-legacy-idle-libsql-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let db = Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE messages (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts              INTEGER NOT NULL,
+                        sender          TEXT NOT NULL,
+                        recipient       TEXT NOT NULL,
+                        subject         TEXT,
+                        body            TEXT NOT NULL,
+                        in_reply_to     INTEGER,
+                        idempotency_key TEXT,
+                        trace_id        TEXT,
+                        priority        TEXT NOT NULL DEFAULT 'normal',
+                        superseded_by   INTEGER,
+                        expires_at      INTEGER,
+                        kind            TEXT
+                     );
+                     INSERT INTO messages
+                        (id, ts, sender, recipient, body, idempotency_key, priority,
+                         superseded_by, kind)
+                     VALUES
+                        (1, 1, 'a', 'b', 'waiting once', 'event:legacy-idle-1',
+                         'urgent', 2, 'idle'),
+                        (2, 2, 'a', 'b', 'waiting again', 'event:legacy-idle-2',
+                         'urgent', NULL, 'idle');",
+                )
+                .await
+                .unwrap();
+                let mut columns = conn
+                    .query(
+                        "SELECT name FROM pragma_table_info('messages')
+                         WHERE name IN ('request_supersedes', 'request_dedup_idle')",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                assert!(columns.next().await.unwrap().is_none());
+            });
+        }
+
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let metadata =
+                s.rt.block_on(async {
+                    let mut rows = s
+                        .conn
+                        .query(
+                            "SELECT request_priority, request_ttl, request_supersedes,
+                                    request_dedup_idle
+                             FROM messages WHERE id = 2",
+                            (),
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("legacy current idle row missing"))?;
+                    Ok::<_, anyhow::Error>((
+                        row.get::<String>(0)?,
+                        row.get::<i64>(1)?,
+                        row.get::<i64>(2)?,
+                        row.get::<i64>(3)?,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(metadata, ("urgent".to_string(), 0, 0, 1));
+            assert_eq!(superseded_by_of(&s, "b", 1), Some(2));
+        }
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        assert_eq!(
+            s.send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "waiting again",
+                Some("event:legacy-idle-2"),
+                Some("trace:legacy-retry"),
+                Some("urgent"),
+                None,
+                0,
+                true,
+            )
+            .unwrap(),
+            (2, false)
+        );
+        assert_eq!(s.total_messages().unwrap(), 2);
+        assert_eq!(superseded_by_of(&s, "b", 1), Some(2));
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_reply_ttl_replays_after_parent_removal_libsql() {
+        let s = mem();
+        let parent = s
+            .send("a", "b", Some("root"), "question", None, None)
+            .unwrap();
+        let (reply, created) = s
+            .reply_configured_idempotent(
+                "b",
+                parent,
+                "answer",
+                Some("event:configured-reply"),
+                Some("urgent"),
+                3_600,
+                None,
+            )
+            .unwrap();
+        assert!(created);
+        let stored = s
+            .message_by_idempotency_key("event:configured-reply")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.in_reply_to, Some(parent));
+        assert_eq!(stored.priority, "urgent");
+        assert_eq!(stored.request_priority.as_deref(), Some("urgent"));
+        assert_eq!(
+            stored.expires_at,
+            Some(crate::model::expiry_from_ttl(stored.ts, 3_600))
+        );
+        assert_eq!(
+            s.reply_configured_idempotent(
+                "b",
+                parent,
+                "answer",
+                Some("event:configured-reply"),
+                Some("urgent"),
+                3_600,
+                None,
+            )
+            .unwrap(),
+            (reply, false)
+        );
+        assert!(s
+            .reply_configured_idempotent(
+                "b",
+                parent,
+                "answer",
+                Some("event:configured-reply"),
+                Some("urgent"),
+                1_800,
+                None,
+            )
+            .is_err());
+
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    params(vec![parent.into()]),
+                )
+                .await
+        })
+        .unwrap();
+        assert_eq!(
+            s.reply_configured_idempotent(
+                "b",
+                parent,
+                "answer",
+                Some("event:configured-reply"),
+                Some("urgent"),
+                3_600,
+                None,
+            )
+            .unwrap(),
+            (reply, false)
+        );
+        assert_eq!(s.total_messages().unwrap(), 1);
+        assert_eq!(
+            s.message_by_idempotency_key("event:configured-reply")
+                .unwrap()
+                .unwrap()
+                .id,
+            reply
+        );
+    }
+
+    #[test]
+    fn migration_refuses_to_strip_key_bound_by_v2_signature_libsql() {
+        let dir = std::env::temp_dir().join(format!(
+            "weave-v2-key-collision-libsql-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collision.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            s.rt.block_on(async {
+                s.conn
+                    .execute(
+                        "INSERT INTO messages
+                            (ts, sender, recipient, body, idempotency_key)
+                         VALUES (1, 'a', 'b', 'accepted', 'event:v2-collision')",
+                        (),
+                    )
+                    .await?;
+                s.conn
+                    .execute(
+                        "INSERT INTO outbox
+                            (ts, to_peer, to_host, from_peer, body, sig, idempotency_key)
+                         VALUES (1, 'b', '', 'a', 'queued', 'v2:bound', 'event:v2-collision')",
+                        (),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap();
+        }
+
+        let err = LibsqlStore::open(&cfg).err().expect("migration must fail");
+        assert!(err.to_string().contains("signed v2 outbox row"));
+        let ro = LibsqlStore::open_readonly(&path).unwrap();
+        let preserved = ro
+            .rt
+            .block_on(async {
+                let mut rows = ro
+                    .conn
+                    .query(
+                        "SELECT sig, idempotency_key FROM outbox WHERE body = 'queued'",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("queued row remains");
+                Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<String>(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("v2:bound".to_string(), "event:v2-collision".to_string())
+        );
+        drop(ro);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v2_idempotency_migration_handles_null_later_and_safe_earlier_rows_libsql() {
+        for (label, rows, must_fail) in [
+            (
+                "null",
+                vec![("v2:null", None), ("", Some("event:other"))],
+                true,
+            ),
+            (
+                "later-v2",
+                vec![
+                    ("legacy", Some("event:dup")),
+                    ("v2:later", Some("event:dup")),
+                ],
+                true,
+            ),
+            (
+                "earlier-v2",
+                vec![
+                    ("v2:earlier", Some("event:dup")),
+                    ("legacy", Some("event:dup")),
+                ],
+                false,
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "weave-v2-key-{label}-libsql-{}-{}",
+                std::process::id(),
+                now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("migration.db");
+            let cfg = Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".to_string()),
+                ..Config::default()
+            };
+            {
+                let store = LibsqlStore::open(&cfg).unwrap();
+                store
+                    .rt
+                    .block_on(async {
+                        store
+                            .conn
+                            .execute("DROP INDEX idx_outbox_idempotency_key", ())
+                            .await?;
+                        for (index, (signature, key)) in rows.iter().enumerate() {
+                            store
+                                .conn
+                                .execute(
+                                    "INSERT INTO outbox
+                                        (ts, to_peer, to_host, from_peer, body, sig, idempotency_key)
+                                     VALUES (?1, 'b', '', 'a', ?2, ?3, ?4)",
+                                    params(vec![
+                                        (index as i64 + 1).into(),
+                                        format!("row-{index}").into(),
+                                        (*signature).into(),
+                                        (*key).into(),
+                                    ]),
+                                )
+                                .await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .unwrap();
+            }
+
+            let reopened = LibsqlStore::open(&cfg);
+            if must_fail {
+                let error = reopened.err().expect("signed v2 key loss must fail");
+                assert!(error.to_string().contains("signed v2 outbox row"));
+            } else {
+                let store = reopened.expect("earlier signed row retains its key");
+                let keys = store
+                    .rt
+                    .block_on(async {
+                        let mut rows = store
+                            .conn
+                            .query("SELECT idempotency_key FROM outbox ORDER BY id", ())
+                            .await?;
+                        let mut keys = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            keys.push(row.get::<Option<String>>(0)?);
+                        }
+                        Ok::<_, anyhow::Error>(keys)
+                    })
+                    .unwrap();
+                assert_eq!(keys, vec![Some("event:dup".to_string()), None]);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn keyed_mutations_replay_exactly_once_across_reopen_libsql() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("weave-keyed-libsql-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let (sent, created) = s
+            .send_idempotent(
+                "a",
+                "b",
+                None,
+                "hello",
+                Some("event:send"),
+                Some("trace:first-send"),
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            s.send_idempotent(
+                "a",
+                "b",
+                None,
+                "hello",
+                Some("event:send"),
+                Some("trace:retry-send"),
+            )
+            .unwrap(),
+            (sent, false)
+        );
+        assert_eq!(
+            s.message_by_idempotency_key("event:send")
+                .unwrap()
+                .unwrap()
+                .trace_id
+                .as_deref(),
+            Some("trace:first-send")
+        );
+        assert!(s
+            .send_idempotent("a", "b", None, "different", Some("event:send"), None)
+            .is_err());
+
+        let (cid, question_id, created) = s
+            .ask_idempotent(
+                "a",
+                "b",
+                None,
+                "question",
+                AskKind::FreeText,
+                None,
+                None,
+                Some("event:ask"),
+            )
+            .unwrap();
+        assert!(created);
+        assert!(s
+            .send_idempotent("a", "b", None, "question", Some("event:ask"), None,)
+            .is_err());
+        drop(s);
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        assert_eq!(
+            s.ask_idempotent(
+                "a",
+                "b",
+                None,
+                "question",
+                AskKind::FreeText,
+                None,
+                None,
+                Some("event:ask"),
+            )
+            .unwrap(),
+            (cid.clone(), question_id, false)
+        );
+        let (answer_id, created) = s
+            .answer_idempotent("b", &cid, "answer", Some("event:answer"))
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            s.answer_idempotent("b", &cid, "answer", Some("event:answer"))
+                .unwrap(),
+            (answer_id, false)
+        );
+        assert!(s
+            .reply_idempotent("b", question_id, "answer", Some("event:answer"))
+            .is_err());
+        assert!(s
+            .answer_idempotent("b", &cid, "second", Some("event:answer-2"))
+            .is_err());
+
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        let (reply_id, created) = s
+            .reply_idempotent("b", root, "reply", Some("event:reply"))
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            s.reply_idempotent("b", root, "reply", Some("event:reply"))
+                .unwrap(),
+            (reply_id, false)
+        );
+        assert!(s
+            .reply_idempotent("b", root, "reply", Some("event:ask"))
+            .is_err());
+        let (intent_id, created) = s
+            .enqueue_intent_idempotent(
+                "b",
+                "host-b",
+                "a",
+                None,
+                "intent",
+                "",
+                Some("event:intent"),
+                Some("trace:first-intent"),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            s.enqueue_intent_idempotent(
+                "b",
+                "host-b",
+                "a",
+                None,
+                "intent",
+                "",
+                Some("event:intent"),
+                Some("trace:retry-intent"),
+                None,
+                0,
+            )
+            .unwrap(),
+            (intent_id, false)
+        );
+        assert!(s
+            .enqueue_intent_idempotent(
+                "b",
+                "host-b",
+                "a",
+                None,
+                "different",
+                "",
+                Some("event:intent"),
+                None,
+                None,
+                0,
+            )
+            .is_err());
+        assert_eq!(s.outbox_all(10).unwrap().len(), 1);
+        assert_eq!(
+            s.outbox_all(10).unwrap()[0].trace_id.as_deref(),
+            Some("trace:first-intent")
+        );
+        assert_eq!(s.list_asks("a", AskRole::Any, 10).unwrap().len(), 1);
+        assert_eq!(s.all_messages(20).unwrap().len(), 5);
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// WL-084 (dual-backend parity): mirror of the sqlite backend's
@@ -5430,6 +8340,37 @@ mod tests {
     }
 
     #[test]
+    fn expiry_prunes_ask_and_clears_surviving_reply_edges_libsql() {
+        let s = mem();
+        let (parent, parent_question) = s
+            .ask("a", "b", None, "first?", AskKind::FreeText, None, None)
+            .unwrap();
+        let (child, child_question) = s
+            .ask(
+                "a",
+                "b",
+                None,
+                "second?",
+                AskKind::FreeText,
+                None,
+                Some(&parent),
+            )
+            .unwrap();
+        s.set_message_expiry(parent_question, now().saturating_sub(1))
+            .unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 1);
+        assert!(s.get_ask(&parent).unwrap().is_none());
+        assert_eq!(s.get_ask(&child).unwrap().unwrap().reply_to, None);
+        let child_message = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == child_question)
+            .unwrap();
+        assert_eq!(child_message.in_reply_to, None);
+    }
+
+    #[test]
     fn list_asks_role_filtering() {
         let s = mem();
         let (c1, _) = s
@@ -5452,9 +8393,23 @@ mod tests {
         let q = s
             .send("a", "b", Some("subj"), "question?", None, None)
             .unwrap();
-        let ans = s
-            .send("b", "a", Some("Re: subj"), "answer!", None, None)
+        let q_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == q)
+            .unwrap()
+            .ts;
+        let (ans, _) = s
+            .reply_configured_idempotent("b", q, "answer!", None, None, 0, None)
             .unwrap();
+        let answer_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == ans)
+            .unwrap()
+            .ts;
         let id = crate::model::new_ask_id(q);
         assert!(s
             .import_ask(
@@ -5469,8 +8424,8 @@ mod tests {
                 Some("yes\nno"),
                 None,
                 None,
-                100,
-                200,
+                q_ts,
+                answer_ts,
                 None,
                 None,
             )
@@ -5495,12 +8450,36 @@ mod tests {
                 Some("yes\nno"),
                 None,
                 None,
-                100,
-                200,
+                q_ts,
+                answer_ts,
                 None,
                 None,
             )
             .unwrap());
+        let mismatch = s
+            .import_ask(
+                &crate::model::new_ask_id(q),
+                q,
+                Some(ans),
+                "a",
+                "b",
+                Some("subj"),
+                AskState::Acked,
+                AskKind::Choice,
+                Some("yes\nno"),
+                None,
+                Some("different terminal state"),
+                q_ts,
+                answer_ts + 1,
+                Some(answer_ts + 1),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatch.contains("different content or lifecycle state"),
+            "a matching triple must not mask lifecycle drift: {mismatch}"
+        );
         assert_eq!(s.list_asks("a", AskRole::Any, 50).unwrap().len(), 1);
     }
 
@@ -5510,14 +8489,23 @@ mod tests {
     #[test]
     fn import_ask_acked_and_group_libsql() {
         let s = mem();
+        let q = s
+            .send("a", "b", Some("poll"), "yes or no?", None, None)
+            .unwrap();
+        let opened = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == q)
+            .unwrap()
+            .ts;
         let pid = crate::model::new_ask_many_id(500);
         assert!(s
-            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", opened, 2)
             .unwrap());
         assert!(!s
-            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", 500, 2)
+            .import_ask_group(&pid, "a", Some("poll"), "yes or no?", opened, 2)
             .unwrap());
-        let q = s.send("a", "b", None, "yes or no?", None, None).unwrap();
         let id = crate::model::new_ask_id(q);
         assert!(s
             .import_ask(
@@ -5526,21 +8514,21 @@ mod tests {
                 None,
                 "a",
                 "b",
-                None,
+                Some("poll"),
                 AskState::Acked,
                 AskKind::FreeText,
                 None,
                 None,
                 Some("closing note"),
-                10,
-                30,
-                Some(30),
+                opened,
+                opened,
+                Some(opened),
                 Some(&pid),
             )
             .unwrap());
         let got = s.get_ask(&id).unwrap().unwrap();
         assert_eq!(got.state, AskState::Acked);
-        assert_eq!(got.closed_ts, Some(30));
+        assert_eq!(got.closed_ts, Some(opened));
         assert_eq!(got.close_note.as_deref(), Some("closing note"));
         assert_eq!(got.parent_id.as_deref(), Some(pid.as_str()));
         let res = s.ask_many_result(&pid, None).unwrap().unwrap();
@@ -5617,6 +8605,194 @@ mod tests {
                 None,
             )
             .is_err());
+    }
+
+    #[test]
+    fn import_ask_rejects_incoherent_lifecycle_links_aliases_and_groups_libsql() {
+        let s = mem();
+        let q = s
+            .send("a", "b", Some("topic"), "question", None, None)
+            .unwrap();
+        let q_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == q)
+            .unwrap()
+            .ts;
+        let detached = s
+            .send("b", "a", Some("Re: topic"), "detached", None, None)
+            .unwrap();
+        let detached_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == detached)
+            .unwrap()
+            .ts;
+        assert!(s
+            .import_ask(
+                "ask_1_90",
+                q,
+                None,
+                "a",
+                "b",
+                Some("topic"),
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts + 1,
+                q_ts + 1,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("question timestamp"));
+        let (linked, _) = s
+            .reply_configured_idempotent("b", q, "linked", None, None, 0, None)
+            .unwrap();
+        let linked_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == linked)
+            .unwrap()
+            .ts;
+        assert!(s
+            .import_ask(
+                "ask_1_91",
+                q,
+                Some(linked),
+                "a",
+                "b",
+                Some("topic"),
+                AskState::Answered,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts,
+                linked_ts + 1,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("answer timestamp"));
+        assert!(s
+            .import_ask(
+                "ask_1_101",
+                q,
+                Some(detached),
+                "a",
+                "b",
+                Some("topic"),
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts,
+                q_ts,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("open ask has incoherent lifecycle"));
+        assert!(s
+            .import_ask(
+                "ask_1_102",
+                q,
+                Some(detached),
+                "a",
+                "b",
+                Some("topic"),
+                AskState::Answered,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts,
+                detached_ts,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("answer is incoherent"));
+        assert!(s
+            .import_ask(
+                "ask_1_103",
+                q,
+                None,
+                "a",
+                "b",
+                Some("topic"),
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts,
+                q_ts,
+                None,
+                None,
+            )
+            .unwrap());
+        assert!(s
+            .import_ask(
+                "ask_1_104",
+                q,
+                None,
+                "a",
+                "c",
+                Some("topic"),
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                q_ts,
+                q_ts,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("already claimed"));
+        let orphan_q = s.send("a", "c", None, "orphan", None, None).unwrap();
+        let orphan_ts = s
+            .all_messages(10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == orphan_q)
+            .unwrap()
+            .ts;
+        assert!(s
+            .import_ask(
+                "ask_2_105",
+                orphan_q,
+                None,
+                "a",
+                "c",
+                None,
+                AskState::Open,
+                AskKind::FreeText,
+                None,
+                None,
+                None,
+                orphan_ts,
+                orphan_ts,
+                None,
+                Some("askm_404_1"),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("group 'askm_404_1' is missing"));
     }
 
     /// libsql parity: `has_open_asks` matches the sqlite semantics.
@@ -5872,9 +9048,10 @@ mod tests {
         );
     }
 
-    /// libsql parity (P2): a legacy P1-era DB whose `asks` lacks `parent_id` (and has
-    /// no `ask_groups`) upgrades in place — parent_id added NULL on the old row,
-    /// ask_groups created, a fresh fanout then works. Mirrors the sqlite test.
+    /// libsql parity (P2): a legacy P1-era DB whose `asks` lacks `parent_id` and
+    /// whose `messages` table predates `idempotency_key` upgrades in place. The
+    /// message column is installed before the keyed-ask backfill, parent_id is added
+    /// NULL on the old row, ask_groups is created, and a fresh fanout then works.
     #[test]
     fn legacy_asks_gains_parent_id_and_ask_groups_libsql() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -5887,41 +9064,56 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.db");
-        // Seed a P1-era store, then drop parent_id + ask_groups to simulate the older
-        // schema (recreate `asks` WITHOUT parent_id, drop ask_groups).
+        // Build a genuine P1-era, pre-WL-026 store: `messages` has no
+        // idempotency_key, `asks` has no parent_id/request-shape columns, and there
+        // is no ask_groups table. Opening it must not reference the missing message
+        // column before the additive WL-026 migration runs.
         {
-            let cfg = Config {
-                db: Some(path.to_string_lossy().into_owned()),
-                backend: Some("libsql".to_string()),
-                ..Config::default()
-            };
-            let s = LibsqlStore::open(&cfg).unwrap();
-            s.send("a", "b", None, "q", None, None).unwrap();
-            s.rt
-                .block_on(async {
-                    s.conn.execute("DROP TABLE asks", ()).await?;
-                    s.conn.execute("DROP TABLE ask_groups", ()).await?;
-                    s.conn
-                        .execute(
-                            "CREATE TABLE asks (
-                                id TEXT PRIMARY KEY, question_msg_id INTEGER NOT NULL,
-                                answer_msg_id INTEGER, asker TEXT NOT NULL, askee TEXT NOT NULL,
-                                subject TEXT, state TEXT NOT NULL, reply_to TEXT, close_note TEXT,
-                                opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
-                                closed_ts INTEGER)",
-                            (),
-                        )
-                        .await?;
-                    s.conn
-                        .execute(
-                            "INSERT INTO asks (id, question_msg_id, asker, askee, state, opened_ts, updated_ts) \
-                             VALUES ('ask_1_legacy', 1, 'a', 'b', 'open', 1, 1)",
-                            (),
-                        )
-                        .await?;
-                    Ok::<_, anyhow::Error>(())
-                })
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap();
+            rt.block_on(async {
+                let db = Builder::new_local(&path).build().await.unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute(
+                    "CREATE TABLE messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                        sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT,
+                        body TEXT NOT NULL, in_reply_to INTEGER
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "CREATE TABLE asks (
+                        id TEXT PRIMARY KEY, question_msg_id INTEGER NOT NULL,
+                        answer_msg_id INTEGER, asker TEXT NOT NULL, askee TEXT NOT NULL,
+                        subject TEXT, state TEXT NOT NULL, reply_to TEXT, close_note TEXT,
+                        opened_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
+                        closed_ts INTEGER
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO messages (ts, sender, recipient, subject, body)
+                     VALUES (1, 'a', 'b', NULL, 'q')",
+                    (),
+                )
+                .await
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO asks
+                         (id, question_msg_id, asker, askee, state, opened_ts, updated_ts)
+                     VALUES ('ask_1_legacy', 1, 'a', 'b', 'open', 1, 1)",
+                    (),
+                )
+                .await
+                .unwrap();
+            });
         }
         // Re-open runs the migration: parent_id (NULL) added, ask_groups recreated.
         {
@@ -5933,6 +9125,42 @@ mod tests {
             let s = LibsqlStore::open(&cfg).unwrap();
             let old = s.get_ask("ask_1_legacy").unwrap().unwrap();
             assert_eq!(old.parent_id, None);
+            let (has_idempotency_key, request_shape) =
+                s.rt.block_on(async {
+                    let mut columns = s
+                        .conn
+                        .query(
+                            "SELECT 1 FROM pragma_table_info('messages')
+                              WHERE name='idempotency_key'",
+                            (),
+                        )
+                        .await?;
+                    let has_idempotency_key = columns.next().await?.is_some();
+                    let mut rows = s
+                        .conn
+                        .query(
+                            "SELECT request_subject, request_subject_provided
+                               FROM asks WHERE id = 'ask_1_legacy'",
+                            (),
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("migrated legacy ask missing"))?;
+                    let shape = (row.get::<Option<String>>(0)?, row.get::<Option<i64>>(1)?);
+                    Ok::<_, anyhow::Error>((has_idempotency_key, shape))
+                })
+                .unwrap();
+            assert!(
+                has_idempotency_key,
+                "idempotency schema must exist before the ask replay backfill"
+            );
+            assert_eq!(
+                request_shape,
+                (None, None),
+                "an unkeyed legacy ask must not be misclassified as keyed"
+            );
             let out = s.create_ask_many("a", &["c".into()], None, "fan?").unwrap();
             assert_eq!(
                 s.ask_many_result(&out.parent_id, None)
@@ -6160,6 +9388,40 @@ mod tests {
         assert_eq!(rows[0].body, "new");
     }
 
+    #[test]
+    fn gc_clears_effective_supersession_link_to_deleted_successor_libsql() {
+        let s = mem();
+        let predecessor = s.send("a", "b", None, "first", None, None).unwrap();
+        let successor = s.send("a", "b", None, "second", None, None).unwrap();
+        s.supersede("a", predecessor, successor).unwrap();
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                    params(vec![successor.into()]),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+
+        assert_eq!(s.gc(3600).unwrap(), 1);
+        let link =
+            s.rt.block_on(async {
+                let mut rows = s
+                    .conn
+                    .query(
+                        "SELECT superseded_by FROM messages WHERE id = ?1",
+                        params(vec![predecessor.into()]),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("predecessor remains");
+                Ok::<_, anyhow::Error>(row.get::<Option<i64>>(0)?)
+            })
+            .unwrap();
+        assert_eq!(link, None);
+    }
+
     /// P6 (libsql parity): record_delivery appends metadata-only stages that
     /// list_delivery returns oldest-first; the body never appears in a trace.
     #[test]
@@ -6215,6 +9477,63 @@ mod tests {
             s.list_delivery(mid, i64::MAX).unwrap().len() as i64,
             MAX_DELIVERY_ROWS
         );
+    }
+
+    #[test]
+    fn delivery_exists_searches_beyond_the_display_cap_libsql() {
+        use crate::model::{DeliveryOutcome, DeliveryRefKind, DeliveryStage, MAX_DELIVERY_ROWS};
+        let s = mem();
+        let mid = s.send("a", "b", None, "x", None, None).unwrap();
+        for _ in 0..(MAX_DELIVERY_ROWS + 5) {
+            s.record_delivery(
+                mid,
+                DeliveryRefKind::Message.as_str(),
+                "telegram",
+                DeliveryStage::RelayFailed.as_str(),
+                DeliveryOutcome::Fail.as_str(),
+            )
+            .unwrap();
+        }
+        s.record_delivery(
+            mid,
+            DeliveryRefKind::Message.as_str(),
+            "telegram",
+            DeliveryStage::Relayed.as_str(),
+            DeliveryOutcome::Ok.as_str(),
+        )
+        .unwrap();
+        assert!(!s
+            .list_delivery(mid, i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|trace| trace.stage == DeliveryStage::Relayed.as_str()));
+        assert!(s
+            .has_delivery(
+                mid,
+                DeliveryRefKind::Message.as_str(),
+                "telegram",
+                DeliveryStage::Relayed.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap());
+        assert!(!s
+            .has_delivery(
+                mid,
+                DeliveryRefKind::Message.as_str(),
+                "slack",
+                DeliveryStage::Relayed.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap());
+        assert!(!s
+            .has_delivery(
+                -1,
+                DeliveryRefKind::Message.as_str(),
+                "telegram",
+                DeliveryStage::Relayed.as_str(),
+                DeliveryOutcome::Ok.as_str(),
+            )
+            .unwrap());
     }
 
     /// P6 (libsql parity): gc prunes old delivery_log rows in the same pass.
@@ -6350,6 +9669,34 @@ mod tests {
         assert!(
             s.send("a", "b\nc", None, "x", None, None).is_err(),
             "control char in recipient rejected"
+        );
+        assert!(
+            s.send(
+                "a",
+                "b",
+                Some(&"é".repeat(crate::store::MAX_SUBJECT_LEN + 1)),
+                "x",
+                None,
+                None,
+            )
+            .is_err(),
+            "subject cap is counted in Unicode scalar values"
+        );
+        assert!(
+            s.send("a", "b", Some("bad\nsubject"), "x", None, None)
+                .is_err(),
+            "control characters in a subject are rejected"
+        );
+        let key = "explicit-empty-subject";
+        s.send("a", "b", Some(""), "x", Some(key), None).unwrap();
+        assert_eq!(
+            s.message_by_idempotency_key(key)
+                .unwrap()
+                .unwrap()
+                .subject
+                .as_deref(),
+            Some(""),
+            "an explicit empty subject remains distinct from omission"
         );
         assert!(s.send("a", "b", None, "x", None, None).is_ok());
     }
@@ -7345,6 +10692,112 @@ mod tests {
         assert_eq!(after.iter().map(|m| m.id).collect::<Vec<_>>(), vec![i3]);
     }
 
+    #[test]
+    fn outbox_request_priority_normalizes_before_replay_libsql() {
+        let s = mem();
+        let (urgent_id, urgent_created) = s
+            .enqueue_intent_idempotent(
+                "bob",
+                "",
+                "alice",
+                None,
+                "urgent body",
+                "",
+                Some("event:outbox-priority-urgent"),
+                None,
+                Some("URGENT"),
+                60,
+            )
+            .unwrap();
+        assert!(urgent_created);
+        assert_eq!(
+            s.enqueue_intent_idempotent(
+                "bob",
+                "",
+                "alice",
+                None,
+                "urgent body",
+                "",
+                Some("event:outbox-priority-urgent"),
+                None,
+                Some("urgent"),
+                60,
+            )
+            .unwrap(),
+            (urgent_id, false)
+        );
+
+        let (normal_id, normal_created) = s
+            .enqueue_intent_idempotent(
+                "bob",
+                "",
+                "alice",
+                None,
+                "normal body",
+                "",
+                Some("event:outbox-priority-default"),
+                None,
+                Some("not-a-priority"),
+                0,
+            )
+            .unwrap();
+        assert!(normal_created);
+        assert_eq!(
+            s.enqueue_intent_idempotent(
+                "bob",
+                "",
+                "alice",
+                None,
+                "normal body",
+                "",
+                Some("event:outbox-priority-default"),
+                None,
+                Some("normal"),
+                0,
+            )
+            .unwrap(),
+            (normal_id, false)
+        );
+
+        let rows = s.outbox_all(10).unwrap();
+        let urgent = rows.iter().find(|intent| intent.id == urgent_id).unwrap();
+        assert_eq!(urgent.priority, "urgent");
+        assert_eq!(urgent.ttl, 60);
+        let normal = rows.iter().find(|intent| intent.id == normal_id).unwrap();
+        assert_eq!(normal.priority, "normal");
+        assert_eq!(normal.ttl, 0);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn outbox_request_invalid_ttl_is_atomic_libsql() {
+        let s = mem();
+        for (key, ttl) in [
+            ("event:outbox-ttl-negative", -1),
+            (
+                "event:outbox-ttl-oversized",
+                crate::model::MAX_MSG_TTL_SECS + 1,
+            ),
+        ] {
+            assert!(s
+                .enqueue_intent_idempotent(
+                    "bob",
+                    "",
+                    "alice",
+                    None,
+                    "must not persist",
+                    "",
+                    Some(key),
+                    None,
+                    Some("urgent"),
+                    ttl,
+                )
+                .is_err());
+        }
+        assert!(s.outbox_all(10).unwrap().is_empty());
+        assert!(s.list_outbox("bob", 0, 10).unwrap().is_empty());
+    }
+
     /// The pull cursor defaults to 0 and round-trips through set/get. (libsql.)
     #[test]
     fn pull_cursor_default_and_roundtrip_libsql() {
@@ -7355,6 +10808,188 @@ mod tests {
         s.pull_cursor_set("/src.db", 99).unwrap();
         assert_eq!(s.pull_cursor_get("/src.db").unwrap(), 99);
         assert_eq!(s.pull_cursor_get("/other.db").unwrap(), 0);
+        s.pull_cursor_set("/src.db", 7).unwrap();
+        assert_eq!(
+            s.pull_cursor_get("/src.db").unwrap(),
+            99,
+            "a stale writer cannot regress the high-water mark"
+        );
+    }
+
+    #[test]
+    fn pull_cursors_are_scoped_by_recipient_and_host_libsql() {
+        let _env = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-pull-scope-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_path = dir.join("a.db");
+        let b_path = dir.join("b.db");
+        let cfg = |path: &std::path::Path| Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        {
+            let a = LibsqlStore::open(&cfg(&a_path)).unwrap();
+            for (to, host, body) in [
+                ("carol", "", "for carol"),
+                ("bob", "", "for bob"),
+                ("dave", "host-good", "for host-good"),
+            ] {
+                a.enqueue_intent(to, host, "alice", None, body, "", None, None, None, 0)
+                    .unwrap();
+            }
+        }
+        let b = LibsqlStore::open(&cfg(&b_path)).unwrap();
+        let allow = vec![StoreSource::Local(a_path)];
+        let wrong_host = crate::testenv::EnvVarGuard::set("HOSTNAME", "host-wrong");
+
+        assert_eq!(
+            pull_from_store(&b, "bob", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
+            1
+        );
+        assert_eq!(
+            pull_from_store(&b, "carol", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
+            1
+        );
+        assert_eq!(
+            pull_from_store(&b, "dave", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
+            0
+        );
+        drop(wrong_host);
+        let _right_host = crate::testenv::EnvVarGuard::set("HOSTNAME", "host-good");
+        assert_eq!(
+            pull_from_store(&b, "dave", &allow, &VerifyPolicy::advisory())
+                .unwrap()
+                .committed,
+            1
+        );
+        assert_eq!(b.inbox("bob", false, false, 10).unwrap().0.len(), 1);
+        assert_eq!(b.inbox("carol", false, false, 10).unwrap().0.len(), 1);
+        assert_eq!(b.inbox("dave", false, false, 10).unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn legacy_v1_cursor_migration_spans_bounded_drains_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let _env = crate::testenv::lock_env();
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-legacy-cursor-libsql-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("source.db");
+        let local_path = dir.join("local.db");
+        let cfg = |path: &std::path::Path| Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let keyed_ids = [64_i64, 128, 192, 256, 280, 300, 302];
+
+        {
+            let source_store = LibsqlStore::open(&cfg(&source_path)).unwrap();
+            for expected_id in 1_i64..=302 {
+                let key = keyed_ids
+                    .contains(&expected_id)
+                    .then(|| format!("event:legacy-cursor-{expected_id}"));
+                let (id, created) = source_store
+                    .enqueue_intent_idempotent(
+                        "bob",
+                        "",
+                        "alice",
+                        None,
+                        &format!("intent-{expected_id}"),
+                        "",
+                        key.as_deref(),
+                        None,
+                        Some("normal"),
+                        0,
+                    )
+                    .unwrap();
+                assert_eq!(id, expected_id);
+                assert!(created);
+            }
+        }
+
+        let local = LibsqlStore::open(&cfg(&local_path)).unwrap();
+        local
+            .send("alice", "bob", None, "intent-1", None, None)
+            .unwrap();
+        local
+            .send_configured_idempotent(
+                "alice",
+                "bob",
+                None,
+                "intent-64",
+                Some("event:legacy-cursor-64"),
+                None,
+                Some("normal"),
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+
+        let source = canonical_source(&source_path);
+        let host = crate::config::this_host();
+        let scoped_cursor = crate::store::pull_cursor_scope_key(&source, "bob", &host);
+        local.pull_cursor_set(&source, 300).unwrap();
+        let allow = vec![StoreSource::Local(source_path)];
+
+        let first = pull_from_store(&local, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
+        assert_eq!(first.committed, 3);
+        assert_eq!(
+            local.pull_cursor_get(&scoped_cursor).unwrap(),
+            MAX_PULL_PER_DRAIN
+        );
+
+        let second = pull_from_store(&local, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
+        assert_eq!(second.committed, 4);
+        assert_eq!(local.pull_cursor_get(&scoped_cursor).unwrap(), 302);
+        assert!(local.pull_cursor_get(&scoped_cursor).unwrap() > 300);
+
+        let third = pull_from_store(&local, "bob", &allow, &VerifyPolicy::advisory()).unwrap();
+        assert_eq!(third.committed, 0);
+        assert_eq!(local.pull_cursor_get(&scoped_cursor).unwrap(), 302);
+
+        let messages = local.all_messages(100).unwrap();
+        assert_eq!(messages.len(), 9);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.body == "intent-1")
+                .count(),
+            1,
+            "the already-delivered legacy keyless row must not duplicate"
+        );
+        assert!(
+            !messages.iter().any(|message| message.body == "intent-2"),
+            "first-page legacy keyless rows stay skipped"
+        );
+        assert!(
+            !messages.iter().any(|message| message.body == "intent-257"),
+            "migration mode must remain active on the second bounded drain"
+        );
+        assert!(messages.iter().any(|message| message.body == "intent-301"));
+        assert!(messages.iter().any(|message| message.body == "intent-302"));
+        assert!(local
+            .message_by_idempotency_key("event:legacy-cursor-302")
+            .unwrap()
+            .is_some());
+        drop(local);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The `identity_keys` registry round-trips registered pubkeys through
@@ -8989,7 +12624,13 @@ mod tests {
     fn supersede_rejects_foreign_and_missing_libsql() {
         let s = mem();
         let a = s.send("a", "b", None, "A", None, None).unwrap();
+        let newer = s.send("a", "b", None, "B", None, None).unwrap();
         let b = s.send("c", "b", None, "C", None, None).unwrap();
+        assert!(s.supersede("a", a, a).is_err(), "self-link rejected");
+        assert!(
+            s.supersede("a", newer, a).is_err(),
+            "backward link rejected"
+        );
         assert!(s.supersede("c", a, b).is_err(), "foreign sender rejected");
         assert_eq!(superseded_by_of(&s, "b", a), None);
         assert!(
@@ -9090,6 +12731,80 @@ mod tests {
             superseded_by_of(&s, "b", a_b3),
             None,
             "c never touches a's ping"
+        );
+    }
+
+    #[test]
+    fn idle_dedup_rejects_missing_or_wrong_route_successor_libsql() {
+        let s = mem();
+        let prior = s.send("a", "b", None, "prior", None, None).unwrap();
+        s.supersede_prior_idle("a", "b", prior).unwrap();
+        assert!(s.supersede_prior_idle("a", "b", 999_999).is_err());
+        let wrong_sender = s.send("c", "b", None, "wrong", None, None).unwrap();
+        assert!(s.supersede_prior_idle("a", "b", wrong_sender).is_err());
+        let wrong_recipient = s.send("a", "z", None, "wrong", None, None).unwrap();
+        assert!(s.supersede_prior_idle("a", "b", wrong_recipient).is_err());
+        assert_eq!(superseded_by_of(&s, "b", prior), None);
+    }
+
+    #[test]
+    fn idle_dedup_idempotency_replay_is_noop_libsql() {
+        let s = mem();
+        // Mirror SQLite: idle classification and supersession are one keyed
+        // request. An exact retry returns the accepted row without reapplying
+        // the mutation or ever pointing the row at itself.
+        let (p1, created) = s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "ping",
+                Some("k-1"),
+                None,
+                Some("normal"),
+                None,
+                0,
+                true,
+            )
+            .unwrap();
+        assert!(created);
+        let (replay, replay_created) = s
+            .send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "ping",
+                Some("k-1"),
+                Some("trace:retry"),
+                Some("normal"),
+                None,
+                0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(replay, p1, "idempotency replay returns the existing id");
+        assert!(!replay_created, "idempotency replay must be a no-op");
+        assert_eq!(
+            superseded_by_of(&s, "b", p1),
+            None,
+            "must not self-supersede"
+        );
+        assert_eq!(s.unread_count("b").unwrap(), 1);
+        assert!(
+            s.send_configured_idempotent(
+                "a",
+                "b",
+                None,
+                "ping",
+                Some("k-1"),
+                None,
+                Some("normal"),
+                None,
+                0,
+                false,
+            )
+            .is_err(),
+            "changing the keyed idle request must not alias the accepted message"
         );
     }
 
@@ -9205,5 +12920,517 @@ mod tests {
         let m = hist.iter().find(|m| m.body == "hi").expect("committed");
         let exp = m.expires_at.expect("ttl re-stamped as expiry");
         assert!(exp > now() + 500 && exp <= now() + 600);
+    }
+
+    #[test]
+    fn unread_count_is_exact_validated_and_pure_on_readonly_libsql() {
+        let s = mem();
+        let path = s.local_path.clone().unwrap();
+        let direct = s.send("alice", "bob", None, "direct", None, None).unwrap();
+        s.send("alice", "all", None, "broadcast", None, None)
+            .unwrap();
+        s.send("bob", "bob", None, "self", None, None).unwrap();
+        s.send("alice", "carol", None, "foreign", None, None)
+            .unwrap();
+        let old = s.send("alice", "bob", None, "old", None, None).unwrap();
+        let new = s.send("alice", "bob", None, "new", None, None).unwrap();
+        s.supersede("alice", old, new).unwrap();
+        let expired = s.send("alice", "bob", None, "expired", None, None).unwrap();
+        s.set_message_expiry(expired, now() - 1).unwrap();
+        assert_eq!(Store::unread_count(&s, "bob").unwrap(), 3);
+        assert!(Store::unread_count(&s, "").is_err());
+        s.mark_message_read("bob", direct).unwrap();
+        let rows_before = s.total_messages().unwrap();
+        drop(s);
+
+        let readonly = LibsqlStore::open_readonly(&path).unwrap();
+        assert_eq!(Store::unread_count(&readonly, "bob").unwrap(), 2);
+        assert_eq!(
+            readonly.total_messages().unwrap(),
+            rows_before,
+            "pure count must not sweep the expired row"
+        );
+    }
+
+    #[test]
+    fn mark_message_read_is_exact_recipient_scoped_and_idempotent_libsql() {
+        let s = mem();
+        let direct = s.send("alice", "bob", None, "direct", None, None).unwrap();
+        let broadcast = s
+            .send("alice", "all", None, "broadcast", None, None)
+            .unwrap();
+        let foreign = s
+            .send("alice", "carol", None, "foreign", None, None)
+            .unwrap();
+        let self_sent = s.send("bob", "bob", None, "self", None, None).unwrap();
+        let superseded = s.send("alice", "bob", None, "old", None, None).unwrap();
+        let successor = s.send("alice", "bob", None, "new", None, None).unwrap();
+        s.supersede("alice", superseded, successor).unwrap();
+        let expired = s.send("alice", "bob", None, "expired", None, None).unwrap();
+        s.set_message_expiry(expired, now() - 1).unwrap();
+
+        assert!(s.mark_message_read("bob", direct).unwrap());
+        assert!(s.mark_message_read("bob", direct).unwrap());
+        assert!(s.mark_message_read("bob", broadcast).unwrap());
+        assert!(!s.mark_message_read("bob", foreign).unwrap());
+        assert!(!s.mark_message_read("bob", self_sent).unwrap());
+        assert!(!s.mark_message_read("bob", superseded).unwrap());
+        assert!(!s.mark_message_read("bob", expired).unwrap());
+        assert!(!s.mark_message_read("bob", i64::MAX).unwrap());
+        assert!(!s.mark_message_read("bob", -1).unwrap());
+        assert!(s.mark_message_read("", direct).is_err());
+        assert_eq!(s.receipts(direct).unwrap().len(), 1);
+        assert_eq!(s.receipts(broadcast).unwrap().len(), 1);
+        assert!(s.receipts(successor).unwrap().is_empty());
+        assert!(s.receipts(foreign).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bridge_inbox_completion_is_atomic_fenced_and_restart_durable_libsql() {
+        let s = mem();
+        let path = s.local_path.clone().unwrap();
+        s.claim_bridge_runtime(
+            BridgePlatform::Telegram,
+            "telegram-bridge",
+            "operator",
+            "owner-a",
+            Some(10),
+            "host-a",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let first = s
+            .send("alice", "telegram-bridge", None, "first", None, None)
+            .unwrap();
+        let second = s
+            .send("carol", "telegram-bridge", None, "second", None, None)
+            .unwrap();
+        let foreign = s
+            .send("alice", "someone-else", None, "foreign", None, None)
+            .unwrap();
+        let update = BridgeRuntimeUpdate {
+            cursor: Some("telegram-cursor-9".into()),
+            ..BridgeRuntimeUpdate::default()
+        };
+
+        assert!(s
+            .complete_bridge_inbox_snapshot(
+                BridgePlatform::Telegram,
+                "owner-a",
+                "telegram-bridge",
+                &[first, foreign],
+                &update,
+            )
+            .is_err());
+        assert!(s.receipts(first).unwrap().is_empty());
+        assert_eq!(
+            s.bridge_runtime_status(BridgePlatform::Telegram)
+                .unwrap()
+                .unwrap()
+                .cursor,
+            ""
+        );
+        assert_eq!(s.unread_count("telegram-bridge").unwrap(), 2);
+
+        assert!(!s
+            .complete_bridge_inbox_snapshot(
+                BridgePlatform::Telegram,
+                "stale-owner",
+                "telegram-bridge",
+                &[first, second],
+                &update,
+            )
+            .unwrap());
+        assert!(s.receipts(first).unwrap().is_empty());
+
+        assert!(s
+            .complete_bridge_inbox_snapshot(
+                BridgePlatform::Telegram,
+                "owner-a",
+                "telegram-bridge",
+                &[first, second],
+                &update,
+            )
+            .unwrap());
+        assert_eq!(s.unread_count("telegram-bridge").unwrap(), 0);
+        drop(s);
+
+        let reopened = LibsqlStore::open(&Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".into()),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(
+            reopened
+                .bridge_runtime_status(BridgePlatform::Telegram)
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "telegram-cursor-9"
+        );
+        assert_eq!(reopened.unread_count("telegram-bridge").unwrap(), 0);
+        assert!(reopened
+            .complete_bridge_inbox_snapshot(
+                BridgePlatform::Telegram,
+                "owner-a",
+                "telegram-bridge",
+                &[first, second],
+                &update,
+            )
+            .unwrap());
+        assert_eq!(reopened.receipts(first).unwrap().len(), 1);
+        assert_eq!(reopened.receipts(second).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bridge_runtime_claim_fencing_cursor_reclaim_release_and_bounds_libsql() {
+        let s = mem();
+        let fresh_cutoff = now().saturating_sub(60);
+        let claimed = s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner-a",
+                Some(10),
+                "host-a",
+                fresh_cutoff,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.status, BridgeRuntimeStatus::Starting);
+        assert!(s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner-b",
+                Some(11),
+                "host-b",
+                fresh_cutoff,
+            )
+            .unwrap()
+            .is_none());
+        assert!(s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner-a",
+                Some(10),
+                "host-a",
+                fresh_cutoff,
+            )
+            .unwrap()
+            .is_some());
+        let update = BridgeRuntimeUpdate {
+            cursor: Some("cursor-101".into()),
+            status: Some(BridgeRuntimeStatus::Running),
+            last_poll_ts: Some(100),
+            last_success_ts: Some(90),
+            last_delivery_ts: Some(80),
+            error: BridgeRuntimeErrorUpdate::Set {
+                class: "provider_timeout".into(),
+                message: "bounded detail".into(),
+            },
+        };
+        assert!(!s
+            .update_bridge_runtime(BridgePlatform::Telegram, "owner-b", &update)
+            .unwrap());
+        assert!(s
+            .update_bridge_runtime(BridgePlatform::Telegram, "owner-a", &update)
+            .unwrap());
+        assert!(s
+            .update_bridge_runtime(
+                BridgePlatform::Telegram,
+                "owner-a",
+                &BridgeRuntimeUpdate {
+                    last_poll_ts: Some(50),
+                    last_success_ts: Some(40),
+                    last_delivery_ts: Some(30),
+                    error: BridgeRuntimeErrorUpdate::Clear,
+                    ..BridgeRuntimeUpdate::default()
+                },
+            )
+            .unwrap());
+        let state = s
+            .bridge_runtime_status(BridgePlatform::Telegram)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cursor, "cursor-101");
+        assert_eq!(state.status, BridgeRuntimeStatus::Running);
+        assert_eq!(
+            (
+                state.last_poll_ts,
+                state.last_success_ts,
+                state.last_delivery_ts
+            ),
+            (100, 90, 80)
+        );
+        assert!(state.last_error_class.is_empty() && state.last_error.is_empty());
+
+        s.claim_bridge_runtime(
+            BridgePlatform::Slack,
+            "slack-bridge",
+            "operator",
+            "slack-owner",
+            Some(12),
+            "host-s",
+            fresh_cutoff,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            s.list_bridge_runtime_statuses()
+                .unwrap()
+                .into_iter()
+                .map(|state| state.platform)
+                .collect::<Vec<_>>(),
+            vec![BridgePlatform::Telegram, BridgePlatform::Slack]
+        );
+
+        assert!(s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner-b",
+                Some(11),
+                "host-b",
+                now() + 1,
+            )
+            .unwrap()
+            .is_some());
+        assert!(!s
+            .update_bridge_runtime(
+                BridgePlatform::Telegram,
+                "owner-a",
+                &BridgeRuntimeUpdate::default(),
+            )
+            .unwrap());
+        assert!(!s
+            .release_bridge_runtime(BridgePlatform::Telegram, "owner-a")
+            .unwrap());
+        assert!(s
+            .release_bridge_runtime(BridgePlatform::Telegram, "owner-b")
+            .unwrap());
+        let released = s
+            .bridge_runtime_status(BridgePlatform::Telegram)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.status, BridgeRuntimeStatus::Stopped);
+        assert!(released.owner_id.is_empty());
+        assert_eq!(released.cursor, "cursor-101");
+
+        assert!(s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                &"x".repeat(crate::model::MAX_BRIDGE_OWNER_ID_LEN + 1),
+                Some(1),
+                "host",
+                0,
+            )
+            .is_err());
+        assert!(s
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner",
+                Some(0),
+                "host",
+                0,
+            )
+            .is_err());
+        assert!(s
+            .update_bridge_runtime(
+                BridgePlatform::Slack,
+                "slack-owner",
+                &BridgeRuntimeUpdate {
+                    cursor: Some("x".repeat(crate::model::MAX_BRIDGE_CURSOR_LEN + 1)),
+                    ..BridgeRuntimeUpdate::default()
+                },
+            )
+            .is_err());
+        assert!(s
+            .update_bridge_runtime(
+                BridgePlatform::Slack,
+                "slack-owner",
+                &BridgeRuntimeUpdate {
+                    status: Some(BridgeRuntimeStatus::Stopped),
+                    ..BridgeRuntimeUpdate::default()
+                },
+            )
+            .is_err());
+        assert!(s
+            .update_bridge_runtime(
+                BridgePlatform::Slack,
+                "slack-owner",
+                &BridgeRuntimeUpdate {
+                    error: BridgeRuntimeErrorUpdate::Set {
+                        class: "x".repeat(crate::model::MAX_BRIDGE_ERROR_CLASS_LEN + 1),
+                        message: String::new(),
+                    },
+                    ..BridgeRuntimeUpdate::default()
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_bridge_runtime_claim_collision_has_exactly_one_winner_libsql() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-bridge-claim-race-{}-{}",
+            std::process::id(),
+            new_attempt_id(now())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let open = |path: &std::path::Path| {
+            LibsqlStore::open(&Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".into()),
+                ..Config::default()
+            })
+            .unwrap()
+        };
+        drop(open(&path));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["owner-a", "owner-b"]
+            .into_iter()
+            .map(|owner| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let store = LibsqlStore::open(&Config {
+                        db: Some(path.to_string_lossy().into_owned()),
+                        backend: Some("libsql".into()),
+                        ..Config::default()
+                    })
+                    .unwrap();
+                    barrier.wait();
+                    store.claim_bridge_runtime(
+                        BridgePlatform::Telegram,
+                        "telegram-bridge",
+                        "operator",
+                        owner,
+                        Some(1),
+                        "host",
+                        now().saturating_sub(60),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|state| state.is_some()).count(), 1);
+        let winner = open(&path)
+            .bridge_runtime_status(BridgePlatform::Telegram)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(winner.owner_id.as_str(), "owner-a" | "owner-b"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bridge_runtime_table_migrates_on_legacy_libsql_open() {
+        let s = mem();
+        let path = s.local_path.clone().unwrap();
+        s.rt.block_on(async {
+            s.conn
+                .execute("DROP TABLE bridge_runtime", ())
+                .await
+                .unwrap();
+            s.conn
+                .execute("DROP TABLE bridge_staged_events", ())
+                .await
+                .unwrap();
+            s.conn
+                .execute("DROP INDEX idx_delivery_log_exact", ())
+                .await
+                .unwrap();
+        });
+        drop(s);
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+        let reopened = LibsqlStore::open(&cfg).unwrap();
+        assert!(reopened
+            .bridge_runtime_status(BridgePlatform::Telegram)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .claim_bridge_runtime(
+                BridgePlatform::Telegram,
+                "telegram-bridge",
+                "operator",
+                "owner",
+                Some(1),
+                "host",
+                0,
+            )
+            .unwrap()
+            .is_some());
+        let ddl = reopened
+            .rt
+            .block_on(async {
+                let mut rows = reopened
+                    .conn
+                    .query(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bridge_runtime'",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("bridge_runtime ddl");
+                Ok::<_, anyhow::Error>(row.get::<String>(0)?)
+            })
+            .unwrap();
+        assert!(!ddl.to_ascii_lowercase().contains("token"));
+        let exact_index = reopened
+            .rt
+            .block_on(async {
+                let mut rows = reopened
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_delivery_log_exact'",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("exact relay lookup index");
+                Ok::<_, anyhow::Error>(row.get::<i64>(0)?)
+            })
+            .unwrap();
+        assert_eq!(
+            exact_index, 1,
+            "legacy opens add the exact relay lookup index"
+        );
+        let staging_schema = reopened
+            .rt
+            .block_on(async {
+                let mut rows = reopened
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM sqlite_master
+                          WHERE (type='table' AND name='bridge_staged_events')
+                             OR (type='index' AND name='idx_bridge_staged_route_order')",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("durable bridge staging schema");
+                Ok::<_, anyhow::Error>(row.get::<i64>(0)?)
+            })
+            .unwrap();
+        assert_eq!(staging_schema, 2, "legacy opens add durable bridge staging");
     }
 }

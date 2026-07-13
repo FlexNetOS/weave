@@ -110,6 +110,66 @@ pub fn canonical_message(from: &str, to: &str, body: &str) -> Vec<u8> {
     out
 }
 
+/// Semantic fields covered by the current (`v2`) cross-store intent signature.
+/// `trace_id` is deliberately excluded because it is attempt-local diagnostics:
+/// exact retries preserve the first stored trace while allowing a later attempt
+/// to carry a new one. Every field that changes delivery or message meaning is
+/// included, with `None` distinct from an explicitly empty value.
+#[derive(Debug, Clone, Copy)]
+pub struct IntentSignatureFields<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub to_host: &'a str,
+    pub subject: Option<&'a str>,
+    pub body: &'a str,
+    pub idempotency_key: Option<&'a str>,
+    pub priority: &'a str,
+    pub ttl: i64,
+}
+
+/// Canonical byte encoding for a complete intent's semantic tuple. Callers pass
+/// the Store-canonical host and priority values. Length prefixes and explicit
+/// option markers make every field boundary and `None`/`Some` shape unambiguous.
+pub fn canonical_intent_v2(fields: &IntentSignatureFields<'_>) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"weave-intent-v2\0";
+
+    fn push_field(out: &mut Vec<u8>, field: &[u8]) {
+        out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+
+    fn push_optional(out: &mut Vec<u8>, field: Option<&str>) {
+        match field {
+            Some(field) => {
+                out.push(1);
+                push_field(out, field.as_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+
+    let mut out = Vec::with_capacity(
+        DOMAIN.len()
+            + fields.from.len()
+            + fields.to.len()
+            + fields.to_host.len()
+            + fields.subject.map_or(0, str::len)
+            + fields.body.len()
+            + fields.idempotency_key.map_or(0, str::len)
+            + 80,
+    );
+    out.extend_from_slice(DOMAIN);
+    push_field(&mut out, fields.from.as_bytes());
+    push_field(&mut out, fields.to.as_bytes());
+    push_field(&mut out, fields.to_host.as_bytes());
+    push_optional(&mut out, fields.subject);
+    push_field(&mut out, fields.body.as_bytes());
+    push_optional(&mut out, fields.idempotency_key);
+    push_field(&mut out, fields.priority.as_bytes());
+    out.extend_from_slice(&fields.ttl.to_be_bytes());
+    out
+}
+
 /// Generate a fresh Ed25519 keypair, persist the PRIVATE key 0600 under the config
 /// dir (creating the dir 0700 if needed), and return the hex-encoded PUBLIC key.
 /// Refuses to clobber an existing key file (a keypair is long-lived identity; an
@@ -258,6 +318,15 @@ pub fn sign_intent(key: &SigningKey, from: &str, to: &str, body: &str) -> String
     to_hex(&sig.to_bytes())
 }
 
+/// Sign the complete v2 intent tuple. The `v2:` marker is stored alongside the
+/// hex signature so receivers can continue accepting already-queued v1 rows
+/// without guessing which canonical encoding was used.
+pub fn sign_intent_v2(key: &SigningKey, fields: &IntentSignatureFields<'_>) -> String {
+    let msg = canonical_intent_v2(fields);
+    let sig: Signature = key.sign(&msg);
+    format!("v2:{}", to_hex(&sig.to_bytes()))
+}
+
 /// Verify `sig_hex` over the canonical `(from,to,body)` message against the
 /// hex-encoded public key `pubkey_hex`. Returns `Ok(true)` only on a valid
 /// signature; a malformed key/signature or a verification failure returns
@@ -293,6 +362,40 @@ pub fn verify_intent(
     let signature = Signature::from_bytes(&sig_arr);
     let msg = canonical_message(from, to, body);
     Ok(verifying.verify(&msg, &signature).is_ok())
+}
+
+/// Verify a `v2:` signature over the complete semantic intent tuple. A missing or
+/// unknown marker, malformed key/signature, or failed verification is simply
+/// `Ok(false)`, matching the legacy verifier's fail-closed caller contract.
+pub fn verify_intent_v2(
+    pubkey_hex: &str,
+    encoded_sig: &str,
+    fields: &IntentSignatureFields<'_>,
+) -> Result<bool> {
+    let Some(sig_hex) = encoded_sig.strip_prefix("v2:") else {
+        return Ok(false);
+    };
+    if pubkey_hex.len() > MAX_KEY_HEX_LEN || encoded_sig.len() > MAX_KEY_HEX_LEN {
+        return Ok(false);
+    }
+    let pk_bytes = match from_hex(pubkey_hex) {
+        Ok(bytes) if bytes.len() == ed25519_dalek::PUBLIC_KEY_LENGTH => bytes,
+        _ => return Ok(false),
+    };
+    let sig_bytes = match from_hex(sig_hex) {
+        Ok(bytes) if bytes.len() == SIGNATURE_LENGTH => bytes,
+        _ => return Ok(false),
+    };
+    let mut pk = [0u8; ed25519_dalek::PUBLIC_KEY_LENGTH];
+    pk.copy_from_slice(&pk_bytes);
+    let verifying = match VerifyingKey::from_bytes(&pk) {
+        Ok(key) => key,
+        Err(_) => return Ok(false),
+    };
+    let mut sig = [0u8; SIGNATURE_LENGTH];
+    sig.copy_from_slice(&sig_bytes);
+    let msg = canonical_intent_v2(fields);
+    Ok(verifying.verify(&msg, &Signature::from_bytes(&sig)).is_ok())
 }
 
 /// Number of hex chars of the SHA-256 digest shown in the DISPLAY fingerprint
@@ -406,6 +509,79 @@ mod tests {
         assert!(!verify_intent(&pk, &sig, "mallory", "bob", "hello").unwrap());
         assert!(!verify_intent(&pk, &sig, "alice", "carol", "hello").unwrap());
         assert!(!verify_intent(&pk, &sig, "alice", "bob", "HELLO").unwrap());
+    }
+
+    #[test]
+    fn v2_signature_binds_every_delivery_semantic() {
+        let key = test_key(17);
+        let pk = to_hex(key.verifying_key().as_bytes());
+        let fields = IntentSignatureFields {
+            from: "alice",
+            to: "bob",
+            to_host: "host-b",
+            subject: Some("topic"),
+            body: "hello",
+            idempotency_key: Some("event_1"),
+            priority: "urgent",
+            ttl: 600,
+        };
+        let sig = sign_intent_v2(&key, &fields);
+        assert!(sig.starts_with("v2:"));
+        assert!(verify_intent_v2(&pk, &sig, &fields).unwrap());
+
+        let mutations = [
+            IntentSignatureFields {
+                from: "mallory",
+                ..fields
+            },
+            IntentSignatureFields {
+                to: "carol",
+                ..fields
+            },
+            IntentSignatureFields {
+                to_host: "host-c",
+                ..fields
+            },
+            IntentSignatureFields {
+                subject: Some("other"),
+                ..fields
+            },
+            IntentSignatureFields {
+                body: "HELLO",
+                ..fields
+            },
+            IntentSignatureFields {
+                idempotency_key: Some("event_2"),
+                ..fields
+            },
+            IntentSignatureFields {
+                priority: "normal",
+                ..fields
+            },
+            IntentSignatureFields { ttl: 601, ..fields },
+        ];
+        for mutation in mutations {
+            assert!(!verify_intent_v2(&pk, &sig, &mutation).unwrap());
+        }
+        assert!(!verify_intent_v2(
+            &pk,
+            &sig,
+            &IntentSignatureFields {
+                subject: None,
+                ..fields
+            },
+        )
+        .unwrap());
+        assert!(!verify_intent_v2(
+            &pk,
+            &sig,
+            &IntentSignatureFields {
+                subject: Some(""),
+                ..fields
+            }
+        )
+        .unwrap());
+        assert!(!verify_intent_v2(&pk, "v3:00", &fields).unwrap());
     }
 
     /// A signature from a DIFFERENT key never verifies (the spoofed-`from` case).

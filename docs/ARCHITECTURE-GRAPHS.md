@@ -231,9 +231,10 @@ CROSS-MACHINE PUSH
 
 Machine A                                  Machine B
 +-------------+                            +----------------------+
-| weave push  | --HTTP POST /api---------> | dashboard/serve write|
-+------+------+   bearer + signed intent  +----------+-----------+
-       |                                             |
+| weave push  | --HTTPS POST /push-------> | dashboard/serve      |
++------+------+   push token + signed     +----------+-----------+
+       |          intent; distinct from              |
+       |          operator /api token                |
        |                                             v
        |                                  commit_pulled pipeline
        |                                  verify/revalidate/dedup
@@ -308,7 +309,7 @@ Why this shape:
 - Weave owns governance: policy, permissions, leases, job trail, MCP/CLI surface.
 - Obscura owns browser mechanics.
 - Weave does not link browser/runtime internals into the default binary.
-- Obscura child stderr/tokens must never leak into MCP JSON-RPC stdout.
+- Obscura child stderr must never leak into MCP JSON-RPC stdout.
 - Internal/private URL access is denied by default.
 
 ## 7. CC Switch provider/vendor flow

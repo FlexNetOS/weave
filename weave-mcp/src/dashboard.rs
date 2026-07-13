@@ -159,9 +159,40 @@ pub struct DashboardSettings {
     pub pull_from_count: usize,
     pub inject_pulled: bool,
     pub allow_inject_from_count: Option<usize>,
+    /// Legacy shared fallback only; platform-specific fields below are canonical.
     pub bridge_identity: String,
     pub telegram_configured: bool,
+    pub telegram_ready: bool,
+    pub telegram_active: bool,
+    pub telegram_stale: bool,
+    pub telegram_healthy: bool,
+    pub telegram_status: String,
+    pub telegram_runtime_present: bool,
+    pub telegram_runtime_status: String,
+    pub telegram_heartbeat: i64,
+    pub telegram_identity: String,
+    pub telegram_recipient: String,
+    pub telegram_pending: i64,
+    pub telegram_last_success: i64,
+    pub telegram_last_delivery: i64,
+    pub telegram_last_error_class: String,
+    pub telegram_issues: Vec<String>,
     pub slack_configured: bool,
+    pub slack_ready: bool,
+    pub slack_active: bool,
+    pub slack_stale: bool,
+    pub slack_healthy: bool,
+    pub slack_status: String,
+    pub slack_runtime_present: bool,
+    pub slack_runtime_status: String,
+    pub slack_heartbeat: i64,
+    pub slack_identity: String,
+    pub slack_recipient: String,
+    pub slack_pending: i64,
+    pub slack_last_success: i64,
+    pub slack_last_delivery: i64,
+    pub slack_last_error_class: String,
+    pub slack_issues: Vec<String>,
     pub pretooluse_approver_configured: bool,
     pub pretooluse_timeout_secs: i64,
     pub obscura_allow_ops: Vec<String>,
@@ -755,25 +786,49 @@ fn render_settings_panel(b: &mut String, snap: &DashboardSnapshot) {
             .map(|n| format!("{n} narrowed"))
             .unwrap_or_else(|| "same as pull_from".to_string()),
     );
-    detail_item(b, "bridge identity", &s.bridge_identity);
+    detail_item(b, "legacy bridge identity", &s.bridge_identity);
     detail_item(
         b,
         "telegram",
-        if s.telegram_configured {
-            "configured"
-        } else {
-            "not configured"
-        },
+        &format!(
+            "{} (identity={}, recipient={}, pending={}, runtime={}, heartbeat={}, last_success={}, last_delivery={})",
+            s.telegram_status,
+            s.telegram_identity,
+            s.telegram_recipient,
+            s.telegram_pending,
+            s.telegram_runtime_status,
+            s.telegram_heartbeat,
+            s.telegram_last_success,
+            s.telegram_last_delivery
+        ),
     );
+    if !s.telegram_last_error_class.is_empty() {
+        detail_item(b, "telegram last error", &s.telegram_last_error_class);
+    }
+    if !s.telegram_issues.is_empty() {
+        detail_item(b, "telegram issues", &s.telegram_issues.join(", "));
+    }
     detail_item(
         b,
         "slack",
-        if s.slack_configured {
-            "configured"
-        } else {
-            "not configured"
-        },
+        &format!(
+            "{} (identity={}, recipient={}, pending={}, runtime={}, heartbeat={}, last_success={}, last_delivery={})",
+            s.slack_status,
+            s.slack_identity,
+            s.slack_recipient,
+            s.slack_pending,
+            s.slack_runtime_status,
+            s.slack_heartbeat,
+            s.slack_last_success,
+            s.slack_last_delivery
+        ),
     );
+    if !s.slack_last_error_class.is_empty() {
+        detail_item(b, "slack last error", &s.slack_last_error_class);
+    }
+    if !s.slack_issues.is_empty() {
+        detail_item(b, "slack issues", &s.slack_issues.join(", "));
+    }
     detail_item(
         b,
         "pretooluse approver",
@@ -994,6 +1049,10 @@ mod tests {
             superseded_by: None,
             expires_at: None,
             kind: None,
+            request_priority: None,
+            request_ttl: None,
+            request_supersedes: None,
+            request_dedup_idle: None,
         }
     }
 
