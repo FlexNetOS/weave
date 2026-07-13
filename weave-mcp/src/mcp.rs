@@ -1931,7 +1931,7 @@ fn mcp_peer_diagnostics(
     McpPeerDiagnostics {
         process_expected,
         process_alive,
-        pane_alive: matches!(capability, Capability::Live),
+        pane_alive: capability.pane_not_known_absent(),
         reachable: matches!(capability, Capability::Live),
         responsive_recently: mcp_peer_recently_responded(store, &p.name, now_ts),
         last_transport_success: mcp_peer_last_transport_success(store, &p.name),
@@ -1939,6 +1939,7 @@ fn mcp_peer_diagnostics(
         stale_reason,
         inject_probe: match capability {
             Capability::Live => "live",
+            Capability::TransportUnavailable => "transport_unavailable",
             Capability::RegisteredNotAlive => "absent",
             Capability::NotInjectable => "not_injectable",
         },
@@ -2920,9 +2921,10 @@ fn tool_get_peer_policy(store: &dyn Store, args: &Value) -> Result<String, Strin
 }
 
 /// Connect handshake: capability-probe `peer` before sending. Reports a structured
-/// verdict and degrades gracefully — a registered-but-not-alive or non-injectable
-/// peer is NOT an error (`isError=false`); its messages still arrive via the store
-/// on its next turn. Only a non-existent peer is an error.
+/// verdict and degrades gracefully — a transport-unavailable,
+/// registered-but-not-alive, or non-injectable peer is NOT an error
+/// (`isError=false`); its messages still arrive via the store on its next turn.
+/// Only a non-existent peer is an error.
 fn tool_connect(
     store: &dyn Store,
     args: &Value,
@@ -2945,6 +2947,13 @@ fn tool_connect(
             "Peer '{to}' is live [{}] {} — a live nudge can be delivered now.",
             target.mux.as_str(),
             target.id
+        ),
+        Capability::TransportUnavailable => format!(
+            "Peer '{to}' has no live transport [{}] {} — {} could not be launched/probed from a trusted directory; \
+             durable delivery remains queued and arrives on the recipient's next inbox drain.",
+            target.mux.as_str(),
+            target.id,
+            target.mux.binary()
         ),
         Capability::RegisteredNotAlive => format!(
             "Peer '{to}' is registered but not alive [{}] {} — delivery will be queued; \
@@ -3018,6 +3027,7 @@ fn ask_delivery_verdict(
     let target = Target::from_peer(&peer);
     match injector.capability(&target) {
         Capability::NotInjectable => "recipient_not_injectable",
+        Capability::TransportUnavailable => "queued_next_turn",
         // Injectable (live or registered): fire the same paste-safe nudge tool_send
         // does and report whether it actually landed.
         _ => {
@@ -4393,7 +4403,7 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_connect",
-            "description": "Probe whether a peer can be reached by a live nudge right now, and report the verdict (live / registered-but-not-alive / not-injectable). A not-alive or non-injectable peer is NOT an error — its messages are still delivered via the store on its next turn; only a non-existent peer is an error.",
+            "description": "Probe whether a peer can be reached by a live nudge right now, and report the verdict (live / transport-unavailable / registered-but-not-alive / not-injectable). An unavailable, not-alive, or non-injectable peer is NOT an error — its messages are still delivered via the store on its next turn; only a non-existent peer is an error.",
             "inputSchema": {"type":"object","properties":{
                 "to":{"type":"string","description":"The peer session name to connect to."}
             },"required":["to"]}
