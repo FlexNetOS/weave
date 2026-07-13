@@ -9,9 +9,9 @@ exact code-level guarantees and a candid residual-risk register. Where this
 document and the code disagree, the code wins; please file an issue.
 
 > **One-line summary:** weave is a single-user, single-host tool. It assumes the
-> machine operator is trusted and focuses its hardening on the two places where
-> *peer-supplied text* crosses a boundary — the keystrokes it types into another
-> session's terminal, and the rows it stores in a shared SQLite file.
+> machine operator is trusted and hardens the boundaries where peer-supplied text
+> is stored, rendered, typed into another session, or deliberately sent through
+> an opt-in provider feature.
 
 ---
 
@@ -19,9 +19,12 @@ document and the code disagree, the code wins; please file an issue.
 
 weave runs **locally** and trusts the operator of the machine. Its store is a
 local SQLite (or local libSQL) file owned by that user; every session that can
-read that file is, by construction, the same Unix user. There is no network
-listener, no authentication, and no cross-user isolation — those are explicit
-non-goals for the local mesh (see §6).
+read that file is, by construction, the same Unix user. The default local mesh
+has no routable listener or peer authentication and speaks MCP over stdio; those
+are explicit non-goals for the local mesh (see §6). Optional features expand
+that boundary deliberately: remote libSQL connects to its configured service,
+the `llm` feature can send summarization requests to a configured provider, and
+the human-surface dashboard can bind an operator-selected local listener.
 
 The one privilege a peer *does* hold is sharp and worth stating plainly:
 
@@ -54,11 +57,12 @@ scope (§6).
 | A peer session sending hostile *message content* | **Yes** | Primary threat: flag/shell injection into the mux CLI, control-char abuse of the recipient pane, resource exhaustion, prompt injection. |
 | A peer poisoning its own *registration* (mux/target id) | **Yes** | A target id is captured from the recipient's environment at register time and is therefore attacker-influenceable; see target-id validation (§3). |
 | Another **local Unix user** reading the store | **Partially** | Mitigated at-rest by `0600`/`0700` permissions (§4), but anyone who is already the same user, or root, can read it. |
-| A **network** attacker | **No** | weave opens no socket and speaks only MCP over stdio. |
+| A **network** attacker | **Conditional** | The default local mesh accepts no routable inbound connection. Opt-in remote libSQL, LLM provider calls, and human surfaces add the explicitly configured network boundaries documented below. |
 | A malicious **dependency** in the build | **Accepted tradeoff** | See supply-chain residual risk (§5). |
 
-The security focus is therefore on **how injected and stored text is handled**,
-not on network or cross-user attackers.
+The core security focus is therefore **how injected and stored text is handled**.
+Optional network features add the explicitly configured boundaries documented
+below; cross-user isolation remains outside the local-mesh model.
 
 ---
 
@@ -254,10 +258,41 @@ I/O + `serde_json` (no shell, no second mutation; it never rewrites the file).
   existing config, so a user's settings and secrets are safe to re-run against.
 
 ### Secret handling
-`Config` has a hand-written `Debug` impl that **redacts** `libsql_auth_token` to
-`<redacted>`, so the token can never leak through a `{:?}` in a log line, panic
-message, or error context. The config template and docs steer users toward the
-`WEAVE_LIBSQL_AUTH_TOKEN` environment variable over storing the token on disk.
+`Config` has a hand-written `Debug` impl that **redacts** database/pull tokens,
+the LLM API credential, bot tokens, and proxy credentials to `<redacted>`, so
+they cannot leak through a `{:?}` in a log line, panic message, or error context.
+The config template and docs steer users toward the matching environment
+variables over storing credentials on disk.
+
+### Opt-in LLM outbound boundary (`--features llm`)
+
+The default build links no HTTP/TLS client. An `llm` build still makes no LLM
+request until both an endpoint and API credential are configured; an absent
+value fails before any outbound connection. Once configured, summarization
+deliberately sends thread/message text and the API credential (as a bearer
+credential) to that external provider. Use an HTTPS endpoint so rustls protects
+both in transit; plain HTTP should be limited to a provider on trusted loopback.
+Redirects are never followed, so a provider cannot forward the credential or
+message text to a second origin or downgrade the configured connection.
+
+The request and response boundaries are deliberately bounded:
+
+- thread summaries use one canonical snapshot of at most 200 messages, independent
+  of the CLI display `--limit`, then cap the conversation text embedded in the
+  prompt at 16,000 Unicode scalar values;
+- the raw response is read through a 64 KiB cap before JSON decoding, and the
+  selected summary is capped at 16,000 Unicode scalars;
+- rendered/cached summaries collapse whitespace to one paragraph, reject
+  non-whitespace controls (including ANSI ESC), and reject empty output;
+- provider status, transport, and decode errors omit response bodies, API
+  credentials, and endpoint/redirect URLs.
+
+Cached summaries surface only for a still-live root and the current persistent
+message generation. Any message insert, update, delete, clear, retention GC, or
+expiry sweep invalidates the cache; expiry is swept before cache lookup, and the
+post-provider write is conditional on the generation remaining unchanged.
+Snapshots containing expiring messages are never cached and are rejected if a
+message expires or mutates while the provider is working.
 
 ### MCP stdout discipline
 The MCP server writes **only** JSON-RPC frames to stdout; all diagnostics go to
@@ -381,9 +416,12 @@ time-bounded exception — carried forward as tracked work, never a blanket sile
 
 - **Authentication / multi-user isolation.** Session identity is advisory; weave
   does not authenticate peers or defend one local session against another.
-- **Network exposure.** No listener, no daemon (the v0.2 presence daemon is
-  opt-in, off by default, and uses a `0600` UDS — see
-  [`ROADMAP-v0.2.md`](ROADMAP-v0.2.md)).
+- **Default-mesh network exposure.** The default local mesh has no routable
+  listener or daemon (the v0.2 presence daemon is opt-in, off by default, and
+  uses a `0600` UDS — see
+  [`ROADMAP-v0.2.md`](ROADMAP-v0.2.md)). Optional outbound LLM/remote-libSQL
+  connections and human surfaces are explicit operator choices, not local-mesh
+  peer exposure.
 - **Cross-machine injection.** Cross-machine *presence* is a roadmap item; pushing
   keystrokes into a remote host's pane is explicitly out of scope.
 - **Encryption at rest.** Secrecy relies on Unix file permissions (`0600`), not

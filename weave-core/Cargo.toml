@@ -35,7 +35,7 @@ getrandom = "0.2"
 # which weave needs for remote HTTPS and which libsql still pins to 0.25 (even on
 # git main) — tracked in deny.toml + WL-044b.
 libsql = { version = "0.9.30", default-features = false, features = ["core", "remote", "tls"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = { version = "0.10", optional = true }

@@ -896,6 +896,24 @@ cargo test --features sign
 cargo test --no-default-features --features "libsql sign"
 ```
 
+The optional **`llm`** feature is also tested on both backends. Its hermetic
+fixtures bind loopback-only HTTP listeners and assert the OpenAI-compatible
+request shape, rustls HTTPS scheme acceptance (a loopback TCP connection before
+the expected handshake failure), refusal to follow a two-listener redirect,
+Unicode-scalar input caps, the 64 KiB pre-decode response cap, normalized/control-
+free 16,000-scalar output, and bounded/redacted errors. Real stdio JSON-RPC tests
+cover MCP feature exposure and provider failures; CLI regressions prove `--limit`
+does not shrink the shared 200-message summary snapshot. Both store modules cover
+generation-conditional writes, legacy fail-closed migration, cache invalidation on
+all message mutations/clear/GC/expiry; the MCP fixture covers ephemeral expiry
+during provider work. The `llm + obscura` MCP lane also exercises the single
+canonical environment lock. No test contacts an external provider:
+
+```bash
+cargo test --features llm
+cargo test --no-default-features --features "libsql llm"
+```
+
 The integration, security, and property suites are backend-agnostic *by
 construction*: they drive the compiled binary and assert behavior (delivery,
 read-tracking, routing, hardening), so whichever backend was compiled in is the

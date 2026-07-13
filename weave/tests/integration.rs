@@ -13,6 +13,8 @@
 
 mod common;
 
+#[cfg(feature = "llm")]
+use common::serve_llm_responses;
 use common::{
     run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_in_cwd_env, run_ok,
     run_ok_env, McpServer, TestDb,
@@ -3013,6 +3015,185 @@ fn reply_thread_receipts_roundtrip() {
     assert!(
         rec.contains('a'),
         "receipts for #2 should list reader a: {rec}"
+    );
+}
+
+#[test]
+fn mcp_llm_catalog_matches_top_level_feature() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let result = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    for name in ["weave_thread_summarize", "weave_summarize_text"] {
+        assert_eq!(
+            names.contains(&name),
+            cfg!(feature = "llm"),
+            "{name} exposure must match the top-level llm feature: {names:?}"
+        );
+    }
+    mcp.shutdown();
+}
+
+#[cfg(feature = "llm")]
+#[test]
+fn mcp_llm_json_rpc_success_uses_configured_provider() {
+    let api_key = "json-rpc-fixture-secret";
+    let success = serde_json::json!({
+        "choices": [{"message": {"content": "  JSON-RPC\n\t summary works  "}}]
+    })
+    .to_string();
+    let (endpoint, _requests, provider) = serve_llm_responses(vec![("200 OK", success)]);
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn_env(
+        &db,
+        &[
+            ("WEAVE_LLM_ENDPOINT", &endpoint),
+            ("WEAVE_LLM_API_KEY", api_key),
+            ("WEAVE_LLM_TIMEOUT_SECS", "2"),
+        ],
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_summarize_text",
+        serde_json::json!({"text": "summarize this through real JSON-RPC"}),
+    );
+    assert!(!is_err, "successful provider call was an MCP error: {text}");
+    assert_eq!(text, "JSON-RPC summary works");
+
+    mcp.shutdown();
+    provider.join().unwrap();
+}
+
+#[cfg(feature = "llm")]
+#[test]
+fn cli_summary_limit_does_not_shrink_the_cached_provider_snapshot() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "canonical root body",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "reply",
+            "--from",
+            "bob",
+            "--in-reply-to",
+            "1",
+            "--body",
+            "canonical reply body",
+        ],
+    );
+    let body = serde_json::json!({
+        "choices": [{"message": {"content": "canonical cached summary"}}]
+    })
+    .to_string();
+    let (endpoint, requests, provider) = serve_llm_responses(vec![("200 OK", body)]);
+    let output = run_ok_env(
+        &db,
+        &["thread", "--root", "1", "--limit", "1", "--summarize"],
+        &[
+            ("WEAVE_LLM_ENDPOINT", &endpoint),
+            ("WEAVE_LLM_API_KEY", "fixture-key"),
+            ("WEAVE_LLM_TIMEOUT_SECS", "2"),
+        ],
+    );
+    assert!(output.contains("canonical cached summary"), "{output}");
+
+    let request = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("record canonical provider request");
+    provider.join().unwrap();
+    let request_body = request.split_once("\r\n\r\n").unwrap().1;
+    let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+    let prompt = request_body["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.contains("canonical root body"), "prompt: {prompt}");
+    assert!(prompt.contains("canonical reply body"), "prompt: {prompt}");
+
+    // No provider configuration is supplied on the second call: this proves the
+    // canonical full-thread result, not the display `--limit`, populated cache.
+    let cached = run_ok(&db, &["thread", "--root", "1", "--summarize"]);
+    assert!(cached.contains("canonical cached summary"), "{cached}");
+}
+
+#[cfg(all(feature = "llm", feature = "sqlite"))]
+#[test]
+fn cli_thread_summary_validates_cached_text_before_output() {
+    use weave_core::store::{SqliteStore, Store};
+
+    let db = TestDb::new();
+    let store = SqliteStore::open(&db.path).unwrap();
+    let root = store
+        .send("alice", "bob", Some("subject"), "hello", None, None)
+        .unwrap();
+
+    store
+        .store_summary(root, "  cached\n\t summary  ", "legacy-model")
+        .unwrap();
+    drop(store);
+    let output = run_ok(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert_eq!(output, format!("thread #{root} summary:\ncached summary\n"));
+
+    let store = SqliteStore::open(&db.path).unwrap();
+    store
+        .store_summary(root, "safe\u{1b}[31munsafe", "legacy-model")
+        .unwrap();
+    drop(store);
+    let (ok, out, err) = run(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert!(!ok, "unsafe cached output must fail, stdout: {out}");
+    assert!(
+        err.contains("control"),
+        "clear cache validation error: {err}"
+    );
+    assert!(!err.contains("[31munsafe"), "cached text leaked: {err}");
+
+    let store = SqliteStore::open(&db.path).unwrap();
+    store
+        .store_summary(root, &"é".repeat(16_001), "legacy-model")
+        .unwrap();
+    drop(store);
+    let (ok, out, err) = run(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert!(!ok, "oversized cached output must fail, stdout: {out}");
+    assert!(err.contains("16000"), "clear cache size error: {err}");
+}
+
+#[cfg(not(feature = "llm"))]
+#[test]
+fn thread_summarize_errors_when_llm_is_not_compiled() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "b", "--body", "hello"],
+    );
+    let (ok, out, err) = run(&db, &["thread", "--root", "1", "--summarize"]);
+    assert!(!ok, "feature-off summarize must fail, stdout: {out}");
+    assert!(
+        err.contains("compiled without the llm feature"),
+        "clear feature error: {err}"
+    );
+}
+
+#[test]
+fn thread_refresh_requires_summarize_flag() {
+    let db = TestDb::new();
+    let (ok, out, err) = run(&db, &["thread", "--root", "1", "--refresh"]);
+    assert!(!ok, "--refresh alone must be rejected, stdout: {out}");
+    assert!(
+        err.contains("--summarize"),
+        "clap should explain the required flag: {err}"
     );
 }
 

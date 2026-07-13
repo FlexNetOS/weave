@@ -19,7 +19,7 @@ default = ["sqlite"]
 sqlite = ["weave-core/sqlite", "dep:rusqlite"]
 libsql = ["weave-core/libsql", "weave-mcp/libsql"]
 sign = ["weave-core/sign", "weave-mcp/sign"]
-llm = ["weave-core/llm"]
+llm = ["weave-core/llm", "weave-mcp/llm"]
 # WL-048 / ADR-0004: human surfaces. The dashboard render lives in weave-mcp; the
 # bot bridges live in this bin — so the flag threads to BOTH core and mcp, and
 # pulls reqwest into THIS crate (the bots' HTTP client). Cargo unifies it with the
@@ -40,7 +40,7 @@ clap_complete = "4.6.1"
 clap_mangen = "0.2.31"
 # WL-048 bot HTTP client — same blocking+rustls reqwest weave-core uses under
 # `llm`; optional + gated under `surfaces` so the default build links none.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }

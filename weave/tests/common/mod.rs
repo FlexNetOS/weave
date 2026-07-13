@@ -10,7 +10,8 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +64,90 @@ impl Default for TestDb {
     }
 }
 
+/// Serve deterministic OpenAI-compatible responses on loopback for black-box
+/// CLI/MCP tests. Each tuple is `(HTTP status, raw body)`. Accept/read deadlines
+/// keep failures bounded, and an early client close is permitted when a response
+/// exceeds the client's hard byte cap.
+pub fn serve_llm_responses(
+    responses: Vec<(&'static str, String)>,
+) -> (String, Receiver<String>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind black-box LLM fixture");
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for (status, body) in responses {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "client did not connect to black-box LLM fixture"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept black-box LLM request: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 2048];
+            let header_end = loop {
+                let n = stream.read(&mut buf).expect("read black-box LLM request");
+                assert!(n > 0, "client closed before request headers completed");
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_len {
+                let n = stream
+                    .read(&mut buf)
+                    .expect("read black-box LLM request body");
+                assert!(n > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..n]);
+            }
+            request_tx
+                .send(String::from_utf8(request).expect("LLM request is UTF-8"))
+                .expect("record black-box LLM request");
+            if let Err(err) = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ) {
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "write black-box LLM fixture response: {err}"
+                );
+            }
+        }
+    });
+    (
+        format!("http://{addr}/v1/chat/completions"),
+        request_rx,
+        server,
+    )
+}
+
 impl Drop for TestDb {
     fn drop(&mut self) {
         // Best-effort cleanup of the db and any sqlite sidecar files.
@@ -93,6 +178,11 @@ pub fn scrub_env(cmd: &mut Command) {
         "WEAVE_DB",
         "WEAVE_LIBSQL_URL",
         "WEAVE_LIBSQL_AUTH_TOKEN",
+        "WEAVE_LLM_ENDPOINT",
+        "WEAVE_LLM_API_KEY",
+        "WEAVE_LLM_MODEL",
+        "WEAVE_LLM_TIMEOUT_SECS",
+        "WEAVE_LLM_MAX_INPUT_CHARS",
         "WEAVE_MUX_DIR",
         // WL-084 identity inputs — a stray outer value would leak a client
         // pid, a spawn cert, or an env-file path into every hook under test.

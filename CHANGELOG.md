@@ -732,6 +732,32 @@
 - **Tests:** store round-trip tests for both backends; unconfigured-endpoint and
   secret-redaction tests for the LLM module.
 
+### Fixed
+- **TLS + feature propagation:** optional `reqwest` clients now compile with the
+  rustls/webpki-roots backend, and the top-level `llm` feature also enables the
+  MCP LLM handlers. The default build still compiles neither `reqwest` nor rustls.
+- **MCP:** `weave_thread_summarize` and `weave_summarize_text` now call the
+  configured provider; thread summaries use one shared, display-limit-independent
+  200-message snapshot and refresh the durable cache, retain a good cache on
+  refresh failure, persist the effective model name, reject missing threads, and
+  are advertised only in `llm` builds.
+- **config/client hardening:** all five documented `WEAVE_LLM_*` overlays now take
+  effect through `Config::load`; input caps count Unicode scalars and clamp to
+  `1..=16000`, request timeouts clamp to `1..=300` seconds, empty provider results
+  fail loudly, redirects are refused, and provider error bodies, credentials, and
+  endpoint/Location URLs are not echoed. Raw responses are bounded to 64 KiB
+  before JSON decode; summary output is bounded to 16,000 Unicode scalars,
+  whitespace-normalized to one paragraph, and rejected on non-whitespace controls.
+- **cache correctness (both backends):** summary reads require a live root and the
+  current persistent message generation. Message insert/update/delete triggers,
+  clear, retention GC, and expiry sweep invalidate the whole cache; expiry is
+  swept before lookup, and provider results use an atomic generation-conditional
+  write so a concurrent reply/update/delete cannot publish stale text. Legacy
+  caches migrate with generation `-1` and fail closed. Ephemeral snapshots are
+  never cached and cannot emit after mutation or deadline expiry.
+- **CLI:** feature-off `thread --summarize` now errors explicitly and `--refresh`
+  requires `--summarize`.
+
 ## [Unreleased] — message priority & contact policies (WL-031 + WL-032)
 
 > **Message importance levels and per-peer contact policies.** Senders can tag
