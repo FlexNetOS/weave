@@ -1,0 +1,8 @@
+# Meta fleet baseline; peer-owned config and lock.
+scope: project
+agent: codex
+skills:
+  - source: https://github.com/FlexNetOS/meta
+    ref: fb7273a7c8d05dce0bac649ded940a86ad41e107
+    sub-dir: agent-env/skills
+    skills: [meta-gitkb-review]

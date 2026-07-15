@@ -1,0 +1,26 @@
+version: 3
+skills:
+  skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review:
+    destination: .codex/skills/meta-gitkb-review
+    hash: f59fc59b0ade740a4e9346a05e55ad820443b1dbc2094aa3a19900b88b4f0ddf
+    skill: meta-gitkb-review
+    description: Review a FlexNetOS Meta peer through the shared Meta/GitKB policy while preserving its independent repository and native assistant adapters.
+    source: https://github.com/FlexNetOS/meta
+    source_revision: ref:fb7273a7c8d05dce0bac649ded940a86ad41e107
+    scope: project
+assets: {}
+source_selectors:
+  skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review: v2|base=56:v1|kind=skill|sub-dir=16:agent-env/skills|selection=name|scope=project|targets=2|32:.agents/skills/meta-gitkb-review31:.codex/skills/meta-gitkb-review
+installed_outputs:
+  67:skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review|31:.codex/skills/meta-gitkb-review|10:skill-tree|4:tree:
+    asset_id: skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review
+    destination: .codex/skills/meta-gitkb-review
+    format: skill-tree
+    unit: tree
+    hash: f59fc59b0ade740a4e9346a05e55ad820443b1dbc2094aa3a19900b88b4f0ddf
+  67:skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review|32:.agents/skills/meta-gitkb-review|10:skill-tree|4:tree:
+    asset_id: skill::v3|33:https://github.com/FlexNetOS/meta|17:meta-gitkb-review
+    destination: .agents/skills/meta-gitkb-review
+    format: skill-tree
+    unit: tree
+    hash: f59fc59b0ade740a4e9346a05e55ad820443b1dbc2094aa3a19900b88b4f0ddf
