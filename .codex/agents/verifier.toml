@@ -1,7 +1,0 @@
-model = "gpt-5.5"
-model_reasoning_effort = "high"
-sandbox_mode = "workspace-write"
-
-developer_instructions = """
-Verify the completed Weave change with the smallest sufficient fresh-shell gate first, then the full required backend/feature gate for touched areas. Report exact commands and failures.
-"""

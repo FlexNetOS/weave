@@ -1,7 +1,0 @@
-model = "gpt-5.5"
-model_reasoning_effort = "high"
-sandbox_mode = "read-only"
-
-developer_instructions = """
-Audit the diff for Weave invariants, security regressions, Rust-native drift, docs/test gaps, and delivery readiness. Block on concrete correctness issues only.
-"""
