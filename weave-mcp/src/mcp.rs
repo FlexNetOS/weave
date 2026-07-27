@@ -6088,7 +6088,7 @@ mod tests {
             argv_child: &[String],
             window: bool,
         ) -> anyhow::Result<SpawnOutcome> {
-            self.spawn_calls.lock().unwrap().push(SpawnRecord {
+            self.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(SpawnRecord {
                 mux,
                 cwd: cwd.to_string(),
                 name: name.to_string(),
@@ -6102,7 +6102,7 @@ mod tests {
             })
         }
         fn kill(&self, target: &Target) -> anyhow::Result<bool> {
-            self.kill_calls.lock().unwrap().push(target.clone());
+            self.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(target.clone());
             Ok(true)
         }
     }
@@ -6819,7 +6819,7 @@ mod tests {
             "result discloses the cert: {out}"
         );
 
-        let calls = inj.spawn_calls.lock().unwrap();
+        let calls = inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1, "exactly one spawn fired");
         let rec = &calls[0];
         assert_eq!(rec.mux, Mux::Tmux);
@@ -6863,7 +6863,7 @@ mod tests {
             "error explains the allowlist denial: {err}"
         );
         assert!(
-            inj.spawn_calls.lock().unwrap().is_empty(),
+            inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
             "no spawn fires when the cwd is denied"
         );
         assert!(st.get_peer("kid").unwrap().is_none(), "no phantom peer row");
@@ -6897,7 +6897,7 @@ mod tests {
         )
         .expect_err("cannot spawn over a live peer");
         assert!(err.contains("already registered"), "{err}");
-        assert!(inj.spawn_calls.lock().unwrap().is_empty());
+        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     /// `weave_kill_peer` for an unknown peer ⇒ Err (isError), no kill call.
@@ -6913,7 +6913,7 @@ mod tests {
         )
         .expect_err("unknown peer must error");
         assert!(err.contains("no registered peer"), "{err}");
-        assert!(inj.kill_calls.lock().unwrap().is_empty());
+        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     /// `weave_kill_peer` happy path: a registered tmux peer is killed via the trait.
@@ -6933,7 +6933,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("Killed"), "{out}");
-        let calls = inj.kill_calls.lock().unwrap();
+        let calls = inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].mux, Mux::Tmux);
         assert_eq!(calls[0].id, "%3");
@@ -6955,7 +6955,7 @@ mod tests {
             "graceful unsupported message: {out}"
         );
         assert!(
-            inj.kill_calls.lock().unwrap().is_empty(),
+            inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
             "no kill argv runs on an unsupported mux"
         );
     }
@@ -6991,8 +6991,8 @@ mod tests {
             );
         }
         // No spawn/kill ever fired — the gate blocks before call_tool.
-        assert!(inj.spawn_calls.lock().unwrap().is_empty());
-        assert!(inj.kill_calls.lock().unwrap().is_empty());
+        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     // ---- WL-050 / ADR-0003 token-light progressive-disclosure MCP -----------
