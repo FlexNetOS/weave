@@ -23,3 +23,6 @@ cc-switch-main.zip
 .handoff/**/*.db-shm
 .handoff/**/*.sqlite.bak
 .handoff/**/*.redb.tmp
+
+# local agent worktrees -- never part of the tree
+.worktrees/
