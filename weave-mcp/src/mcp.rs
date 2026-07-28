@@ -6023,7 +6023,7 @@ mod tests {
             argv_child: &[String],
             window: bool,
         ) -> anyhow::Result<SpawnOutcome> {
-            self.spawn_calls.lock().unwrap().push(SpawnRecord {
+            self.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(SpawnRecord {
                 mux,
                 cwd: cwd.to_string(),
                 name: name.to_string(),
@@ -6037,7 +6037,7 @@ mod tests {
             })
         }
         fn kill(&self, target: &Target) -> anyhow::Result<bool> {
-            self.kill_calls.lock().unwrap().push(target.clone());
+            self.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(target.clone());
             Ok(true)
         }
     }
@@ -6190,7 +6190,7 @@ mod tests {
         // obscura spawn. Point config discovery at an empty dir (no config.toml) so
         // the policy is genuinely unset, and the obscura bin at a name that does not
         // resolve — proving the deny happens first (a spawn would error differently).
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let empty_cfg = std::env::temp_dir().join(format!("weave-noconf-{}", std::process::id()));
         let _xdg =
             weave_core::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", &empty_cfg.to_string_lossy());
@@ -6214,7 +6214,7 @@ mod tests {
     #[cfg(feature = "obscura")]
     #[test]
     fn weave_web_ssrf_blocked_before_spawn() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-ssrf-{}", std::process::id()));
         let _xdg =
@@ -6240,7 +6240,7 @@ mod tests {
         // An unknown op is refused by the deny-by-default parse gate (even with a
         // wildcard allow-list) BEFORE any obscura spawn — a clean error, never a
         // panic or a spawn of a binary that does not resolve.
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-unk-{}", std::process::id()));
         let _xdg =
@@ -6270,7 +6270,7 @@ mod tests {
         // binary does not resolve to a trusted dir. weave must surface a clean error
         // (binary not found), never a panic. This is the "allowed but obscura-missing"
         // path distinct from deny-by-default.
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let empty_cfg =
             std::env::temp_dir().join(format!("weave-noconf-miss-{}", std::process::id()));
         let _xdg =
@@ -6337,7 +6337,7 @@ mod tests {
     /// recorded (name, cert) the runner turns into WEAVE_SESSION / WEAVE_BIRTH_CERT.
     #[test]
     fn spawn_peer_happy_path_records_and_registers() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let allow = std::env::temp_dir().join(format!("weave-spawn-ok-{}", std::process::id()));
         std::fs::create_dir_all(&allow).unwrap();
         let allow_real = std::fs::canonicalize(&allow).unwrap();
@@ -6362,7 +6362,7 @@ mod tests {
             "result discloses the cert: {out}"
         );
 
-        let calls = inj.spawn_calls.lock().unwrap();
+        let calls = inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1, "exactly one spawn fired");
         let rec = &calls[0];
         assert_eq!(rec.mux, Mux::Tmux);
@@ -6387,7 +6387,7 @@ mod tests {
     /// Err (isError at the protocol seam) and NO spawn call fires.
     #[test]
     fn spawn_peer_disallowed_cwd_is_error() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("WEAVE_SPAWN_DIRS");
         let st = store();
         let inj = RecordingInjector {
@@ -6407,7 +6407,7 @@ mod tests {
             "error explains the allowlist denial: {err}"
         );
         assert!(
-            inj.spawn_calls.lock().unwrap().is_empty(),
+            inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
             "no spawn fires when the cwd is denied"
         );
         assert!(st.get_peer("kid").unwrap().is_none(), "no phantom peer row");
@@ -6416,7 +6416,7 @@ mod tests {
     /// Spawning over an already-registered name is refused (Err) before any launch.
     #[test]
     fn spawn_peer_existing_name_is_error() {
-        let _g = SPAWN_ENV_LOCK.lock().unwrap();
+        let _g = SPAWN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let allow = std::env::temp_dir().join(format!("weave-spawn-dup-{}", std::process::id()));
         std::fs::create_dir_all(&allow).unwrap();
         let allow_real = std::fs::canonicalize(&allow).unwrap();
@@ -6438,7 +6438,7 @@ mod tests {
         )
         .expect_err("cannot spawn over a live peer");
         assert!(err.contains("already registered"), "{err}");
-        assert!(inj.spawn_calls.lock().unwrap().is_empty());
+        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
         std::env::remove_var("WEAVE_SPAWN_DIRS");
     }
 
@@ -6455,7 +6455,7 @@ mod tests {
         )
         .expect_err("unknown peer must error");
         assert!(err.contains("no registered peer"), "{err}");
-        assert!(inj.kill_calls.lock().unwrap().is_empty());
+        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     /// `weave_kill_peer` happy path: a registered tmux peer is killed via the trait.
@@ -6475,7 +6475,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("Killed"), "{out}");
-        let calls = inj.kill_calls.lock().unwrap();
+        let calls = inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].mux, Mux::Tmux);
         assert_eq!(calls[0].id, "%3");
@@ -6497,7 +6497,7 @@ mod tests {
             "graceful unsupported message: {out}"
         );
         assert!(
-            inj.kill_calls.lock().unwrap().is_empty(),
+            inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
             "no kill argv runs on an unsupported mux"
         );
     }
@@ -6533,8 +6533,8 @@ mod tests {
             );
         }
         // No spawn/kill ever fired — the gate blocks before call_tool.
-        assert!(inj.spawn_calls.lock().unwrap().is_empty());
-        assert!(inj.kill_calls.lock().unwrap().is_empty());
+        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     // ---- WL-050 / ADR-0003 token-light progressive-disclosure MCP -----------
@@ -6548,7 +6548,7 @@ mod tests {
     /// token-light point: a bounded standing context cost regardless of op count.
     #[test]
     fn progressive_default_surface_is_just_the_meta_tool() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        let _g = MCP_EAGER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("WEAVE_MCP_EAGER");
         let listed = tools();
         let arr = listed.as_array().expect("tools() is an array");
@@ -6577,7 +6577,7 @@ mod tests {
     /// or piles on standing dispatchers trips this immediately.
     #[test]
     fn standing_mcp_surface_is_within_token_budget() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        let _g = MCP_EAGER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("WEAVE_MCP_EAGER");
         let listed = tools();
         let bytes = serde_json::to_string(&listed)
@@ -6601,7 +6601,7 @@ mod tests {
     /// the catalog — the backward-compatible path for harnesses that require flat tools.
     #[test]
     fn eager_mode_restores_the_full_flat_table() {
-        let _g = MCP_EAGER_LOCK.lock().unwrap();
+        let _g = MCP_EAGER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("WEAVE_MCP_EAGER", "1");
         let listed = tools();
         let n = listed.as_array().map(|a| a.len()).unwrap_or(0);

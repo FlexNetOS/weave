@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn sanitize_key_accepts_good_rejects_bad() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(sanitize_key("foo-bar_123").unwrap(), "foo-bar_123");
         assert!(sanitize_key("../etc").is_err());
         assert!(sanitize_key("foo/bar").is_err());
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn memory_roundtrip() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn memory_search_substring() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "a", "A", &[], "alpha content").unwrap();
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn memory_search_tag_priority() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "only-body", "X", &[], "rusty body").unwrap();
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn memory_list_and_delete() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "x", "X", &[], "body").unwrap();
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn memory_path_is_under_config_dir() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/weave-cfg-test");
         let p = memory_path(&MemoryScope::Global, "foo").unwrap();
         assert!(p.starts_with("/tmp/weave-cfg-test/weave/memory/"));
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn parse_entry_handles_empty_body() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("weave-mem-parse-{}", crate::model::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.md");
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn parse_entry_rejects_no_frontmatter() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("weave-mem-parse2-{}", crate::model::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.md");
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn path_traversal_rejected() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         assert!(memory_write(&scope, "../../../etc/passwd", "T", &[], "B").is_err());
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn oversized_body_rejected() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         let big = "x".repeat(MAX_BODY_BYTES + 1);
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn bad_tag_chars_stripped() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "tags", "T", &["foo;rm -rf".into()], "B").unwrap();
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn build_context_prefix_smoke() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn build_context_prefix_no_match_returns_empty() {
-        let _guard = FS_LOCK.lock().unwrap();
+        let _guard = FS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = tmp_memory_dir();
         let prefix = build_context_prefix("me", "default", "xyz abc", 3);
         assert_eq!(prefix, "");
