@@ -721,6 +721,40 @@ a successful, still-current provider response. The MCP catalog exposes
 default binary links no HTTP/TLS client, and an `llm` build makes no provider call
 while its endpoint or credential is unconfigured.
 
+## Thread summaries (`--features llm`)
+
+Build the optional OpenAI-compatible, rustls-backed summarization client and
+configure it through `config.toml` or the matching environment overlays:
+
+```bash
+cargo build --release --features llm
+WEAVE_LLM_ENDPOINT=https://api.openai.com/v1/chat/completions \
+WEAVE_LLM_API_KEY=... WEAVE_LLM_MODEL=gpt-4o-mini \
+  weave thread --root 42 --summarize
+weave thread --root 42 --summarize --refresh
+weave summarize --text "text to condense"
+```
+
+`WEAVE_LLM_TIMEOUT_SECS` and `WEAVE_LLM_MAX_INPUT_CHARS` overlay the matching
+config fields. Timeouts clamp to `1..=300` seconds; input is capped by Unicode
+scalar count to `1..=16000`. A thread summary always uses the same canonical
+snapshot of at most 200 messages; `thread --limit` changes display only, not what
+is summarized. The configured external provider receives that bounded text and
+the bearer API credential, so use an HTTPS endpoint. Redirects are not followed.
+Provider responses are capped at 64 KiB before JSON decoding; summary text is
+limited to 16,000 Unicode scalars, collapsed to one paragraph, and rejected if
+empty or control-bearing.
+
+Thread summaries are cached in the selected store. A cache hit requires a live
+root and the current message generation; every message mutation, clear, GC, or
+expiry deletion invalidates summaries. Expiry is swept before lookup, a provider
+result is stored only if the generation is unchanged, and snapshots containing
+ephemeral messages are never cached. `--refresh` replaces a good cache only after
+a successful, still-current provider response. The MCP catalog exposes
+`weave_thread_summarize` and `weave_summarize_text` only in an `llm` build. The
+default binary links no HTTP/TLS client, and an `llm` build makes no provider call
+while its endpoint or credential is unconfigured.
+
 ## Human surfaces (`--features surfaces`)
 
 Optional **human** surfaces, all Rust-native (no Next.js, no Python, no async
