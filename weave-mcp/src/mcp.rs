@@ -6332,7 +6332,7 @@ mod tests {
             true
         }
         fn inject_mode(&self, _t: &Target, body: &str, _m: Nudge) -> anyhow::Result<bool> {
-            self.inject_calls.lock().unwrap().push(body.to_string());
+            self.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(body.to_string());
             Ok(true)
         }
         fn capability(&self, _t: &Target) -> Capability {
@@ -6448,7 +6448,7 @@ mod tests {
         call("weave_send", send.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_send", send, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 1);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
 
         let ask = json!({
             "from":"bridge", "to":"a", "body":"question", "no_memory":true,
@@ -6457,7 +6457,7 @@ mod tests {
         call("weave_ask", ask.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_ask", ask, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 2);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 2);
 
         let (cid, _) = st
             .ask(
@@ -6477,7 +6477,7 @@ mod tests {
         call("weave_answer", answer.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_answer", answer, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 3);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 3);
 
         let root = st
             .send("a", "bridge", None, "reply to me", None, None)
@@ -6489,7 +6489,7 @@ mod tests {
         call("weave_reply", reply.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_reply", reply, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 4);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 4);
 
         let notify = json!({
             "from":"bridge", "to":"a", "body":"ping",
@@ -6498,7 +6498,7 @@ mod tests {
         call("weave_notify", notify.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_notify", notify, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 5);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 5);
 
         let cross_store = json!({
             "from":"bridge", "to":"remote", "body":"federated", "no_memory":true,
@@ -6508,7 +6508,7 @@ mod tests {
         let replay = call("weave_send", cross_store, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
         assert_eq!(st.outbox_all(10).unwrap().len(), 1);
-        assert_eq!(injector.inject_calls.lock().unwrap().len(), 5);
+        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 5);
 
         assert_eq!(st.all_messages(20).unwrap().len(), 7);
         assert_eq!(
