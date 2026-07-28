@@ -13,6 +13,8 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub use crate::model::BridgePlatform;
+
 /// A resolved federation / Tier-2 pull source: either a LOCAL store file path or a
 /// REMOTE libSQL/Turso endpoint URL (with an optional auth token). Backend-agnostic
 /// data (no I/O); produced by [`Config::peer_db_sources`] / [`pull_from_sources`]
@@ -676,6 +678,149 @@ pub fn hook_recipient_matches(pattern: &str, recipient: &str) -> bool {
     pattern == recipient
 }
 
+/// Hard character bound for non-secret platform identifiers such as a Telegram
+/// chat id / bot username or a Slack channel id. These values cross an external
+/// API boundary and may later be rendered in status, so accept only non-empty,
+/// control-free values within a fixed cap. The cap is intentionally generous for
+/// both platforms while preventing hostile config/env values from becoming an
+/// unbounded status or request field.
+pub const MAX_BRIDGE_EXTERNAL_ID_LEN: usize = 256;
+
+/// Distinct fallback inbox identities keep an otherwise-default dual-platform
+/// configuration from sharing one consumer cursor/inbox.
+pub const DEFAULT_TELEGRAM_BRIDGE_IDENTITY: &str = "telegram";
+pub const DEFAULT_SLACK_BRIDGE_IDENTITY: &str = "slack";
+
+/// Stable, token-free reason why one bridge is not runtime-ready.
+///
+/// Variants deliberately carry no offending value: a token must never appear in
+/// an error, status response, panic payload, or debug rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeConfigIssue {
+    MissingToken,
+    InvalidToken,
+    MissingConversation,
+    InvalidConversation,
+    InvalidIdentity,
+    MissingRecipient,
+    InvalidRecipient,
+    InvalidBotUsername,
+    IdentityCollision,
+    IdentityRecipientCollision,
+}
+
+impl BridgeConfigIssue {
+    fn description(self) -> &'static str {
+        match self {
+            Self::MissingToken => "token is missing",
+            Self::InvalidToken => "token is invalid",
+            Self::MissingConversation => "external conversation is missing",
+            Self::InvalidConversation => "external conversation is invalid",
+            Self::InvalidIdentity => "bridge identity is invalid",
+            Self::MissingRecipient => "internal recipient is missing",
+            Self::InvalidRecipient => "internal recipient is invalid",
+            Self::InvalidBotUsername => "bot username is invalid",
+            Self::IdentityCollision => "bridge identity collides with another platform",
+            Self::IdentityRecipientCollision => {
+                "bridge identity and internal recipient must be different"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for BridgeConfigIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.description())
+    }
+}
+
+/// Public, token-free resolved configuration/readiness for one platform.
+///
+/// Invalid raw values are omitted from the resolved fields and represented only
+/// by a value-free [`BridgeConfigIssue`], making this safe for doctor, dashboard,
+/// CLI status, and MCP responses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BridgeConfigView {
+    pub platform: BridgePlatform,
+    pub configured: bool,
+    pub ready: bool,
+    pub identity: Option<String>,
+    pub recipient: Option<String>,
+    pub conversation: Option<String>,
+    pub bot_username: Option<String>,
+    pub issues: Vec<BridgeConfigIssue>,
+}
+
+/// Validated Telegram runtime configuration. The token is necessarily present so
+/// the transport can authenticate, but its Debug implementation always redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TelegramBridgeRuntimeConfig {
+    pub token: String,
+    pub chat_id: String,
+    pub identity: String,
+    pub recipient: String,
+    pub bot_username: Option<String>,
+}
+
+impl std::fmt::Debug for TelegramBridgeRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramBridgeRuntimeConfig")
+            .field("token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .field("identity", &self.identity)
+            .field("recipient", &self.recipient)
+            .field("bot_username", &self.bot_username)
+            .finish()
+    }
+}
+
+/// Validated Slack runtime configuration. The token is necessarily present so
+/// the transport can authenticate, but its Debug implementation always redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SlackBridgeRuntimeConfig {
+    pub token: String,
+    pub channel: String,
+    pub identity: String,
+    pub recipient: String,
+}
+
+impl std::fmt::Debug for SlackBridgeRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackBridgeRuntimeConfig")
+            .field("token", &"<redacted>")
+            .field("channel", &self.channel)
+            .field("identity", &self.identity)
+            .field("recipient", &self.recipient)
+            .finish()
+    }
+}
+
+/// Token-free failure returned when a validated runtime config cannot be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeConfigError {
+    pub platform: BridgePlatform,
+    pub issues: Vec<BridgeConfigIssue>,
+}
+
+impl std::fmt::Display for BridgeConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bridge is not ready", self.platform.as_str())?;
+        if !self.issues.is_empty() {
+            f.write_str(": ")?;
+            for (index, issue) in self.issues.iter().enumerate() {
+                if index != 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{issue}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BridgeConfigError {}
+
 #[derive(Deserialize, Default, Clone)]
 pub struct Config {
     pub session: Option<String>,
@@ -829,6 +974,22 @@ pub struct Config {
     /// NOT a secret. Overlaid by `WEAVE_TELEGRAM_CHAT_ID`. Inert without `surfaces`.
     #[serde(default)]
     pub telegram_chat_id: Option<String>,
+    /// Telegram-specific weave inbox identity. Overlaid by
+    /// `WEAVE_TELEGRAM_IDENTITY`. Resolution order is this field, the legacy shared
+    /// [`bridge_identity`](Self::bridge_identity), then the distinct fixed default
+    /// `"telegram"`. Validated exactly with `check_ident` at the runtime seam.
+    #[serde(default)]
+    pub telegram_identity: Option<String>,
+    /// Internal weave recipient for ordinary inbound Telegram text. Overlaid by
+    /// `WEAVE_TELEGRAM_RECIPIENT`. When absent it may fall back only to an explicit
+    /// [`session`](Self::session); bridge resolution never guesses from the cwd.
+    #[serde(default)]
+    pub telegram_recipient: Option<String>,
+    /// Optional Telegram bot username used for exact command addressing. This is
+    /// not a secret. Overlaid by `WEAVE_TELEGRAM_BOT_USERNAME` and bounded/control-
+    /// rejected with the other external platform identifiers.
+    #[serde(default)]
+    pub telegram_bot_username: Option<String>,
     /// WL-048: Slack bot token for the `weave slack` bridge. A SECRET — same
     /// handling as `telegram_token`. Overlaid by `WEAVE_SLACK_TOKEN`. Inert without
     /// the `surfaces` feature.
@@ -838,10 +999,20 @@ pub struct Config {
     /// NOT a secret. Overlaid by `WEAVE_SLACK_CHANNEL`. Inert without `surfaces`.
     #[serde(default)]
     pub slack_channel: Option<String>,
-    /// WL-048: the weave peer name a bridge posts AS when relaying a human reply
-    /// from Telegram/Slack into the mesh (validated via `check_ident` before
-    /// `Store::send`). NOT a secret. Overlaid by `WEAVE_BRIDGE_IDENTITY`. `None` ⇒
-    /// the bridge falls back to a fixed default identity. Inert without `surfaces`.
+    /// Slack-specific weave inbox identity. Overlaid by `WEAVE_SLACK_IDENTITY`.
+    /// Resolution mirrors Telegram but ends at the distinct fixed default `"slack"`.
+    #[serde(default)]
+    pub slack_identity: Option<String>,
+    /// Internal weave recipient for ordinary inbound Slack text. Overlaid by
+    /// `WEAVE_SLACK_RECIPIENT`; absent values may fall back only to explicit
+    /// [`session`](Self::session), never a cwd guess.
+    #[serde(default)]
+    pub slack_recipient: Option<String>,
+    /// WL-048 legacy shared weave identity for Telegram/Slack. New configurations
+    /// should use the platform-specific identity fields above. This remains a
+    /// backward-compatible fallback for one bridge, but two configured bridges that
+    /// resolve to the same identity are not ready. NOT a secret. Overlaid by
+    /// `WEAVE_BRIDGE_IDENTITY`.
     #[serde(default)]
     pub bridge_identity: Option<String>,
     /// WL-049 / ADR-0002 (only meaningful in a `--features obscura` build): the
@@ -856,9 +1027,11 @@ pub struct Config {
     /// (truthy/falsy). Inert without the `obscura` feature.
     #[serde(default)]
     pub obscura_stealth: Option<bool>,
-    /// WL-049: optional upstream proxy URL passed to `obscura mcp --proxy`. May
-    /// carry credentials, so treat as a SECRET — redacted in Debug, never logged.
-    /// Overlaid by `WEAVE_OBSCURA_PROXY`. Inert without the `obscura` feature.
+    /// WL-049: optional credential-free upstream proxy URL passed to `obscura mcp
+    /// --proxy`. Upstream accepts this MCP setting only through argv, so weave
+    /// rejects embedded userinfo rather than exposing credentials in the process
+    /// list. Still redacted in Debug and never logged. Overlaid by
+    /// `WEAVE_OBSCURA_PROXY`. Inert without the `obscura` feature.
     #[serde(default)]
     pub obscura_proxy: Option<String>,
     /// WL-049: optional User-Agent string passed to `obscura mcp --user-agent`. NOT
@@ -889,11 +1062,6 @@ pub struct Config {
     /// `WEAVE_OBSCURA_ALLOW_INTERNAL` (truthy/falsy). Inert without `obscura`.
     #[serde(default)]
     pub obscura_allow_internal: Option<bool>,
-    /// WL-049: optional auth token passed to obscura via the `OBSCURA_TOKEN` child
-    /// env var (never argv, never logged). A SECRET — redacted in Debug. Overlaid by
-    /// `WEAVE_OBSCURA_TOKEN`. Inert without the `obscura` feature.
-    #[serde(default)]
-    pub obscura_token: Option<String>,
     /// WL-036 post-send hooks: external programs run AFTER a matching send/ack.
     /// File-only (DELIBERATELY no env overlay): a hook is an argv-to-spawn, so
     /// exposing it through an env var would let an ambient/inherited env inject a
@@ -970,11 +1138,16 @@ impl std::fmt::Debug for Config {
                 &self.telegram_token.as_ref().map(|_| "<redacted>"),
             )
             .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("telegram_identity", &self.telegram_identity)
+            .field("telegram_recipient", &self.telegram_recipient)
+            .field("telegram_bot_username", &self.telegram_bot_username)
             .field(
                 "slack_token",
                 &self.slack_token.as_ref().map(|_| "<redacted>"),
             )
             .field("slack_channel", &self.slack_channel)
+            .field("slack_identity", &self.slack_identity)
+            .field("slack_recipient", &self.slack_recipient)
             .field("bridge_identity", &self.bridge_identity)
             .field("obscura_bin", &self.obscura_bin)
             .field("obscura_stealth", &self.obscura_stealth)
@@ -987,10 +1160,6 @@ impl std::fmt::Debug for Config {
             .field("obscura_allow_ops", &self.obscura_allow_ops)
             .field("obscura_allow_domains", &self.obscura_allow_domains)
             .field("obscura_allow_internal", &self.obscura_allow_internal)
-            .field(
-                "obscura_token",
-                &self.obscura_token.as_ref().map(|_| "<redacted>"),
-            )
             .field("post_send_hook", &self.post_send_hook)
             .field("pretooluse_approver", &self.pretooluse_approver)
             .field("pretooluse_timeout_secs", &self.pretooluse_timeout_secs)
@@ -1070,6 +1239,85 @@ pub fn this_host() -> String {
     }
 }
 
+fn bridge_token_is_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_TOKEN_LEN
+        && !token.chars().any(|character| character.is_control())
+}
+
+fn validate_bridge_token(token: Option<&str>, issues: &mut Vec<BridgeConfigIssue>) {
+    match token {
+        None | Some("") => issues.push(BridgeConfigIssue::MissingToken),
+        Some(token) if !bridge_token_is_valid(token) => {
+            issues.push(BridgeConfigIssue::InvalidToken);
+        }
+        Some(_) => {}
+    }
+}
+
+fn bridge_external_id_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_BRIDGE_EXTERNAL_ID_LEN
+        && !value.chars().any(|character| character.is_control())
+}
+
+fn resolve_required_external_id(
+    value: Option<&str>,
+    issues: &mut Vec<BridgeConfigIssue>,
+) -> Option<String> {
+    match value {
+        None | Some("") => {
+            issues.push(BridgeConfigIssue::MissingConversation);
+            None
+        }
+        Some(value) if !bridge_external_id_is_valid(value) => {
+            issues.push(BridgeConfigIssue::InvalidConversation);
+            None
+        }
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn resolve_optional_bot_username(
+    value: Option<&str>,
+    issues: &mut Vec<BridgeConfigIssue>,
+) -> Option<String> {
+    match value {
+        None => None,
+        Some(value) if !bridge_external_id_is_valid(value) => {
+            issues.push(BridgeConfigIssue::InvalidBotUsername);
+            None
+        }
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn resolve_bridge_identity(value: &str, issues: &mut Vec<BridgeConfigIssue>) -> Option<String> {
+    if crate::model::validate_ident("bridge identity", value).is_err() {
+        issues.push(BridgeConfigIssue::InvalidIdentity);
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn resolve_bridge_recipient(
+    value: Option<&str>,
+    issues: &mut Vec<BridgeConfigIssue>,
+) -> Option<String> {
+    match value {
+        None => {
+            issues.push(BridgeConfigIssue::MissingRecipient);
+            None
+        }
+        Some(value) if crate::model::validate_ident("bridge recipient", value).is_err() => {
+            issues.push(BridgeConfigIssue::InvalidRecipient);
+            None
+        }
+        Some(value) => Some(value.to_string()),
+    }
+}
+
 impl Config {
     /// Load from disk (if present) and overlay environment overrides.
     pub fn load() -> Self {
@@ -1086,6 +1334,9 @@ impl Config {
         }
         if let Some(v) = nonempty("WEAVE_DB") {
             cfg.db = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_MUX_PREFERENCE") {
+            cfg.mux_preference = Some(v);
         }
         if let Some(v) = nonempty("WEAVE_LIBSQL_URL") {
             cfg.libsql_url = Some(v);
@@ -1233,18 +1484,34 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_TELEGRAM_CHAT_ID") {
             cfg.telegram_chat_id = Some(v);
         }
+        if let Some(v) = nonempty("WEAVE_TELEGRAM_IDENTITY") {
+            cfg.telegram_identity = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_TELEGRAM_RECIPIENT") {
+            cfg.telegram_recipient = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_TELEGRAM_BOT_USERNAME") {
+            cfg.telegram_bot_username = Some(v);
+        }
         if let Some(v) = nonempty("WEAVE_SLACK_TOKEN") {
             cfg.slack_token = Some(v);
         }
         if let Some(v) = nonempty("WEAVE_SLACK_CHANNEL") {
             cfg.slack_channel = Some(v);
         }
+        if let Some(v) = nonempty("WEAVE_SLACK_IDENTITY") {
+            cfg.slack_identity = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_SLACK_RECIPIENT") {
+            cfg.slack_recipient = Some(v);
+        }
         if let Some(v) = nonempty("WEAVE_BRIDGE_IDENTITY") {
             cfg.bridge_identity = Some(v);
         }
         // WL-049 / ADR-0002 obscura governed web access (only meaningful in a
-        // `--features obscura` build). The proxy URL and token are SECRETS — env is
-        // preferred over the config file and the value is never echoed here. The
+        // `--features obscura` build). The proxy URL is redacted metadata and never
+        // echoed here. Credential-bearing proxy URLs are rejected before spawn
+        // because upstream exposes them through argv. The
         // allow-lists are comma-separated; an env value REPLACES the config list
         // (these are policy allow-lists, not additive source unions — a tighter env
         // override must never be silently widened by a stale config list).
@@ -1273,9 +1540,6 @@ impl Config {
         if let Some(v) = nonempty("WEAVE_OBSCURA_ALLOW_INTERNAL").and_then(|s| parse_bool(&s)) {
             cfg.obscura_allow_internal = Some(v);
         }
-        if let Some(v) = nonempty("WEAVE_OBSCURA_TOKEN") {
-            cfg.obscura_token = Some(v);
-        }
         // WL-055 PreToolUse gate overlays.
         if let Some(v) = nonempty("WEAVE_PRETOOLUSE_APPROVER") {
             cfg.pretooluse_approver = Some(v);
@@ -1288,6 +1552,172 @@ impl Config {
             cfg.pretooluse_timeout_secs = Some(v);
         }
         cfg
+    }
+
+    fn unresolved_bridge_config_view(&self, platform: BridgePlatform) -> BridgeConfigView {
+        let (token, conversation, platform_identity, platform_recipient, default_identity) =
+            match platform {
+                BridgePlatform::Telegram => (
+                    self.telegram_token.as_deref(),
+                    self.telegram_chat_id.as_deref(),
+                    self.telegram_identity.as_deref(),
+                    self.telegram_recipient.as_deref(),
+                    DEFAULT_TELEGRAM_BRIDGE_IDENTITY,
+                ),
+                BridgePlatform::Slack => (
+                    self.slack_token.as_deref(),
+                    self.slack_channel.as_deref(),
+                    self.slack_identity.as_deref(),
+                    self.slack_recipient.as_deref(),
+                    DEFAULT_SLACK_BRIDGE_IDENTITY,
+                ),
+            };
+
+        let mut issues = Vec::new();
+        validate_bridge_token(token, &mut issues);
+        let conversation = resolve_required_external_id(conversation, &mut issues);
+        let raw_identity = platform_identity
+            .or(self.bridge_identity.as_deref())
+            .unwrap_or(default_identity);
+        let identity = resolve_bridge_identity(raw_identity, &mut issues);
+        // `Config::session` is the explicit file/env value. Do not call `session()`:
+        // that convenience resolver guesses from cwd and could silently route a bot
+        // message to whichever directory happened to launch the process.
+        let raw_recipient = platform_recipient.or(self.session.as_deref());
+        let recipient = resolve_bridge_recipient(raw_recipient, &mut issues);
+        if identity.is_some() && identity == recipient {
+            issues.push(BridgeConfigIssue::IdentityRecipientCollision);
+        }
+        let bot_username = match platform {
+            BridgePlatform::Telegram => {
+                resolve_optional_bot_username(self.telegram_bot_username.as_deref(), &mut issues)
+            }
+            BridgePlatform::Slack => None,
+        };
+        let configured = token.is_some_and(|value| !value.is_empty());
+
+        BridgeConfigView {
+            platform,
+            configured,
+            ready: issues.is_empty(),
+            identity,
+            recipient,
+            conversation,
+            bot_username,
+            issues,
+        }
+    }
+
+    /// Resolve both bridge views together so the cross-platform inbox collision
+    /// invariant is evaluated once and reported symmetrically. The returned values
+    /// contain no credential bytes and are safe for public status surfaces.
+    pub fn bridge_config_views(&self) -> [BridgeConfigView; 2] {
+        let mut telegram = self.unresolved_bridge_config_view(BridgePlatform::Telegram);
+        let mut slack = self.unresolved_bridge_config_view(BridgePlatform::Slack);
+        let identity_collision = telegram.configured
+            && slack.configured
+            && telegram.identity.is_some()
+            && telegram.identity == slack.identity;
+        if identity_collision {
+            telegram.issues.push(BridgeConfigIssue::IdentityCollision);
+            slack.issues.push(BridgeConfigIssue::IdentityCollision);
+            telegram.ready = false;
+            slack.ready = false;
+        }
+        [telegram, slack]
+    }
+
+    /// Token-free Telegram readiness/configuration view.
+    pub fn telegram_bridge_config_view(&self) -> BridgeConfigView {
+        let [telegram, _] = self.bridge_config_views();
+        telegram
+    }
+
+    /// Token-free Slack readiness/configuration view.
+    pub fn slack_bridge_config_view(&self) -> BridgeConfigView {
+        let [_, slack] = self.bridge_config_views();
+        slack
+    }
+
+    /// Resolve a complete, validated Telegram runtime configuration. Failures carry
+    /// only value-free issue classifications; the token never enters an error.
+    pub fn telegram_bridge_runtime(
+        &self,
+    ) -> Result<TelegramBridgeRuntimeConfig, BridgeConfigError> {
+        let view = self.telegram_bridge_config_view();
+        if !view.ready {
+            return Err(BridgeConfigError {
+                platform: BridgePlatform::Telegram,
+                issues: view.issues,
+            });
+        }
+        let token = self
+            .telegram_token
+            .as_deref()
+            .filter(|token| bridge_token_is_valid(token))
+            .map(str::to_string)
+            .ok_or_else(|| BridgeConfigError {
+                platform: BridgePlatform::Telegram,
+                issues: vec![BridgeConfigIssue::InvalidToken],
+            })?;
+        let chat_id = view.conversation.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Telegram,
+            issues: vec![BridgeConfigIssue::MissingConversation],
+        })?;
+        let identity = view.identity.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Telegram,
+            issues: vec![BridgeConfigIssue::InvalidIdentity],
+        })?;
+        let recipient = view.recipient.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Telegram,
+            issues: vec![BridgeConfigIssue::MissingRecipient],
+        })?;
+        Ok(TelegramBridgeRuntimeConfig {
+            token,
+            chat_id,
+            identity,
+            recipient,
+            bot_username: view.bot_username,
+        })
+    }
+
+    /// Resolve a complete, validated Slack runtime configuration. Failures carry
+    /// only value-free issue classifications; the token never enters an error.
+    pub fn slack_bridge_runtime(&self) -> Result<SlackBridgeRuntimeConfig, BridgeConfigError> {
+        let view = self.slack_bridge_config_view();
+        if !view.ready {
+            return Err(BridgeConfigError {
+                platform: BridgePlatform::Slack,
+                issues: view.issues,
+            });
+        }
+        let token = self
+            .slack_token
+            .as_deref()
+            .filter(|token| bridge_token_is_valid(token))
+            .map(str::to_string)
+            .ok_or_else(|| BridgeConfigError {
+                platform: BridgePlatform::Slack,
+                issues: vec![BridgeConfigIssue::InvalidToken],
+            })?;
+        let channel = view.conversation.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Slack,
+            issues: vec![BridgeConfigIssue::MissingConversation],
+        })?;
+        let identity = view.identity.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Slack,
+            issues: vec![BridgeConfigIssue::InvalidIdentity],
+        })?;
+        let recipient = view.recipient.ok_or_else(|| BridgeConfigError {
+            platform: BridgePlatform::Slack,
+            issues: vec![BridgeConfigIssue::MissingRecipient],
+        })?;
+        Ok(SlackBridgeRuntimeConfig {
+            token,
+            channel,
+            identity,
+            recipient,
+        })
     }
 
     /// Is `cwd` an allowed directory to spawn a child agent into (WL-047)?
@@ -2019,9 +2449,13 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Every setting below is OPTIONAL and shown commented-out with its default.
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
-# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>,
-# WEAVE_LLM_ENDPOINT, WEAVE_LLM_API_KEY, WEAVE_LLM_MODEL,
-# WEAVE_LLM_TIMEOUT_SECS, WEAVE_LLM_MAX_INPUT_CHARS, WEAVE_SPAWN_DIRS)
+# WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_MUX_PREFERENCE, WEAVE_PULL_TOKEN,
+# WEAVE_PULL_TOKEN_<LABEL>, WEAVE_LLM_ENDPOINT, WEAVE_LLM_API_KEY, WEAVE_LLM_MODEL,
+# WEAVE_LLM_TIMEOUT_SECS, WEAVE_LLM_MAX_INPUT_CHARS, WEAVE_SPAWN_DIRS,
+# WEAVE_TELEGRAM_TOKEN, WEAVE_TELEGRAM_CHAT_ID, WEAVE_TELEGRAM_IDENTITY,
+# WEAVE_TELEGRAM_RECIPIENT, WEAVE_TELEGRAM_BOT_USERNAME,
+# WEAVE_SLACK_TOKEN, WEAVE_SLACK_CHANNEL, WEAVE_SLACK_IDENTITY,
+# WEAVE_SLACK_RECIPIENT, WEAVE_BRIDGE_IDENTITY)
 # take precedence over anything set here.
 
 # Default identity for this machine/session. When unset, weave falls back to
@@ -2042,6 +2476,11 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Placeholders: {from} (sender) and {body} (message text). Omit {body} for a
 # quiet \"you have mail\" ping that carries no content.
 # nudge_template = \"[weave] message from {from}: {body} (run weave_inbox to read)\"
+
+# Preferred multiplexer for live injection. Unset/unknown uses auto-detection.
+# Accepted values: tmux, zellij, wezterm, kitty, screen, iterm2. Overridable via
+# WEAVE_MUX_PREFERENCE.
+# mux_preference = \"tmux\"
 
 # Auto-retention: at SessionStart weave opportunistically deletes messages older
 # than this many seconds (best-effort; failures are ignored). Default 2592000
@@ -2191,6 +2630,42 @@ pub const CONFIG_TEMPLATE: &str = "\
 # WEAVE_SPAWN_DIRS (path-list separated, `:` on unix / `;` on windows).
 # spawn_allowed_dirs = [\"/home/me/agents\", \"/srv/work\"]
 
+# OPTIONAL TELEGRAM BRIDGE (only with --features surfaces). It is ready only when
+# token, chat id, a valid identity, and a valid internal recipient all resolve.
+# Tokens are SECRETS: prefer WEAVE_TELEGRAM_TOKEN and never paste one into logs.
+# telegram_token = \"...\"
+# External chat id for inbound filtering and outbound delivery. Bounded and
+# control-character rejected. Overridable via WEAVE_TELEGRAM_CHAT_ID.
+# telegram_chat_id = \"-1001234567890\"
+# Weave inbox/sender identity owned by the Telegram bridge. Default \"telegram\";
+# overridable via WEAVE_TELEGRAM_IDENTITY. Must be a valid weave identity.
+# telegram_identity = \"telegram\"
+# Internal weave recipient for ordinary inbound Telegram text. When unset, only an
+# explicit session setting / WEAVE_SESSION is used as fallback; cwd is never guessed.
+# Overridable via WEAVE_TELEGRAM_RECIPIENT.
+# telegram_recipient = \"desktop\"
+# Optional bot username for exact `/command@username` addressing. Overridable via
+# WEAVE_TELEGRAM_BOT_USERNAME; bounded and control-character rejected.
+# telegram_bot_username = \"my_weave_bot\"
+
+# OPTIONAL SLACK BRIDGE (only with --features surfaces). It has the same readiness
+# requirements and token handling, with distinct defaults and routing fields.
+# Prefer WEAVE_SLACK_TOKEN for the SECRET token.
+# slack_token = \"...\"
+# External channel id; overridable via WEAVE_SLACK_CHANNEL.
+# slack_channel = \"C0123456789\"
+# Weave inbox/sender identity. Default \"slack\"; WEAVE_SLACK_IDENTITY overrides it.
+# slack_identity = \"slack\"
+# Internal recipient; explicit session is the only fallback. Overridable via
+# WEAVE_SLACK_RECIPIENT.
+# slack_recipient = \"desktop\"
+
+# LEGACY shared bridge identity fallback. Prefer telegram_identity/slack_identity.
+# WEAVE_BRIDGE_IDENTITY overrides this value. It remains backward-compatible for a
+# single bridge, but two configured platforms may not resolve to one shared inbox;
+# give them distinct platform identities or both will report not ready.
+# bridge_identity = \"legacy-bridge\"
+
 # PRETOOLUSE APPROVAL GATE (WL-055): the enforcing PreToolUse hook (opt-in via
 # `weave setup --pretooluse`, Claude only) raises a BLOCKING approval ask TO this
 # peer whenever a dangerous tool (Bash/Edit/Write + weave's dangerous MCP tools) is
@@ -2268,6 +2743,7 @@ mod tests {
         assert!(cfg.backend.is_none());
         assert!(cfg.db.is_none());
         assert!(cfg.nudge_template.is_none());
+        assert!(cfg.mux_preference.is_none());
         assert!(cfg.libsql_url.is_none());
         assert!(cfg.libsql_auth_token.is_none());
         assert!(cfg.retention_secs.is_none());
@@ -2285,6 +2761,16 @@ mod tests {
         assert!(cfg.llm_model.is_none());
         assert!(cfg.llm_timeout_secs.is_none());
         assert!(cfg.llm_max_input_chars.is_none());
+        assert!(cfg.telegram_token.is_none());
+        assert!(cfg.telegram_chat_id.is_none());
+        assert!(cfg.telegram_identity.is_none());
+        assert!(cfg.telegram_recipient.is_none());
+        assert!(cfg.telegram_bot_username.is_none());
+        assert!(cfg.slack_token.is_none());
+        assert!(cfg.slack_channel.is_none());
+        assert!(cfg.slack_identity.is_none());
+        assert!(cfg.slack_recipient.is_none());
+        assert!(cfg.bridge_identity.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -2304,6 +2790,7 @@ mod tests {
             "backend",
             "db",
             "nudge_template",
+            "mux_preference",
             "libsql_url",
             "libsql_auth_token",
             "retention_secs",
@@ -2321,12 +2808,174 @@ mod tests {
             "llm_model",
             "llm_timeout_secs",
             "llm_max_input_chars",
+            "telegram_token",
+            "telegram_chat_id",
+            "telegram_identity",
+            "telegram_recipient",
+            "telegram_bot_username",
+            "slack_token",
+            "slack_channel",
+            "slack_identity",
+            "slack_recipient",
+            "bridge_identity",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
                 "template is missing config key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn env_example_documents_runtime_environment_contract() {
+        let example = include_str!("../../.env.example");
+        for key in [
+            // Config overlays and operator-tuned runtime knobs.
+            "WEAVE_SESSION",
+            "WEAVE_CIRCLE",
+            "WEAVE_BACKEND",
+            "WEAVE_DB",
+            "WEAVE_LIBSQL_URL",
+            "WEAVE_LIBSQL_AUTH_TOKEN",
+            "WEAVE_RETENTION_SECS",
+            "WEAVE_MUX_PREFERENCE",
+            "WEAVE_PEER_DBS",
+            "WEAVE_PULL_FROM",
+            "WEAVE_PULL_TOKEN",
+            "WEAVE_PULL_TOKEN_PROD",
+            "WEAVE_PULL_TOKEN_<LABEL>",
+            "WEAVE_PULL_TIMEOUT_MS",
+            "WEAVE_PULL_TIMEOUT_MS_PROD",
+            "WEAVE_PULL_TIMEOUT_MS_<LABEL>",
+            "WEAVE_INJECT_PULLED",
+            "WEAVE_ALLOW_INJECT_FROM",
+            "WEAVE_PUSH_TOKEN",
+            "WEAVE_ADMIN_TOKEN",
+            "WEAVE_STRICT_VERIFY",
+            "WEAVE_TRUST",
+            "WEAVE_REVOKED",
+            "WEAVE_LLM_ENDPOINT",
+            "WEAVE_LLM_API_KEY",
+            "WEAVE_LLM_MODEL",
+            "WEAVE_LLM_TIMEOUT_SECS",
+            "WEAVE_LLM_MAX_INPUT_CHARS",
+            "WEAVE_TELEGRAM_TOKEN",
+            "WEAVE_TELEGRAM_CHAT_ID",
+            "WEAVE_TELEGRAM_IDENTITY",
+            "WEAVE_TELEGRAM_RECIPIENT",
+            "WEAVE_TELEGRAM_BOT_USERNAME",
+            "WEAVE_SLACK_TOKEN",
+            "WEAVE_SLACK_CHANNEL",
+            "WEAVE_SLACK_IDENTITY",
+            "WEAVE_SLACK_RECIPIENT",
+            "WEAVE_BRIDGE_IDENTITY",
+            "WEAVE_BOT_WRITES",
+            "WEAVE_OBSCURA_BIN",
+            "WEAVE_OBSCURA_STEALTH",
+            "WEAVE_OBSCURA_PROXY",
+            "WEAVE_OBSCURA_USER_AGENT",
+            "WEAVE_OBSCURA_TIMEOUT_SECS",
+            "WEAVE_OBSCURA_ALLOW_OPS",
+            "WEAVE_OBSCURA_ALLOW_DOMAINS",
+            "WEAVE_OBSCURA_ALLOW_INTERNAL",
+            "WEAVE_PRETOOLUSE_APPROVER",
+            "WEAVE_PRETOOLUSE_TIMEOUT_SECS",
+            "WEAVE_MCP_EAGER",
+            "WEAVE_NO_CLEAR",
+            "WEAVE_PIDFILE",
+            "WEAVE_DAEMON_HEARTBEAT_SECS",
+            "WEAVE_DAEMON_EVICT_SECS",
+            "WEAVE_DAEMON_EVICT_CUTOFF_SECS",
+            "WEAVE_STOP_WAKE",
+            "WEAVE_RESPONDER_ON_HOOK",
+            "WEAVE_RESPONDER_STATUS",
+            "WEAVE_CLIENT_PID",
+            "WEAVE_BIRTH_CERT",
+            "WEAVE_MUX_DIR",
+            "WEAVE_SPAWN_DIRS",
+            "WEAVE_FXRUN_AGENT",
+            "WEAVE_TEST_TURSO_URL",
+            "WEAVE_TEST_TURSO_TOKEN",
+            // Env generated for hook/runner/harness child processes.
+            "WEAVE_HOOK_EVENT",
+            "WEAVE_HOOK_SENDER",
+            "WEAVE_HOOK_RECIPIENT",
+            "WEAVE_HOOK_SUBJECT",
+            "WEAVE_HOOK_MESSAGE_ID",
+            "WEAVE_HOOK_BODY",
+            "WEAVE_HOOK_PAYLOAD",
+            "WEAVE_JOB_ID",
+            "WEAVE_ATTEMPT_ID",
+            "WEAVE_WORKER",
+            "WEAVE_JOB_TITLE",
+            "WEAVE_JOB_PROMPT",
+            "WEAVE_JOB_DESCRIPTION",
+            "WEAVE_LEASES_JSON",
+            "WEAVE_POLICY_OWNER",
+            "WEAVE_WORKTREE",
+            "WEAVE_BUDGET",
+            "WEAVE_MAX_ITERS",
+            "WEAVE_SLEEP",
+            "WEAVE_MODEL",
+            "WEAVE_AGENT_CMD",
+            "WEAVE_AGENT_MODEL_ARGS",
+            "WEAVE_APPLY",
+            "WEAVE_KIMI_PLAN",
+            "WEAVE_KIMI_REVIEW",
+            "WEAVE_KIMI_CMD",
+            "WEAVE_KIMI_MODEL",
+            "WEAVE_KIMI_SESSION",
+            "WEAVE_KIMI_SESSION_FLAG",
+            "WEAVE_KIMI_EXTRA_ARGS",
+            "WEAVE_FORGE_WORKTREE",
+            "WEAVE_FORGE_TASK",
+            "WEAVE_FORGE_BUDGET",
+            "WEAVE_FORGE_MAX_ITERS",
+            "WEAVE_FORGE_SLEEP",
+            "WEAVE_FORGE_APPLY",
+            // Host, mux, and provider-switch names Weave observes or manages.
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "HOSTNAME",
+            "PATH",
+            "TMPDIR",
+            "NO_COLOR",
+            "TMUX_PANE",
+            "TMUX",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+            "WEZTERM_PANE",
+            "KITTY_WINDOW_ID",
+            "KITTY_LISTEN_ON",
+            "STY",
+            "TERM_PROGRAM",
+            "TERM_SESSION_ID",
+            "CLAUDE_ENV_FILE",
+            "OLLAMA_HOST",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "GEMINI_API_KEY",
+            "GEMINI_MODEL",
+            "GOOGLE_GEMINI_MODEL",
+        ] {
+            let assignment = format!("# {key}=");
+            assert!(
+                example
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&assignment)),
+                ".env.example is missing a commented assignment for {key}"
+            );
+        }
+        assert!(
+            !example.contains("sk-test")
+                && !example.contains("xoxb-")
+                && !example.contains("replace-with-"),
+            ".env.example must use non-secret placeholders, not real-looking fixture values"
+        );
     }
 
     #[test]
@@ -2947,6 +3596,358 @@ llm_max_input_chars = 999
         // Non-secret identifiers are shown.
         assert!(dbg.contains("-100123"), "chat id shown: {dbg}");
         assert!(dbg.contains("C0XYZ"), "channel shown: {dbg}");
+    }
+
+    /// Cycle C: a complete bridge resolves a token-free public view and a
+    /// secret-bearing runtime config. Platform defaults are deliberately distinct,
+    /// and the only recipient fallback is the explicitly configured session (never
+    /// the cwd-derived session guess used by interactive CLI convenience paths).
+    #[test]
+    fn bridge_config_defaults_session_fallback_and_missing_values() {
+        let cfg = Config {
+            session: Some("desktop".to_string()),
+            telegram_token: Some("tg-secret".to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            slack_token: Some("slack-secret".to_string()),
+            slack_channel: Some("C0XYZ".to_string()),
+            ..Config::default()
+        };
+
+        let [telegram, slack] = cfg.bridge_config_views();
+        assert!(telegram.configured && telegram.ready);
+        assert!(slack.configured && slack.ready);
+        assert_eq!(telegram.identity.as_deref(), Some("telegram"));
+        assert_eq!(slack.identity.as_deref(), Some("slack"));
+        assert_eq!(telegram.recipient.as_deref(), Some("desktop"));
+        assert_eq!(slack.recipient.as_deref(), Some("desktop"));
+        assert_eq!(telegram.conversation.as_deref(), Some("-100123"));
+        assert_eq!(slack.conversation.as_deref(), Some("C0XYZ"));
+        assert!(telegram.issues.is_empty());
+        assert!(slack.issues.is_empty());
+
+        let tg_runtime = cfg.telegram_bridge_runtime().expect("telegram ready");
+        let slack_runtime = cfg.slack_bridge_runtime().expect("slack ready");
+        assert_eq!(tg_runtime.identity, "telegram");
+        assert_eq!(tg_runtime.recipient, "desktop");
+        assert_eq!(tg_runtime.chat_id, "-100123");
+        assert_eq!(slack_runtime.identity, "slack");
+        assert_eq!(slack_runtime.recipient, "desktop");
+        assert_eq!(slack_runtime.channel, "C0XYZ");
+
+        let no_recipient = Config {
+            telegram_token: Some("tg-secret".to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            ..Config::default()
+        };
+        let view = no_recipient.telegram_bridge_config_view();
+        assert!(view.configured);
+        assert!(!view.ready);
+        assert_eq!(view.recipient, None);
+        assert!(view.issues.contains(&BridgeConfigIssue::MissingRecipient));
+
+        let empty = Config::default().telegram_bridge_config_view();
+        assert!(!empty.configured);
+        assert!(!empty.ready);
+        assert!(empty.issues.contains(&BridgeConfigIssue::MissingToken));
+        assert!(empty
+            .issues
+            .contains(&BridgeConfigIssue::MissingConversation));
+        assert!(empty.issues.contains(&BridgeConfigIssue::MissingRecipient));
+    }
+
+    /// Cycle C input gates: tokens use the shared MAX_TOKEN_LEN byte cap; external
+    /// platform identifiers have their own character cap; and every value rejects
+    /// control characters. Identity/recipient validation is exactly check_ident's
+    /// contract, including its MAX_IDENT character bound.
+    #[test]
+    fn bridge_config_bounds_controls_and_exact_ident_validation() {
+        let base = Config {
+            session: Some("desktop".to_string()),
+            telegram_token: Some("t".repeat(MAX_TOKEN_LEN)),
+            telegram_chat_id: Some("c".repeat(MAX_BRIDGE_EXTERNAL_ID_LEN)),
+            telegram_bot_username: Some("weave_bot".to_string()),
+            ..Config::default()
+        };
+        assert!(base.telegram_bridge_config_view().ready);
+
+        let over_token = Config {
+            telegram_token: Some("TOKEN_SENTINEL".repeat(MAX_TOKEN_LEN)),
+            ..base.clone()
+        };
+        let error = over_token.telegram_bridge_runtime().unwrap_err();
+        let rendered = format!("{error:?} {error}");
+        assert!(error.issues.contains(&BridgeConfigIssue::InvalidToken));
+        assert!(!rendered.contains("TOKEN_SENTINEL"));
+
+        let control_token = Config {
+            telegram_token: Some("secret\nvalue".to_string()),
+            ..base.clone()
+        };
+        assert!(control_token
+            .telegram_bridge_config_view()
+            .issues
+            .contains(&BridgeConfigIssue::InvalidToken));
+
+        let over_chat = Config {
+            telegram_chat_id: Some("c".repeat(MAX_BRIDGE_EXTERNAL_ID_LEN + 1)),
+            ..base.clone()
+        };
+        let over_view = over_chat.telegram_bridge_config_view();
+        assert_eq!(over_view.conversation, None);
+        assert!(over_view
+            .issues
+            .contains(&BridgeConfigIssue::InvalidConversation));
+
+        let control_chat = Config {
+            telegram_chat_id: Some("-100\r123".to_string()),
+            ..base.clone()
+        };
+        assert!(control_chat
+            .telegram_bridge_config_view()
+            .issues
+            .contains(&BridgeConfigIssue::InvalidConversation));
+
+        let invalid_username = Config {
+            telegram_bot_username: Some("weave\nbot".to_string()),
+            ..base.clone()
+        };
+        let username_view = invalid_username.telegram_bridge_config_view();
+        assert_eq!(username_view.bot_username, None);
+        assert!(username_view
+            .issues
+            .contains(&BridgeConfigIssue::InvalidBotUsername));
+
+        let invalid_identity = Config {
+            telegram_identity: Some("i".repeat(crate::model::MAX_IDENT + 1)),
+            ..base.clone()
+        };
+        assert!(invalid_identity
+            .telegram_bridge_config_view()
+            .issues
+            .contains(&BridgeConfigIssue::InvalidIdentity));
+
+        let invalid_recipient = Config {
+            telegram_recipient: Some("bad\nrecipient".to_string()),
+            ..base
+        };
+        assert!(invalid_recipient
+            .telegram_bridge_config_view()
+            .issues
+            .contains(&BridgeConfigIssue::InvalidRecipient));
+    }
+
+    /// The legacy shared bridge identity remains a single-platform fallback, but
+    /// cannot make two simultaneously configured bridges own one inbox. Explicit
+    /// distinct per-platform identities resolve the ambiguity.
+    #[test]
+    fn bridge_config_rejects_shared_identity_collision() {
+        let legacy = Config {
+            session: Some("desktop".to_string()),
+            telegram_token: Some("tg-secret".to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            slack_token: Some("slack-secret".to_string()),
+            slack_channel: Some("C0XYZ".to_string()),
+            bridge_identity: Some("shared-bridge".to_string()),
+            ..Config::default()
+        };
+        let [telegram, slack] = legacy.bridge_config_views();
+        assert!(!telegram.ready && !slack.ready);
+        assert_eq!(telegram.identity.as_deref(), Some("shared-bridge"));
+        assert_eq!(slack.identity.as_deref(), Some("shared-bridge"));
+        assert!(telegram
+            .issues
+            .contains(&BridgeConfigIssue::IdentityCollision));
+        assert!(slack.issues.contains(&BridgeConfigIssue::IdentityCollision));
+
+        let single_platform = Config {
+            slack_token: None,
+            slack_channel: None,
+            ..legacy.clone()
+        };
+        let telegram = single_platform.telegram_bridge_config_view();
+        assert!(
+            telegram.ready,
+            "legacy fallback remains valid for one bridge"
+        );
+        assert_eq!(telegram.identity.as_deref(), Some("shared-bridge"));
+
+        let distinct = Config {
+            telegram_identity: Some("telegram-inbox".to_string()),
+            slack_identity: Some("slack-inbox".to_string()),
+            ..legacy
+        };
+        let [telegram, slack] = distinct.bridge_config_views();
+        assert!(telegram.ready && slack.ready);
+        assert_eq!(telegram.identity.as_deref(), Some("telegram-inbox"));
+        assert_eq!(slack.identity.as_deref(), Some("slack-inbox"));
+    }
+
+    /// A bridge cannot send ordinary inbound text from an identity back to that
+    /// same identity: inbox eligibility intentionally excludes self-sent rows.
+    /// Reject the route at configuration time instead of accepting a black hole.
+    #[test]
+    fn bridge_config_rejects_identity_equal_to_recipient() {
+        let cfg = Config {
+            telegram_token: Some("tg-secret".to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            telegram_identity: Some("same-route".to_string()),
+            telegram_recipient: Some("same-route".to_string()),
+            ..Config::default()
+        };
+        let view = cfg.telegram_bridge_config_view();
+        assert!(view.configured);
+        assert!(!view.ready);
+        assert!(view
+            .issues
+            .contains(&BridgeConfigIssue::IdentityRecipientCollision));
+        let error = cfg.telegram_bridge_runtime().unwrap_err();
+        assert!(error
+            .issues
+            .contains(&BridgeConfigIssue::IdentityRecipientCollision));
+    }
+
+    /// Runtime config Debug is safe even though the validated runtime object must
+    /// carry the credential to the HTTP transport.
+    #[test]
+    fn bridge_runtime_debug_redacts_tokens() {
+        const TG_SECRET: &str = "telegram-runtime-secret";
+        const SLACK_SECRET: &str = "slack-runtime-secret";
+        let cfg = Config {
+            session: Some("desktop".to_string()),
+            telegram_token: Some(TG_SECRET.to_string()),
+            telegram_chat_id: Some("-100123".to_string()),
+            slack_token: Some(SLACK_SECRET.to_string()),
+            slack_channel: Some("C0XYZ".to_string()),
+            ..Config::default()
+        };
+        let tg = format!("{:?}", cfg.telegram_bridge_runtime().unwrap());
+        let slack = format!("{:?}", cfg.slack_bridge_runtime().unwrap());
+        assert!(
+            !tg.contains(TG_SECRET),
+            "telegram runtime leaked token: {tg}"
+        );
+        assert!(
+            !slack.contains(SLACK_SECRET),
+            "slack runtime leaked token: {slack}"
+        );
+        assert!(tg.contains("<redacted>"));
+        assert!(slack.contains("<redacted>"));
+    }
+
+    /// Every new platform-specific env value overrides the file while the legacy
+    /// shared identity remains available only as the lower-precedence fallback.
+    #[test]
+    fn load_overlays_all_bridge_environment_values() {
+        let _g = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-config-bridge-overlay-{}-{}",
+            std::process::id(),
+            crate::model::now()
+        ));
+        let weave_dir = dir.join("weave");
+        std::fs::create_dir_all(&weave_dir).unwrap();
+        std::fs::write(
+            weave_dir.join("config.toml"),
+            r#"
+session = "file-session"
+telegram_token = "file-tg-token"
+telegram_chat_id = "file-chat"
+telegram_identity = "file-tg-identity"
+telegram_recipient = "file-tg-recipient"
+telegram_bot_username = "file_bot"
+slack_token = "file-slack-token"
+slack_channel = "file-channel"
+slack_identity = "file-slack-identity"
+slack_recipient = "file-slack-recipient"
+bridge_identity = "legacy-file"
+"#,
+        )
+        .unwrap();
+
+        let _xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        let _session = crate::testenv::EnvVarGuard::set("WEAVE_SESSION", "env-session");
+        let _tg_token = crate::testenv::EnvVarGuard::set("WEAVE_TELEGRAM_TOKEN", "env-tg-token");
+        let _tg_chat = crate::testenv::EnvVarGuard::set("WEAVE_TELEGRAM_CHAT_ID", "env-chat");
+        let _tg_identity =
+            crate::testenv::EnvVarGuard::set("WEAVE_TELEGRAM_IDENTITY", "env-tg-identity");
+        let _tg_recipient =
+            crate::testenv::EnvVarGuard::set("WEAVE_TELEGRAM_RECIPIENT", "env-tg-recipient");
+        let _tg_username =
+            crate::testenv::EnvVarGuard::set("WEAVE_TELEGRAM_BOT_USERNAME", "env_bot");
+        let _slack_token = crate::testenv::EnvVarGuard::set("WEAVE_SLACK_TOKEN", "env-slack-token");
+        let _slack_channel = crate::testenv::EnvVarGuard::set("WEAVE_SLACK_CHANNEL", "env-channel");
+        let _slack_identity =
+            crate::testenv::EnvVarGuard::set("WEAVE_SLACK_IDENTITY", "env-slack-identity");
+        let _slack_recipient =
+            crate::testenv::EnvVarGuard::set("WEAVE_SLACK_RECIPIENT", "env-slack-recipient");
+        let _legacy = crate::testenv::EnvVarGuard::set("WEAVE_BRIDGE_IDENTITY", "legacy-env");
+
+        let cfg = Config::load();
+        assert_eq!(cfg.telegram_token.as_deref(), Some("env-tg-token"));
+        assert_eq!(cfg.telegram_chat_id.as_deref(), Some("env-chat"));
+        assert_eq!(cfg.telegram_identity.as_deref(), Some("env-tg-identity"));
+        assert_eq!(cfg.telegram_recipient.as_deref(), Some("env-tg-recipient"));
+        assert_eq!(cfg.telegram_bot_username.as_deref(), Some("env_bot"));
+        assert_eq!(cfg.slack_token.as_deref(), Some("env-slack-token"));
+        assert_eq!(cfg.slack_channel.as_deref(), Some("env-channel"));
+        assert_eq!(cfg.slack_identity.as_deref(), Some("env-slack-identity"));
+        assert_eq!(cfg.slack_recipient.as_deref(), Some("env-slack-recipient"));
+        assert_eq!(cfg.bridge_identity.as_deref(), Some("legacy-env"));
+        let [telegram, slack] = cfg.bridge_config_views();
+        assert!(telegram.ready && slack.ready);
+        assert_eq!(telegram.identity.as_deref(), Some("env-tg-identity"));
+        assert_eq!(telegram.recipient.as_deref(), Some("env-tg-recipient"));
+        assert_eq!(telegram.bot_username.as_deref(), Some("env_bot"));
+        assert_eq!(slack.identity.as_deref(), Some("env-slack-identity"));
+        assert_eq!(slack.recipient.as_deref(), Some("env-slack-recipient"));
+
+        drop((
+            _legacy,
+            _slack_recipient,
+            _slack_identity,
+            _slack_channel,
+            _slack_token,
+            _tg_username,
+            _tg_recipient,
+            _tg_identity,
+            _tg_chat,
+            _tg_token,
+            _session,
+            _xdg,
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn template_documents_bridge_routing_and_legacy_fallback() {
+        for key in [
+            "telegram_identity",
+            "telegram_recipient",
+            "telegram_bot_username",
+            "slack_identity",
+            "slack_recipient",
+            "bridge_identity",
+        ] {
+            assert!(CONFIG_TEMPLATE.contains(key), "missing template key {key}");
+        }
+        for env in [
+            "WEAVE_TELEGRAM_IDENTITY",
+            "WEAVE_TELEGRAM_RECIPIENT",
+            "WEAVE_TELEGRAM_BOT_USERNAME",
+            "WEAVE_SLACK_IDENTITY",
+            "WEAVE_SLACK_RECIPIENT",
+            "WEAVE_BRIDGE_IDENTITY",
+        ] {
+            assert!(CONFIG_TEMPLATE.contains(env), "missing template env {env}");
+        }
+        assert!(CONFIG_TEMPLATE.contains("legacy"));
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert!(cfg.telegram_identity.is_none());
+        assert!(cfg.telegram_recipient.is_none());
+        assert!(cfg.telegram_bot_username.is_none());
+        assert!(cfg.slack_identity.is_none());
+        assert!(cfg.slack_recipient.is_none());
     }
 
     /// TOKEN CAP / CONTROL-CHAR REJECTION: an over-long token and a control-char
@@ -3855,6 +4856,29 @@ llm_max_input_chars = 999
     fn mux_preference_roundtrips_via_config() {
         let cfg: Config = toml::from_str(r#"mux_preference = "kitty""#).unwrap();
         assert_eq!(cfg.mux_preference(), Some("kitty"));
+    }
+
+    #[test]
+    fn mux_preference_overlays_from_env() {
+        let _g = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-config-mux-overlay-{}-{}",
+            std::process::id(),
+            crate::model::now()
+        ));
+        let weave_dir = dir.join("weave");
+        std::fs::create_dir_all(&weave_dir).unwrap();
+        std::fs::write(weave_dir.join("config.toml"), r#"mux_preference = "tmux""#).unwrap();
+
+        let _xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        let _mux = crate::testenv::EnvVarGuard::set("WEAVE_MUX_PREFERENCE", "kitty");
+
+        let cfg = Config::load();
+        assert_eq!(cfg.mux_preference(), Some("kitty"));
+
+        drop((_mux, _xdg));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

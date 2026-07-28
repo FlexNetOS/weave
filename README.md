@@ -22,6 +22,14 @@ multiplexer is present.
 cargo build --release      # -> target/release/weave
 ```
 
+## Environment configuration
+
+Start from the complete, secret-free [`.env.example`](.env.example). It documents
+every supported environment input, feature gate, authentication boundary, signing
+setup, and intentionally generated-only child variable. Weave does not auto-load
+`.env`; use a trusted secret manager or explicit loader, and never commit the
+resulting local file.
+
 ## Use with your coding agent
 
 `weave setup --provider <claude|codex|gemini|aider>` wires weave into your host's
@@ -108,7 +116,7 @@ weave inbox --me envctl              # read (marks read); --peek to not mark; --
 weave export --out mailbox.html      # self-contained, offline, searchable HTML of your mailbox (--for <id>; --all for explicit whole-store; --limit N)
 weave backup --out mailbox.tar       # no-dep snapshot of DB + config + Claude settings (--force to overwrite)
 weave restore --in mailbox.tar       # restore that snapshot (traversal-guarded; --force to clobber DB/config/settings; remote libSQL unsupported)
-weave session export --out s.json    # portable JSON of a session (messages + mesh memory) for cross-instance resume (--for <id>; --force)
+weave session export --out s.json    # schema-v2 portable JSON (message semantics + asks/groups + memory) for cross-instance resume (--for <id>; --force)
 weave session import --in s.json     # import that session into THIS instance (idempotent; --as <id> to remap; --dry-run for counts)
 
 # Tracked ask/answer/ack (correlation-tracked request/response — distinct from send/reply)
@@ -169,8 +177,8 @@ weave kill worker                    # kill the peer's pane (tmux/kitty/wezterm)
 
 weave mcp --session desktop          # run the MCP stdio server
 
-# Cross-store delivery (Tier-2): deposit a message for a recipient in another store
-weave send --from desktop --to envctl --to-store /path/to/other/messages.db --body "ship it"
+# Cross-store delivery (Tier-2): label a route and deposit an intent in THIS store
+weave send --from desktop --to envctl --to-store envctl-route --to-host buildbox --body "ship it"
 weave outbox                         # inspect pending cross-store intents you queued (--json)
 weave pull --me envctl               # pull + commit intents from your pull_from sources now
 ```
@@ -369,6 +377,13 @@ compactly (non-idle turn_state + a live description only), `weave_whoami` always
 On `weave_send`, if the recipient is a registered injectable peer, a live nudge is pushed
 into its pane; otherwise the message waits and is delivered on the recipient's next turn.
 
+Automatic mesh-memory context is applied only to unkeyed message bodies. A keyed
+`send`, `notify`, `reply`, `ask`, or `answer` stores the caller's body verbatim (as
+does an explicit no-memory option), so an exact retry cannot collide merely because
+memory changed between attempts. A supersede is also route-scoped: the predecessor,
+successor, and caller must have the same sender **and recipient**; it cannot replace
+one recipient's row with a message addressed to another.
+
 `weave_notify` `{ to, body, subject? }` is a **fire-and-forget** (no-reply) notification: it
 persists a normal message, fires the same live nudge if the recipient is injectable, and
 returns the **honest delivery verdict** — `transport_delivered` (nudge landed live) /
@@ -380,12 +395,17 @@ inject_failed / not_injectable → drained) — the complement to `weave_receipt
 READ receipts). The trace is **metadata-only** (it never carries the message body); an
 unknown/never-traced id returns an empty trace, not an error.
 
-**Cross-store (Tier-2).** Pass `to_store` (a path to another store) to `weave_send` to queue
-the message as a directed intent in **your own** outbox — the recipient pulls and commits it
-into its inbox on its next drain (no foreign write; broadcast is refused with a cross-store
-target). `weave_outbox` is a read-only self-inspection of intents you have queued that have
-not yet been pulled. On the receiving side, a `weave_inbox` drain with `WEAVE_PULL_FROM`
-configured pulls and commits eligible intents in the same call.
+**Cross-store (Tier-2).** Pass `to_store` to `weave_send` to select cross-store
+mode and give the operation an operator-facing route label. The label is validated
+but is **not persisted**, does not select/open a recipient database, and is not a
+delivery address. Weave queues the directed intent in **your own** outbox; the
+recipient must explicitly list this sender store in `pull_from`, then pull and
+commit the intent into its own inbox (no foreign write; broadcast is refused).
+Optional `to_host` is enforced at commit: a nonempty normalized host must exactly
+match the receiver; empty is a wildcard. `weave_outbox` is a read-only
+self-inspection of queued intents. On the receiving side, a `weave_inbox` drain
+with `WEAVE_PULL_FROM` configured pulls and commits eligible intents in the same
+call.
 
 `weave_attach` adopts the calling session into the store without a restart (re-captures the
 current pane and upserts the caller's own peer row only). `weave_connect` reports the same
@@ -710,7 +730,8 @@ so enabling `surfaces` adds **one** shared copy, and the default `cargo build` a
 zero. These are **CLI subcommands, not MCP tools**, so the MCP surface is unchanged.
 
 ```bash
-cargo build --release --features surfaces        # composes: --features "libsql surfaces"
+cargo build --release --features surfaces        # default sqlite + surfaces
+# libSQL variant: --no-default-features --features "libsql surfaces"
 
 # Read-only web dashboard (sessions/presence, recent messages, jobs, leases,
 # schedules). Localhost-bound, bearer-gated; a random token is printed to stderr
@@ -719,24 +740,74 @@ cargo build --release --features surfaces        # composes: --features "libsql 
 weave dashboard                                   # default port 8788
 weave dashboard --port 9000 --token mysecret
 
-# Telegram / Slack bridges (poll-only): relay between a chat and the mesh.
-WEAVE_TELEGRAM_TOKEN=… WEAVE_TELEGRAM_CHAT_ID=… weave telegram
-WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=…        weave slack
+# Telegram / Slack bridges (poll-only): relay between one chat and one mesh peer.
+WEAVE_TELEGRAM_TOKEN=… WEAVE_TELEGRAM_CHAT_ID=… \
+  WEAVE_TELEGRAM_RECIPIENT=agent weave telegram
+WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=… \
+  WEAVE_SLACK_RECIPIENT=agent weave slack
+# Network-free durable/config status; bounded, non-consuming API checks:
+weave telegram --status --json
+weave telegram --check --json
+weave slack --status --json
+weave slack --check --json
 # Optional, explicit human-chat write gate for /send, /ask, /answer, /reply:
-WEAVE_BOT_WRITES=1 WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=… weave slack
+WEAVE_BOT_WRITES=1 WEAVE_SLACK_TOKEN=… WEAVE_SLACK_CHANNEL=… \
+  WEAVE_SLACK_RECIPIENT=agent weave slack
 ```
+
+The Telegram check performs bounded `getMe` and `getChat` calls: it verifies the
+configured bot identity and that the configured chat is accessible, without
+polling updates or posting a message. The Slack check similarly verifies identity
+and configured-conversation read access without posting.
 
 The dashboard is **read-only** (`GET /` HTML, `GET /events` SSE — never mutates) and
 HTML-escapes every stored string. Bot tokens are **secrets** — supply them via
 config (`telegram_token` / `slack_token`) or the env vars above (envctl can inject
-them); they are Debug-redacted and never logged. The bridge posts inbound human
-replies into the mesh as the configured `bridge_identity` (`WEAVE_BRIDGE_IDENTITY`,
-default `telegram`/`slack`). Both bot bridges answer `/inbox`, `/peers`,
-`/sessions`, and `/help` through the same JSON-RPC dispatcher as MCP/CLI. Mutating
-chat commands (`/send <to> <body>`, `/ask <to> <body>`, `/answer <ask_id> <body>`,
-`/reply <message_id> <body>`) are disabled unless `WEAVE_BOT_WRITES=1` is set; once
-enabled, they still route through the same dangerous-tool gate instead of a
-bot-specific write path. See ADR-0004 for the locked stack decision.
+them); they are Debug-redacted and never logged. Each platform has its own weave
+identity and internal recipient (`telegram_identity` / `telegram_recipient`,
+`slack_identity` / `slack_recipient`, or their `WEAVE_*` overlays). The distinct
+identity defaults are `telegram` and `slack`; legacy `bridge_identity` is accepted
+only as an unambiguous fallback. Each bridge identity must also differ from its
+internal recipient. Ordinary inbound text is sent **from** that bridge
+identity **to** the configured recipient, so the bridge never drains and echoes its
+own inbound row. Telegram accepts `/inbox`, `/peers`, `/sessions`, and `/help`.
+Slack accepts history-safe ordinary channel messages such as `!weave inbox`,
+`!weave peers`, `!weave sessions`, and `!weave help`; legacy `/command` text is
+also accepted if it reaches Slack history. Mutating commands use the corresponding
+prefix (`/send` on Telegram or `!weave send` on Slack) and are disabled unless
+`WEAVE_BOT_WRITES=1` is set. Once enabled, they still route through the same
+dangerous-tool gate instead of a bot-specific write path.
+
+Bridge authorization is conversation-scoped; there is currently no per-user
+allowlist. Every member who can post in the configured chat/channel can invoke its
+read commands, and enabling `WEAVE_BOT_WRITES=1` grants every such member the
+bridge identity's write commands. Use a dedicated private conversation.
+
+For Slack, configure a bot token (normally `xoxb-...`) and add the app to the
+configured conversation. Reading requires the matching history scope:
+`channels:history` for public channels, `groups:history` for private channels,
+`im:history` for direct messages, or `mpim:history` for multi-person direct
+messages. See Slack's [`conversations.history` documentation](https://docs.slack.dev/reference/methods/conversations.history/).
+Running the relay also posts replies and outbound rows, which requires
+`chat:write`; see [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postmessage).
+`weave slack --check` calls `auth.test` and makes one bounded history request for
+the configured channel. It validates checked identity plus channel-read access,
+does not post, and does not claim that posting is available.
+
+Outbound rows are peeked oldest-first and marked read one at a time only after a
+bounded HTTP response and the platform's `ok` result confirm acceptance. A failed
+post remains unread. A durable token-free runtime row fences one owner per platform,
+persists inbound progress, and powers `--status`, doctor, MCP doctor, and dashboard
+health, including explicit runtime-presence, heartbeat, and stale-owner posture.
+The cursor is bound to the checked external account and configured conversation so
+a route change bootstraps a new boundary instead of reusing incompatible progress.
+After Telegram accepts a `/inbox` response, Weave commits that update cursor and the
+exact selected message receipts together in one owner-fenced Store transaction on
+both backends. A failure cannot leave the cursor advanced with those rows unread.
+Delivery is intentionally **at-least-once**: a process stop in the narrow
+interval after remote acceptance but before that local transaction (Telegram offers
+no `sendMessage` idempotency key) can still cause a retry; Weave never claims
+impossible cross-system exactly-once delivery.
 
 ## Governed web access (`--features obscura`)
 
@@ -745,12 +816,15 @@ browser. Behind a default-OFF `--features obscura`, weave spawns the separate
 [`obscura`](https://github.com/FlexNetOS/obscura) browser binary (`obscura mcp`) as
 a child via **argv-only `std::process::Command` (never a shell)** and speaks
 newline-delimited JSON-RPC over its stdio as a hand-rolled MCP **client**. No
-V8/tokio/obscura crate is linked — the default `cargo build` adds **zero** deps
-(std + the already-present `serde_json` carry the whole client). obscura is a
-*runtime* dependency (a separate installed binary), not a compile-time one.
+V8/tokio/obscura crate is linked — the default `cargo build` adds **zero** deps;
+the feature adds only a URL parser for browser-compatible policy/proxy parsing.
+obscura itself is a *runtime* dependency (a separate installed binary), not a
+linked compile-time dependency.
 
 ```bash
-cargo build --release --features obscura          # composes: --features "libsql obscura"
+cargo build --release --features obscura          # default sqlite + obscura
+# libSQL variant (backends are mutually exclusive):
+cargo build --release --no-default-features --features libsql,obscura
 
 # Deny-by-default: configure an allow-list first (config.toml or env), then drive a
 # browser op. ONE op per call; all 35 obscura browser_* ops are reachable.
@@ -767,12 +841,25 @@ explicitly allows it (`obscura_allow_ops` / `WEAVE_OBSCURA_ALLOW_OPS`, or `"*"`)
 and every URL is **SSRF-guarded** — loopback / `localhost` / link-local
 (`169.254.*` incl. the cloud-metadata endpoint) / RFC1918 private / `*.local` /
 bare-IP targets are blocked unless `obscura_allow_internal=true`. Optional
-`obscura_allow_domains` narrows to a domain allow-list (or `"*"` for any public host;
-SSRF still blocks internal); `--lease-ttl` rate-limits per
-host; `--audit` records a durable job. Web access reuses weave's existing
+`obscura_allow_domains` narrows direct `navigate`/`tab_new` URL arguments (or `"*"`
+for any public host; SSRF still blocks internal). It is not a complete browser
+egress allowlist: later clicks, scripts, redirects, and subresources are not checked
+against that domain list. Obscura adds DNS/private-address/redirect SSRF checks at
+fetch time; use network isolation when strict egress control is required.
+URLs containing embedded credentials are rejected, and durable audit jobs retain
+only the validated host—not paths, queries, or fragments.
+`--lease-ttl` rate-limits per host; `--audit` records a durable job. Web access reuses weave's existing
 permission/lease/job primitives (the same gate as any other mesh work) and
 `weave_web` is gated as a **dangerous** tool (blocked in safe HTTP mode). The
-obscura child's stderr and any proxy/token secrets are never logged. See ADR-0002.
+obscura child's stderr is discarded rather than logged. Proxy URLs must be credential-free
+because the upstream MCP CLI accepts them only on argv; credential-bearing URLs are
+rejected before spawn. The child receives a scrubbed environment (only `PATH` and a
+validated absolute `TMPDIR` are retained), so ambient Obscura toggles and unrelated
+credentials cannot bypass weave's policy or leak into the browser process.
+`obscura_allow_internal=true` is mapped to
+Obscura's explicit per-process private-network flag. The pinned stdio MCP server has no
+token-auth input; access is controlled by weave's local policy gate and the OS process
+boundary. See ADR-0002.
 
 ## Post-send hooks (`[[post_send_hook]]`)
 
@@ -844,19 +931,32 @@ Agents in **different stores** can message each other without sharing one
 recipient's store.
 
 - **Send** queues a directed *intent* in the **sender's own** outbox
-  (`weave send --to-store <recipient-store> --to <name>`). The recipient's store is
-  not touched. Inspect pending intents with `weave outbox`.
+  (`weave send --to-store <route-label> --to <name>`). `to_store` is a bounded
+  operator label that selects this mode; it is not persisted and never selects or
+  opens a recipient database. The recipient's store is not touched. Optional
+  `--to-host <host>` is an enforced destination constraint: a nonempty value must
+  exactly match the receiver's normalized host. Inspect pending intents with
+  `weave outbox`.
 - **Receive** by listing the sender's store as a delivery source —
   `WEAVE_PULL_FROM=/path/to/sender/messages.db` (comma- or path-separated), or
   `pull_from = [...]` in `config.toml`. On each drain (hook/`weave watch`) or an
   explicit `weave pull`, weave opens each allowed source **read-only**, commits the
   intents addressed to you into **your own** inbox (your store assigns the id and
-  timestamp), and advances a per-source cursor. `pull_from` is **distinct** from
+  timestamp), and advances a cursor scoped to the exact
+  `(source, recipient, receiver-host)` route. `pull_from` is **distinct** from
   `peer_dbs` (delivery vs. visibility) and capped at 16 sources.
 - **Delivery is next-drain** (pull-latency-bound), not instant, and **idempotent**:
-  a normal re-drain never duplicates. The single edge case is a crash *between*
-  committing a message and advancing the cursor, which re-delivers **at most one**
-  intent on the next drain (a bounded at-least-once guarantee).
+  a normal re-drain never duplicates. A crash *between* committing a message and
+  advancing the cursor retries **at most one** intent on the next drain; its stable
+  key resolves to the existing local row rather than inserting a duplicate.
+
+Older databases used one source-global cursor. During the one-way upgrade to
+route-scoped cursors, keyed rows at or below that old watermark are reconciled by
+their durable keys. A legacy **keyless** row in that ambiguous range is skipped
+with a warning to preserve at-most-once behavior: the old schema cannot prove which
+recipient route already consumed it. Migration mode persists across bounded pages
+until the route reaches the old watermark; new keyless rows receive stable
+source/id-derived keys.
 
 #### Remote sources — cross-machine pull (`--features libsql`)
 
@@ -999,6 +1099,48 @@ from a source therefore also grants it a live-pane ping. To narrow or disable it
   nudge to a trusted subset of your pull sources; other sources still deliver to
   your inbox, just without a keystroke.
 
+### Cross-machine push (`--features surfaces`)
+
+`weave push` is the sender-initiated form of the same receiver-owned commit path:
+
+```bash
+# Every deliberate retry reuses the same explicit key.
+weave push --to envctl --host https://mesh.example --body "ship it" \
+  --idempotency-key deploy-2026-07-13
+```
+
+The wire `weave_push` action requires `idempotency_key`. The CLI always supplies
+one: omitting `--idempotency-key` mints a **fresh key for that invocation**, so two
+separate invocations are two messages. If an HTTP result is uncertain, retry with
+the same explicit key; an exact replay succeeds without a second local row or a
+second live nudge, while reuse for different semantics is rejected. Nonempty
+`to_host` is checked against the receiver's normalized host.
+
+The endpoint must be an HTTP(S) origin (optionally ending in `/push`). HTTPS is
+required except for `localhost` or an IP loopback address; userinfo, query,
+fragment, and arbitrary paths are rejected. The bearer token resolves as
+`--token` then `WEAVE_PUSH_TOKEN` and is never a config fallback. Responses are
+time-bounded, capped at 64 KiB before JSON parsing, and must be the matching
+JSON-RPC 2.0/MCP reply (`id: 1`, object result, boolean `isError`, text content);
+only bounded/sanitized result or error text is shown and the supplied token is
+redacted.
+
+Enable reception with a credential dedicated to push. It must differ from the
+dashboard/MCP operator token, and `--write`/`--dangerous` is not required:
+
+```bash
+weave dashboard --token "$WEAVE_ADMIN_TOKEN" --push-token "$WEAVE_PUSH_TOKEN"
+# or: weave serve --token "$WEAVE_ADMIN_TOKEN" --push-token "$WEAVE_PUSH_TOKEN"
+```
+
+`POST /push` accepts only a direct `weave_push` call. Its token cannot read the
+dashboard, call general MCP tools, or use dashboard action routes; never give a
+remote sender the operator token. Weave's receiver speaks plain HTTP. For a remote
+HTTPS origin, keep Weave on loopback behind a TLS terminator/reverse proxy that
+forwards only `/push`, or use an SSH loopback forward and send to
+`http://127.0.0.1:<forwarded-port>`. Binding a Tailscale/WireGuard address alone
+does not provide TLS.
+
 ### Signed sender identity (optional `sign` feature)
 
 The **default build is crypto-free** — no `ed25519-dalek` in its dependency tree.
@@ -1008,11 +1150,16 @@ verification automatically. You opt into signed identity by building with the
 `sign` feature:
 
 ```bash
-cargo build --release --features sign         # composes with libsql too: --features "libsql sign"
+cargo build --release --features sign         # default sqlite + sign
+# libSQL variant: --no-default-features --features "libsql sign"
 ```
 
 A `--features sign` build adds the `weave key` subcommand and verifies signatures
-on pull/commit using Ed25519 over the canonical `(from, to, body)`:
+on pull/commit. Newly queued `v2:` signatures bind the complete semantic intent:
+`from`, `to`, normalized `to_host`, subject presence/value, body, the required
+stable idempotency key, canonical priority, and TTL. `trace_id` is deliberately
+excluded because it is attempt-local diagnostics; an exact retry preserves the
+first accepted trace:
 
 ```bash
 weave key gen --me desktop          # generate a keypair; private key stored 0600, public key + fingerprint registered + printed
@@ -1029,6 +1176,20 @@ weave audit revocations             # list the observed-revocation audit log (de
 The private key lives at `~/.config/weave/ed25519.key` (mode `0600`) and is never
 logged or printed. A signed intent makes the cross-store `from` **unforgeable**; a
 **tampered or spoofed signature is always rejected** regardless of mode.
+
+Receivers retain a legacy fallback for already queued, unprefixed v1 signatures,
+which covered only `(from, to, body)`. Roll out this change **receiver first**:
+upgrade every receiver so it understands `v2:`, then upgrade senders. A v2-aware
+receiver accepts both old v1 rows and new full-semantic v2 rows; an old receiver
+cannot validate the marked v2 encoding. This fallback is for draining existing
+queues, not for creating new partial-coverage signatures.
+
+There is not yet a receiver-side retirement switch: upgraded receivers continue
+accepting unprefixed v1 rows indefinitely, so drain/remove legacy queues before
+assuming every accepted signature covers the full v2 semantic tuple. If store open
+refuses a signed-v2 idempotency migration, follow the backup-first offline recovery
+procedure in `docs/OPERATIONS.md`; never edit a bound key independently of its
+signature.
 
 Keys live in a **multi-key registry** (`identity_keys`): each identity may have
 **several** registered keys at once. A signed pulled intent commits IFF its signature
@@ -1153,9 +1314,9 @@ loop. External commands are spawned argv-only, never via a shell string.
 ## Status
 
 v0.2.0 — a small internal Cargo workspace (`weave-core` ← `weave-inject` ← `weave-mcp` ← `weave`)
-that links to **one** dependency-light static binary. Both backends build clean under clippy
-`-D warnings` and `cargo fmt --check`; **706 tests green** on the default `sqlite` backend and
-**657 green** on `--features libsql` (the `sign` and `surfaces` feature combos are CI-gated too).
+that links to **one** dependency-light static binary. Both backends are gated by clippy
+`-D warnings`, `cargo fmt --check`, and feature-matrix tests (including `sign`, `surfaces`,
+and the mutually exclusive `sqlite`/`libsql` backends).
 MCP + CLI + native multi-mux injector + `weave setup` automation are all working.
 
 The MCP surface is **token-light** (ADR-0003): ~70 `weave_*` operations are exposed through a

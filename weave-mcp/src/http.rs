@@ -4,7 +4,7 @@
 //! Accepts POST requests with `Content-Length`, verifies `Authorization: Bearer`,
 //! dispatches through [`dispatch_request`], and returns JSON-RPC responses.
 
-use crate::mcp::{dispatch_request, PullConsent};
+use crate::mcp::{dispatch_push_request, dispatch_request, PullConsent};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,13 +12,124 @@ use weave_core::config::StoreSource;
 use weave_inject::Injector;
 
 const DEFAULT_PROTOCOL: &str = "HTTP/1.1";
+const HTTP_IO_TIMEOUT_SECS: u64 = 10;
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_HEADER_COUNT: usize = 100;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_CONNECTIONS: usize = 64;
+
+struct ConnectionSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn claim_connection_slot(
+    active: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<ConnectionSlot> {
+    active
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |count| (count < MAX_HTTP_CONNECTIONS).then_some(count + 1),
+        )
+        .ok()
+        .map(|_| ConnectionSlot(std::sync::Arc::clone(active)))
+}
+
+fn configure_http_stream(stream: &TcpStream) -> std::io::Result<()> {
+    let timeout = Some(std::time::Duration::from_secs(HTTP_IO_TIMEOUT_SECS));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    stream.set_nodelay(true)?;
+    Ok(())
+}
+
+/// Read one UTF-8 HTTP line without allowing `BufRead::read_line` to grow a
+/// caller-controlled String without bound.
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    out: &mut String,
+    max_bytes: usize,
+) -> anyhow::Result<usize> {
+    let started = std::time::Instant::now();
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        if started.elapsed().as_secs() >= HTTP_IO_TIMEOUT_SECS {
+            anyhow::bail!("HTTP line read exceeded the time limit");
+        }
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if bytes.len().saturating_add(take) > max_bytes {
+            anyhow::bail!("HTTP line exceeds the {max_bytes}-byte limit");
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    let len = bytes.len();
+    *out = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("HTTP line is not UTF-8"))?;
+    Ok(len)
+}
+
+fn read_bounded_header_line<R: BufRead>(
+    reader: &mut R,
+    out: &mut String,
+    total_bytes: &mut usize,
+    count: &mut usize,
+    started: &std::time::Instant,
+) -> anyhow::Result<usize> {
+    if started.elapsed().as_secs() >= HTTP_IO_TIMEOUT_SECS {
+        anyhow::bail!("HTTP header read exceeded the time limit");
+    }
+    if *count >= MAX_HEADER_COUNT {
+        anyhow::bail!("HTTP request exceeds the {MAX_HEADER_COUNT}-header limit");
+    }
+    let n = read_bounded_line(reader, out, MAX_HEADER_LINE_BYTES)?;
+    *count += 1;
+    *total_bytes = (*total_bytes).saturating_add(n);
+    if *total_bytes > MAX_HEADER_BYTES {
+        anyhow::bail!("HTTP headers exceed the {MAX_HEADER_BYTES}-byte limit");
+    }
+    Ok(n)
+}
+
+fn read_bounded_body<R: Read>(reader: &mut R, content_length: usize) -> anyhow::Result<Vec<u8>> {
+    if content_length > MAX_HTTP_BODY_BYTES {
+        anyhow::bail!("HTTP body exceeds the {MAX_HTTP_BODY_BYTES}-byte limit");
+    }
+    let started = std::time::Instant::now();
+    let mut body = vec![0u8; content_length];
+    let mut offset = 0usize;
+    while offset < body.len() {
+        if started.elapsed().as_secs() >= HTTP_IO_TIMEOUT_SECS {
+            anyhow::bail!("HTTP body read exceeded the time limit");
+        }
+        let read = reader.read(&mut body[offset..])?;
+        if read == 0 {
+            anyhow::bail!("HTTP body ended before Content-Length bytes were received");
+        }
+        offset += read;
+    }
+    Ok(body)
+}
 
 /// WL-056 / ADR-0005: is `bind` a loopback address (the safe default that needs no
 /// token)? Parses the address as an `IpAddr` and asks the stdlib; a bare `localhost`
 /// is treated as loopback too. A non-parseable / non-loopback address is NOT
 /// loopback, so `serve_http` will require a bearer token for it (fail-closed). This
 /// is a pure function (unit-tested) — the routable-bind fail-closed gate rests on it.
-fn is_loopback_bind(bind: &str) -> bool {
+pub fn is_loopback_bind(bind: &str) -> bool {
     let host = bind.trim();
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -29,6 +140,20 @@ fn is_loopback_bind(bind: &str) -> bool {
         // (fail-closed: never assume an unrecognized bind is safe).
         Err(_) => false,
     }
+}
+
+fn validate_separate_push_token(token: &str, push_token: Option<&str>) -> anyhow::Result<()> {
+    if let Some(push_token) = push_token {
+        if push_token.is_empty() {
+            anyhow::bail!("push token must not be empty");
+        }
+        if push_token == token {
+            anyhow::bail!(
+                "push token must differ from the operator token so push authority stays isolated"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// WL-048: how long the SSE accept thread sleeps between dashboard snapshots
@@ -48,18 +173,23 @@ const SSE_TICK_SECS: u64 = 2;
 /// EMPTY bearer token is refused — weave never opens an unauthenticated listener on
 /// a routable address.
 #[allow(clippy::too_many_arguments)]
-pub fn serve_http(
-    store: &dyn weave_core::store::Store,
+pub fn serve_http<F>(
     me_default: Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: Vec<StoreSource>,
     pull: PullConsent,
-    injector: &dyn Injector,
+    injector: &(dyn Injector + Sync),
     bind: &str,
     port: u16,
     token: &str,
+    push_token: Option<&str>,
     dangerous: bool,
-) -> anyhow::Result<()> {
+    store_factory: F,
+) -> anyhow::Result<()>
+where
+    F: Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync + 'static,
+{
+    validate_separate_push_token(token, push_token)?;
     // FAIL-CLOSED: refuse to bind a routable address without a bearer token (no open
     // listener on the network). Checked BEFORE TcpListener::bind so we never even
     // open the socket. A loopback bind keeps today's posture (empty token allowed).
@@ -72,26 +202,54 @@ pub fn serve_http(
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr)?;
     log(&format!("HTTP MCP server listening on http://{addr}"));
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut s) => {
-                if let Err(e) = handle_connection(
-                    &mut s,
-                    store,
-                    &me_default,
-                    nudge_template,
-                    &extra_dbs,
-                    &pull,
-                    injector,
-                    token,
-                    dangerous,
-                ) {
-                    log(&format!("connection error: {e}"));
+    let token = token.to_string();
+    let push_token = push_token.map(str::to_string);
+    let nudge_template = nudge_template.map(str::to_string);
+    let extra_dbs = std::sync::Arc::new(extra_dbs);
+    let pull = std::sync::Arc::new(pull);
+    let factory = std::sync::Arc::new(store_factory);
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut s) => {
+                    if let Err(e) = configure_http_stream(&s) {
+                        log(&format!("connection timeout setup error: {e}"));
+                        continue;
+                    }
+                    let Some(slot) = claim_connection_slot(&active) else {
+                        let _ = write_http(&mut s, 503, b"Server busy");
+                        continue;
+                    };
+                    let token = token.clone();
+                    let push_token = push_token.clone();
+                    let nudge_template = nudge_template.clone();
+                    let me_default = me_default.clone();
+                    let extra_dbs = std::sync::Arc::clone(&extra_dbs);
+                    let pull = std::sync::Arc::clone(&pull);
+                    let factory = std::sync::Arc::clone(&factory);
+                    scope.spawn(move || {
+                        let _slot = slot;
+                        if let Err(e) = handle_connection(
+                            &mut s,
+                            factory.as_ref(),
+                            &me_default,
+                            nudge_template.as_deref(),
+                            extra_dbs.as_slice(),
+                            pull.as_ref(),
+                            injector,
+                            &token,
+                            push_token.as_deref(),
+                            dangerous,
+                        ) {
+                            log(&format!("connection error: {e}"));
+                        }
+                    });
                 }
+                Err(e) => log(&format!("accept error: {e}")),
             }
-            Err(e) => log(&format!("accept error: {e}")),
         }
-    }
+    });
     Ok(())
 }
 
@@ -110,6 +268,7 @@ pub fn serve_dashboard<F>(
     bind: &str,
     port: u16,
     token: &str,
+    push_token: Option<&str>,
     write: bool,
     me_default: Option<String>,
     injector: &(dyn Injector + Sync),
@@ -118,9 +277,10 @@ pub fn serve_dashboard<F>(
 where
     F: Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync + 'static,
 {
+    validate_separate_push_token(token, push_token)?;
     // FAIL-CLOSED: same routable-bind-requires-token rule as `serve_http`. The
-    // `POST /api` write surface (`--write`) is the cross-machine push receive seam,
-    // so an exposed dashboard must carry a token too.
+    // Dashboard/operator access still requires its own token on a routable bind.
+    // Cross-machine push uses the distinct, push-only `/push` credential.
     if !is_loopback_bind(bind) && token.is_empty() {
         anyhow::bail!(
             "refusing to bind a routable address without a bearer token \
@@ -134,26 +294,32 @@ where
         if write { "read-write" } else { "read-only" }
     ));
     let token = token.to_string();
+    let push_token = push_token.map(str::to_string);
     let factory = std::sync::Arc::new(store_factory);
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::scope(|scope| {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut s) => {
+                    if let Err(e) = configure_http_stream(&s) {
+                        log(&format!("dashboard timeout setup error: {e}"));
+                        continue;
+                    }
+                    let Some(slot) = claim_connection_slot(&active) else {
+                        let _ = write_http(&mut s, 503, b"Server busy");
+                        continue;
+                    };
                     let token = token.clone();
+                    let push_token = push_token.clone();
                     let factory = std::sync::Arc::clone(&factory);
                     let me_default = me_default.clone();
                     scope.spawn(move || {
-                        let store = match factory() {
-                            Ok(st) => st,
-                            Err(e) => {
-                                log(&format!("dashboard store open error: {e}"));
-                                return;
-                            }
-                        };
+                        let _slot = slot;
                         if let Err(e) = handle_dashboard_connection(
                             &mut s,
-                            store.as_ref(),
+                            factory.as_ref(),
                             &token,
+                            push_token.as_deref(),
                             write,
                             &me_default,
                             injector,
@@ -179,8 +345,9 @@ where
 #[allow(clippy::too_many_arguments)]
 fn handle_dashboard_connection(
     stream: &mut TcpStream,
-    store: &dyn weave_core::store::Store,
+    store_factory: &(dyn Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync),
     token: &str,
+    push_token: Option<&str>,
     write: bool,
     me_default: &Option<String>,
     injector: &dyn Injector,
@@ -188,7 +355,7 @@ fn handle_dashboard_connection(
     use crate::dashboard::{route, Route};
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first_line = String::new();
-    reader.read_line(&mut first_line)?;
+    read_bounded_line(&mut reader, &mut first_line, MAX_REQUEST_LINE_BYTES)?;
     let mut rl = first_line.split_whitespace();
     let method = rl.next().unwrap_or("").to_string();
     let path = rl.next().unwrap_or("").to_string();
@@ -199,24 +366,25 @@ fn handle_dashboard_connection(
             write_http(stream, 401, b"Unauthorized")?;
             return Ok(());
         }
+        let store = store_factory().map_err(|e| anyhow::anyhow!("opening dashboard store: {e}"))?;
         if let Some(peer) = transcript_peer_from_path(&path) {
-            return serve_dashboard_peer_transcript_json(stream, store, peer, &path);
+            return serve_dashboard_peer_transcript_json(stream, store.as_ref(), peer, &path);
         }
         if let Some(job_id) = job_status_id_from_path(&path) {
-            return serve_dashboard_job_status_json(stream, store, job_id);
+            return serve_dashboard_job_status_json(stream, store.as_ref(), job_id);
         }
         if let Some(job_id) = job_result_id_from_path(&path) {
-            return serve_dashboard_job_result_json(stream, store, job_id);
+            return serve_dashboard_job_result_json(stream, store.as_ref(), job_id);
         }
         return match route(&method, &path) {
-            Route::Page => serve_dashboard_page(stream, store, write),
-            Route::Events => serve_dashboard_events(stream, store, write),
-            Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store, write),
-            Route::PeersJson => serve_dashboard_peers_json(stream, store),
-            Route::EventsJson => serve_dashboard_events_json(stream, store, &path),
-            Route::JobsJson => serve_dashboard_jobs_json(stream, store),
-            Route::AsksPendingJson => serve_dashboard_asks_pending_json(stream, store),
-            Route::SettingsJson => serve_dashboard_settings_json(stream, store, write),
+            Route::Page => serve_dashboard_page(stream, store.as_ref(), write),
+            Route::Events => serve_dashboard_events(stream, store.as_ref(), write),
+            Route::SnapshotJson => serve_dashboard_snapshot_json(stream, store.as_ref(), write),
+            Route::PeersJson => serve_dashboard_peers_json(stream, store.as_ref()),
+            Route::EventsJson => serve_dashboard_events_json(stream, store.as_ref(), &path),
+            Route::JobsJson => serve_dashboard_jobs_json(stream, store.as_ref()),
+            Route::AsksPendingJson => serve_dashboard_asks_pending_json(stream, store.as_ref()),
+            Route::SettingsJson => serve_dashboard_settings_json(stream, store.as_ref(), write),
             Route::HealthJson => serve_dashboard_health_json(stream),
             _ => {
                 write_http(stream, 404, b"Not Found")?;
@@ -226,7 +394,12 @@ fn handle_dashboard_connection(
     }
 
     if method == "POST" {
-        if !write {
+        let push_only = path_without_query(&path) == "/push";
+        let Some(required_token) = (if push_only { push_token } else { Some(token) }) else {
+            write_http(stream, 404, b"Not Found")?;
+            return Ok(());
+        };
+        if !push_only && !write {
             write_http(
                 stream,
                 403,
@@ -234,19 +407,29 @@ fn handle_dashboard_connection(
             )?;
             return Ok(());
         }
-        let action = dashboard_action_tool(&path);
-        if path_without_query(&path) != "/api" && action.is_none() {
+        let action = (!push_only).then(|| dashboard_action_tool(&path)).flatten();
+        if !push_only && path_without_query(&path) != "/api" && action.is_none() {
             write_http(stream, 404, b"Not Found")?;
             return Ok(());
         }
         // Parse headers (content-length + bearer/cookie), mirroring the JSON-RPC POST
         // path while also allowing browser forms authenticated by the dashboard cookie.
         let mut content_length = 0usize;
-        let mut auth_ok = token.is_empty() || query_token_matches(Some(&path), token);
+        let mut auth_ok = !push_only
+            && (required_token.is_empty() || query_token_matches(Some(&path), required_token));
+        let mut header_bytes = 0usize;
+        let mut header_count = 0usize;
+        let header_started = std::time::Instant::now();
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line == "\r\n" || line == "\n" {
+            let n = read_bounded_header_line(
+                &mut reader,
+                &mut line,
+                &mut header_bytes,
+                &mut header_count,
+                &header_started,
+            )?;
+            if n == 0 || line == "\r\n" || line == "\n" {
                 break;
             }
             let lower = line.to_lowercase();
@@ -254,16 +437,29 @@ fn handle_dashboard_connection(
                 content_length = lower
                     .split(':')
                     .nth(1)
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
+                    .ok_or_else(|| anyhow::anyhow!("invalid Content-Length header"))?
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid Content-Length header"))?;
+                if content_length > MAX_HTTP_BODY_BYTES {
+                    anyhow::bail!("HTTP body exceeds the {MAX_HTTP_BODY_BYTES}-byte limit");
+                }
+            }
+            if lower.starts_with("transfer-encoding:") {
+                anyhow::bail!("Transfer-Encoding is not supported");
             }
             if lower.starts_with("authorization:") {
                 let provided = line.split(':').nth(1).unwrap_or("").trim();
-                if provided == format!("Bearer {token}") || provided == format!("bearer {token}") {
+                if provided == format!("Bearer {required_token}")
+                    || provided == format!("bearer {required_token}")
+                {
                     auth_ok = true;
                 }
             }
-            if lower.starts_with("cookie:") && cookie_token_matches(&line, token) {
+            if !push_only
+                && lower.starts_with("cookie:")
+                && cookie_token_matches(&line, required_token)
+            {
                 auth_ok = true;
             }
         }
@@ -271,8 +467,7 @@ fn handle_dashboard_connection(
             write_http(stream, 401, b"Unauthorized")?;
             return Ok(());
         }
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body)?;
+        let body = read_bounded_body(&mut reader, content_length)?;
         let req: Value = if let Some(tool) = action {
             dashboard_action_request(tool, &body)?
         } else {
@@ -284,18 +479,30 @@ fn handle_dashboard_connection(
                 }
             }
         };
-        // The SAME handler as MCP/CLI. `dangerous = true` because `--write` is the
-        // operator's explicit opt-in to mutations on this bearer-gated local surface.
-        let resp = dispatch_request(
-            store,
-            me_default,
-            None,
-            &[],
-            &PullConsent::empty(),
-            &req,
-            injector,
-            true,
-        );
+        let store = store_factory().map_err(|e| anyhow::anyhow!("opening dashboard store: {e}"))?;
+        let resp = if push_only {
+            dispatch_push_request(
+                store.as_ref(),
+                me_default,
+                &PullConsent::empty(),
+                &req,
+                injector,
+            )
+        } else {
+            // The operator token and `--write` are both required for the full
+            // dashboard action surface. The separately scoped push credential can
+            // never reach this branch.
+            dispatch_request(
+                store.as_ref(),
+                me_default,
+                None,
+                &[],
+                &PullConsent::empty(),
+                &req,
+                injector,
+                true,
+            )
+        };
         let resp_body = resp.unwrap_or_else(|| "{}".to_string());
         write_http(stream, 200, resp_body.as_bytes())?;
         return Ok(());
@@ -308,18 +515,19 @@ fn handle_dashboard_connection(
 #[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: &mut TcpStream,
-    store: &dyn weave_core::store::Store,
+    store_factory: &(dyn Fn() -> anyhow::Result<Box<dyn weave_core::store::Store>> + Send + Sync),
     me_default: &Option<String>,
     nudge_template: Option<&str>,
     extra_dbs: &[StoreSource],
     pull: &PullConsent,
     injector: &dyn Injector,
     token: &str,
+    push_token: Option<&str>,
     dangerous: bool,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first_line = String::new();
-    reader.read_line(&mut first_line)?;
+    read_bounded_line(&mut reader, &mut first_line, MAX_REQUEST_LINE_BYTES)?;
 
     // Parse the request line into (method, path). The POST/JSON-RPC path below is
     // unchanged; the `surfaces` build additionally accepts read-only GET routes.
@@ -348,27 +556,33 @@ fn handle_connection(
                 write_http(stream, 401, b"Unauthorized")?;
                 return Ok(());
             }
+            let store = store_factory()
+                .map_err(|e| anyhow::anyhow!("opening HTTP store after authentication: {e}"))?;
             if let Some(peer) = transcript_peer_from_path(&path) {
-                return serve_dashboard_peer_transcript_json(stream, store, peer, &path);
+                return serve_dashboard_peer_transcript_json(stream, store.as_ref(), peer, &path);
             }
             if let Some(job_id) = job_status_id_from_path(&path) {
-                return serve_dashboard_job_status_json(stream, store, job_id);
+                return serve_dashboard_job_status_json(stream, store.as_ref(), job_id);
             }
             if let Some(job_id) = job_result_id_from_path(&path) {
-                return serve_dashboard_job_result_json(stream, store, job_id);
+                return serve_dashboard_job_result_json(stream, store.as_ref(), job_id);
             }
             match route(&method, &path) {
-                Route::Page => return serve_dashboard_page(stream, store, dangerous),
-                Route::Events => return serve_dashboard_events(stream, store, dangerous),
+                Route::Page => return serve_dashboard_page(stream, store.as_ref(), dangerous),
+                Route::Events => return serve_dashboard_events(stream, store.as_ref(), dangerous),
                 Route::SnapshotJson => {
-                    return serve_dashboard_snapshot_json(stream, store, dangerous)
+                    return serve_dashboard_snapshot_json(stream, store.as_ref(), dangerous)
                 }
-                Route::PeersJson => return serve_dashboard_peers_json(stream, store),
-                Route::EventsJson => return serve_dashboard_events_json(stream, store, &path),
-                Route::JobsJson => return serve_dashboard_jobs_json(stream, store),
-                Route::AsksPendingJson => return serve_dashboard_asks_pending_json(stream, store),
+                Route::PeersJson => return serve_dashboard_peers_json(stream, store.as_ref()),
+                Route::EventsJson => {
+                    return serve_dashboard_events_json(stream, store.as_ref(), &path)
+                }
+                Route::JobsJson => return serve_dashboard_jobs_json(stream, store.as_ref()),
+                Route::AsksPendingJson => {
+                    return serve_dashboard_asks_pending_json(stream, store.as_ref())
+                }
                 Route::SettingsJson => {
-                    return serve_dashboard_settings_json(stream, store, dangerous)
+                    return serve_dashboard_settings_json(stream, store.as_ref(), dangerous)
                 }
                 Route::HealthJson => return serve_dashboard_health_json(stream),
                 _ => {
@@ -382,13 +596,32 @@ fn handle_connection(
         }
     }
 
+    let push_only = path_without_query(&path) == "/push";
+    if !push_only && path_without_query(&path) != "/" {
+        write_http(stream, 404, b"Not Found")?;
+        return Ok(());
+    }
+    let Some(required_token) = (if push_only { push_token } else { Some(token) }) else {
+        write_http(stream, 404, b"Not Found")?;
+        return Ok(());
+    };
+
     // Parse headers.
     let mut content_length = 0usize;
-    let mut auth_ok = token.is_empty();
+    let mut auth_ok = required_token.is_empty();
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
+    let header_started = std::time::Instant::now();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line == "\n" {
+        let n = read_bounded_header_line(
+            &mut reader,
+            &mut line,
+            &mut header_bytes,
+            &mut header_count,
+            &header_started,
+        )?;
+        if n == 0 || line == "\r\n" || line == "\n" {
             break;
         }
         let lower = line.to_lowercase();
@@ -396,12 +629,22 @@ fn handle_connection(
             content_length = lower
                 .split(':')
                 .nth(1)
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
+                .ok_or_else(|| anyhow::anyhow!("invalid Content-Length header"))?
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid Content-Length header"))?;
+            if content_length > MAX_HTTP_BODY_BYTES {
+                anyhow::bail!("HTTP body exceeds the {MAX_HTTP_BODY_BYTES}-byte limit");
+            }
+        }
+        if lower.starts_with("transfer-encoding:") {
+            anyhow::bail!("Transfer-Encoding is not supported");
         }
         if lower.starts_with("authorization:") {
             let provided = line.split(':').nth(1).unwrap_or("").trim();
-            if provided == format!("Bearer {token}") || provided == format!("bearer {token}") {
+            if provided == format!("Bearer {required_token}")
+                || provided == format!("bearer {required_token}")
+            {
                 auth_ok = true;
             }
         }
@@ -413,8 +656,7 @@ fn handle_connection(
     }
 
     // Read body.
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
+    let body = read_bounded_body(&mut reader, content_length)?;
 
     // Dispatch JSON-RPC.
     let req: Value = match serde_json::from_slice(&body) {
@@ -425,16 +667,22 @@ fn handle_connection(
         }
     };
 
-    let resp = dispatch_request(
-        store,
-        me_default,
-        nudge_template,
-        extra_dbs,
-        pull,
-        &req,
-        injector,
-        dangerous,
-    );
+    let store = store_factory()
+        .map_err(|e| anyhow::anyhow!("opening HTTP store after authentication: {e}"))?;
+    let resp = if push_only {
+        dispatch_push_request(store.as_ref(), me_default, pull, &req, injector)
+    } else {
+        dispatch_request(
+            store.as_ref(),
+            me_default,
+            nudge_template,
+            extra_dbs,
+            pull,
+            &req,
+            injector,
+            dangerous,
+        )
+    };
 
     let resp_body = resp.unwrap_or_else(|| "{}".to_string());
     write_http(stream, 200, resp_body.as_bytes())?;
@@ -446,8 +694,10 @@ fn write_http(stream: &mut TcpStream, status: u16, body: &[u8]) -> std::io::Resu
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Unknown",
     };
     let header = format!(
@@ -491,11 +741,23 @@ fn read_headers_auth_only<R: BufRead>(
     path: Option<&str>,
 ) -> anyhow::Result<bool> {
     let mut auth_ok = token.is_empty() || query_token_matches(path, token);
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
+    let header_started = std::time::Instant::now();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.is_empty() || line == "\r\n" || line == "\n" {
+        let n = read_bounded_header_line(
+            reader,
+            &mut line,
+            &mut header_bytes,
+            &mut header_count,
+            &header_started,
+        )?;
+        if n == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        if line.to_lowercase().starts_with("transfer-encoding:") {
+            anyhow::bail!("Transfer-Encoding is not supported");
         }
         if line.to_lowercase().starts_with("authorization:") {
             let provided = line.split(':').nth(1).unwrap_or("").trim();
@@ -539,7 +801,6 @@ fn cookie_token_matches(line: &str, token: &str) -> bool {
     })
 }
 
-#[cfg(feature = "surfaces")]
 fn path_without_query(path: &str) -> &str {
     path.split_once('?').map(|(p, _)| p).unwrap_or(path)
 }
@@ -725,14 +986,130 @@ fn build_snapshot(
         asks,
         leases,
         schedules,
-        settings: dashboard_settings(write_enabled),
+        settings: dashboard_settings(store, write_enabled)?,
     })
 }
 
 #[cfg(feature = "surfaces")]
-fn dashboard_settings(write_enabled: bool) -> crate::dashboard::DashboardSettings {
+struct DashboardBridgeStatus {
+    configured: bool,
+    ready: bool,
+    active: bool,
+    stale: bool,
+    healthy: bool,
+    status: String,
+    runtime_present: bool,
+    runtime_status: String,
+    heartbeat: i64,
+    identity: String,
+    recipient: String,
+    pending: i64,
+    last_success: i64,
+    last_delivery: i64,
+    last_error_class: String,
+    issues: Vec<String>,
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_bridge_status(
+    store: &dyn weave_core::store::Store,
+    view: weave_core::config::BridgeConfigView,
+) -> anyhow::Result<DashboardBridgeStatus> {
+    let runtime = store.bridge_runtime_status(view.platform)?;
+    let now = weave_core::model::now();
+    let active = runtime
+        .as_ref()
+        .is_some_and(|state| state.is_active_at(now));
+    let stale = runtime.as_ref().is_some_and(|state| state.is_stale_at(now));
+    let healthy = view.ready
+        && active
+        && runtime.as_ref().is_some_and(|state| {
+            let external_route_matches =
+                weave_core::model::BridgeCursorEnvelope::decode(&state.cursor)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|cursor| {
+                        view.conversation.as_deref() == Some(cursor.external_scope.as_str())
+                    });
+            state.status == weave_core::model::BridgeRuntimeStatus::Running
+                && state.last_error_class.is_empty()
+                && view.identity.as_deref() == Some(state.identity.as_str())
+                && view.recipient.as_deref() == Some(state.recipient.as_str())
+                && external_route_matches
+        });
+    let status = if healthy {
+        "healthy"
+    } else if active {
+        "degraded"
+    } else if stale {
+        "stale"
+    } else if view.ready {
+        "ready_inactive"
+    } else if view.configured {
+        "not_ready"
+    } else {
+        "not_configured"
+    };
+    let pending = match view.identity.as_deref() {
+        Some(identity) => store.unread_count(identity)?,
+        None => 0,
+    };
+    let mut issues = view
+        .issues
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if runtime.as_ref().is_some_and(|state| {
+        view.identity.as_deref() != Some(state.identity.as_str())
+            || view.recipient.as_deref() != Some(state.recipient.as_str())
+    }) {
+        issues.push("runtime route differs from current configuration".to_string());
+    }
+    if runtime.as_ref().is_some_and(|state| {
+        weave_core::model::BridgeCursorEnvelope::decode(&state.cursor)
+            .ok()
+            .flatten()
+            .is_none_or(|cursor| {
+                view.conversation.as_deref() != Some(cursor.external_scope.as_str())
+            })
+    }) {
+        issues.push("runtime external route differs from current configuration".to_string());
+    }
+    Ok(DashboardBridgeStatus {
+        configured: view.configured,
+        ready: view.ready,
+        active,
+        stale,
+        healthy,
+        status: status.to_string(),
+        runtime_present: runtime.is_some(),
+        runtime_status: runtime
+            .as_ref()
+            .map(|state| state.status.as_str().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        heartbeat: runtime.as_ref().map_or(0, |state| state.heartbeat_ts),
+        identity: view.identity.unwrap_or_else(|| "-".to_string()),
+        recipient: view.recipient.unwrap_or_else(|| "-".to_string()),
+        pending,
+        last_success: runtime.as_ref().map_or(0, |state| state.last_success_ts),
+        last_delivery: runtime.as_ref().map_or(0, |state| state.last_delivery_ts),
+        last_error_class: runtime
+            .as_ref()
+            .map(|state| state.last_error_class.clone())
+            .unwrap_or_default(),
+        issues,
+    })
+}
+
+#[cfg(feature = "surfaces")]
+fn dashboard_settings(
+    store: &dyn weave_core::store::Store,
+    write_enabled: bool,
+) -> anyhow::Result<crate::dashboard::DashboardSettings> {
     let cfg = weave_core::config::Config::load();
-    crate::dashboard::DashboardSettings {
+    let telegram = dashboard_bridge_status(store, cfg.telegram_bridge_config_view())?;
+    let slack = dashboard_bridge_status(store, cfg.slack_bridge_config_view())?;
+    Ok(crate::dashboard::DashboardSettings {
         circle: cfg.circle(),
         write_enabled,
         spawn_allowed_dirs: cfg.spawn_allowed_dirs.clone().unwrap_or_default(),
@@ -742,10 +1119,44 @@ fn dashboard_settings(write_enabled: bool) -> crate::dashboard::DashboardSetting
         allow_inject_from_count: cfg.allow_inject_from.as_ref().map(Vec::len),
         bridge_identity: cfg
             .bridge_identity
-            .clone()
-            .unwrap_or_else(|| "bridge".to_string()),
-        telegram_configured: cfg.telegram_token.as_deref().is_some_and(|s| !s.is_empty()),
-        slack_configured: cfg.slack_token.as_deref().is_some_and(|s| !s.is_empty()),
+            .as_deref()
+            .filter(|identity| {
+                weave_core::model::validate_ident("legacy bridge identity", identity).is_ok()
+            })
+            .unwrap_or("-")
+            .to_string(),
+        telegram_configured: telegram.configured,
+        telegram_ready: telegram.ready,
+        telegram_active: telegram.active,
+        telegram_stale: telegram.stale,
+        telegram_healthy: telegram.healthy,
+        telegram_status: telegram.status,
+        telegram_runtime_present: telegram.runtime_present,
+        telegram_runtime_status: telegram.runtime_status,
+        telegram_heartbeat: telegram.heartbeat,
+        telegram_identity: telegram.identity,
+        telegram_recipient: telegram.recipient,
+        telegram_pending: telegram.pending,
+        telegram_last_success: telegram.last_success,
+        telegram_last_delivery: telegram.last_delivery,
+        telegram_last_error_class: telegram.last_error_class,
+        telegram_issues: telegram.issues,
+        slack_configured: slack.configured,
+        slack_ready: slack.ready,
+        slack_active: slack.active,
+        slack_stale: slack.stale,
+        slack_healthy: slack.healthy,
+        slack_status: slack.status,
+        slack_runtime_present: slack.runtime_present,
+        slack_runtime_status: slack.runtime_status,
+        slack_heartbeat: slack.heartbeat,
+        slack_identity: slack.identity,
+        slack_recipient: slack.recipient,
+        slack_pending: slack.pending,
+        slack_last_success: slack.last_success,
+        slack_last_delivery: slack.last_delivery,
+        slack_last_error_class: slack.last_error_class,
+        slack_issues: slack.issues,
         pretooluse_approver_configured: cfg
             .pretooluse_approver
             .as_deref()
@@ -754,7 +1165,7 @@ fn dashboard_settings(write_enabled: bool) -> crate::dashboard::DashboardSetting
         obscura_allow_ops: cfg.obscura_allow_ops.clone().unwrap_or_default(),
         obscura_allow_domains: cfg.obscura_allow_domains.clone().unwrap_or_default(),
         obscura_allow_internal: cfg.obscura_allow_internal.unwrap_or(false),
-    }
+    })
 }
 
 #[cfg(feature = "surfaces")]
@@ -1175,7 +1586,37 @@ fn settings_json(s: &crate::dashboard::DashboardSettings) -> serde_json::Value {
         "allow_inject_from_count": s.allow_inject_from_count,
         "bridge_identity": &s.bridge_identity,
         "telegram_configured": s.telegram_configured,
+        "telegram_ready": s.telegram_ready,
+        "telegram_active": s.telegram_active,
+        "telegram_stale": s.telegram_stale,
+        "telegram_healthy": s.telegram_healthy,
+        "telegram_status": &s.telegram_status,
+        "telegram_runtime_present": s.telegram_runtime_present,
+        "telegram_runtime_status": &s.telegram_runtime_status,
+        "telegram_heartbeat": s.telegram_heartbeat,
+        "telegram_identity": &s.telegram_identity,
+        "telegram_recipient": &s.telegram_recipient,
+        "telegram_pending": s.telegram_pending,
+        "telegram_last_success": s.telegram_last_success,
+        "telegram_last_delivery": s.telegram_last_delivery,
+        "telegram_last_error_class": &s.telegram_last_error_class,
+        "telegram_issues": &s.telegram_issues,
         "slack_configured": s.slack_configured,
+        "slack_ready": s.slack_ready,
+        "slack_active": s.slack_active,
+        "slack_stale": s.slack_stale,
+        "slack_healthy": s.slack_healthy,
+        "slack_status": &s.slack_status,
+        "slack_runtime_present": s.slack_runtime_present,
+        "slack_runtime_status": &s.slack_runtime_status,
+        "slack_heartbeat": s.slack_heartbeat,
+        "slack_identity": &s.slack_identity,
+        "slack_recipient": &s.slack_recipient,
+        "slack_pending": s.slack_pending,
+        "slack_last_success": s.slack_last_success,
+        "slack_last_delivery": s.slack_last_delivery,
+        "slack_last_error_class": &s.slack_last_error_class,
+        "slack_issues": &s.slack_issues,
         "pretooluse_approver_configured": s.pretooluse_approver_configured,
         "pretooluse_timeout_secs": s.pretooluse_timeout_secs,
         "obscura_allow_ops": &s.obscura_allow_ops,
@@ -1276,7 +1717,11 @@ fn write_http_html(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_bind;
+    use super::{
+        is_loopback_bind, read_bounded_body, read_bounded_header_line, read_bounded_line,
+        validate_separate_push_token, MAX_HEADER_BYTES, MAX_HTTP_BODY_BYTES,
+    };
+    use std::io::{BufReader, Cursor};
 
     #[test]
     fn loopback_addresses_are_recognized() {
@@ -1297,5 +1742,36 @@ mod tests {
                                                   // Unparseable / hostname → NOT loopback (never assume an unknown bind is safe).
         assert!(!is_loopback_bind("example.com"));
         assert!(!is_loopback_bind(""));
+    }
+
+    #[test]
+    fn push_credential_must_be_nonempty_and_separate() {
+        assert!(validate_separate_push_token("operator", None).is_ok());
+        assert!(validate_separate_push_token("operator", Some("push-only")).is_ok());
+        assert!(validate_separate_push_token("operator", Some("")).is_err());
+        assert!(validate_separate_push_token("same", Some("same")).is_err());
+    }
+
+    #[test]
+    fn request_lines_headers_and_bodies_are_hard_bounded() {
+        let oversized_line = format!("{}\n", "x".repeat(33));
+        let mut reader = BufReader::new(Cursor::new(oversized_line.into_bytes()));
+        let mut line = String::new();
+        assert!(read_bounded_line(&mut reader, &mut line, 32).is_err());
+
+        let header = format!("X-Test: {}\r\n", "x".repeat(MAX_HEADER_BYTES));
+        let mut reader = BufReader::new(Cursor::new(header.into_bytes()));
+        let mut total = 0usize;
+        let mut count = 0usize;
+        let started = std::time::Instant::now();
+        assert!(
+            read_bounded_header_line(&mut reader, &mut line, &mut total, &mut count, &started,)
+                .is_err()
+        );
+
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        assert!(read_bounded_body(&mut empty, MAX_HTTP_BODY_BYTES + 1).is_err());
+        let mut short = Cursor::new(vec![0u8; 3]);
+        assert!(read_bounded_body(&mut short, 4).is_err());
     }
 }

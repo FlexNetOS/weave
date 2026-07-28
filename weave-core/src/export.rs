@@ -174,6 +174,10 @@ mod tests {
             superseded_by: None,
             expires_at: None,
             kind: None,
+            request_priority: None,
+            request_ttl: None,
+            request_supersedes: None,
+            request_dedup_idle: None,
         }
     }
 

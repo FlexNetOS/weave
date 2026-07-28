@@ -1,5 +1,67 @@
 # Changelog
 
+## [Unreleased] — fix: exact replay, routing, and intent-integrity contracts
+
+- Session interchange is now schema v2. It preserves effective priority and
+  successor links plus the exact configured top-level send tuple (requested
+  priority, relative TTL, predecessor, idle-dedup), validates same
+  sender+recipient graph closure before writes, re-stamps TTL once on first import,
+  and never extends it on re-import. Keyless message keys hash the complete source
+  identity; ask-group ids are deterministic over source identity+parent id and
+  require exact payload equality on replay. Schema v1 remains readable without
+  inventing semantics it did not record.
+- Cross-store `to_store` is now documented and validated as a non-persisted operator
+  route label, never a recipient-database selector. Nonempty `to_host` is enforced
+  at commit, and pull progress is scoped to `(source, recipient, receiver host)`.
+  During migration from a source-global cursor, keyed rows reconcile exactly while
+  ambiguous legacy keyless rows are skipped with a warning across all bounded pages.
+- New `v2:` Ed25519 signatures cover every delivery-semantic intent field (`from`,
+  `to`, normalized host, subject shape/value, body, stable event key, canonical
+  priority, TTL) while excluding attempt-local `trace_id`. Receivers retain the
+  unprefixed `(from,to,body)` v1 verifier for queued rows; deploy receiver support
+  before upgrading senders.
+- Push now requires an idempotency key on the wire. The CLI mints a fresh key when
+  omitted, so uncertain retries must explicitly reuse one; an exact replay succeeds
+  without a duplicate row/nudge. Non-loopback endpoints require HTTPS, URL shape is
+  origin-only, and response reads/rendering are bounded with token redaction.
+- Keyed `send` / `notify` / `reply` / `ask` / `answer` bodies bypass automatic
+  memory prefixing so changing memory cannot turn an exact retry into a collision.
+  Supersede links are constrained to one sender+recipient route.
+
+## [Unreleased] — fix: durable Telegram and Slack bridge health
+
+- Telegram and Slack now require a complete, validated per-platform route: token,
+  external conversation, distinct weave bridge identity, and explicit internal
+  recipient; an identity equal to its recipient is rejected because it cannot
+  produce a visible inbox route. The legacy shared `bridge_identity` remains a single-platform
+  fallback, but a configured identity collision makes both bridges not ready.
+- Outbound mail is no longer consumed before a remote post succeeds. HTTP status,
+  bounded JSON, and the platform's application-level `ok` result must all confirm
+  acceptance before exactly that message is marked read; failed delivery remains
+  unread for retry and is recorded with token-free `relayed` / `relay_failed`
+  metadata. The guarantee is at-least-once across an unavoidable remote/local
+  process-stop boundary.
+- Each platform owns a fenced, durable runtime row containing only routing,
+  cursor, heartbeat, lifecycle, and classified error metadata. Telegram filters
+  the configured chat. After Telegram accepts a `/inbox` response, its update cursor
+  and the exact rendered message receipts commit atomically in one owner-fenced
+  transaction on SQLite and libSQL; an acknowledgement failure cannot advance the
+  cursor alone. Telegram provider replies remain honestly at-least-once across the
+  irreducible acceptance-to-local-commit crash window. Slack persists exact
+  timestamps, processes oldest-first, and follows bounded cursor pagination.
+- `weave telegram|slack --status [--json]` is non-consuming and network-free.
+  Telegram `--check [--json]` performs bounded `getMe` identity and `getChat`
+  configured-chat access checks; Slack
+  `--check [--json]` performs `auth.test` plus one bounded
+  `conversations.history` read of the configured channel. Neither check consumes a
+  weave inbox row or sends a provider message, and the Slack check does not claim
+  post capability. CLI doctor, MCP doctor, and dashboard settings now report the
+  same token-free configured/ready/active/stale/degraded/healthy state, runtime
+  heartbeat, and pending count.
+- Slack commands now have a history-safe ordinary-message form, `!weave <command>
+  ...`, advertised by Slack help; legacy slash-prefixed text remains accepted when
+  it reaches history. Ordinary `!text` remains ordinary relay content.
+
 ## [Unreleased] — fix: trusted runtime health and honest capability reporting
 
 - Trusted mux/program resolution now includes `$HOME/.nix-profile/toolbin`
@@ -36,6 +98,13 @@
 - The feature-aware CLI/TUI command ledger now includes the `obscura`-gated
   `web` command, so maximal builds enforce the same help, behavior, docs, status,
   and risk metadata contract as the default command surface.
+- Governed Obscura children now receive a scrubbed environment, map internal-host
+  access only through the explicit upstream process flag, and are killed/restarted
+  whenever any spawn-time setting changes. Proxy configuration is restricted to an
+  origin-only credential-free URL because it is passed on argv. The inert
+  `obscura_token` / `WEAVE_OBSCURA_TOKEN` surface was removed: the pinned stdio MCP
+  server has no token-auth input, so local policy and the process boundary are the
+  actual access controls.
 
 ## [Unreleased] — feat: collision-proof per-session identity (WL-084)
 
@@ -259,23 +328,34 @@
 - **Consent-based cross-machine push**: a sender A on machine 1 delivers a message
   to recipient B on machine 2 and **B's pane lights up without B polling** — the
   A-initiated dual of the existing Tier-2 pull, over **one** commit pipeline.
-- **Receive** is a new `weave_push` write action on the existing `--features
-  surfaces` bearer-gated `POST /api` surface (`weave dashboard --write`). The handler
+- **Receive** is a new `weave_push` action on dedicated `POST /push`, authenticated
+  by a `--push-token` that must differ from the dashboard/MCP operator token. The
+  route accepts only a direct `weave_push` call; it cannot read dashboard/MCP state
+  or invoke another mutating tool, and does not require `--write`/`--dangerous`. The handler
   (`mcp::tool_push`) commits via the **existing** `store::commit_pulled` — re-validate,
   verify the ed25519 signature under the receiver's `VerifyPolicy`, `Store::send`
   (B assigns id/ts), `idempotency_key` dedup — then fires the existing caller-side
-  consent nudge into **B's own** pane. No new `Store` method, no schema change, **no
-  new standing MCP tool** (the catalog op only).
+  consent nudge into **B's own** pane only for a newly created row. An exact replay
+  is successful without another row or nudge. No new standing MCP tool (the catalog
+  op only).
 - **Send**: `weave push --to <name> --host <url:port> [--token …] [--subject …]
   [--to-host …] [--priority …] [--ttl …] [--idempotency-key …]` (body from `--body`
-  or stdin). Signs the canonical `(from,to,body)` if keyed and POSTs the Intent to B's
-  `/api` with `Authorization: Bearer <token>` (token from `--token`/`$WEAVE_PUSH_TOKEN`),
-  reusing the existing blocking+rustls `reqwest` client (no new dep). `--host` is
-  **EXPLICIT-ONLY** (never auto-resolved from message content — SSRF avoidance).
+  or bounded stdin). Signs the full v2 semantic tuple if keyed and POSTs the Intent
+  to B's `/push` with `Authorization: Bearer <push-token>` (token from
+  `--token`/`$WEAVE_PUSH_TOKEN`), reusing the existing blocking+rustls `reqwest`
+  client (no new dep). The wire action requires `idempotency_key`; CLI omission
+  mints a fresh key for that invocation, while an uncertain retry explicitly reuses
+  the same key. Exact replay succeeds without a duplicate nudge. `--host` is
+  **EXPLICIT-ONLY**, HTTPS is required outside loopback, URL shape is origin-only,
+  and the JSON response is capped at 64 KiB, validated as the matching JSON-RPC
+  2.0/MCP result, then rendered through bounded, control-free, token-redacting text extraction.
 - **Bind opt-in**: `weave serve`/`weave dashboard` gain `--bind <addr>` (default
   `127.0.0.1`, posture unchanged). A non-loopback bind with an **empty** bearer token
   is **refused before the socket opens** (fail-closed — no open listener on a routable
   address).
+- The built-in receiver is plain HTTP. Remote HTTPS deployments require a TLS
+  terminator/reverse proxy exposing only `/push`, or an SSH loopback forward; a
+  private-overlay address alone is not TLS termination.
 - Invariants preserved: owner-only-writes (B commits its own row), no-daemon-by-default
   (default `cargo build` byte-identical, `cargo tree` unchanged), verify-on-commit,
   token-light (standing budget test unaffected), dual-backend, no new crate.
@@ -407,20 +487,23 @@
   **WL-040** is the *logical, portable, versioned* interchange. Export reads messages via
   `Store::history`, asks via `list_asks` (recorded for fidelity), and the filesystem mesh
   memory; the document is written atomically (sibling-temp + rename) and read-back-verified.
-  Import re-inserts messages via the existing `Store::send` — minting fresh local ids (free
-  id-remap) and deduping on `idempotency_key` (a deterministic synthetic key
-  `wl040:<identity>:<id>` is used for keyless legacy messages) so **re-import is idempotent**
-  — and writes memory via `memory_write`; identity is remapped via `--as` (occurrences of
-  the source identity become the importing identity; third-party names preserved). `--dry-run`
-  reports counts without writing. The import file is treated as **untrusted external input**:
-  every field is bounded (`check_ident`, `MAX_BODY`, subject cap, idempotency/trace shape)
-  before any store write; all writes go through the parameterized `Store::send`; no shell, no
-  embedded path fields, `--in`/`--out` are UTF-8- and traversal-guarded. **No new `Store`
-  method, no schema change, no new standing MCP tool** (CLI is the zero-standing-cost path).
-  Asks are recorded in the envelope but **not replayed** in this version (faithful ask-state
-  replay needs a new dual-backend `Store::import_ask` accepting out-of-order `AskState` —
-  tracked as **WL-040b**); peers are excluded by design (host/mux/birth-cert-local; takeover
-  hazard). See `docs/FORMAT-session-export.md`.
+  Schema v2 imports through keyed plain/configured send seams, minting fresh local ids
+  while preserving effective priority/successor state and the exact configured
+  request tuple. A keyless row receives
+  `wl040:<32-hex-full-identity-hash>:<source-id>`; trace is attempt-local and excluded
+  from replay identity. Relative TTL is re-stamped once on first import and is not
+  extended on re-import. Predecessor/successor closure must be ordered and remain on
+  the same sender+recipient route. Identity is remapped via `--as` (source occurrences
+  become the importing identity; third-party names are preserved), and `--dry-run`
+  reports counts without writing.
+  Tracked asks now replay through dual-backend `Store::import_ask`; broadcast-ask
+  groups use deterministic `askm_imp_<32-hex>` target ids and require exact payload
+  equality on collision/replay. Schema-v1 documents still parse with the unavailable
+  configured semantics absent. Store-bound fields, keys, ids, and cross-references
+  are validated before Store writes; SQL is parameterized, no shell/path field is present, and paths are
+  guarded. Peers remain excluded by design (host/mux/birth-cert-local; takeover
+  hazard). This remains CLI-only (no standing MCP token). See
+  `docs/FORMAT-session-export.md`.
 - **Idle notification dedup (WL-039), `weave notify --dedup-idle` (CLI) and a `dedupIdle`
   property on `weave_notify` (MCP, zero standing-token cost):** a new idle/notification
   "still waiting" ping from a sender auto-supersedes that sender's prior **unread** idle
@@ -465,8 +548,9 @@
   and a `supersedes` property on `weave_send` (MCP, zero standing-token cost):** a sender
   replaces a prior message; the predecessor is stamped `superseded_by` and **hidden from
   the recipient's unread inbox** (kept and flagged in history/thread/search for audit).
-  Chains supported (only the tail is unread). **Sender-only authorization** — you may
-  only supersede your own messages (censorship/DoS guard). Additive nullable
+  Chains supported (only the tail is unread). **Same sender+recipient authorization**
+  — the caller must own the predecessor, the successor must share that sender, and
+  both rows must address the same recipient (censorship/route-change guard). Additive nullable
   `messages.superseded_by` column, mirrored across both backends; distinct from
   `in_reply_to` threading.
 - **Post-send hooks (WL-036), config `[[post_send_hook]]`:** run an operator-authored
@@ -539,8 +623,9 @@
   (default OFF):** weave becomes the governance plane for obscura's stealth web
   access. It spawns the separate `obscura mcp` binary (argv-only, trusted-path
   resolved, no shell) and speaks newline-delimited JSON-RPC over its stdio as a
-  hand-rolled MCP **client** — **no V8/tokio/obscura crate linked**, and the
-  default `cargo tree` is byte-identical (zero new deps; std + serde_json only).
+  hand-rolled MCP **client** — **no V8/tokio/obscura crate linked**. The optional
+  feature uses `url` for browser-compatible authority/proxy parsing, while the
+  default `cargo tree` remains byte-identical (zero new default deps).
   One token-light `weave_web {action,args,describe?}` MCP dispatcher + a
   `weave web <op>` CLI proxy all 35 `browser_*` ops (ADR-0003), not 35 eager
   tools; `weave_web` is gated as dangerous. Access is **deny-by-default** via a
@@ -1522,22 +1607,28 @@
 ### Added
 - **store:** Tier-2 cross-store delivery tables + driver — `outbox` (pending
   directed intents the owner queues for recipients in other stores), `pull_cursor`
-  (per-source idempotency high-water mark), and `keys` (registered public keys);
+  (route-scoped source+recipient+receiver-host high-water mark), and `keys`
+  (registered public keys);
   additive trait methods (`enqueue_intent` / `list_outbox` / `outbox_all` /
   `pull_cursor_get` / `pull_cursor_set` and `register_key` / `get_key` /
   `list_keys`) and the `pull_from_store` / `commit_pulled` free functions, all
   mirrored across both backends. **Owner-only-writes:** a sender only writes its own
   outbox; a receiver opens each source `SQLITE_OPEN_READ_ONLY` and commits intents
-  addressed to it into its own inbox. Delivery is idempotent (dedup on the source's
-  monotonic `outbox.id`); the only re-delivery window is a crash between commit and
-  cursor-advance, bounded to at most one intent.
-- **cli:** `weave send --to-store <store> [--to-host <host>]` queues a cross-store
-  intent; `weave outbox` inspects pending intents (`--json`); `weave pull` pulls +
+  addressed to it into its own inbox. Delivery is idempotent (stable event key,
+  plus a source/id-derived key for new keyless rows); a crash between commit and
+  cursor advance retries at most one intent and resolves to the existing row.
+  Legacy source-global cursors reconcile keyed rows while warning and skipping
+  ambiguous legacy keyless rows across every bounded migration page.
+- **cli:** `weave send --to-store <route-label> [--to-host <host>]` queues a
+  cross-store intent. The label is validated but not persisted and never selects or
+  opens a recipient DB; nonempty `to_host` is enforced at receive. `weave outbox`
+  inspects pending intents (`--json`); `weave pull` pulls +
   commits from configured `pull_from` sources now (also driven by the hook/`watch`
   drain).
-- **mcp:** `weave_send` cross-store routing via `to_store` / `to_host` (queues an
-  intent; broadcast refused); new `weave_outbox` tool; the `weave_inbox` drain pulls
-  cross-store messages when `pull_from` is configured.
+- **mcp:** `weave_send` cross-store routing via a non-persisted `to_store` operator
+  label and enforced `to_host` (queues an intent; broadcast refused); new
+  `weave_outbox` tool; the `weave_inbox` drain pulls cross-store messages when
+  `pull_from` is configured.
 - **config:** `pull_from` / `WEAVE_PULL_FROM` (delivery sources, distinct from
   `peer_dbs`, capped at 16); `inject_pulled` / `WEAVE_INJECT_PULLED` (consent nudge,
   **default ON**); `allow_inject_from` / `WEAVE_ALLOW_INJECT_FROM` (narrow the
@@ -1551,8 +1642,10 @@
 - **feat(sign):** OPTIONAL Ed25519 signed sender identity behind the `sign` Cargo
   feature (new `sign` module + `ed25519-dalek` / `getrandom`, mirroring the `libsql`
   optional-dep pattern). Adds `weave key gen|show|add|list` (only under
-  `--features sign`); signs cross-store intents over canonical `(from, to, body)` and
-  verifies on commit so a signed `from` is unforgeable and a tampered/spoofed
+  `--features sign`); new marked v2 signatures cover the full delivery-semantic
+  tuple (excluding attempt-local trace), while receivers retain the unprefixed
+  `(from,to,body)` v1 verifier for queued rows. Roll out receiver support first.
+  Verification on commit makes a signed `from` unforgeable and a tampered/spoofed
   signature is always rejected. Private key at `~/.config/weave/ed25519.key` (0600),
   never logged. **The default build links no crypto** (`ed25519-dalek` is absent from
   the default and libSQL shippable dependency graphs).

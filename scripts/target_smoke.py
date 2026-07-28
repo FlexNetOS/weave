@@ -469,9 +469,11 @@ def artifact_matrix(full: bool) -> list[Artifact]:
             ("debug-sign", ["--features", "sign"], "sqlite,sign"),
             ("debug-surfaces", ["--features", "surfaces"], "sqlite,surfaces"),
             ("debug-obscura", ["--features", "obscura"], "sqlite,obscura"),
+            ("debug-maximal", ["--features", "sign llm surfaces obscura"], "sqlite,sign,llm,surfaces,obscura"),
             ("debug-libsql", ["--no-default-features", "--features", "libsql"], "libsql"),
             ("debug-libsql-sign", ["--no-default-features", "--features", "libsql sign"], "libsql,sign"),
             ("debug-libsql-surfaces", ["--no-default-features", "--features", "libsql surfaces"], "libsql,surfaces"),
+            ("debug-libsql-maximal", ["--no-default-features", "--features", "libsql sign llm surfaces obscura"], "libsql,sign,llm,surfaces,obscura"),
         ]
         for name, flags, features in combos:
             tdir = REPORT_DIR / "build" / name
@@ -538,7 +540,7 @@ def main() -> int:
 
     if not args.full:
         report["skipped_feature_matrix"] = [a.name for a in artifact_matrix(True)[2:]]
-        report["note"] = "Run with --full to build/sign/surfaces/obscura/libsql feature artifacts in isolated target dirs."
+        report["note"] = "Run with --full to build sign/surfaces/obscura and maximal sqlite/libsql feature artifacts in isolated target dirs."
 
     report["finished_at_epoch_ms"] = now_ms()
     report["status"] = "fail" if any_fail else "pass"

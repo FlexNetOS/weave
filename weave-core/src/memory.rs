@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 const MAX_KEY_LEN: usize = 128;
+const MAX_SCOPE_NAME_LEN: usize = 128;
 const MAX_TITLE_LEN: usize = 256;
 const MAX_TAGS: usize = 16;
 const MAX_TAG_LEN: usize = 64;
@@ -97,26 +98,17 @@ pub fn memory_write(
     let title = sanitize_title(title);
     let tags = sanitize_tags(tags);
 
-    if body.len() > MAX_BODY_BYTES {
-        anyhow::bail!(
-            "body is too long ({} bytes; max {})",
-            body.len(),
-            MAX_BODY_BYTES
-        );
-    }
+    validate_body(body)?;
 
     let dir = memory_dir(scope);
     std::fs::create_dir_all(&dir)?;
 
-    // Cap file count per scope.
-    let count = std::fs::read_dir(&dir)?.count();
-    if count >= MAX_FILES_PER_SCOPE {
-        anyhow::bail!(
-            "scope file count cap reached ({MAX_FILES_PER_SCOPE}); delete an entry first"
-        );
-    }
-
     let path = dir.join(format!("{key}.md"));
+    let target_exists = path.exists();
+    // Cap only creation of a new logical key. An overwrite must remain available
+    // at capacity so ordinary edits and idempotent session re-import still work.
+    let count = std::fs::read_dir(&dir)?.count();
+    validate_scope_capacity(count, target_exists)?;
     let now = crate::model::now();
 
     // Preserve created_ts if the file already exists.
@@ -138,6 +130,38 @@ pub fn memory_write(
 
     let text = format_entry(&entry);
     std::fs::write(&path, text)?;
+    Ok(())
+}
+
+fn validate_scope_capacity(count: usize, target_exists: bool) -> anyhow::Result<()> {
+    if !target_exists && count >= MAX_FILES_PER_SCOPE {
+        anyhow::bail!(
+            "scope file count cap reached ({MAX_FILES_PER_SCOPE}); delete an entry first"
+        );
+    }
+    Ok(())
+}
+
+/// Validate that a portable memory entry can be written without silently
+/// changing any of its fields.
+///
+/// The interactive memory surfaces intentionally normalize titles, tags, and
+/// named scopes for convenience. A session import is different: it promises a
+/// faithful round trip and performs database writes before filesystem memory is
+/// materialized. Import callers must therefore run this validator during their
+/// all-fields preflight instead of relying on that later normalization.
+pub fn validate_portable_entry(
+    scope: &MemoryScope,
+    key: &str,
+    title: &str,
+    tags: &[String],
+    body: &str,
+) -> anyhow::Result<()> {
+    validate_portable_scope(scope)?;
+    sanitize_key(key)?;
+    validate_portable_title(title)?;
+    validate_portable_tags(tags)?;
+    validate_body(body)?;
     Ok(())
 }
 
@@ -416,6 +440,27 @@ fn config_memory_dir() -> PathBuf {
     crate::config::config_dir().join("memory")
 }
 
+fn validate_portable_scope(scope: &MemoryScope) -> anyhow::Result<()> {
+    let name = match scope {
+        MemoryScope::Global => return Ok(()),
+        MemoryScope::Project(name)
+        | MemoryScope::Persona(name)
+        | MemoryScope::Orchestrator(name) => name,
+    };
+    if name.is_empty() {
+        anyhow::bail!("named memory scope must not be empty");
+    }
+    if name.chars().count() > MAX_SCOPE_NAME_LEN {
+        anyhow::bail!("memory scope name is too long (max {MAX_SCOPE_NAME_LEN} chars)");
+    }
+    if sanitize_dir_component(name) != name.as_str() {
+        anyhow::bail!(
+            "memory scope name must be [a-zA-Z0-9_-] only, without surrounding whitespace"
+        );
+    }
+    Ok(())
+}
+
 fn sanitize_key(key: &str) -> anyhow::Result<String> {
     if key.is_empty() {
         anyhow::bail!("key must not be empty");
@@ -444,6 +489,20 @@ fn sanitize_title(title: &str) -> String {
     }
 }
 
+fn validate_portable_title(title: &str) -> anyhow::Result<()> {
+    if title.chars().any(char::is_control) {
+        anyhow::bail!("memory title must not contain control characters");
+    }
+    if title.trim() != title {
+        anyhow::bail!("memory title must not contain surrounding whitespace");
+    }
+    if title.chars().count() > MAX_TITLE_LEN {
+        anyhow::bail!("memory title is too long (max {MAX_TITLE_LEN} chars)");
+    }
+    debug_assert_eq!(sanitize_title(title), title);
+    Ok(())
+}
+
 fn sanitize_tags(tags: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in tags.iter().take(MAX_TAGS) {
@@ -458,6 +517,30 @@ fn sanitize_tags(tags: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn validate_portable_tags(tags: &[String]) -> anyhow::Result<()> {
+    if tags.len() > MAX_TAGS {
+        anyhow::bail!("memory entry has too many tags (max {MAX_TAGS})");
+    }
+    if sanitize_tags(tags) != tags {
+        anyhow::bail!(
+            "memory tags must be unique, non-empty [a-zA-Z0-9_-] values of at most \
+             {MAX_TAG_LEN} chars, without surrounding whitespace"
+        );
+    }
+    Ok(())
+}
+
+fn validate_body(body: &str) -> anyhow::Result<()> {
+    if body.len() > MAX_BODY_BYTES {
+        anyhow::bail!(
+            "body is too long ({} bytes; max {})",
+            body.len(),
+            MAX_BODY_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn sanitize_dir_component(s: &str) -> String {
@@ -666,6 +749,75 @@ mod tests {
     }
 
     #[test]
+    fn portable_entry_validation_rejects_every_lossy_field() {
+        let valid = || {
+            validate_portable_entry(
+                &MemoryScope::Project("weave-core".into()),
+                "build_rules",
+                "Build rules",
+                &["rust".into(), "testing_2".into()],
+                "Run both backends.",
+            )
+        };
+        valid().expect("fully faithful portable entry");
+
+        assert!(validate_portable_entry(
+            &MemoryScope::Project("../weave".into()),
+            "key",
+            "Title",
+            &[],
+            "body"
+        )
+        .is_err());
+        assert!(validate_portable_entry(
+            &MemoryScope::Persona(String::new()),
+            "key",
+            "Title",
+            &[],
+            "body"
+        )
+        .is_err());
+        assert!(
+            validate_portable_entry(&MemoryScope::Global, "../key", "Title", &[], "body").is_err()
+        );
+        assert!(
+            validate_portable_entry(&MemoryScope::Global, "key", " padded ", &[], "body").is_err()
+        );
+        assert!(validate_portable_entry(
+            &MemoryScope::Global,
+            "key",
+            &"t".repeat(MAX_TITLE_LEN + 1),
+            &[],
+            "body"
+        )
+        .is_err());
+        assert!(validate_portable_entry(
+            &MemoryScope::Global,
+            "key",
+            "Title",
+            &[" bad tag ".into()],
+            "body"
+        )
+        .is_err());
+        assert!(validate_portable_entry(
+            &MemoryScope::Global,
+            "key",
+            "Title",
+            &["dup".into(), "dup".into()],
+            "body"
+        )
+        .is_err());
+        assert!(validate_portable_entry(
+            &MemoryScope::Global,
+            "key",
+            "Title",
+            &[],
+            &"b".repeat(MAX_BODY_BYTES + 1)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn memory_roundtrip() {
         let _env = crate::testenv::lock_env();
         let (base, _xdg) = tmp_memory_dir();
@@ -683,6 +835,15 @@ mod tests {
         assert_eq!(e.tags, vec!["rust", "test"]);
         assert_eq!(e.body, "Body here.");
         cleanup(&base);
+    }
+
+    #[test]
+    fn memory_scope_capacity_allows_overwrite_but_rejects_new_key() {
+        validate_scope_capacity(MAX_FILES_PER_SCOPE, true)
+            .expect("an existing key remains writable at the scope cap");
+        assert!(validate_scope_capacity(MAX_FILES_PER_SCOPE, false).is_err());
+        validate_scope_capacity(MAX_FILES_PER_SCOPE - 1, false)
+            .expect("one remaining slot accepts a new key");
     }
 
     #[test]

@@ -6,11 +6,13 @@ native multi-mux injector. It complements [README.md](../README.md) (quickstart)
 and [ARCHITECTURE.md](../ARCHITECTURE.md) (design); this document is about
 *running* weave day to day.
 
-weave is **one static binary, no daemon, no Python**. There is no service to
-start, no port to open, and nothing to keep alive. The shared SQLite (or
-libSQL) file *is* the broker; the multiplexer CLIs do the pushing. Operating
-weave is therefore mostly: install the binary, run `weave setup` once, and
-occasionally `weave doctor` / `weave gc`.
+weave is **one Rust binary, no required daemon, no Python**. The core mesh has no
+service to start or port to open: the shared SQLite (or libSQL) store is the
+broker and the multiplexer CLIs do the pushing. Optional `surfaces` commands are
+explicit foreground services: a dashboard listens locally, while Telegram and
+Slack bridges keep a poll loop alive. Operating the core is therefore mostly:
+install the binary, run `weave setup` once, and occasionally run `weave doctor` /
+`weave gc`; run only the optional surface processes you deliberately configure.
 
 ---
 
@@ -32,7 +34,7 @@ install -m 0755 target/release/weave ~/.local/bin/weave
 ### Option B — cargo install
 
 ```bash
-cargo install --path .                 # from a checkout
+cargo install --path weave             # from the workspace checkout root
 # or, once published:
 # cargo install weave
 ```
@@ -48,7 +50,7 @@ enabling both. To build the libSQL/Turso variant, disable defaults:
 
 ```bash
 cargo build --release --no-default-features --features libsql
-cargo install --path . --no-default-features --features libsql
+cargo install --path weave --no-default-features --features libsql
 ```
 
 The `libsql` feature additionally pulls in the libSQL client and a (current-
@@ -201,6 +203,14 @@ targets are ambiguous.
 so a body like `--body "-n flag broke it"` is taken literally, not parsed as a
 flag.
 
+Keyed message writes are byte-stable by design. Supplying an idempotency key to a
+`send`, `notify`, `reply`, `ask`, or `answer` stores the caller's body verbatim and
+does not auto-prefix current mesh-memory context; an explicit no-memory option has
+the same body behavior. This keeps a retry from colliding just because memory
+changed between attempts. A `--supersedes` replacement is constrained to one
+sender+recipient route: the caller must own the predecessor and the successor must
+have the same sender **and recipient**.
+
 ### Peers, sessions, presence
 
 ```bash
@@ -253,6 +263,186 @@ weave man               | gzip -c > ~/.local/share/man/man1/weave.1.gz
 Both are generated live from the clap command definition, so they always match
 the installed binary's actual flags.
 
+### Telegram and Slack bridge operations (`--features surfaces`)
+
+Configure a complete, platform-specific route before starting a bridge. Tokens are
+secrets; identities and recipients are weave peer names, and a platform's bridge
+identity must differ from its internal recipient.
+
+Authorization is conversation-scoped; there is currently no per-user allowlist.
+Every member who can post in the configured chat/channel can invoke read commands,
+and `WEAVE_BOT_WRITES=1` grants every such member the bridge identity's write
+commands. Use a dedicated private conversation.
+
+```bash
+export WEAVE_TELEGRAM_TOKEN='…'
+export WEAVE_TELEGRAM_CHAT_ID='…'
+export WEAVE_TELEGRAM_IDENTITY='telegram'       # optional distinct default
+export WEAVE_TELEGRAM_RECIPIENT='agent'
+
+weave telegram --status --json   # no network, does not consume inbox rows
+weave telegram --check --json    # bounded identity + configured-chat access calls
+weave telegram                   # blocking poll loop; Ctrl-C stops it
+```
+
+Slack uses a bot token and a conversation the app can read:
+
+```bash
+export WEAVE_SLACK_TOKEN='xoxb-...'
+export WEAVE_SLACK_CHANNEL='C...'
+export WEAVE_SLACK_IDENTITY='slack'             # optional distinct default
+export WEAVE_SLACK_RECIPIENT='agent'
+
+weave slack --status --json     # no network, does not consume inbox rows
+weave slack --check --json      # auth identity + one bounded channel-history read
+weave slack                     # blocking poll loop; Ctrl-C stops it
+```
+
+Add the Slack app/bot to the configured conversation. Its bot token needs the
+matching read scope: `channels:history` for a public channel, `groups:history` for
+a private channel, `im:history` for a direct message, or `mpim:history` for a
+multi-person direct message. Slack documents these requirements under
+[`conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/).
+The running relay additionally needs `chat:write` for replies and outbound rows;
+see [`chat.postMessage`](https://docs.slack.dev/reference/methods/chat.postmessage).
+The Slack check performs `auth.test` followed by one bounded read of the configured
+channel. It sends no message and therefore does not validate or claim post access.
+
+Send Slack commands as ordinary history-visible messages: `!weave inbox`,
+`!weave peers`, `!weave sessions`, `!weave ask <to> <body>`, and `!weave help`.
+Legacy slash-command text remains accepted if it reaches history, but Slack clients
+normally reserve leading `/` input for registered slash commands. Telegram keeps
+the `/inbox`, `/ask`, and other slash forms.
+
+Do not give both platforms the same bridge identity: simultaneous configuration is
+rejected as an identity collision. The legacy `WEAVE_BRIDGE_IDENTITY` is a
+compatibility fallback for a single platform, not the preferred dual-platform
+configuration.
+
+`weave doctor`, MCP `weave_doctor`, and dashboard settings report
+`not_configured`, `not_ready`, `ready_inactive`, `stale`, `degraded`, or `healthy`,
+plus the token-free route, runtime-presence/lifecycle, pending count, heartbeat,
+and last-success/delivery timestamps. `stale` means a non-stopped owner row exists
+but its process heartbeat is outside the shared activity window.
+A failed external post leaves its row unread. Delivery is at-least-once; after an
+unexpected process stop immediately following remote acceptance, verify the chat
+before interpreting a repeated post as a second mesh message.
+For Telegram `/inbox`, the accepted snapshot's exact message receipts and update
+cursor are one owner-fenced local transaction. Store/ack failure rolls both back;
+the remaining duplicate window is only the provider-accepted/local-commit boundary,
+because Telegram `sendMessage` has no client idempotency key.
+
+### Cross-store routes and cross-machine push
+
+`--to-store` does **not** name or open the recipient's database. It is a bounded
+operator route label that selects cross-store mode; the label is not persisted.
+The intent is queued in the sender's own outbox, and the receiver must explicitly
+configure that sender store under `pull_from` / `WEAVE_PULL_FROM`:
+
+```bash
+# sender A: "build-route" is a label, not a DB selector
+weave send --to builder --to-store build-route --to-host buildbox \
+  --body "run the release gate"
+
+# receiver B: this is the actual source authorization/address
+export WEAVE_PULL_FROM=/path/to/A/messages.db
+weave pull --me builder
+```
+
+A nonempty `--to-host` is enforced at commit and must exactly match the receiver's
+normalized host; omit it for a recipient-name-only route. Pull cursors are scoped
+to `(source, recipient, receiver host)`, so one recipient cannot advance past
+another's lower outbox id. When upgrading a database with the old source-global
+cursor, keyed rows are reconciled automatically. Legacy keyless rows at/below the
+old watermark are ambiguous and are skipped with a warning to preserve at-most-once
+delivery; this migration posture persists across every bounded page until the route
+catches up.
+
+With `--features surfaces`, the sender-initiated equivalent is `weave push`:
+
+```bash
+weave push --to builder --host https://buildbox.example \
+  --body "run the release gate" --idempotency-key release-2026-07-13
+```
+
+The `weave_push` wire action requires an idempotency key. If the CLI flag is
+omitted, Weave mints a fresh key for that invocation; two invocations are therefore
+two messages. For an uncertain HTTP result, retry with the same explicit key. An
+exact replay succeeds without a second row or live nudge; changed semantics under
+the key are rejected.
+
+Push accepts only an HTTP(S) origin, optionally ending in `/push`. HTTPS is required
+outside `localhost` or an IP loopback address; userinfo, query, fragment, and other
+paths are rejected. The bearer token resolves as `--token` then
+`WEAVE_PUSH_TOKEN`. Requests time out, responses are capped at 64 KiB before JSON
+parsing, and success requires a matching JSON-RPC 2.0/MCP response with the expected
+id, result object, boolean `isError`, and text content. Output is bounded/sanitized
+and the supplied token is redacted.
+
+The receiver uses a separate push-only credential:
+
+```bash
+weave dashboard --token "$WEAVE_ADMIN_TOKEN" --push-token "$WEAVE_PUSH_TOKEN"
+# `--write` is optional and controls only the full operator dashboard actions.
+```
+
+The push token is accepted only on `POST /push`; it cannot read dashboard state or
+invoke another MCP/action tool. It must differ from the operator token. Do not give
+remote senders `--token` for the dashboard or general MCP listener.
+
+Weave itself serves plain HTTP. For a non-loopback sender, terminate TLS in a
+reverse proxy/private-overlay HTTPS service and forward only `/push` to Weave's
+loopback port. A Tailscale/WireGuard IP by itself is not an HTTPS terminator. A
+simple alternative is an SSH local forward to the receiver's loopback port, then
+use `http://127.0.0.1:<forwarded-port>` from the sending machine.
+
+For `--features sign` deployments, upgrade receivers before senders. New `v2:`
+signatures bind `from`, `to`, normalized `to_host`, subject presence/value, body,
+stable idempotency key, canonical priority, and TTL; `trace_id` is attempt-local and
+excluded. A v2-aware receiver also verifies already queued unprefixed v1 signatures
+over their historical `(from, to, body)` tuple, while an old receiver cannot verify
+the marked v2 format.
+
+There is currently no receiver switch that retires the unprefixed-v1 compatibility
+lane. New send paths emit only `v2:`, but upgraded receivers continue accepting
+already-queued v1 rows. Drain or remove legacy queues before treating every accepted
+signature as covering priority, TTL, subject, host, and idempotency semantics.
+
+#### Fail-closed signed-v2 migration recovery
+
+On open, Weave refuses the legacy idempotency cleanup if it finds a `v2:` outbox row
+whose bound key is missing or collides with an accepted message or an earlier queued
+row. The refusal occurs before that row is mutated. Recovery is deliberately offline:
+
+1. Stop every writer and make a byte-for-byte copy/provider snapshot of the store.
+2. Inspect the reported outbox id and every row using the same key. For a local
+   SQLite or local-libSQL file, use `sqlite3` against the copy; for remote libSQL,
+   use the provider's snapshot and SQL console/transaction support.
+3. Never edit a `v2:` row's `idempotency_key`, delivery fields, or `sig`
+   independently—the signature binds them together. If a safe earlier unsigned/v1
+   duplicate can be removed or made keyless, preserve the signed row. Otherwise,
+   record the queued semantics, remove the unusable queued row offline, reopen the
+   upgraded store, and re-enqueue/re-sign it from the owning sender with a fresh key.
+   A `v2:` row whose key is already NULL cannot be reconstructed from the signature.
+4. Reopen the store and run `weave doctor`; retain the snapshot until the recreated
+   intent has been accepted.
+
+Useful read-only inspection on a copied local store:
+
+```sql
+SELECT id, from_peer, to_peer, to_host, subject, body, priority, ttl,
+       idempotency_key, sig
+  FROM outbox
+ WHERE id = <reported-id>;
+
+SELECT 'message' AS source, id, idempotency_key
+  FROM messages WHERE idempotency_key = '<reported-key>'
+UNION ALL
+SELECT 'outbox', id, idempotency_key
+  FROM outbox WHERE idempotency_key = '<reported-key>'
+ ORDER BY source, id;
+```
+
 ---
 
 ## 4. config.toml
@@ -278,6 +468,12 @@ Keys (all optional):
 | `nudge_template`    | Live-injection nudge text. Placeholders `{from}` and `{body}`. Omit `{body}` for a quiet "you have mail" ping with no content. | — |
 | `libsql_url`        | Remote libSQL/Turso endpoint (only used with `backend = "libsql"`). | `WEAVE_LIBSQL_URL` |
 | `libsql_auth_token` | Auth token for the remote endpoint. **Secret** — redacted from debug output; prefer the env var over storing it on disk. | `WEAVE_LIBSQL_AUTH_TOKEN` |
+| `telegram_token` / `telegram_chat_id` | Telegram credential and exact chat scope. | `WEAVE_TELEGRAM_TOKEN` / `WEAVE_TELEGRAM_CHAT_ID` |
+| `telegram_identity` / `telegram_recipient` | Distinct weave sender/inbox identity and internal destination. | `WEAVE_TELEGRAM_IDENTITY` / `WEAVE_TELEGRAM_RECIPIENT` |
+| `telegram_bot_username` | Optional exact command suffix (for `/command@bot`). | `WEAVE_TELEGRAM_BOT_USERNAME` |
+| `slack_token` / `slack_channel` | Slack bot credential and exact readable conversation. | `WEAVE_SLACK_TOKEN` / `WEAVE_SLACK_CHANNEL` |
+| `slack_identity` / `slack_recipient` | Distinct weave sender/inbox identity and internal destination. | `WEAVE_SLACK_IDENTITY` / `WEAVE_SLACK_RECIPIENT` |
+| `bridge_identity` | Legacy single-platform identity fallback; prefer platform-specific identities. | `WEAVE_BRIDGE_IDENTITY` |
 
 **Environment always wins over the file.** This makes per-session overrides
 trivial — e.g. start one agent with `WEAVE_SESSION=envctl` and another with

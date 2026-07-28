@@ -15,9 +15,9 @@ llm = ["weave-core/llm"]
 # WL-048 / ADR-0004: the dashboard render/route/SSE module lives in this crate.
 surfaces = ["weave-core/surfaces"]
 # WL-049 / ADR-0002: the obscura MCP client (spawns the `obscura` binary, speaks
-# newline-delimited JSON-RPC over its stdio) lives in this crate. std + the already-
-# present serde_json only — NO new dependency. Default OFF.
-obscura = ["weave-core/obscura"]
+# newline-delimited JSON-RPC over its stdio) lives in this crate. The optional URL
+# parser validates proxy argv with browser-compatible authority semantics. Default OFF.
+obscura = ["weave-core/obscura", "dep:url"]
 
 [dependencies]
 weave-core = { path = "../weave-core", default-features = false }
@@ -25,3 +25,4 @@ weave-inject = { path = "../weave-inject" }
 anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
+url = { version = "2.5", optional = true }

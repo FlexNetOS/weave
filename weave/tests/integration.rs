@@ -30,6 +30,27 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "sqlite")]
 use std::thread;
 
+/// Bridge status/security fixtures must not inherit a developer's live bot
+/// credentials or routing. Keep this test-local (rather than widening the shared
+/// harness in a Cycle-C-only test change) and remove every current/future
+/// platform-prefixed value before applying an explicit fixture.
+#[cfg(feature = "surfaces")]
+fn scrub_inherited_bridge_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("WEAVE_TELEGRAM_")
+            || name.starts_with("WEAVE_SLACK_")
+            || name.starts_with("WEAVE_BRIDGE_")
+            || name == "WEAVE_BOT_WRITES"
+        {
+            cmd.env_remove(key);
+        }
+    }
+    // Session is the only permitted recipient fallback, so it is bridge-relevant
+    // even though its name is not platform-prefixed.
+    cmd.env_remove("WEAVE_SESSION");
+}
+
 fn expected_top_level_commands() -> Vec<&'static str> {
     vec![
         "mcp",
@@ -1357,6 +1378,84 @@ fn cli_send_idempotency_dedupes() {
         .parse()
         .unwrap();
     assert_eq!(id1, id2, "duplicate idempotency key returns same id");
+}
+
+#[test]
+fn cli_cross_store_send_idempotency_dedupes_outbox() {
+    let db = TestDb::new();
+    let args = [
+        "send",
+        "--from",
+        "a",
+        "--to",
+        "b",
+        "--body",
+        "federated hello",
+        "--to-store",
+        "remote.db",
+        "--idempotency-key",
+        "ik-cross-store-1",
+    ];
+
+    let first = run_ok(&db, &args);
+    assert!(first.contains("queued intent"), "first enqueue: {first}");
+    let replay = run_ok(&db, &args);
+    assert!(
+        replay.contains("idempotent replay"),
+        "second enqueue must report a replay: {replay}"
+    );
+
+    let outbox = run_ok(&db, &["outbox", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&outbox).expect("outbox json");
+    assert_eq!(value["outbox"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn cli_and_mcp_share_the_subject_bound() {
+    let db = TestDb::new();
+    let oversized = "x".repeat(weave_core::store::MAX_SUBJECT_LEN + 1);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            &oversized,
+            "--body",
+            "must not persist",
+        ],
+    );
+    assert!(
+        !ok,
+        "CLI must reject an oversized subject at the Store seam"
+    );
+    assert!(err.contains("subject") && err.contains("too long"), "{err}");
+
+    let mut mcp = McpServer::spawn(&db);
+    let (is_error, text) = mcp.call_tool(
+        "weave_send",
+        serde_json::json!({
+            "from": "alice",
+            "to": "bob",
+            "subject": oversized,
+            "body": "must not persist"
+        }),
+    );
+    assert!(is_error, "MCP must enforce the same subject cap: {text}");
+    assert!(
+        text.contains("subject") && text.contains("too long"),
+        "{text}"
+    );
+    mcp.shutdown();
+
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    assert!(
+        !inbox.contains("must not persist"),
+        "rejections must be atomic: {inbox}"
+    );
 }
 
 #[test]
@@ -4266,6 +4365,12 @@ fn tier2_cross_store_send_outbox_pull_and_idempotency() {
     assert_eq!(ov["outbox"][0]["to"], "bob");
     assert_eq!(ov["outbox"][0]["from"], "alice");
     assert_eq!(ov["outbox"][0]["body"], "hello from another store");
+    assert!(
+        ov["outbox"][0]["idempotency_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()),
+        "every new cross-store intent gets a stable event key: {a_outbox}"
+    );
 
     // A's own inbox (for bob) has NOTHING: the sender never wrote a local row.
     let a_inbox = run_ok(&a, &["inbox", "--me", "bob", "--json", "--peek"]);
@@ -5129,7 +5234,7 @@ fn tier2_inject_failure_is_non_fatal_to_delivery() {
 }
 
 /// MCP `weave_send` cross-store routing: with `to_store` the tool returns a
-/// success (`isError:false`) "Queued intent" result and the intent shows up via
+/// success (`isError:false`) "Queued cross-store intent" result and the intent shows up via
 /// `weave_outbox`. A broadcast cross-store send returns `isError`.
 #[test]
 fn mcp_weave_send_cross_store_routes_to_outbox() {
@@ -5149,7 +5254,7 @@ fn mcp_weave_send_cross_store_routes_to_outbox() {
     );
     assert!(!err, "cross-store weave_send is not an error: {text}");
     assert!(
-        text.contains("Queued intent"),
+        text.contains("Queued cross-store intent"),
         "cross-store send reports a queued intent: {text}"
     );
 
@@ -5181,6 +5286,15 @@ fn mcp_weave_send_cross_store_routes_to_outbox() {
     );
 
     mcp.shutdown();
+
+    let outbox = run_ok(&a, &["outbox", "--json"]);
+    let outbox: serde_json::Value = serde_json::from_str(&outbox).unwrap();
+    assert!(
+        outbox["outbox"][0]["idempotency_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty()),
+        "MCP cross-store sends mint a stable event key when omitted: {outbox}"
+    );
 }
 
 /// MCP `weave_send` cross-store failure path: a bad recipient identity (oversized)
@@ -14080,6 +14194,53 @@ fn supersede_cross_identity_is_rejected() {
 }
 
 #[test]
+fn supersede_cross_recipient_is_rejected() {
+    let db = TestDb::new();
+    let first = run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "bob-only predecessor",
+        ],
+    );
+    let first_id = sent_id(&first);
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "carol",
+            "--body",
+            "wrong-route successor",
+            "--supersedes",
+            &first_id.to_string(),
+        ],
+    );
+    assert!(!ok, "a successor for another recipient must be rejected");
+    assert!(
+        err.contains("same sender and recipient") || err.contains("different recipient"),
+        "rejection should identify the route mismatch: {err:?}"
+    );
+    let bob = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    assert!(
+        bob.contains("bob-only predecessor"),
+        "the rejected attempt must not hide the predecessor: {bob}"
+    );
+    let carol = run_ok(&db, &["inbox", "--me", "carol", "--json", "--peek"]);
+    assert!(
+        !carol.contains("wrong-route successor"),
+        "configured send must roll back when supersede validation fails: {carol}"
+    );
+}
+
+#[test]
 fn supersede_missing_id_errors_cleanly() {
     let db = TestDb::new();
     let (ok, _out, err) = run(
@@ -14268,6 +14429,305 @@ fn post_send_hook_fires_with_env_and_skips_non_match() {
 }
 
 // ---------------------------------------------------------------------------
+// Cycle C: Telegram/Slack configuration and read-only runtime posture.
+//
+// These are deliberately black-box and network-free: every command receives an
+// unreachable loopback proxy, every inherited bridge env value is removed, and
+// only `--status`/doctor surfaces are exercised (never `--check` or a poll loop).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "surfaces")]
+mod bridge_status_black_box {
+    use super::{
+        scrub_env, scrub_inherited_bridge_env, weave_bin, Command, McpServer, Stdio, TestDb,
+    };
+
+    const TELEGRAM_SECRET: &str = "telegram-black-box-secret-canary";
+    const SLACK_SECRET: &str = "slack-black-box-secret-canary";
+    const COMPLETE_BRIDGE_ENV: [(&str, &str); 11] = [
+        ("WEAVE_SESSION", "session-fallback-unused"),
+        ("WEAVE_TELEGRAM_TOKEN", TELEGRAM_SECRET),
+        ("WEAVE_TELEGRAM_CHAT_ID", "-1004242"),
+        ("WEAVE_TELEGRAM_IDENTITY", "telegram-route"),
+        ("WEAVE_TELEGRAM_RECIPIENT", "telegram-destination"),
+        ("WEAVE_TELEGRAM_BOT_USERNAME", "weave_status_bot"),
+        ("WEAVE_SLACK_TOKEN", SLACK_SECRET),
+        ("WEAVE_SLACK_CHANNEL", "CSTATUS42"),
+        ("WEAVE_SLACK_IDENTITY", "slack-route"),
+        ("WEAVE_SLACK_RECIPIENT", "slack-destination"),
+        ("WEAVE_BRIDGE_IDENTITY", ""),
+    ];
+
+    fn run_bridge(
+        db: &TestDb,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> (bool, String, String) {
+        let mut cmd = Command::new(weave_bin());
+        cmd.args(args);
+        scrub_env(&mut cmd);
+        scrub_inherited_bridge_env(&mut cmd);
+        cmd.env("WEAVE_DB", db.path_str());
+        // If a status path accidentally performs HTTP, it fails immediately instead
+        // of reaching a live platform. A correct status path never consults these.
+        for proxy in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env(proxy, "http://127.0.0.1:1");
+        }
+        cmd.env("NO_PROXY", "").env("no_proxy", "");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let output = cmd
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run weave {args:?}: {error}"));
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    fn assert_secret_free(stdout: &str, stderr: &str) {
+        for secret in [TELEGRAM_SECRET, SLACK_SECRET] {
+            assert!(
+                !stdout.contains(secret),
+                "secret leaked to stdout: {stdout}"
+            );
+            assert!(
+                !stderr.contains(secret),
+                "secret leaked to stderr: {stderr}"
+            );
+        }
+    }
+
+    fn issues(snapshot: &serde_json::Value) -> Vec<&str> {
+        snapshot["config"]["issues"]
+            .as_array()
+            .expect("config issues array")
+            .iter()
+            .map(|issue| issue.as_str().expect("issue string"))
+            .collect()
+    }
+
+    fn assert_ready_inactive(
+        snapshot: &serde_json::Value,
+        platform: &str,
+        identity: &str,
+        recipient: &str,
+        conversation: &str,
+    ) {
+        assert_eq!(snapshot["status"], "ready_inactive", "{snapshot}");
+        assert_eq!(snapshot["active"], false, "{snapshot}");
+        assert_eq!(snapshot["stale"], false, "{snapshot}");
+        assert_eq!(snapshot["healthy"], false, "{snapshot}");
+        assert!(snapshot["runtime"].is_null(), "{snapshot}");
+        assert_eq!(snapshot["config"]["platform"], platform, "{snapshot}");
+        assert_eq!(snapshot["config"]["configured"], true, "{snapshot}");
+        assert_eq!(snapshot["config"]["ready"], true, "{snapshot}");
+        assert_eq!(snapshot["config"]["identity"], identity, "{snapshot}");
+        assert_eq!(snapshot["config"]["recipient"], recipient, "{snapshot}");
+        assert_eq!(
+            snapshot["config"]["conversation"], conversation,
+            "{snapshot}"
+        );
+        assert!(issues(snapshot).is_empty(), "{snapshot}");
+    }
+
+    /// Missing credentials/conversation/recipient are visible as a stable
+    /// not-configured/not-ready posture for both commands. The distinct platform
+    /// identity defaults remain visible, and the commands succeed behind a poison
+    /// proxy, pinning the no-network `--status` contract.
+    #[test]
+    fn bridge_status_json_missing_config_is_not_ready_and_network_free() {
+        let db = TestDb::new();
+        for (platform, default_identity) in [("telegram", "telegram"), ("slack", "slack")] {
+            let (ok, stdout, stderr) = run_bridge(&db, &[platform, "--status", "--json"], &[]);
+            assert!(
+                ok,
+                "{platform} status must succeed without config\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert_secret_free(&stdout, &stderr);
+            assert!(!stdout.contains("api.telegram.org"));
+            assert!(!stdout.contains("slack.com/api"));
+            let snapshot: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("{platform} status JSON: {error}\n{stdout}"));
+            assert_eq!(snapshot["status"], "not_configured", "{snapshot}");
+            assert_eq!(snapshot["active"], false, "{snapshot}");
+            assert_eq!(snapshot["stale"], false, "{snapshot}");
+            assert_eq!(snapshot["healthy"], false, "{snapshot}");
+            assert_eq!(snapshot["config"]["platform"], platform, "{snapshot}");
+            assert_eq!(snapshot["config"]["configured"], false, "{snapshot}");
+            assert_eq!(snapshot["config"]["ready"], false, "{snapshot}");
+            assert_eq!(
+                snapshot["config"]["identity"], default_identity,
+                "{snapshot}"
+            );
+            assert!(snapshot["config"]["recipient"].is_null(), "{snapshot}");
+            let issues = issues(&snapshot);
+            assert!(issues.contains(&"missing_token"), "{snapshot}");
+            assert!(issues.contains(&"missing_conversation"), "{snapshot}");
+            assert!(issues.contains(&"missing_recipient"), "{snapshot}");
+        }
+    }
+
+    /// Fully distinct, two-way routing is ready but inactive until a bridge process
+    /// owns and heartbeats its durable runtime row. Neither credential can appear in
+    /// stdout or stderr.
+    #[test]
+    fn bridge_status_json_complete_distinct_config_is_ready_inactive_and_token_free() {
+        let db = TestDb::new();
+        for (platform, identity, recipient, conversation) in [
+            (
+                "telegram",
+                "telegram-route",
+                "telegram-destination",
+                "-1004242",
+            ),
+            ("slack", "slack-route", "slack-destination", "CSTATUS42"),
+        ] {
+            let (ok, stdout, stderr) =
+                run_bridge(&db, &[platform, "--status", "--json"], &COMPLETE_BRIDGE_ENV);
+            assert!(
+                ok,
+                "{platform} status must succeed\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert_secret_free(&stdout, &stderr);
+            let snapshot: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("{platform} status JSON: {error}\n{stdout}"));
+            assert_ready_inactive(&snapshot, platform, identity, recipient, conversation);
+            if platform == "telegram" {
+                assert_eq!(
+                    snapshot["config"]["bot_username"], "weave_status_bot",
+                    "{snapshot}"
+                );
+            } else {
+                assert!(snapshot["config"]["bot_username"].is_null());
+            }
+        }
+    }
+
+    /// One configured legacy identity cannot own both platform inboxes. Doctor's
+    /// JSON bridges block reports the collision symmetrically without token bytes.
+    #[test]
+    fn doctor_json_reports_both_shared_identity_collisions_token_free() {
+        let db = TestDb::new();
+        let collision_env = [
+            ("WEAVE_TELEGRAM_TOKEN", TELEGRAM_SECRET),
+            ("WEAVE_TELEGRAM_CHAT_ID", "-1004242"),
+            ("WEAVE_TELEGRAM_RECIPIENT", "telegram-destination"),
+            ("WEAVE_SLACK_TOKEN", SLACK_SECRET),
+            ("WEAVE_SLACK_CHANNEL", "CSTATUS42"),
+            ("WEAVE_SLACK_RECIPIENT", "slack-destination"),
+            ("WEAVE_BRIDGE_IDENTITY", "shared-bridge-route"),
+        ];
+        let (ok, stdout, stderr) = run_bridge(&db, &["doctor", "--json"], &collision_env);
+        assert!(
+            ok,
+            "doctor --json must succeed\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert_secret_free(&stdout, &stderr);
+        let doctor: serde_json::Value =
+            serde_json::from_str(&stdout).expect("doctor --json parses");
+        let bridges = doctor["bridges"].as_object().expect("doctor bridges block");
+        assert_eq!(bridges.len(), 2, "{doctor}");
+        for platform in ["telegram", "slack"] {
+            let snapshot = &bridges[platform];
+            assert_eq!(snapshot["status"], "not_ready", "{snapshot}");
+            assert_eq!(snapshot["active"], false, "{snapshot}");
+            assert_eq!(snapshot["stale"], false, "{snapshot}");
+            assert_eq!(snapshot["healthy"], false, "{snapshot}");
+            assert_eq!(snapshot["config"]["configured"], true, "{snapshot}");
+            assert_eq!(snapshot["config"]["ready"], false, "{snapshot}");
+            assert_eq!(
+                snapshot["config"]["identity"], "shared-bridge-route",
+                "{snapshot}"
+            );
+            assert!(
+                issues(snapshot).contains(&"identity_collision"),
+                "{snapshot}"
+            );
+        }
+    }
+
+    fn scrubbed_mcp_env(overrides: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut env = std::env::vars_os()
+            .filter_map(|(key, _)| {
+                let key = key.into_string().ok()?;
+                (key.starts_with("WEAVE_TELEGRAM_")
+                    || key.starts_with("WEAVE_SLACK_")
+                    || key.starts_with("WEAVE_BRIDGE_")
+                    || key == "WEAVE_BOT_WRITES"
+                    || key == "WEAVE_SESSION")
+                    .then(|| (key, String::new()))
+            })
+            .collect::<Vec<_>>();
+        env.extend(
+            overrides
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        env
+    }
+
+    /// Human and MCP doctors use the same token-free status vocabulary and exact
+    /// platform-specific routing. Every recognized inherited bridge value is
+    /// cleared/overridden before the MCP fixture is applied.
+    #[test]
+    fn human_and_mcp_doctor_show_token_free_bridge_posture() {
+        let db = TestDb::new();
+        let (ok, stdout, stderr) = run_bridge(&db, &["doctor"], &COMPLETE_BRIDGE_ENV);
+        assert!(
+            ok,
+            "human doctor must succeed\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert_secret_free(&stdout, &stderr);
+        assert!(
+            stdout.contains(
+                "telegram: status=ready_inactive identity=telegram-route recipient=telegram-destination"
+            ),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(
+                "slack: status=ready_inactive identity=slack-route recipient=slack-destination"
+            ),
+            "{stdout}"
+        );
+
+        let owned_env = scrubbed_mcp_env(&COMPLETE_BRIDGE_ENV);
+        let env_refs = owned_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let mut mcp = McpServer::spawn_env(&db, &env_refs);
+        let (is_error, text) = mcp.call_tool("weave_doctor", serde_json::json!({}));
+        assert!(!is_error, "MCP doctor failed: {text}");
+        assert_secret_free(&text, "");
+        assert!(
+            text.contains(
+                "telegram bridge: status=ready_inactive identity=telegram-route recipient=telegram-destination"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "slack bridge: status=ready_inactive identity=slack-route recipient=slack-destination"
+            ),
+            "{text}"
+        );
+        mcp.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WL-048: human surfaces — `weave dashboard` HTTP server (surfaces feature).
 //
 // These drive the *compiled* binary's `dashboard` subcommand as a black box:
@@ -14278,7 +14738,7 @@ fn post_send_hook_fires_with_env_and_skips_non_match() {
 
 #[cfg(feature = "surfaces")]
 mod surfaces_dashboard {
-    use super::{run_env, run_ok, scrub_env, weave_bin, TestDb};
+    use super::{run_env, run_ok, scrub_env, scrub_inherited_bridge_env, weave_bin, TestDb};
     use crate::common::unique_db;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -14338,6 +14798,7 @@ mod surfaces_dashboard {
                 cmd.arg("--write");
             }
             scrub_env(&mut cmd);
+            scrub_inherited_bridge_env(&mut cmd);
             cmd.env("WEAVE_DB", db.path_str());
             for (k, v) in extra_env {
                 cmd.env(k, v);
@@ -14686,11 +15147,14 @@ mod surfaces_dashboard {
         );
     }
 
-    /// The repowire-style settings surface shows token-free runtime posture:
-    /// write mode, circle, spawn allowlist, bridge/bot booleans, and safety knobs
-    /// without leaking configured secret values.
+    /// Settings HTML, `/settings`, and `/api/snapshot` expose the exact resolved
+    /// platform routing and ready/active/healthy dimensions while keeping both bot
+    /// credentials out of every response.
     #[test]
-    fn dashboard_settings_panel_and_json_are_token_free() {
+    fn dashboard_settings_and_snapshot_expose_exact_token_free_bridge_posture() {
+        const TG_SECRET: &str = "telegram-dashboard-secret-canary";
+        const SLACK_SECRET: &str = "slack-dashboard-secret-canary";
+        const INVALID_LEGACY_IDENTITY: &str = "legacy\ncontrol-value";
         let db = TestDb::new();
         seed_peers(&db);
         let allow = unique_db().with_extension("spawn-allow");
@@ -14703,8 +15167,17 @@ mod surfaces_dashboard {
             &[
                 ("WEAVE_CIRCLE", "dash-circle"),
                 ("WEAVE_SPAWN_DIRS", &allow_s),
-                ("WEAVE_BRIDGE_IDENTITY", "dash-bridge"),
-                ("WEAVE_TELEGRAM_TOKEN", "telegram-secret-value"),
+                ("WEAVE_SESSION", "unused-dashboard-session"),
+                ("WEAVE_BRIDGE_IDENTITY", INVALID_LEGACY_IDENTITY),
+                ("WEAVE_TELEGRAM_TOKEN", TG_SECRET),
+                ("WEAVE_TELEGRAM_CHAT_ID", "-1009876"),
+                ("WEAVE_TELEGRAM_IDENTITY", "dashboard-telegram"),
+                ("WEAVE_TELEGRAM_RECIPIENT", "telegram-target"),
+                ("WEAVE_TELEGRAM_BOT_USERNAME", "dashboard_bot"),
+                ("WEAVE_SLACK_TOKEN", SLACK_SECRET),
+                ("WEAVE_SLACK_CHANNEL", "CDASHBOARD"),
+                ("WEAVE_SLACK_IDENTITY", "dashboard-slack"),
+                ("WEAVE_SLACK_RECIPIENT", "slack-target"),
                 ("WEAVE_PRETOOLUSE_APPROVER", "security-peer"),
             ],
         );
@@ -14714,34 +15187,86 @@ mod surfaces_dashboard {
                 && page.contains("<h2>Settings</h2>")
                 && page.contains("dash-circle")
                 && page.contains("enabled")
-                && page.contains("dash-bridge")
+                && page.contains("ready_inactive")
+                && page.contains("dashboard-telegram")
+                && page.contains("telegram-target")
+                && page.contains("dashboard-slack")
+                && page.contains("slack-target")
                 && page.contains(&allow_s),
             "settings panel should render token-free config posture: {page}"
         );
-        assert!(
-            !page.contains("telegram-secret-value"),
-            "settings panel must not leak secret tokens: {page}"
-        );
+        for secret in [TG_SECRET, SLACK_SECRET] {
+            assert!(
+                !page.contains(secret),
+                "settings panel leaked token: {page}"
+            );
+        }
 
         let settings = http_get(dash.port, "/settings", Some("secret-tok"));
-        assert!(
-            settings.contains("\"write_enabled\": true")
-                && settings.contains("\"circle\": \"dash-circle\"")
-                && settings.contains("\"telegram_configured\": true")
-                && settings.contains("\"pretooluse_approver_configured\": true")
-                && settings.contains(&allow_s),
-            "settings JSON should expose redacted posture: {settings}"
+        let settings_json: serde_json::Value =
+            serde_json::from_str(http_body(&settings)).expect("dashboard settings JSON");
+        let posture = &settings_json["settings"];
+        assert_eq!(posture["write_enabled"], true, "{settings}");
+        assert_eq!(posture["circle"], "dash-circle", "{settings}");
+        assert_eq!(posture["bridge_identity"], "-", "{settings}");
+        assert_eq!(posture["telegram_configured"], true, "{settings}");
+        assert_eq!(posture["telegram_ready"], true, "{settings}");
+        assert_eq!(posture["telegram_active"], false, "{settings}");
+        assert_eq!(posture["telegram_stale"], false, "{settings}");
+        assert_eq!(posture["telegram_healthy"], false, "{settings}");
+        assert_eq!(posture["telegram_status"], "ready_inactive", "{settings}");
+        assert_eq!(posture["telegram_runtime_present"], false, "{settings}");
+        assert_eq!(posture["telegram_runtime_status"], "-", "{settings}");
+        assert_eq!(posture["telegram_heartbeat"], 0, "{settings}");
+        assert_eq!(
+            posture["telegram_identity"], "dashboard-telegram",
+            "{settings}"
         );
-        assert!(
-            !settings.contains("telegram-secret-value"),
-            "settings JSON must not leak secret tokens: {settings}"
+        assert_eq!(
+            posture["telegram_recipient"], "telegram-target",
+            "{settings}"
         );
+        assert_eq!(posture["slack_configured"], true, "{settings}");
+        assert_eq!(posture["slack_ready"], true, "{settings}");
+        assert_eq!(posture["slack_active"], false, "{settings}");
+        assert_eq!(posture["slack_stale"], false, "{settings}");
+        assert_eq!(posture["slack_healthy"], false, "{settings}");
+        assert_eq!(posture["slack_status"], "ready_inactive", "{settings}");
+        assert_eq!(posture["slack_runtime_present"], false, "{settings}");
+        assert_eq!(posture["slack_runtime_status"], "-", "{settings}");
+        assert_eq!(posture["slack_heartbeat"], 0, "{settings}");
+        assert_eq!(posture["slack_identity"], "dashboard-slack", "{settings}");
+        assert_eq!(posture["slack_recipient"], "slack-target", "{settings}");
+        assert_eq!(posture["pretooluse_approver_configured"], true);
+        assert!(
+            posture["spawn_allowed_dirs"]
+                .as_array()
+                .is_some_and(|dirs| dirs
+                    .iter()
+                    .any(|dir| dir.as_str() == Some(allow_s.as_str()))),
+            "{settings}"
+        );
+        for secret in [TG_SECRET, SLACK_SECRET] {
+            assert!(
+                !settings.contains(secret),
+                "settings JSON leaked token: {settings}"
+            );
+        }
+        assert!(!settings.contains(INVALID_LEGACY_IDENTITY), "{settings}");
 
         let snapshot = http_get(dash.port, "/api/snapshot", Some("secret-tok"));
-        assert!(
-            snapshot.contains("\"settings\"") && snapshot.contains("\"dash-circle\""),
-            "snapshot should include settings posture: {snapshot}"
+        let snapshot_json: serde_json::Value =
+            serde_json::from_str(http_body(&snapshot)).expect("dashboard snapshot JSON");
+        assert_eq!(
+            &snapshot_json["settings"], posture,
+            "snapshot and /settings must expose identical posture"
         );
+        for secret in [TG_SECRET, SLACK_SECRET] {
+            assert!(
+                !snapshot.contains(secret),
+                "snapshot JSON leaked token: {snapshot}"
+            );
+        }
     }
 
     /// Structured pending-question controls render choice buttons and tool-permission
@@ -15311,9 +15836,9 @@ mod surfaces_dashboard {
 // WL-056 / ADR-0005: cross-machine PUSH delivery (consent-based, daemon-free).
 //
 // These drive the *compiled* binary as a black box: a `weave dashboard --write`
-// server is the RECEIVER (B) — the bearer-gated `POST /api` surface where the
+// server is the RECEIVER (B) — its separately credentialed `POST /push` surface
 // `weave_push` receive handler commits into B's OWN inbox via the SAME Tier-2
-// pull-commit pipeline. The SENDER (A) is either a raw `POST /api` client (to drive
+// pull-commit pipeline. The SENDER (A) is either a raw `POST /push` client (to drive
 // the receive handler directly with crafted args) or the `weave push` CLI verb.
 // Owner-only-writes is structural: A never opens B's store; B commits its own row.
 // Run on BOTH backends (sqlite default + libsql via --no-default-features).
@@ -15325,6 +15850,8 @@ mod surfaces_push {
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
+
+    const OPERATOR_TOKEN: &str = "operator-b";
 
     fn free_port() -> u16 {
         let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -15342,7 +15869,7 @@ mod surfaces_push {
         }
     }
 
-    /// Spawn `weave dashboard --write` (the WL-052a `POST /api` receive surface) with
+    /// Spawn a dashboard with distinct operator and push-only credentials.
     /// extra env (e.g. WEAVE_TRUST / WEAVE_STRICT_VERIFY / XDG_CONFIG_HOME so the
     /// receive handler's `Config::load()` VerifyPolicy + key table are populated).
     fn spawn_receiver(db: &TestDb, token: &str, extra_env: &[(&str, &str)]) -> Server {
@@ -15353,6 +15880,8 @@ mod surfaces_push {
             "--port",
             &port.to_string(),
             "--token",
+            OPERATOR_TOKEN,
+            "--push-token",
             token,
             "--write",
         ]);
@@ -15380,11 +15909,11 @@ mod surfaces_push {
         Server { child, port }
     }
 
-    /// Raw `POST /api` (optionally bearer) → full raw HTTP response text.
-    fn http_post(port: u16, bearer: Option<&str>, body: &str) -> String {
+    /// Raw POST (optionally bearer) → full raw HTTP response text.
+    fn http_post(port: u16, path: &str, bearer: Option<&str>, body: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let mut req = String::from("POST /api HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        let mut req = format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
         if let Some(t) = bearer {
             req.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }
@@ -15396,6 +15925,20 @@ mod surfaces_push {
         let mut buf = Vec::new();
         let _ = s.read_to_end(&mut buf);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn http_get(port: u16, path: &str, bearer: Option<&str>) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(token) = bearer {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     /// A `weave_push` JSON-RPC envelope with the given arguments object.
@@ -15411,6 +15954,7 @@ mod surfaces_push {
     fn inbox_via_api(port: u16, token: &str, me: &str) -> String {
         http_post(
             port,
+            "/api",
             Some(token),
             &serde_json::json!({
                 "jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -15429,9 +15973,11 @@ mod surfaces_push {
         let recv = spawn_receiver(&b, "tok-b", &[]);
         let resp = http_post(
             recv.port,
+            "/push",
             Some("tok-b"),
             &push_rpc(serde_json::json!({
-                "from":"alice","to":"bob","body":"x-machine hello"
+                "from":"alice","to":"bob","body":"x-machine hello",
+                "idempotency_key":"happy-path-1"
             })),
         );
         assert!(
@@ -15443,7 +15989,7 @@ mod surfaces_push {
             "push should commit (advisory accept): {resp}"
         );
         // Read back via B's own API: exactly one message from alice with the body.
-        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        let inbox = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
         assert!(
             inbox.contains("x-machine hello"),
             "the pushed message is delivered to B's inbox: {inbox}"
@@ -15463,12 +16009,20 @@ mod surfaces_push {
         let body = push_rpc(serde_json::json!({
             "from":"alice","to":"bob","body":"dup-body","idempotency_key":"k-1"
         }));
-        let r1 = http_post(recv.port, Some("tok-b"), &body);
+        let r1 = http_post(recv.port, "/push", Some("tok-b"), &body);
         assert!(r1.starts_with("HTTP/1.1 200"), "first push 200:\n{r1}");
-        // Second identical POST: the receive handler rejects (already delivered) OR
-        // returns success — either way B must hold EXACTLY ONE row.
-        let _r2 = http_post(recv.port, Some("tok-b"), &body);
-        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        // An exact retry is a successful replay, not a false commit failure.
+        let r2 = http_post(recv.port, "/push", Some("tok-b"), &body);
+        assert!(r2.starts_with("HTTP/1.1 200"), "retry push 200:\n{r2}");
+        assert!(
+            r2.contains("\"isError\":false") || r2.contains("\"isError\": false"),
+            "retry must be a successful idempotent replay: {r2}"
+        );
+        assert!(
+            r2.contains("idempotent replay"),
+            "retry response should identify replay: {r2}"
+        );
+        let inbox = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
         let count = inbox.matches("dup-body").count();
         assert_eq!(
             count, 1,
@@ -15483,6 +16037,7 @@ mod surfaces_push {
         let recv = spawn_receiver(&b, "tok-b", &[]);
         let resp = http_post(
             recv.port,
+            "/push",
             None,
             &push_rpc(serde_json::json!({
                 "from":"mallory","to":"bob","body":"unauthorized"
@@ -15493,11 +16048,52 @@ mod surfaces_push {
             "missing bearer must be 401/403:\n{resp}"
         );
         // Nothing committed.
-        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        let inbox = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
         assert!(
             !inbox.contains("unauthorized"),
             "an unauthenticated push must not commit: {inbox}"
         );
+    }
+
+    #[test]
+    fn push_credential_cannot_read_or_call_operator_tools() {
+        let b = TestDb::new();
+        let recv = spawn_receiver(&b, "tok-b", &[]);
+
+        let page = http_get(recv.port, "/", Some("tok-b"));
+        assert!(page.starts_with("HTTP/1.1 401"), "{page}");
+
+        let send = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"weave_send","arguments":{"from":"spoofed","to":"bob","body":"forbidden"}}
+        })
+        .to_string();
+        let operator_route = http_post(recv.port, "/api", Some("tok-b"), &send);
+        assert!(
+            operator_route.starts_with("HTTP/1.1 401"),
+            "push token reached operator route: {operator_route}"
+        );
+        let push_route = http_post(recv.port, "/push", Some("tok-b"), &send);
+        assert!(
+            push_route.contains("accepts only a direct weave_push call"),
+            "push route accepted another tool: {push_route}"
+        );
+        let operator_on_push = http_post(
+            recv.port,
+            "/push",
+            Some(OPERATOR_TOKEN),
+            &push_rpc(serde_json::json!({
+                "from":"spoofed","to":"bob","body":"also forbidden",
+                "idempotency_key":"wrong-authority"
+            })),
+        );
+        assert!(
+            operator_on_push.starts_with("HTTP/1.1 401"),
+            "{operator_on_push}"
+        );
+
+        let inbox = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
+        assert!(!inbox.contains("forbidden"), "{inbox}");
     }
 
     /// SIGNED HAPPY PATH + FORGED REJECTED (sign feature): under a configured trust
@@ -15563,7 +16159,7 @@ mod surfaces_push {
             signed.contains("delivered to 'bob'") || signed.to_lowercase().contains("deliver"),
             "the CLI push reports B's success: {signed}"
         );
-        let inbox = inbox_via_api(recv.port, "tok-b", "bob");
+        let inbox = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
         assert!(
             inbox.contains("signed x-machine push"),
             "a verified signed push commits under strict trust: {inbox}"
@@ -15573,6 +16169,7 @@ mod surfaces_push {
         // under strict (no row). Sent as a raw POST so we control the bad sig.
         let forged = http_post(
             recv.port,
+            "/push",
             Some("tok-b"),
             &push_rpc(serde_json::json!({
                 "from":"alice","to":"bob","body":"forged payload",
@@ -15584,7 +16181,7 @@ mod surfaces_push {
             forged.contains("\"isError\":true") || forged.contains("\"isError\": true"),
             "a forged signature must be rejected at commit: {forged}"
         );
-        let inbox2 = inbox_via_api(recv.port, "tok-b", "bob");
+        let inbox2 = inbox_via_api(recv.port, OPERATOR_TOKEN, "bob");
         assert!(
             !inbox2.contains("forged payload"),
             "a forged push must not commit any row: {inbox2}"
@@ -15985,6 +16582,451 @@ fn session_export_import_round_trips_across_distinct_dbs() {
 }
 
 #[test]
+fn session_export_rejects_a_limit_that_would_orphan_an_ask() {
+    let db = TestDb::new();
+    let file = unique_session_file();
+    run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "closure question",
+            "--no-memory",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "carol",
+            "--body",
+            "newer unrelated row",
+        ],
+    );
+
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(
+        !ok,
+        "an incomplete ask closure must not be exported as successful"
+    );
+    assert!(
+        err.contains("limit omitted question message") && err.contains("required by ask"),
+        "the closure error must be actionable: {err}"
+    );
+    assert!(
+        !file.exists(),
+        "a rejected export must not leave a partial file"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_export_rejects_limit_that_splits_a_live_ask_group() {
+    let db = TestDb::new();
+    let file = unique_session_file();
+    run_ok(
+        &db,
+        &[
+            "ask-many",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--to",
+            "carol",
+            "--subject",
+            "portable poll",
+            "--body",
+            "choose one",
+        ],
+    );
+
+    let (ok, _out, err) = run(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(!ok, "a live ask group must export as a complete child set");
+    assert!(
+        err.contains("limit omitted ask") && err.contains("required by ask group"),
+        "group closure error must be actionable: {err}"
+    );
+    assert!(!file.exists());
+}
+
+#[test]
+fn session_export_normalizes_chain_after_retention_removes_parent_question() {
+    let db = TestDb::new();
+    let target = TestDb::new();
+    let file = unique_session_file();
+    let first = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "retention chain root",
+            "--no-memory",
+        ],
+    );
+    let first_id = extract_cid(&first);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "retention chain survivor",
+            "--reply-to",
+            &first_id,
+            "--no-memory",
+        ],
+    );
+    run_ok(&db, &["gc", "--older-than-secs", "1"]);
+
+    let exported = run_ok(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(exported.contains("1 ask(s)"), "{exported}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let asks = envelope["asks"].as_array().unwrap();
+    assert_eq!(asks.len(), 1, "the retention-dangling parent is omitted");
+    assert_eq!(asks[0]["reply_to"], serde_json::Value::Null);
+    assert_eq!(envelope["messages"][0]["body"], "retention chain survivor");
+
+    run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    let imported = run_ok(
+        &target,
+        &["asks", "--me", "alice", "--role", "any", "--json"],
+    );
+    let imported: serde_json::Value = serde_json::from_str(&imported).unwrap();
+    assert_eq!(imported["asks"].as_array().unwrap().len(), 1);
+    assert!(imported["asks"][0]["reply_to"].is_null());
+
+    let _ = std::fs::remove_file(file);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn session_export_normalizes_omitted_stale_parent_metadata() {
+    let db = TestDb::new();
+    let file = unique_session_file();
+    let first = run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "stale omitted root",
+            "--no-memory",
+        ],
+    );
+    let first_id = extract_cid(&first);
+    run_ok(
+        &db,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "newest surviving child",
+            "--reply-to",
+            &first_id,
+            "--no-memory",
+        ],
+    );
+    let listed = run_ok(&db, &["asks", "--me", "alice", "--role", "any", "--json"]);
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    let parent_question = listed["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ask| ask["id"] == first_id)
+        .unwrap()["question_msg_id"]
+        .as_i64()
+        .unwrap();
+    let connection = rusqlite::Connection::open(&db.path).unwrap();
+    connection
+        .execute("DELETE FROM messages WHERE id = ?1", [parent_question])
+        .unwrap();
+    drop(connection);
+
+    let output = run_ok(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(output.contains("1 ask(s)"), "{output}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(envelope["asks"].as_array().unwrap().len(), 1);
+    assert!(envelope["asks"][0]["reply_to"].is_null());
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn session_import_plain_message_rejects_configured_key_alias() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "same visible payload",
+            "--priority",
+            "high",
+            "--idempotency-key",
+            "session_semantic_alias",
+            "--no-memory",
+        ],
+    );
+    let file = unique_session_file();
+    let envelope = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 2,
+        "identity": "alice", "exported_at": 1,
+        "messages": [{
+            "id": 1, "ts": 1, "sender": "alice", "recipient": "bob",
+            "body": "same visible payload", "priority": "high",
+            "idempotency_key": "session_semantic_alias"
+        }],
+        "asks": [], "ask_groups": [], "memory": []
+    });
+    std::fs::write(&file, envelope.to_string()).unwrap();
+    let (ok, _out, error) = run(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(!ok, "plain and configured operations must not alias by key");
+    assert!(error.contains("different content"), "{error}");
+    let inbox = run_ok(&db, &["inbox", "--me", "bob", "--json", "--peek"]);
+    let inbox: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["messages"][0]["body"], "same visible payload");
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn session_import_restores_plain_effective_priority_atomically() {
+    let db = TestDb::new();
+    let source = unique_session_file();
+    let exported = unique_session_file();
+    let envelope = serde_json::json!({
+        "weave_session_export": 1, "schema_version": 1,
+        "identity": "alice", "exported_at": 1,
+        "messages": [{
+            "id": 1, "ts": 1, "sender": "alice", "recipient": "bob",
+            "body": "legacy urgent", "priority": "urgent",
+            "idempotency_key": "session_plain_priority"
+        }],
+        "asks": [], "memory": []
+    });
+    std::fs::write(&source, envelope.to_string()).unwrap();
+    run_ok(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            source.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    let replay = run_ok(
+        &db,
+        &[
+            "session",
+            "import",
+            "--in",
+            source.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(replay.contains("0 message(s) inserted"), "{replay}");
+    let (ok, _out, error) = run(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "legacy urgent",
+            "--priority",
+            "urgent",
+            "--idempotency-key",
+            "session_plain_priority",
+            "--no-memory",
+        ],
+    );
+    assert!(
+        !ok,
+        "a configured send must not claim a portable plain import's key"
+    );
+    assert!(error.contains("different message"), "{error}");
+    run_ok(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            exported.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    let round_trip: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&exported).unwrap()).unwrap();
+    assert_eq!(round_trip["messages"][0]["priority"], "urgent");
+    assert!(round_trip["messages"][0]["configured_send"].is_null());
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(exported);
+}
+
+#[test]
+fn session_export_after_ttl_predecessor_expiry_remains_portable() {
+    let db = TestDb::new();
+    let file = unique_session_file();
+    let first = run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "short lived predecessor",
+            "--idempotency-key",
+            "ttl_session_predecessor",
+            "--ttl",
+            "1",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "durable successor",
+            "--idempotency-key",
+            "ttl_session_successor",
+            "--supersedes",
+            &sent_id(&first).to_string(),
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let out = run_ok(
+        &db,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    assert!(out.contains("1 message(s)"), "{out}");
+    let export: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(export["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(export["messages"][0]["body"], "durable successor");
+    assert_eq!(
+        export["messages"][0]["configured_send"]["supersedes"],
+        serde_json::Value::Null,
+        "a deleted source-local predecessor id has no portable target mapping"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn session_import_is_idempotent_on_reimport() {
     let a = TestDb::new();
     let b = TestDb::new();
@@ -16046,6 +17088,356 @@ fn session_import_is_idempotent_on_reimport() {
     let inbox = run_ok(&b, &["inbox", "--me", "bob"]);
     let count = inbox.matches("dedup me").count();
     assert_eq!(count, 1, "exactly one copy after re-import: {inbox}");
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_rejects_independent_same_identity_keyless_namespace_collision() {
+    let source_a = TestDb::new();
+    let source_b = TestDb::new();
+    let target = TestDb::new();
+    let file_a = unique_session_file();
+    let file_b = unique_session_file();
+
+    run_ok(
+        &source_a,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "independent source alpha",
+        ],
+    );
+    run_ok(
+        &source_b,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "independent source beta",
+        ],
+    );
+    for (source, file) in [(&source_a, &file_a), (&source_b, &file_b)] {
+        run_ok(
+            source,
+            &[
+                "session",
+                "export",
+                "--out",
+                file.to_str().unwrap(),
+                "--for",
+                "alice",
+            ],
+        );
+    }
+
+    run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file_a.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    let (ok, _out, err) = run(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file_b.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        !ok,
+        "independent stores must not alias one synthesized namespace"
+    );
+    assert!(
+        err.contains("source namespace conflict")
+            && err.contains("independent same-identity stores"),
+        "collision must be explicit and actionable: {err}"
+    );
+    let inbox = run_ok(&target, &["inbox", "--me", "bob", "--peek"]);
+    assert!(inbox.contains("independent source alpha"), "{inbox}");
+    assert!(!inbox.contains("independent source beta"), "{inbox}");
+
+    let _ = std::fs::remove_file(file_a);
+    let _ = std::fs::remove_file(file_b);
+}
+
+#[test]
+fn session_v2_restores_configured_semantics_without_sweeping_target_idle() {
+    let source = TestDb::new();
+    let target = TestDb::new();
+    let file = unique_session_file();
+
+    let predecessor = run_ok(
+        &source,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "sessionv2 predecessor",
+            "--idempotency-key",
+            "sessionv2_predecessor",
+            "--priority",
+            "urgent",
+            "--ttl",
+            "600",
+        ],
+    );
+    let predecessor_id = sent_id(&predecessor);
+    run_ok(
+        &source,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "sessionv2 successor",
+            "--idempotency-key",
+            "sessionv2_successor",
+            "--priority",
+            "high",
+            "--ttl",
+            "300",
+            "--supersedes",
+            &predecessor_id.to_string(),
+        ],
+    );
+    run_ok(
+        &source,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "sessionv2 imported idle",
+            "--idempotency-key",
+            "sessionv2_imported_idle",
+            "--dedup-idle",
+        ],
+    );
+    run_ok(
+        &target,
+        &[
+            "notify",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "sessionv2 target local idle",
+            "--idempotency-key",
+            "sessionv2_target_idle",
+            "--dedup-idle",
+        ],
+    );
+
+    run_ok(
+        &source,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    let exported: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(exported["schema_version"], 2);
+    let messages = exported["messages"].as_array().unwrap();
+    let predecessor = messages
+        .iter()
+        .find(|message| message["body"] == "sessionv2 predecessor")
+        .unwrap();
+    let successor = messages
+        .iter()
+        .find(|message| message["body"] == "sessionv2 successor")
+        .unwrap();
+    let imported_idle = messages
+        .iter()
+        .find(|message| message["body"] == "sessionv2 imported idle")
+        .unwrap();
+    assert_eq!(predecessor["configured_send"]["priority"], "urgent");
+    assert_eq!(predecessor["configured_send"]["ttl"], 600);
+    assert_eq!(predecessor["superseded_by"], successor["id"]);
+    assert_eq!(
+        successor["configured_send"]["supersedes"],
+        predecessor["id"]
+    );
+    assert_eq!(successor["configured_send"]["priority"], "high");
+    assert_eq!(successor["configured_send"]["ttl"], 300);
+    assert_eq!(imported_idle["configured_send"]["dedup_idle"], true);
+
+    let first_import = run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        first_import.contains("3 message(s) inserted"),
+        "configured import summary: {first_import}"
+    );
+    let inbox = run_ok(&target, &["inbox", "--me", "bob", "--json", "--peek"]);
+    assert!(
+        inbox.contains("sessionv2 target local idle"),
+        "rehydrating dedup-idle must not sweep target-local state: {inbox}"
+    );
+    assert!(inbox.contains("sessionv2 imported idle"), "{inbox}");
+    assert!(inbox.contains("sessionv2 successor"), "{inbox}");
+    assert!(
+        !inbox.contains("sessionv2 predecessor"),
+        "the restored effective successor link must hide its predecessor: {inbox}"
+    );
+
+    let second_import = run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        second_import.contains("0 message(s) inserted") && second_import.contains("3 skipped"),
+        "configured re-import must be exact and idempotent: {second_import}"
+    );
+    let audit = run_ok(
+        &target,
+        &["search", "--query", "sessionv2", "--json", "--limit", "20"],
+    );
+    let audit: serde_json::Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["messages"].as_array().unwrap().len(), 4);
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_v2_round_trips_thread_parent_links() {
+    let source = TestDb::new();
+    let target = TestDb::new();
+    let file = unique_session_file();
+    let root = run_ok(
+        &source,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "portable thread",
+            "--body",
+            "portablethreadroot",
+        ],
+    );
+    run_ok(
+        &source,
+        &[
+            "reply",
+            "--from",
+            "bob",
+            "--in-reply-to",
+            &sent_id(&root).to_string(),
+            "--body",
+            "portablethreadchild",
+            "--no-memory",
+        ],
+    );
+    run_ok(
+        &source,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    let export: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let rows = export["messages"].as_array().unwrap();
+    let source_root = rows
+        .iter()
+        .find(|row| row["body"] == "portablethreadroot")
+        .unwrap();
+    let source_child = rows
+        .iter()
+        .find(|row| row["body"] == "portablethreadchild")
+        .unwrap();
+    assert_eq!(source_child["in_reply_to"], source_root["id"]);
+
+    run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    let found = run_ok(
+        &target,
+        &["search", "--query", "portablethreadroot", "--json"],
+    );
+    let found: serde_json::Value = serde_json::from_str(&found).unwrap();
+    let target_root = found["messages"][0]["id"].as_i64().unwrap();
+    let thread = run_ok(
+        &target,
+        &["thread", "--root", &target_root.to_string(), "--json"],
+    );
+    assert!(thread.contains("portablethreadroot"), "{thread}");
+    assert!(thread.contains("portablethreadchild"), "{thread}");
+
+    let replay = run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(
+        replay.contains("0 message(s) inserted") && replay.contains("2 skipped"),
+        "thread re-import must be exact: {replay}"
+    );
 
     let _ = std::fs::remove_file(&file);
 }
@@ -16349,6 +17741,182 @@ fn session_import_replays_ask_thread_and_group() {
     );
 
     let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn session_import_remaps_ask_reply_to_chain() {
+    let source = TestDb::new();
+    let target = TestDb::new();
+    let file = unique_session_file();
+
+    let first = run_ok(
+        &source,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "first chained question",
+            "--no-memory",
+        ],
+    );
+    let first_id = extract_cid(&first);
+    run_ok(
+        &source,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "second chained question",
+            "--reply-to",
+            &first_id,
+            "--no-memory",
+        ],
+    );
+    run_ok(
+        &source,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+
+    let listed = run_ok(
+        &target,
+        &["asks", "--me", "alice", "--role", "asker", "--json"],
+    );
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    let asks = listed["asks"].as_array().unwrap();
+    assert_eq!(asks.len(), 2);
+    let ids: std::collections::HashSet<&str> =
+        asks.iter().filter_map(|ask| ask["id"].as_str()).collect();
+    let chained = asks
+        .iter()
+        .find(|ask| ask["reply_to"].is_string())
+        .expect("one imported ask remains chained");
+    let mapped_parent = chained["reply_to"].as_str().unwrap();
+    assert!(ids.contains(mapped_parent));
+    assert_ne!(
+        mapped_parent, first_id,
+        "source correlation id must be remapped"
+    );
+
+    let replay = run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+    assert!(replay.contains("0 ask(s) replayed"), "{replay}");
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn session_import_preserves_explicit_subject_on_chained_ask() {
+    let source = TestDb::new();
+    let target = TestDb::new();
+    let file = unique_session_file();
+
+    let first = run_ok(
+        &source,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--subject",
+            "original topic",
+            "--body",
+            "first subject question",
+            "--no-memory",
+        ],
+    );
+    let first_id = extract_cid(&first);
+    run_ok(
+        &source,
+        &[
+            "ask",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--reply-to",
+            &first_id,
+            "--subject",
+            "explicit new topic",
+            "--body",
+            "second subject question",
+            "--no-memory",
+        ],
+    );
+    run_ok(
+        &source,
+        &[
+            "session",
+            "export",
+            "--out",
+            file.to_str().unwrap(),
+            "--for",
+            "alice",
+        ],
+    );
+    run_ok(
+        &target,
+        &[
+            "session",
+            "import",
+            "--in",
+            file.to_str().unwrap(),
+            "--as",
+            "alice",
+        ],
+    );
+
+    let listed = run_ok(
+        &target,
+        &["asks", "--me", "alice", "--role", "asker", "--json"],
+    );
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    let chained = listed["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ask| ask["reply_to"].is_string())
+        .expect("imported child remains chained");
+    assert_eq!(chained["subject"], "explicit new topic");
+    let found = run_ok(
+        &target,
+        &["search", "--query", "second subject question", "--json"],
+    );
+    let found: serde_json::Value = serde_json::from_str(&found).unwrap();
+    assert_eq!(found["messages"][0]["subject"], "explicit new topic");
+    let _ = std::fs::remove_file(file);
 }
 
 #[test]

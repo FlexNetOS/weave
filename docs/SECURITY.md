@@ -8,10 +8,10 @@ It complements [`ARCHITECTURE.md`](../ARCHITECTURE.md) §7 (Threat model) with t
 exact code-level guarantees and a candid residual-risk register. Where this
 document and the code disagree, the code wins; please file an issue.
 
-> **One-line summary:** weave is a single-user, single-host tool. It assumes the
-> machine operator is trusted and hardens the boundaries where peer-supplied text
-> is stored, rendered, typed into another session, or deliberately sent through
-> an opt-in provider feature.
+> **One-line summary:** weave is a single-user tool whose default mesh is local.
+> It assumes each participating machine's operator is trusted and hardens the
+> boundaries where peer/provider text is stored, rendered, typed into a session,
+> or delivered through an explicitly enabled network surface.
 
 ---
 
@@ -24,7 +24,8 @@ has no routable listener or peer authentication and speaks MCP over stdio; those
 are explicit non-goals for the local mesh (see §6). Optional features expand
 that boundary deliberately: remote libSQL connects to its configured service,
 the `llm` feature can send summarization requests to a configured provider, and
-the human-surface dashboard can bind an operator-selected local listener.
+the human-surface dashboard can bind an operator-selected listener, and a
+separately credentialed push-only route can commit remote delivery intents.
 
 The one privilege a peer *does* hold is sharp and worth stating plainly:
 
@@ -41,11 +42,11 @@ LLM agent, that text is also a **prompt-injection surface**: a hostile body can
 attempt to instruct the receiving agent. weave's stance on this is covered in
 §3 (what is hardened) and §5 (what is not).
 
-Identity is **advisory**. Session names (`from`, `to`, `me`) are free strings
-with no authentication; weave does not defend one local session against another
-impersonating it. Within a single trusted user this is acceptable; across a trust
-boundary it would not be, which is why cross-machine *injection* stays out of
-scope (§6).
+Local session identity is **advisory**. Session names (`from`, `to`, `me`) are free
+strings; weave does not defend one same-user local session against another
+impersonating it. Cross-machine pull/push can optionally bind sender identity with
+ed25519 signatures and a receiver trust policy. Unsigned senders remain advisory
+unless strict/trust configuration requires verification.
 
 ---
 
@@ -63,6 +64,30 @@ scope (§6).
 The core security focus is therefore **how injected and stored text is handled**.
 Optional network features add the explicitly configured boundaries documented
 below; cross-user isolation remains outside the local-mesh model.
+
+### Opt-in network receive boundaries
+
+- The general MCP/dashboard operator bearer grants the documented read surface and,
+  with `--dangerous`/`--write`, broad mutation authority. Treat it as an admin
+  secret and never give it to a push sender.
+- Cross-machine delivery uses a distinct `--push-token` accepted only on
+  `POST /push`. It must differ from the operator token, cannot read dashboard/MCP
+  state, and dispatches only a direct `weave_push`. The receiver revalidates the
+  intent and applies its signature trust/revocation policy before committing.
+- The built-in listener is plain HTTP. Non-loopback senders require an external TLS
+  terminator/reverse proxy exposing only `/push`, or an SSH loopback forward. A
+  private overlay address alone does not terminate HTTPS.
+- Telegram and Slack bridge commands are conversation-scoped; there is currently no
+  external-user allowlist. Every member able to post in the configured chat or
+  channel is an operator of that bridge identity, so use a dedicated private
+  conversation. `WEAVE_BOT_WRITES=1` grants those members the bridge's write actions.
+- Provider acceptance never bypasses local ownership: the receiver process writes
+  its own store and any live pane nudge is performed locally under the receiver's
+  pull-injection consent settings.
+- Telegram `/inbox` advances its provider cursor and acknowledges the exact rendered
+  rows in one owner-fenced Store transaction. This prevents split local state, but
+  does not claim cross-system exactly-once delivery: a crash after `sendMessage`
+  acceptance and before the local commit can repeat the response.
 
 ---
 
@@ -148,6 +173,14 @@ only when its canonicalized direct parent is exactly one of those roots. Empty o
 relative `WEAVE_MUX_DIR`/`HOME` roots, path-shaped relative names, deeper
 descendants, non-files, and non-executable candidates are ignored. Ambient
 `$PATH` therefore cannot redirect these launch surfaces.
+
+The Obscura browser child is additionally started with a scrubbed environment:
+only `PATH` and a validated absolute `TMPDIR` are retained for runtime
+compatibility. Ambient `OBSCURA_*`, proxy, certificate, logging, and unrelated
+credential variables therefore cannot change its behaviour or enter the child.
+Weave maps `obscura_allow_internal=true` to
+Obscura's explicit per-process private-network flag; without that policy opt-in,
+both Weave's URL gate and Obscura's redirect/subresource guard remain closed.
 
 ### Liveness pre-check (advisory, fail-open)
 Before typing, `target_alive()` runs a cheap read-only probe (`tmux has-session`,
@@ -466,8 +499,9 @@ time-bounded exception — carried forward as tracked work, never a blanket sile
   [`ROADMAP-v0.2.md`](ROADMAP-v0.2.md)). Optional outbound LLM/remote-libSQL
   connections and human surfaces are explicit operator choices, not local-mesh
   peer exposure.
-- **Cross-machine injection.** Cross-machine *presence* is a roadmap item; pushing
-  keystrokes into a remote host's pane is explicitly out of scope.
+- **Direct remote mux control.** Weave does not expose a network operation that
+  drives another host's mux. A verified cross-machine intent may be committed by
+  the receiver and then trigger that receiver's existing local, consent-gated nudge.
 - **Encryption at rest.** Secrecy relies on Unix file permissions (`0600`), not
   on encrypting the store.
 

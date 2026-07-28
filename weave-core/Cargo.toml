@@ -16,10 +16,11 @@ llm = ["dep:reqwest"]
 # one reqwest copy). Default OFF ⇒ the default build gains zero compiled deps.
 surfaces = ["dep:reqwest"]
 # WL-049 / ADR-0002: obscura governed web access. weave-core holds only the pure
-# web-access policy + SSRF/loopback URL validator (no I/O, no new dep — std + the
-# already-present serde_json suffice). Default OFF ⇒ the default build gains zero
-# compiled deps. The MCP client that spawns the `obscura` binary lives in weave-mcp.
-obscura = []
+# web-access policy + SSRF/loopback URL validator (no I/O); the optional `url`
+# parser keeps its authority semantics aligned with a browser. Default OFF ⇒ the
+# default build gains zero compiled deps. The MCP client that spawns the `obscura`
+# binary lives in weave-mcp.
+obscura = ["dep:url"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -41,6 +42,7 @@ serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = { version = "0.10", optional = true }
 tokio = { version = "1.52.3", features = ["rt", "time"], optional = true }
 toml = "1.1.2"
+url = { version = "2.5", optional = true }
 
 [dependencies.rusqlite]
 version = "0.40.0"

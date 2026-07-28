@@ -124,28 +124,57 @@ impl PullConsent {
     }
 }
 
-/// Sign a cross-store intent's canonical `(from,to,body)` with this session's
+/// Sign a cross-store intent's complete semantic tuple with this session's
 /// configured signing key (only with `--features sign`), returning the hex
 /// signature for `outbox.sig`, or `""` when no key is configured / the feature is
-/// off. A load error is non-fatal (logs to stderr, sends unsigned). The private key
-/// is never logged. Mirror of `main::sign_intent_if_keyed`.
+/// off. A configured key that cannot be loaded fails before enqueue; it is never
+/// silently downgraded to an unsigned intent. Mirror of `main::sign_intent_if_keyed`.
 #[cfg(feature = "sign")]
-fn sign_intent_if_keyed(from: &str, to: &str, body: &str) -> String {
+#[allow(clippy::too_many_arguments)]
+fn sign_intent_if_keyed(
+    from: &str,
+    to: &str,
+    to_host: &str,
+    subject: Option<&str>,
+    body: &str,
+    idempotency_key: Option<&str>,
+    priority: &str,
+    ttl: i64,
+) -> Result<String, String> {
     match sign::load_signing_key() {
-        Ok(Some(key)) => sign::sign_intent(&key, from, to, body),
-        Ok(None) => String::new(),
-        Err(err) => {
-            log(&format!(
-                "could not load signing key (sending unsigned): {err}"
-            ));
-            String::new()
-        }
+        Ok(Some(key)) => Ok(sign::sign_intent_v2(
+            &key,
+            &sign::IntentSignatureFields {
+                from,
+                to,
+                to_host,
+                subject,
+                body,
+                idempotency_key,
+                priority,
+                ttl,
+            },
+        )),
+        Ok(None) => Ok(String::new()),
+        Err(error) => Err(format!(
+            "configured signing key could not be loaded: {error}"
+        )),
     }
 }
 
 #[cfg(not(feature = "sign"))]
-fn sign_intent_if_keyed(_from: &str, _to: &str, _body: &str) -> String {
-    String::new()
+#[allow(clippy::too_many_arguments)]
+fn sign_intent_if_keyed(
+    _from: &str,
+    _to: &str,
+    _to_host: &str,
+    _subject: Option<&str>,
+    _body: &str,
+    _idempotency_key: Option<&str>,
+    _priority: &str,
+    _ttl: i64,
+) -> Result<String, String> {
+    Ok(String::new())
 }
 
 pub fn serve<I: Injector>(
@@ -259,8 +288,6 @@ const MAX_IDENT_LEN: usize = 128;
 
 /// Maximum accepted length (in characters) for a subject line. Subjects are
 /// single-line metadata, not the payload (that's `body`), so they stay short.
-const MAX_SUBJECT_LEN: usize = 256;
-
 /// WL-051 / ADR-0003: the **standing-token budget** for the MCP surface. The
 /// serialized bytes of the default `tools/list` payload must stay under this ceiling
 /// **regardless of how many operations exist** — `token-light` is a first-class
@@ -293,18 +320,13 @@ fn bound_ident(label: &str, raw: &str) -> Result<String, String> {
     Ok(t.to_string())
 }
 
-/// Validate and bound an optional subject line. `None`/blank yields `Ok(None)`;
-/// an over-length subject is rejected with a clear error.
+/// Validate and bound an optional subject line without changing its exact shape.
+/// An explicit empty subject remains distinct from an omitted subject.
 fn bound_subject(raw: Option<&str>) -> Result<Option<String>, String> {
-    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+    match raw {
         None => Ok(None),
         Some(s) => {
-            let n = s.chars().count();
-            if n > MAX_SUBJECT_LEN {
-                return Err(format!(
-                    "'subject' is too long ({n} chars; max {MAX_SUBJECT_LEN})."
-                ));
-            }
+            store::check_subject(Some(s)).map_err(|err| format!("invalid 'subject': {err}"))?;
             Ok(Some(s.to_string()))
         }
     }
@@ -335,8 +357,8 @@ const DANGEROUS_TOOLS: &[&str] = &[
     "weave_send",
     // WL-056 / ADR-0005: cross-machine PUSH receive handler. It WRITES B's inbox
     // (the Tier-2 commit pipeline, A-initiated), so it is a mutating op — gated in
-    // safe HTTP mode exactly like `weave_send`. It is reachable only when the
-    // operator runs `weave serve --write` (which dispatches with `dangerous=true`).
+    // safe general HTTP mode exactly like `weave_send`; the dedicated `/push`
+    // dispatcher admits this one direct operation under a separate credential.
     "weave_push",
     "weave_notify",
     "weave_reply",
@@ -470,6 +492,35 @@ pub fn dispatch_request(
     }
 }
 
+/// Dispatch the dedicated cross-machine receive surface. This deliberately
+/// accepts exactly one operation: a direct `tools/call` for `weave_push`.
+/// Keeping the check outside the general dangerous-tool switch prevents a push
+/// credential from becoming an operator/admin MCP credential.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_push_request(
+    store: &dyn Store,
+    me_default: &Option<String>,
+    pull: &PullConsent,
+    req: &Value,
+    injector: &dyn Injector,
+) -> Option<String> {
+    let id = req.get("id").cloned()?;
+    let allowed = req.get("method").and_then(Value::as_str) == Some("tools/call")
+        && req
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            == Some("weave_push");
+    if !allowed {
+        return Some(reply_err(
+            &id,
+            -32603,
+            "This endpoint accepts only a direct weave_push call.",
+        ));
+    }
+    dispatch_request(store, me_default, None, &[], pull, req, injector, true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_tool(
     store: &dyn Store,
@@ -496,7 +547,7 @@ fn call_tool(
         ),
         "weave_send" => tool_send(store, me_default, nudge_template, args, injector),
         // WL-056 / ADR-0005: cross-machine PUSH receive handler (the A-initiated dual
-        // of the Tier-2 pull-commit). Reached over the bearer-gated `POST /api` surface.
+        // of the Tier-2 pull-commit). Reached over dedicated bearer-gated `POST /push`.
         "weave_push" => tool_push(store, me_default, pull, args, injector),
         "weave_notify" => tool_notify(store, me_default, nudge_template, args, injector),
         "weave_broadcast_notify" => {
@@ -640,13 +691,15 @@ fn tool_send(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
-    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
-    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
-    let subject = subject.as_deref();
     let idempotency_key = args
         .get("idempotencyKey")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    // Automatic memory is environmental output. Keyed events persist the raw
+    // caller body so the same event cannot collide merely because memory changed.
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory || idempotency_key.is_some());
+    let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
+    let subject = subject.as_deref();
     let priority = args
         .get("priority")
         .and_then(|v| v.as_str())
@@ -677,15 +730,37 @@ fn tool_send(
     // than attempt any foreign write (owner-only-writes). No local inbox row, no
     // inject — we cannot reach the recipient's pane across stores; the receiver
     // pulls and commits it on its next drain.
-    if let Some(store_path) = args
-        .get("to_store")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-    {
+    let to_store = match args.get("to_store") {
+        None => None,
+        Some(value) => {
+            let label = value
+                .as_str()
+                .ok_or("'to_store' must be a string route label.")?
+                .trim();
+            if label.is_empty()
+                || label.chars().count() > 256
+                || label.chars().any(char::is_control)
+            {
+                return Err(
+                    "'to_store' must be a nonempty control-free route label (max 256 characters)."
+                        .to_string(),
+                );
+            }
+            Some(label)
+        }
+    };
+    if let Some(_route_label) = to_store {
         if model::is_broadcast(to) {
             return Err(
                 "cross-store broadcast is not supported; send to a named recipient \
                  (Tier-2 is directed-only)."
+                    .to_string(),
+            );
+        }
+        if supersedes.is_some() {
+            return Err(
+                "'supersedes' is not supported with 'to_store' (the predecessor \
+                 belongs to this store, not the remote delivery intent)."
                     .to_string(),
             );
         }
@@ -694,24 +769,42 @@ fn tool_send(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        // Signed identity (2d): sign the canonical (from,to,body) with this
-        // session's key when one is configured (and the `sign` feature is built),
-        // so the receiver can verify `from` is unforgeable. "" otherwise (advisory).
-        let sig = sign_intent_if_keyed(&from, to, &body);
-        let id = store
-            .enqueue_intent(
+        let canonical_priority = model::MessagePriority::parse(priority.unwrap_or("normal"))
+            .as_str()
+            .to_string();
+        let intent_ttl = ttl.unwrap_or(0);
+        let effective_key = idempotency_key
+            .map(str::to_string)
+            .unwrap_or_else(model::mint_trace_id);
+        let sig = sign_intent_if_keyed(
+            &from,
+            to,
+            to_host,
+            subject,
+            &body,
+            Some(&effective_key),
+            &canonical_priority,
+            intent_ttl,
+        )?;
+        let (id, created) = store
+            .enqueue_intent_idempotent(
                 to,
                 to_host,
                 &from,
                 subject,
                 &body,
                 &sig,
-                idempotency_key,
+                Some(&effective_key),
                 trace_id.as_deref(),
-                priority,
-                ttl.unwrap_or(0),
+                Some(&canonical_priority),
+                intent_ttl,
             )
             .map_err(e)?;
+        if !created {
+            return Ok(format!(
+                "Queued cross-store intent #{id} from '{from}' for '{to}' (idempotent replay; no duplicate hook)."
+            ));
+        }
         // WL-036: a queued cross-store intent IS a send ⇒ fire `Send` hooks. The
         // message was NOT delivered locally (no inbox row / inject), but the send
         // event happened. Best-effort; never sinks the queued result.
@@ -724,33 +817,32 @@ fn tool_send(
             id,
         );
         return Ok(format!(
-            "Queued intent #{id} from '{from}' for '{to}' @ {store_path} (delivered on their next drain)."
+            "Queued cross-store intent #{id} from '{from}' for '{to}' (delivered when the recipient drains this sender store)."
         ));
     }
 
-    let mid = store
-        .send(
+    if args.get("to_host").is_some() {
+        return Err("'to_host' requires 'to_store'.".to_string());
+    }
+
+    let (mid, created) = store
+        .send_configured_idempotent(
             &from,
             to,
             subject,
             &body,
             idempotency_key,
             trace_id.as_deref(),
+            priority,
+            supersedes,
+            ttl.unwrap_or(0),
+            false,
         )
         .map_err(e)?;
-    if let Some(p) = priority {
-        let _ = store.set_message_priority(mid, p);
-    }
-    // WL-038: post-stamp the ephemeral expiry after the send (the
-    // `set_message_priority` post-stamp precedent). `ttl` is already cap-validated.
-    if let Some(t) = ttl {
-        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
-    }
-    // WL-037: post-stamp the supersede link after the send (the `set_message_priority`
-    // post-stamp precedent). Authorization (caller == original sender) + id existence
-    // are enforced in `Store::supersede`; a bad id surfaces as an error string.
-    if let Some(old) = supersedes {
-        store.supersede(&from, old, mid).map_err(e)?;
+    if !created {
+        return Ok(format!(
+            "Sent message #{mid} from '{from}' to '{to}' (idempotent replay; no duplicate nudge)."
+        ));
     }
     let dest = if model::is_broadcast(to) {
         "broadcast"
@@ -856,8 +948,8 @@ fn tool_send(
 }
 
 /// WL-056 / ADR-0005: cross-machine PUSH **receive** handler — the A-initiated DUAL
-/// of the Tier-2 pull-commit, reached over the bearer-gated `POST /api` surface
-/// (`--features surfaces` + `weave serve --write`). A sender A on machine 1 POSTs a
+/// of the Tier-2 pull-commit, reached over separately credentialed `POST /push`.
+/// A sender A on machine 1 POSTs a
 /// signed `Intent` here; B (this handler, on machine 2) commits it into **B's OWN**
 /// inbox and lights B's OWN pane — **without B polling**.
 ///
@@ -917,12 +1009,14 @@ fn tool_push(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let priority = args
+    let priority_raw = args
         .get("priority")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(model::default_priority);
+        .unwrap_or("normal");
+    let priority = model::MessagePriority::parse(priority_raw)
+        .as_str()
+        .to_string();
     let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
         Some(t) if !model::ttl_valid(t) => {
             return Err(format!(
@@ -938,16 +1032,14 @@ fn tool_push(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| Some(model::mint_trace_id()));
-    // Idempotency: push has no `pull_cursor`, so dedup rests on the key. The send
-    // path ALWAYS populates it, but defend in depth here too — synthesize a stable
-    // key from `(from, body)` if a keyless push somehow arrives, so a retried POST
-    // never double-commits.
+    // Push has no pull cursor, so the wire event key is mandatory. The CLI always
+    // supplies one (fresh per invocation unless the caller explicitly reuses it).
     let idempotency_key = args
         .get("idempotency_key")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| synth_push_idempotency_key(&from, &body));
+        .ok_or("'idempotency_key' is required for cross-machine push retries.")?;
 
     // The push wire form is an Intent. `id`/`ts` are advisory on the wire — B
     // re-stamps them on commit via `Store::send` (id/ts B-local).
@@ -967,7 +1059,7 @@ fn tool_push(
     };
 
     // Build the receiver VerifyPolicy from Config exactly as the pull path does
-    // (`main::verify_policy`). The dashboard `POST /api` route hands us
+    // (`main::verify_policy`). A receiver surface may hand us
     // `PullConsent::empty()` (advisory), so we do NOT rely on `pull.policy` for the
     // verification decision — we load it fresh, like every other Config-driven MCP
     // tool (the `Config::load()` precedent). This keeps verify-on-commit honest even
@@ -985,12 +1077,17 @@ fn tool_push(
     // the idempotency key. A forged/unsigned-from-trusted intent is rejected (0
     // committed) before any write.
     let source = format!("push:{from}");
-    let committed = store::commit_pulled(store, &to, &source, &policy, vec![intent]).map_err(e)?;
+    let outcome = store::commit_pulled_outcome(store, &to, &source, &policy, vec![intent], None)
+        .map_err(e)?;
 
-    if committed == 0 {
+    if outcome.replayed == 1 {
+        return Ok(format!(
+            "Push from '{from}' to '{to}' already delivered (idempotent replay)."
+        ));
+    }
+    if outcome.committed != 1 {
         return Err(format!(
-            "push from '{from}' to '{to}' rejected at commit (verification/validation failed) \
-             or already delivered (idempotent)."
+            "push from '{from}' to '{to}' rejected at commit (validation failed)."
         ));
     }
 
@@ -1015,21 +1112,6 @@ fn tool_push(
     Ok(format!(
         "Pushed intent from '{from}' delivered to '{to}' (#committed=1, id assigned locally)."
     ))
-}
-
-/// Synthesize a stable idempotency key for a keyless push: `push:<from>:<ts>:<hash>`
-/// where `<hash>` is an FNV-1a digest of the body (no `rand`/hash crate — weave is
-/// dependency-light). Two identical-body pushes from the same sender in the same
-/// second collapse to one row; the send path normally supplies an explicit key, so
-/// this is a defense-in-depth fallback for a keyless retried POST.
-fn synth_push_idempotency_key(from: &str, body: &str) -> String {
-    // FNV-1a 64-bit over the body bytes.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in body.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("push:{from}:{:x}", h)
 }
 
 /// Caller-side consent nudge for a committed push (mirrors `nudge_pulled` but for the
@@ -1155,40 +1237,34 @@ fn tool_notify(
         other => other,
     };
     let trace_id = Some(model::mint_trace_id());
+    let dedup_idle = args
+        .get("dedupIdle")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Persist via the EXISTING send path (no new persistence — notify is a normal
     // stored message; "no reply" is a caller-intent label, not a schema distinction).
     // `store.send` enforces MAX_BODY via check_body, so an oversized body is a clean
     // error (never a panic / partial persist).
-    let mid = store
-        .send(
+    let (mid, created) = store
+        .send_configured_idempotent(
             &from,
             &to,
             subject.as_deref(),
             body,
             idempotency_key,
             trace_id.as_deref(),
+            priority,
+            None,
+            ttl.unwrap_or(0),
+            dedup_idle,
         )
         .map_err(e)?;
-    if let Some(p) = priority {
-        let _ = store.set_message_priority(mid, p);
+    if !created {
+        return Ok(format!(
+            "Notified '{to}' as message #{mid} from '{from}' (idempotent replay; no duplicate nudge)."
+        ));
     }
-    // WL-038: post-stamp the ephemeral expiry after persist.
-    if let Some(t) = ttl {
-        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
-    }
-    // WL-039: opt-in idle-notification dedup. Stamp this ping idle and supersede
-    // this sender's prior UNREAD idle pings to `to` (collapse "still waiting"
-    // pings to the latest). Best-effort post-persist — a dedup failure never sinks
-    // the notify. Never touches a real message or another sender's pings.
-    let dedup_idle = args
-        .get("dedupIdle")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if dedup_idle {
-        let _ = store.supersede_prior_idle(&from, &to, mid);
-    }
-
     // Trace: queued after persist (best-effort, never sinks the path).
     record_delivery_best_effort(
         store,
@@ -1454,16 +1530,36 @@ fn tool_inbox(
     let (rows, remaining) = store
         .inbox(&me, include_read, mark_read, limit)
         .map_err(e)?;
+    Ok(format_inbox_rows(
+        &me,
+        &rows,
+        remaining,
+        include_read,
+        mark_read,
+    ))
+}
+
+/// Canonical human rendering for an already-read inbox snapshot. Kept separate
+/// from the store read so deferred-ack surfaces (Telegram/Slack) can show the
+/// exact rows they peeked and acknowledge only after their external post is
+/// accepted.
+pub fn format_inbox_rows(
+    me: &str,
+    rows: &[model::Message],
+    remaining: i64,
+    include_read: bool,
+    mark_read: bool,
+) -> String {
     if rows.is_empty() {
         let kind = if include_read {
             "messages"
         } else {
             "unread messages"
         };
-        return Ok(format!("Inbox for '{me}': no {kind}."));
+        return format!("Inbox for '{me}': no {kind}.");
     }
     let mut out = format!("Inbox for '{me}' — {} message(s):", rows.len());
-    for m in &rows {
+    for m in rows {
         let bcast = if model::is_broadcast(&m.recipient) {
             " (broadcast)"
         } else {
@@ -1484,6 +1580,14 @@ fn tool_inbox(
             m.body
         ));
     }
+    // `Store::inbox(mark_read=false)` reports the total unread count, including
+    // the rows just rendered. Convert it to the undisplayed remainder so the
+    // footer never double-counts a deferred-ack snapshot.
+    let remaining = if !include_read && !mark_read {
+        remaining.saturating_sub(rows.len() as i64)
+    } else {
+        remaining
+    };
     let mut footer = Vec::new();
     if mark_read {
         footer.push("marked read".to_string());
@@ -1494,7 +1598,7 @@ fn tool_inbox(
     if !footer.is_empty() {
         out.push_str(&format!("\n\n({})", footer.join("; ")));
     }
-    Ok(out)
+    out
 }
 
 /// Tier-2 consent nudge (decision 5, DEFAULT ON) for the MCP inbox drain: after a
@@ -2153,7 +2257,11 @@ fn tool_reply(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required.")?;
-    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory || idempotency_key.is_some());
     // WL-038: optional ephemeral TTL, cap-validated at the seam.
     let ttl = match args.get("ttl").and_then(|v| v.as_i64()) {
         Some(t) if !model::ttl_valid(t) => {
@@ -2165,10 +2273,21 @@ fn tool_reply(
         other => other,
     };
 
-    let mid = store.reply(&from, in_reply_to, &body).map_err(e)?;
-    // WL-038: post-stamp the ephemeral expiry after persist.
-    if let Some(t) = ttl {
-        let _ = store.set_message_expiry(mid, model::expiry_from_ttl(model::now(), t));
+    let (mid, created) = store
+        .reply_configured_idempotent(
+            &from,
+            in_reply_to,
+            &body,
+            idempotency_key,
+            None,
+            ttl.unwrap_or(0),
+            None,
+        )
+        .map_err(e)?;
+    if !created {
+        return Ok(format!(
+            "Replied to #{in_reply_to} as message #{mid} from '{from}' (idempotent replay; no duplicate nudge)."
+        ));
     }
     let mut out = format!("Replied to #{in_reply_to} as message #{mid} from '{from}'.");
 
@@ -2350,6 +2469,106 @@ fn tool_doctor(
         "\n  claude on PATH: {}",
         if claude { "yes" } else { "no" }
     ));
+    #[cfg(feature = "surfaces")]
+    {
+        let cfg = weave_core::config::Config::load();
+        // Federation diagnostics above may wait on several bounded remote
+        // sources. Classify short-lived bridge heartbeats against a fresh clock,
+        // not the earlier peer-liveness snapshot.
+        let bridge_now = weave_core::model::now();
+        for platform in weave_core::model::BridgePlatform::ALL {
+            let view = match platform {
+                weave_core::model::BridgePlatform::Telegram => cfg.telegram_bridge_config_view(),
+                weave_core::model::BridgePlatform::Slack => cfg.slack_bridge_config_view(),
+            };
+            let runtime = store.bridge_runtime_status(platform).map_err(e)?;
+            let active = runtime
+                .as_ref()
+                .is_some_and(|state| state.is_active_at(bridge_now));
+            let stale = runtime
+                .as_ref()
+                .is_some_and(|state| state.is_stale_at(bridge_now));
+            let healthy = view.ready
+                && active
+                && runtime.as_ref().is_some_and(|state| {
+                    let external_route_matches =
+                        weave_core::model::BridgeCursorEnvelope::decode(&state.cursor)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|cursor| {
+                                view.conversation.as_deref() == Some(cursor.external_scope.as_str())
+                            });
+                    state.status == weave_core::model::BridgeRuntimeStatus::Running
+                        && state.last_error_class.is_empty()
+                        && view.identity.as_deref() == Some(state.identity.as_str())
+                        && view.recipient.as_deref() == Some(state.recipient.as_str())
+                        && external_route_matches
+                });
+            let status = if healthy {
+                "healthy"
+            } else if active {
+                "degraded"
+            } else if stale {
+                "stale"
+            } else if view.ready {
+                "ready_inactive"
+            } else if view.configured {
+                "not_ready"
+            } else {
+                "not_configured"
+            };
+            let pending = match view.identity.as_deref() {
+                Some(identity) => store.unread_count(identity).map_err(e)?,
+                None => 0,
+            };
+            out.push_str(&format!(
+                "\n  {} bridge: status={} identity={} recipient={} pending={}",
+                platform.as_str(),
+                status,
+                view.identity.as_deref().unwrap_or("-"),
+                view.recipient.as_deref().unwrap_or("-"),
+                pending
+            ));
+            if !view.issues.is_empty() {
+                let issues = view
+                    .issues
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(" issues={issues}"));
+            }
+            if let Some(state) = runtime {
+                let route_mismatch = view.identity.as_deref() != Some(state.identity.as_str())
+                    || view.recipient.as_deref() != Some(state.recipient.as_str());
+                let cursor_route = weave_core::model::BridgeCursorEnvelope::decode(&state.cursor)
+                    .ok()
+                    .flatten();
+                let external_route_mismatch = cursor_route.as_ref().is_none_or(|cursor| {
+                    view.conversation.as_deref() != Some(cursor.external_scope.as_str())
+                });
+                out.push_str(&format!(
+                    " runtime={} heartbeat={} last_success={} last_delivery={}",
+                    state.status.as_str(),
+                    state.heartbeat_ts,
+                    state.last_success_ts,
+                    state.last_delivery_ts
+                ));
+                if !state.last_error_class.is_empty() {
+                    out.push_str(&format!(" last_error_class={}", state.last_error_class));
+                }
+                if stale {
+                    out.push_str(" stale=true");
+                }
+                if route_mismatch {
+                    out.push_str(" runtime_route_mismatch=true");
+                }
+                if external_route_mismatch {
+                    out.push_str(" runtime_external_route_mismatch=true");
+                }
+            }
+        }
+    }
     if !extra_dbs.is_empty() {
         out.push_str(&format!(
             "\n  federation:     {} extra store(s) ({fed_ok} ok, {fed_skipped} skipped)",
@@ -3091,7 +3310,11 @@ fn tool_ask(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the question).")?;
-    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory || idempotency_key.is_some());
     let subject = bound_subject(args.get("subject").and_then(|v| v.as_str()))?;
     let reply_to = args
         .get("reply_to")
@@ -3109,8 +3332,8 @@ fn tool_ask(
         .map(model::AskKind::parse)
         .unwrap_or_default();
     let options = args.get("options").and_then(|v| v.as_str());
-    let (cid, qid) = store
-        .ask(
+    let (cid, qid, created) = store
+        .ask_idempotent(
             &from,
             &to,
             subject.as_deref(),
@@ -3118,8 +3341,14 @@ fn tool_ask(
             kind,
             options,
             reply_to,
+            idempotency_key,
         )
         .map_err(e)?;
+    if !created {
+        return Ok(format!(
+            "Opened ask {cid} from '{from}' to '{to}' (idempotent replay; no duplicate nudge)."
+        ));
+    }
     // P6: queued trace keyed by the QUESTION message id so `weave_delivery <qid>`
     // works uniformly. Best-effort; never sinks the ask.
     record_delivery_best_effort(
@@ -3143,27 +3372,44 @@ fn routing_anomaly_body(ask_id: &str, expected: &str, actual: &str) -> String {
     format!("ROUTING_ANOMALY: ask for {expected} delivered to {actual} (ask {ask_id})")
 }
 
+fn derived_idempotency_key(key: &str, purpose: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for component in [key.as_bytes(), purpose.as_bytes()] {
+        for byte in component {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("weave:{purpose}:{hash:016x}")
+}
+
 fn report_routing_anomaly(
     store: &dyn Store,
     nudge_template: Option<&str>,
     injector: &dyn Injector,
     ask: &model::Ask,
     actual: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<Option<i64>, String> {
     if actual == ask.askee {
         return Ok(None);
     }
     let body = routing_anomaly_body(&ask.id, &ask.askee, actual);
-    let mid = store
-        .send(
+    let (mid, created) = store
+        .send_idempotent(
             actual,
             &ask.asker,
             Some("ROUTING_ANOMALY"),
             &body,
-            None,
+            idempotency_key,
             None,
         )
         .map_err(e)?;
+    if !created {
+        return Ok(Some(mid));
+    }
     record_delivery_best_effort(
         store,
         mid,
@@ -3204,7 +3450,11 @@ fn tool_answer(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or("'body' is required (the answer).")?;
-    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory);
+    let idempotency_key = args
+        .get("idempotencyKey")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let body = maybe_prefix_body_mcp(&from, body_raw, no_memory || idempotency_key.is_some());
     let cid = resolve_correlation_id(store, args)?;
     let ask = store
         .get_ask(&cid)
@@ -3212,9 +3462,18 @@ fn tool_answer(
         .ok_or_else(|| format!("No tracked ask '{cid}'."))?;
     let asker = ask.asker.clone();
     if from != ask.askee {
-        let anomaly_mid = report_routing_anomaly(store, nudge_template, injector, &ask, &from)
-            .ok()
-            .flatten();
+        let anomaly_key =
+            idempotency_key.map(|key| derived_idempotency_key(key, "routing-anomaly"));
+        let anomaly_mid = report_routing_anomaly(
+            store,
+            nudge_template,
+            injector,
+            &ask,
+            &from,
+            anomaly_key.as_deref(),
+        )
+        .ok()
+        .flatten();
         let suffix = anomaly_mid
             .map(|mid| format!("; routing anomaly reported as #{mid}"))
             .unwrap_or_default();
@@ -3223,7 +3482,14 @@ fn tool_answer(
             ask.askee, from, cid, suffix
         ));
     }
-    let ans_id = store.answer(&from, &cid, &body).map_err(e)?;
+    let (ans_id, created) = store
+        .answer_idempotent(&from, &cid, &body, idempotency_key)
+        .map_err(e)?;
+    if !created {
+        return Ok(format!(
+            "Answered ask {cid} back to '{asker}' as message #{ans_id} (idempotent replay; no duplicate nudge)."
+        ));
+    }
     record_delivery_best_effort(
         store,
         ans_id,
@@ -4163,16 +4429,16 @@ fn tool_catalog() -> Vec<Value> {
     let mut list = json!([
         {
             "name": "weave_send",
-            "description": "Send a message to another agent session. 'to' = a session name, or 'all'/'*' to broadcast. If the recipient is a registered injectable peer (tmux/zellij), a live nudge is pushed into its pane immediately; otherwise it arrives on the recipient's next turn. Cross-store (Tier-2): pass 'to_store' = a path to another store to queue the message as an intent in YOUR OWN outbox; the recipient pulls and commits it on its next drain (no foreign write, no broadcast).",
+            "description": "Send a message to another agent session. 'to' = a session name, or 'all'/'*' to broadcast. If the recipient is a registered injectable peer (tmux/zellij), a live nudge is pushed into its pane immediately; otherwise it arrives on the recipient's next turn. Cross-store (Tier-2): pass 'to_store' as an operator route label to queue a directed intent in YOUR OWN outbox. The label is not persisted and does not select a recipient database; that recipient must pull this sender store explicitly.",
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"Your session name (or omit to use WEAVE_SESSION)."},
                 "to":{"type":"string","description":"Recipient session name, or 'all'."},
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
-                "to_store":{"type":"string","description":"Cross-store: path to the recipient's store. Queues a directed intent in your outbox (next-drain delivery); not valid with broadcast."},
-                "to_host":{"type":"string","description":"Optional host hint for a cross-store intent (advisory)."},
+                "to_store":{"type":"string","description":"Cross-store mode label. Queues a directed intent in your outbox; the value is not persisted and does not select a recipient database. Not valid with broadcast."},
+                "to_host":{"type":"string","description":"Optional receiving host. A nonempty value must exactly match the receiver's normalized host; empty is a wildcard."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
-                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. An exact retry returns the existing message id. Keyed bodies are stored verbatim; automatic memory prefixing is disabled."},
                 "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
                 "supersedes":{"type":"integer","description":"Optional id of a prior message of YOURS this one replaces; the predecessor is marked superseded and hidden from the recipient's unread inbox (kept, flagged, in history). You may only supersede your own messages."},
                 "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400). The message is auto-deleted (delete-on-sweep) after this many seconds and excluded from every read surface; omit for a permanent message."}
@@ -4180,19 +4446,19 @@ fn tool_catalog() -> Vec<Value> {
         },
         {
             "name": "weave_push",
-            "description": "Cross-machine PUSH RECEIVE handler (WL-056 / ADR-0005): accept a signed Intent delivered over the bearer-gated `weave serve --write` POST /api surface and commit it into THIS machine's inbox via the SAME Tier-2 pull-commit pipeline (re-validate, verify signature, Store::send assigns id/ts locally), then light this pane without polling. This is the RECEIVE side (no host) — the A-initiated dual of a Tier-2 pull. To SEND a push to another machine, use the `weave push --to <name> --host <url:port>` CLI verb. Owner-only-writes: the recipient commits its own row; dedup is by idempotency_key.",
+            "description": "Cross-machine PUSH RECEIVE handler (WL-056 / ADR-0005): accept a signed Intent delivered only through separately credentialed POST /push and commit it into THIS machine's inbox via the SAME Tier-2 pull-commit pipeline (re-validate, verify signature, Store::send assigns id/ts locally), then light this pane without polling. The push credential cannot invoke other MCP operations. This is the RECEIVE side (no host); to SEND, use `weave push --to <name> --host <origin>`. Owner-only-writes: the recipient commits its own row; dedup is by idempotency_key.",
             "inputSchema": {"type":"object","properties":{
                 "from":{"type":"string","description":"The sender's session name."},
                 "to":{"type":"string","description":"Recipient session name on THIS machine (directed-only; no broadcast)."},
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
-                "sig":{"type":"string","description":"Optional ed25519 signature over the canonical (from,to,body); verified under this receiver's trust policy on commit."},
-                "to_host":{"type":"string","description":"Optional host hint (advisory)."},
-                "idempotency_key":{"type":"string","description":"Idempotency key; a retried POST with the same key never double-commits. Synthesized from (from,body) if omitted."},
+                "sig":{"type":"string","description":"Optional versioned ed25519 signature. v2 binds from, to, normalized to_host, subject presence/value, body, idempotency key, canonical priority, and TTL; verified under this receiver's trust policy on commit."},
+                "to_host":{"type":"string","description":"Optional receiving host. A nonempty value must exactly match this receiver's normalized host; empty is a wildcard."},
+                "idempotency_key":{"type":"string","description":"Required idempotency key; an exact retried POST succeeds as a replay and never double-commits."},
                 "trace_id":{"type":"string","description":"Optional end-to-end trace id."},
                 "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
                 "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400)."}
-            },"required":["from","to","body"]}
+            },"required":["from","to","body","idempotency_key"]}
         },
         {
             "name": "weave_notify",
@@ -4202,7 +4468,7 @@ fn tool_catalog() -> Vec<Value> {
                 "to":{"type":"string","description":"Recipient session name (point-to-point; broadcast is not supported)."},
                 "subject":{"type":"string"},
                 "body":{"type":"string"},
-                "idempotencyKey":{"type":"string","description":"Optional idempotency key. A duplicate key returns the existing message id instead of creating a new row."},
+                "idempotencyKey":{"type":"string","description":"Optional idempotency key. An exact retry returns the existing message id. Keyed bodies are stored verbatim; automatic memory prefixing is disabled."},
                 "priority":{"type":"string","description":"Message priority: low, normal, high, urgent (default normal)."},
                 "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400); the message is auto-deleted after this many seconds."},
                 "dedupIdle":{"type":"boolean","description":"Idle-notification dedup: mark this as an idle 'still waiting' ping and auto-supersede YOUR prior UNREAD idle pings to this recipient so they collapse to just the latest. Never touches a real message or another sender's pings (default false)."}
@@ -4308,6 +4574,7 @@ fn tool_catalog() -> Vec<Value> {
                 "in_reply_to":{"type":"integer","description":"The message id you're replying to."},
                 "body":{"type":"string"},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."},
+                "idempotencyKey":{"type":"string","description":"Optional event key. An exact retry returns the original reply id without repeating nudges."},
                 "ttl":{"type":"integer","description":"Optional ephemeral TTL in seconds (1..=86400); the reply is auto-deleted after this many seconds."}
             },"required":["in_reply_to","body"]}
         },
@@ -4417,6 +4684,7 @@ fn tool_catalog() -> Vec<Value> {
                 "body":{"type":"string","description":"The question."},
                 "subject":{"type":"string"},
                 "reply_to":{"type":"string","description":"Optional prior correlation_id this ask chains/closes."},
+                "idempotencyKey":{"type":"string","description":"Optional event key. An exact retry returns the original ask ids without repeating nudges."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["to","body"]}
         },
@@ -4428,6 +4696,7 @@ fn tool_catalog() -> Vec<Value> {
                 "correlation_id":{"type":"string","description":"The ask's correlation_id."},
                 "in_reply_to":{"type":"integer","description":"Alternatively, a message id belonging to the ask."},
                 "body":{"type":"string","description":"The answer."},
+                "idempotencyKey":{"type":"string","description":"Optional event key. An exact retry returns the original answer id without repeating nudges."},
                 "no_memory":{"type":"boolean","description":"Skip memory context prefixing."}
             },"required":["body"]}
         },
@@ -5825,18 +6094,9 @@ fn tool_web(
     // (b) Policy gate (deny-by-default).
     let cfg = weave_core::config::Config::load();
     let policy = WebPolicy::from_config(&cfg);
+    webpolicy::check_args(&op_args).map_err(|d| d.message())?;
     let url = op_args.get("url").and_then(|v| v.as_str());
     let op = policy.decide(action, url).map_err(|d| d.message())?;
-
-    // Defense-in-depth: cap every string arg value (they ride a JSON-RPC frame to
-    // the child). Non-string args are forwarded unchanged.
-    if let Some(obj) = op_args.as_object() {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                webpolicy::check_arg(k, s).map_err(|d| d.message())?;
-            }
-        }
-    }
 
     // (c) Optional lease: when a `lease_ttl` is supplied, reserve a per-host lease so
     // concurrent sessions can mutually-exclude / rate-limit on a target. Released
@@ -5856,8 +6116,14 @@ fn tool_web(
     // forward and stamp it terminally after (the append-only event log is the trail).
     let audit = args.get("audit").and_then(|v| v.as_bool()).unwrap_or(false);
     let job_id = if audit {
+        // Keep paths, queries, fragments, and any other URL detail out of durable
+        // audit rows. The validated host is sufficient to identify the governed
+        // resource; the full request still goes only to the child protocol.
+        let audit_target = url
+            .and_then(webpolicy::url_host)
+            .unwrap_or_else(|| op.name().to_string());
         let spec = model::JobSpec {
-            title: format!("web {} {}", op.name(), url.unwrap_or("")),
+            title: format!("web {} {audit_target}", op.name()),
             description: None,
             kind: Some("web".to_string()),
             owner: Some(me.clone()),
@@ -5866,7 +6132,7 @@ fn tool_web(
             prompt: None,
             correlation_id: None,
             source_kind: Some("weave_web".to_string()),
-            source_id: url.map(str::to_string),
+            source_id: url.map(|_| audit_target),
             scope: None,
             visibility: None,
             deadline_at: None,
@@ -5895,7 +6161,9 @@ fn tool_web(
     if let Some(jid) = job_id {
         let (state, note) = match &outcome {
             Ok(_) => (model::JobState::Completed, "web op ok".to_string()),
-            Err(e) => (model::JobState::Failed, format!("web op failed: {e}")),
+            // Child errors may echo target paths or query strings. The caller gets
+            // the live error, but the durable audit trail records only the state.
+            Err(_) => (model::JobState::Failed, "web op failed".to_string()),
         };
         let patch = model::JobPatch {
             state: Some(state),
@@ -6047,6 +6315,7 @@ mod tests {
     struct RecordingInjector {
         spawn_calls: Mutex<Vec<SpawnRecord>>,
         kill_calls: Mutex<Vec<Target>>,
+        inject_calls: Mutex<Vec<String>>,
         /// The target id the fake mux "echoes" back from a spawn (empty ⇒ none).
         echo_target: String,
         detect_mux: Mux,
@@ -6062,7 +6331,8 @@ mod tests {
         fn target_alive(&self, _t: &Target) -> bool {
             true
         }
-        fn inject_mode(&self, _t: &Target, _b: &str, _m: Nudge) -> anyhow::Result<bool> {
+        fn inject_mode(&self, _t: &Target, body: &str, _m: Nudge) -> anyhow::Result<bool> {
+            self.inject_calls.lock().unwrap().push(body.to_string());
             Ok(true)
         }
         fn capability(&self, _t: &Target) -> Capability {
@@ -6153,6 +6423,100 @@ mod tests {
             inj,
             true,
         )
+    }
+
+    #[test]
+    fn keyed_mutation_replays_do_not_repeat_injection() {
+        let _env = weave_core::testenv::lock_env();
+        let empty_config =
+            std::env::temp_dir().join(format!("weave-mcp-keyed-config-{}", std::process::id()));
+        let _xdg = weave_core::testenv::EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            empty_config.to_string_lossy().as_ref(),
+        );
+        let st = store();
+        st.register_peer("a", "tmux", "%1", "", None).unwrap();
+        let injector = RecordingInjector {
+            detect_mux: Mux::Tmux,
+            ..RecordingInjector::default()
+        };
+
+        let send = json!({
+            "from":"bridge", "to":"a", "body":"hello", "no_memory":true,
+            "idempotencyKey":"bridge-event-send"
+        });
+        call("weave_send", send.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_send", send, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 1);
+
+        let ask = json!({
+            "from":"bridge", "to":"a", "body":"question", "no_memory":true,
+            "idempotencyKey":"bridge-event-ask"
+        });
+        call("weave_ask", ask.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_ask", ask, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 2);
+
+        let (cid, _) = st
+            .ask(
+                "a",
+                "bridge",
+                None,
+                "answer me",
+                model::AskKind::FreeText,
+                None,
+                None,
+            )
+            .unwrap();
+        let answer = json!({
+            "from":"bridge", "correlation_id":cid, "body":"answer", "no_memory":true,
+            "idempotencyKey":"bridge-event-answer"
+        });
+        call("weave_answer", answer.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_answer", answer, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 3);
+
+        let root = st
+            .send("a", "bridge", None, "reply to me", None, None)
+            .unwrap();
+        let reply = json!({
+            "from":"bridge", "in_reply_to":root, "body":"reply", "no_memory":true,
+            "idempotencyKey":"bridge-event-reply"
+        });
+        call("weave_reply", reply.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_reply", reply, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 4);
+
+        let notify = json!({
+            "from":"bridge", "to":"a", "body":"ping",
+            "idempotencyKey":"bridge-event-notify"
+        });
+        call("weave_notify", notify.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_notify", notify, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 5);
+
+        let cross_store = json!({
+            "from":"bridge", "to":"remote", "body":"federated", "no_memory":true,
+            "to_store":"remote.db", "idempotencyKey":"bridge-event-cross-store"
+        });
+        call("weave_send", cross_store.clone(), st.as_ref(), &injector).unwrap();
+        let replay = call("weave_send", cross_store, st.as_ref(), &injector).unwrap();
+        assert!(replay.contains("idempotent replay"));
+        assert_eq!(st.outbox_all(10).unwrap().len(), 1);
+        assert_eq!(injector.inject_calls.lock().unwrap().len(), 5);
+
+        assert_eq!(st.all_messages(20).unwrap().len(), 7);
+        assert_eq!(
+            st.list_asks("bridge", model::AskRole::Any, 10)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[cfg(feature = "llm")]
@@ -6685,7 +7049,10 @@ mod tests {
             &inj,
         )
         .expect_err("SSRF target must be refused");
-        assert!(err.contains("SSRF guard"), "got: {err}");
+        assert!(
+            err.contains("internal/loopback/private host"),
+            "expected internal-host refusal, got: {err}"
+        );
     }
 
     #[cfg(feature = "obscura")]
@@ -6993,6 +7360,33 @@ mod tests {
         // No spawn/kill ever fired — the gate blocks before call_tool.
         assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
         assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+    }
+
+    #[test]
+    fn push_dispatcher_exposes_only_direct_weave_push() {
+        let st = store();
+        let inj = RecordingInjector::default();
+        for request in [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weave_send","arguments":{"from":"spoofed","to":"victim","body":"no"}}}),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weave","arguments":{"mode":"call","name":"weave_push","arguments":{}}}}),
+        ] {
+            let reply = dispatch_push_request(st.as_ref(), &None, &pull_consent(), &request, &inj)
+                .expect("request has an id");
+            let value: Value = serde_json::from_str(&reply).unwrap();
+            assert!(value.get("error").is_some(), "{value}");
+        }
+        assert!(st.inbox("victim", false, false, 10).unwrap().0.is_empty());
+
+        let direct = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"weave_push","arguments":{}}
+        });
+        let reply =
+            dispatch_push_request(st.as_ref(), &None, &pull_consent(), &direct, &inj).unwrap();
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["result"]["isError"], true, "{value}");
+        assert!(value.get("error").is_none(), "{value}");
     }
 
     // ---- WL-050 / ADR-0003 token-light progressive-disclosure MCP -----------
@@ -7377,5 +7771,31 @@ mod tests {
             verdict_to_stage("anything_else"),
             (DeliveryStage::Queued, DeliveryOutcome::Ok)
         );
+    }
+
+    #[test]
+    fn nonmarking_inbox_formatter_reports_only_undisplayed_unread_rows() {
+        let row = model::Message {
+            id: 1,
+            ts: 1,
+            sender: "alice".into(),
+            recipient: "bridge".into(),
+            subject: None,
+            body: "hello".into(),
+            in_reply_to: None,
+            idempotency_key: None,
+            trace_id: None,
+            priority: "normal".into(),
+            superseded_by: None,
+            expires_at: None,
+            kind: Some("message".into()),
+            request_priority: None,
+            request_ttl: None,
+            request_supersedes: None,
+            request_dedup_idle: None,
+        };
+        let rendered = format_inbox_rows("bridge", &[row], 2, false, false);
+        assert!(rendered.contains("1 more unread"), "{rendered}");
+        assert!(!rendered.contains("2 more unread"), "{rendered}");
     }
 }
