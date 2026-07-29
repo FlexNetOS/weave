@@ -470,15 +470,41 @@ fn codex_report(opts: &CodexTools) -> CodexDoctorReport {
 }
 
 fn repo_file(rel: &str) -> bool {
-    repo_root()
-        .map(|root| root.join(rel).is_file())
+    let Some(root) = repo_root() else {
+        return false;
+    };
+    if root.join(rel).is_file() {
+        return true;
+    }
+    // Agent configuration is intentionally shipped as a compressed sidecar in
+    // the current repository layout. Doctor must report the durable asset as
+    // present without extracting it into the worktree or treating an archive
+    // as an executable config path.
+    let archive = root.join(".codex.tar.xz");
+    if !archive.is_file() {
+        return false;
+    }
+    let Some(archive) = archive.to_str() else {
+        return false;
+    };
+    Command::new("tar")
+        .args(["-tJf", archive])
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|entry| entry.trim_end_matches('/') == rel)
+        })
         .unwrap_or(false)
 }
 
 fn repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join("Cargo.toml").is_file() && dir.join(".codex/config.toml").is_file() {
+        if dir.join("Cargo.toml").is_file()
+            && (dir.join(".codex/config.toml").is_file() || dir.join(".codex.tar.xz").is_file())
+        {
             return Some(dir);
         }
         if !dir.pop() {
