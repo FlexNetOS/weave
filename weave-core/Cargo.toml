@@ -21,6 +21,13 @@ surfaces = ["dep:reqwest"]
 # default build gains zero compiled deps. The MCP client that spawns the `obscura`
 # binary lives in weave-mcp.
 obscura = ["dep:url"]
+# A2A (Agent2Agent) v1.0 interop adapter. Default OFF and strictly additive: it
+# maps `Intent` <-> an A2A `Message` plus the JSON-RPC 2.0 `message/send`
+# envelope using the `serde`/`serde_json` already in-tree, so the default build
+# gains zero compiled deps. The SQLite-mailbox transport and the native `Intent`
+# wire format are untouched — interop is an extra representation, not a
+# replacement.
+a2a = []
 
 [dependencies]
 anyhow = "1.0.102"

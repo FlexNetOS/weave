@@ -19,3 +19,6 @@ pub mod llm;
 
 #[cfg(feature = "sign")]
 pub mod sign;
+
+#[cfg(feature = "a2a")]
+pub mod a2a;
