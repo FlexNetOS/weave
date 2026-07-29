@@ -6332,7 +6332,10 @@ mod tests {
             true
         }
         fn inject_mode(&self, _t: &Target, body: &str, _m: Nudge) -> anyhow::Result<bool> {
-            self.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(body.to_string());
+            self.inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(body.to_string());
             Ok(true)
         }
         fn capability(&self, _t: &Target) -> Capability {
@@ -6358,21 +6361,27 @@ mod tests {
             argv_child: &[String],
             window: bool,
         ) -> anyhow::Result<SpawnOutcome> {
-            self.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(SpawnRecord {
-                mux,
-                cwd: cwd.to_string(),
-                name: name.to_string(),
-                cert: cert.to_string(),
-                argv: argv_child.to_vec(),
-                window,
-            });
+            self.spawn_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(SpawnRecord {
+                    mux,
+                    cwd: cwd.to_string(),
+                    name: name.to_string(),
+                    cert: cert.to_string(),
+                    argv: argv_child.to_vec(),
+                    window,
+                });
             Ok(SpawnOutcome {
                 launched: true,
                 target: self.echo_target.clone(),
             })
         }
         fn kill(&self, target: &Target) -> anyhow::Result<bool> {
-            self.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(target.clone());
+            self.kill_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(target.clone());
             Ok(true)
         }
     }
@@ -6448,7 +6457,14 @@ mod tests {
         call("weave_send", send.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_send", send, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
 
         let ask = json!({
             "from":"bridge", "to":"a", "body":"question", "no_memory":true,
@@ -6457,7 +6473,14 @@ mod tests {
         call("weave_ask", ask.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_ask", ask, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 2);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
 
         let (cid, _) = st
             .ask(
@@ -6477,7 +6500,14 @@ mod tests {
         call("weave_answer", answer.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_answer", answer, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 3);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            3
+        );
 
         let root = st
             .send("a", "bridge", None, "reply to me", None, None)
@@ -6489,7 +6519,14 @@ mod tests {
         call("weave_reply", reply.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_reply", reply, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 4);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            4
+        );
 
         let notify = json!({
             "from":"bridge", "to":"a", "body":"ping",
@@ -6498,7 +6535,14 @@ mod tests {
         call("weave_notify", notify.clone(), st.as_ref(), &injector).unwrap();
         let replay = call("weave_notify", notify, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 5);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            5
+        );
 
         let cross_store = json!({
             "from":"bridge", "to":"remote", "body":"federated", "no_memory":true,
@@ -6508,7 +6552,14 @@ mod tests {
         let replay = call("weave_send", cross_store, st.as_ref(), &injector).unwrap();
         assert!(replay.contains("idempotent replay"));
         assert_eq!(st.outbox_all(10).unwrap().len(), 1);
-        assert_eq!(injector.inject_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 5);
+        assert_eq!(
+            injector
+                .inject_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            5
+        );
 
         assert_eq!(st.all_messages(20).unwrap().len(), 7);
         assert_eq!(
@@ -7186,7 +7237,10 @@ mod tests {
             "result discloses the cert: {out}"
         );
 
-        let calls = inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = inj
+            .spawn_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1, "exactly one spawn fired");
         let rec = &calls[0];
         assert_eq!(rec.mux, Mux::Tmux);
@@ -7230,7 +7284,10 @@ mod tests {
             "error explains the allowlist denial: {err}"
         );
         assert!(
-            inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
+            inj.spawn_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "no spawn fires when the cwd is denied"
         );
         assert!(st.get_peer("kid").unwrap().is_none(), "no phantom peer row");
@@ -7264,7 +7321,11 @@ mod tests {
         )
         .expect_err("cannot spawn over a live peer");
         assert!(err.contains("already registered"), "{err}");
-        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(inj
+            .spawn_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     /// `weave_kill_peer` for an unknown peer ⇒ Err (isError), no kill call.
@@ -7280,7 +7341,11 @@ mod tests {
         )
         .expect_err("unknown peer must error");
         assert!(err.contains("no registered peer"), "{err}");
-        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(inj
+            .kill_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     /// `weave_kill_peer` happy path: a registered tmux peer is killed via the trait.
@@ -7300,7 +7365,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("Killed"), "{out}");
-        let calls = inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = inj
+            .kill_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].mux, Mux::Tmux);
         assert_eq!(calls[0].id, "%3");
@@ -7322,7 +7390,10 @@ mod tests {
             "graceful unsupported message: {out}"
         );
         assert!(
-            inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
+            inj.kill_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "no kill argv runs on an unsupported mux"
         );
     }
@@ -7358,8 +7429,16 @@ mod tests {
             );
         }
         // No spawn/kill ever fired — the gate blocks before call_tool.
-        assert!(inj.spawn_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
-        assert!(inj.kill_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(inj
+            .spawn_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        assert!(inj
+            .kill_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]

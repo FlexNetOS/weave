@@ -2806,7 +2806,9 @@ mod tests {
                     // that can keep these distinct.
                     local.push(new_ask_id(7));
                 }
-                let mut g = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut g = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for id in local {
                     assert!(
                         g.insert(id.clone()),
@@ -2819,7 +2821,9 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(
-            seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
             THREADS * PER_THREAD,
             "every concurrently-minted id is unique"
         );
