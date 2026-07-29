@@ -8,7 +8,7 @@
 //!
 //! Protocol (mirrors the http.rs hand-rolled framing precedent):
 //!   1. lazy spawn on first op; resolve `obscura` to a TRUSTED absolute path via
-//!      `weave_inject::resolve_trusted` (never ambient `$PATH`);
+//!      `weave_inject::resolve_trusted_program` (never ambient `$PATH`);
 //!   2. handshake: send `initialize`, read one reply, send the `notifications/
 //!      initialized` notification (no id, no reply);
 //!   3. per op: send `tools/call {name:"browser_<op>", arguments:{…}}`, read
@@ -32,7 +32,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use weave_core::config::Config;
-use weave_inject::{resolve_trusted, spawn_arg_ok, MAX_SPAWN_ARGS};
+use weave_inject::{resolve_trusted_program, spawn_arg_ok, MAX_SPAWN_ARGS};
 
 /// Default per-op read timeout (seconds). Web navigation is slower than mux
 /// injection (whose cap is 5s), so this defaults higher; clamped to a sane range.
@@ -124,7 +124,7 @@ impl ObscuraClient {
     /// resolved; child stderr discarded (never logged — may carry proxy creds).
     fn spawn(cfg: &Config) -> Result<ObscuraClient, String> {
         let bin = cfg.obscura_bin.as_deref().unwrap_or("obscura");
-        let abs = resolve_trusted(bin).ok_or_else(|| {
+        let abs = resolve_trusted_program(bin).ok_or_else(|| {
             "obscura binary not found in a trusted directory (set obscura_bin / WEAVE_OBSCURA_BIN \
              to an installed `obscura`)"
                 .to_string()

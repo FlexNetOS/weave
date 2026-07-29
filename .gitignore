@@ -16,3 +16,10 @@ cc-switch-main.zip
 .handoff/locks/
 .handoff/run/
 .handoff/workspaces/main/scratch/
+
+# handoff continuity: binary ledger cache + migration artifacts are gitignored
+# (committed truth = .handoff/ledger.events.jsonl — ADR-0018 D1 / HFTASK-0067)
+.handoff/**/*.db-wal
+.handoff/**/*.db-shm
+.handoff/**/*.sqlite.bak
+.handoff/**/*.redb.tmp

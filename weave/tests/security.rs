@@ -21,6 +21,8 @@
 
 mod common;
 
+#[cfg(feature = "llm")]
+use common::serve_llm_responses;
 use common::{run, run_env, run_in_cwd, run_ok, run_ok_env, McpServer, TestDb};
 #[cfg(feature = "surfaces")]
 use common::{scrub_env, weave_bin};
@@ -188,6 +190,70 @@ fn mcp_send_with_oversized_identity_is_rejected() {
         inbox.contains("empty"),
         "a rejected oversized send must not persist any message: {inbox:?}"
     );
+}
+
+/// Provider responses are untrusted ingress. The real JSON-RPC MCP path must
+/// bound successful response bodies before decode and must never reflect an
+/// endpoint path/query, bearer key, or provider body through `isError` results.
+#[cfg(feature = "llm")]
+#[test]
+fn mcp_llm_provider_errors_and_oversized_responses_are_bounded_and_secret_free() {
+    let api_key = "black-box-llm-api-key-secret";
+    let endpoint_canary = "endpoint-path-query-canary";
+    let provider_canary = "provider-private-body-canary";
+    let oversized = serde_json::json!({
+        "choices": [{"message": {"content": provider_canary.repeat(3_000)}}]
+    })
+    .to_string();
+    assert!(oversized.len() > 64 * 1024, "fixture must exceed 64 KiB");
+    let (base_endpoint, _requests, provider) = serve_llm_responses(vec![
+        ("502 Bad Gateway", format!("{api_key} {provider_canary}")),
+        ("200 OK", oversized),
+    ]);
+    let endpoint = format!("{base_endpoint}/{endpoint_canary}?secret={endpoint_canary}");
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn_env(
+        &db,
+        &[
+            ("WEAVE_LLM_ENDPOINT", &endpoint),
+            ("WEAVE_LLM_API_KEY", api_key),
+            ("WEAVE_LLM_TIMEOUT_SECS", "2"),
+        ],
+    );
+
+    let (failed, failure_text) = mcp.call_tool(
+        "weave_summarize_text",
+        serde_json::json!({"text": "exercise provider failure"}),
+    );
+    assert!(failed, "provider failure must set isError: {failure_text}");
+    assert!(failure_text.contains("HTTP 502"), "{failure_text}");
+
+    let (oversized_err, oversized_text) = mcp.call_tool(
+        "weave_summarize_text",
+        serde_json::json!({"text": "exercise provider response cap"}),
+    );
+    assert!(
+        oversized_err,
+        "oversized provider response must set isError: {oversized_text}"
+    );
+    assert!(oversized_text.contains("65536"), "{oversized_text}");
+
+    for (label, text) in [
+        ("provider failure", failure_text.as_str()),
+        ("oversized response", oversized_text.as_str()),
+    ] {
+        assert!(
+            text.len() < 256,
+            "{label} error is unbounded: {}",
+            text.len()
+        );
+        for secret in [api_key, endpoint_canary, provider_canary] {
+            assert!(!text.contains(secret), "{label} leaked {secret}: {text}");
+        }
+    }
+
+    mcp.shutdown();
+    provider.join().unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -257,11 +257,13 @@ takes no `inject` dependency).
 ### `inject.rs` — native injector
 
 The `Mux` enum, `Target { mux, id }`, environment detection, the pure
-per-mux command tables, and the runner. Detailed in §3. Also exposes the pure
-`capability(&Target) -> Capability` verdict (`Live` / `RegisteredNotAlive` /
-`NotInjectable`) composed from `injectable()` + the liveness probe — this is what
-`weave connect` / `weave_connect` report (§4). It adds no new spawn path: the
-probe is the existing fail-open `target_alive` and the verdict is a pure value.
+per-mux command tables, and the runner. Detailed in §3. Also exposes the
+`capability(&Target) -> Capability` verdict (`Live` / `TransportUnavailable` /
+`RegisteredNotAlive` / `NotInjectable`) composed from `injectable()`, trusted mux
+resolution, and the liveness probe — this is what `weave connect` /
+`weave_connect` report (§4). It adds no new spawn path: a bounded probe separates
+missing/unlaunchable transport from pane absence, while pane liveness retains the
+existing fail-open `target_alive` semantics.
 
 ### `mcp.rs` — MCP server
 
@@ -704,14 +706,40 @@ binds the caller's own validated identity, so there is no argument path to
 overwrite another peer's row. All three capture the process `pid` + `host`
 (§6) for liveness.
 
+**Unique per-session identity (WL-084).** A *guessed* identity —
+`basename(cwd)` with no config/`$WEAVE_SESSION` — can collide: two sessions in
+same-named directories (or fleet teammates sharing one checkout) resolve the
+same name, and pre-WL-084 the second silently re-bound the first one's pane.
+The SessionStart hook now stores the launcher's per-session id (the Claude
+Code payload's `session_id`) in `peers.client_session` and classifies a
+same-name registration with the pure `store::registration_conflict`:
+*SameSession* (matching session key, or the same live client pid on this
+host) updates the row in place; *Reusable* (stale/dead row) reclaims the name
+— restart continuity; *LiveOther* **never steals** — the session registers
+under a deterministic `name-2`/`name-3` alias (`model::suffixed_name`,
+salted fallback past `MAX_UNIQUIFY_TRIES`). Later hook events resolve their
+row **by session key first**, so a uniquified session drains its own inbox
+(and a key-resolved identity counts as explicit — safe to mark read). The
+assigned name is announced on SessionStart stdout (context injection) and
+best-effort exported as `WEAVE_SESSION` via `$CLAUDE_ENV_FILE`; the MCP
+server lazily re-pins a guessed default to the row owned by its own client
+process. Presence stores the first **long-lived ancestor** of hook and one-shot
+CLI `attach` processes (`store::client_pid`, `/proc` walk, `WEAVE_CLIENT_PID`
+override) — never the dying helper process itself.
+
 **Connect handshake.** Before sending, a caller can probe reachability with
 `weave connect --to <peer>` / `weave_connect`. It looks up the peer, builds a
-`Target`, and reports the pure `inject::capability()` verdict — `Live`,
-`RegisteredNotAlive`, or `NotInjectable`. This **reuses the existing injector**
-(no new injector, no new spawn path): the verdict is computed from `injectable()`
-plus the fail-open liveness probe. A not-alive or non-injectable verdict is **not
-an error** — those messages still arrive via the recipient's next store drain;
-only a non-existent peer is an error.
+`Target`, and reports the `inject::capability()` verdict — `Live`,
+`TransportUnavailable`, `RegisteredNotAlive`, or `NotInjectable`. This **reuses
+the existing injector** (no new injector, no new spawn path): the verdict is
+computed from `injectable()`, trusted mux resolution, and a bounded read-only
+launch/liveness probe. An unavailable, not-alive, or non-injectable verdict is
+**not an error** — those messages still arrive via the recipient's next store
+drain; only a non-existent peer is an error. Trusted resolution requires an
+executable regular file (not merely `is_file()`), and `Live` additionally requires
+the current process to launch the probe successfully. Diagnostics keep the dimensions orthogonal:
+`TransportUnavailable` means `reachable=false` while pane liveness stays fail-open
+rather than being falsely classified absent.
 
 Send path (MCP `weave_send`, mirrored by the `weave send` CLI):
 
@@ -741,11 +769,12 @@ existing TTL heuristic.
 
 When weave is wired into Claude Code's lifecycle hooks, the CLI subcommand
 `weave hook <event>` runs at session events. Each hook reads the event JSON on
-stdin (for `cwd`), resolves the session identity, and acts:
+stdin (for `cwd` + `session_id`), resolves the session identity — config >
+session-key row > basename guess (WL-084, §4) — and acts:
 
 | Hook event | Claude Code trigger | Action |
 |---|---|---|
-| `session` | `SessionStart` | `detect_target()` + `register_peer_full(name, mux, id, cwd, pid, host)` — the session becomes an injectable peer, capturing its PID + host for liveness (§6). Then sets `turn_state = pending_first_turn` (P5). |
+| `session` | `SessionStart` | `detect_target()` + WL-084 conflict classification (§4) + `register_peer_full(name, mux, id, cwd, client_pid, host, …, session key)` — the session becomes an injectable peer under a collision-free name, presence keyed to its long-lived client process (§6). Announces the assigned identity on stdout and best-effort exports `WEAVE_SESSION` via `$CLAUDE_ENV_FILE`. Then sets `turn_state = pending_first_turn` (P5). |
 | `prompt` | `UserPromptSubmit` | Drain unread (`inbox` with `mark_read`) and print each to **stdout**, which Claude Code folds into the agent's context. Then sets `turn_state = working` (P5). |
 | `stop` | `Stop` | Same drain as `prompt`. Then sets `turn_state = idle` (P5). |
 | `notification` | `Notification` | Sets `turn_state = awaiting_input` (P5 — activated this previously-reserved arm). |

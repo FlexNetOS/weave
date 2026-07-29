@@ -1,5 +1,84 @@
 # Changelog
 
+## [Unreleased] — fix: trusted runtime health and honest capability reporting
+
+- Trusted mux/program resolution now includes `$HOME/.nix-profile/toolbin`
+  alongside the conventional Nix profile `bin`, so LifeOS/Nix-installed Zellij
+  can be spawned and injected without an otherwise-redundant `WEAVE_MUX_DIR`.
+  Empty/relative roots and path-shaped relative commands are ignored; a bare
+  command resolves from one trusted root, while an absolute command must have
+  that root as its canonical direct parent. Trusted candidates must be executable
+  regular files, and capability now requires a real bounded read-only probe;
+  neither a mode-0644 lookalike nor unusable execute bits can produce a false
+  `Live` verdict before failing at injection.
+- `connect`/doctor capability checks no longer promise `Live` when the mux
+  executable is missing, unlaunchable, exits non-zero, produces a truncated
+  inventory, or times out; they report `transport_unavailable` and preserve
+  durable next-turn delivery. Probe output is bounded and drained concurrently;
+  process-tree cleanup plus an EOF-independent capture stop prevents inherited
+  pipes from extending the probe deadline. Pane liveness remains
+  fail-open/orthogonal while transport reachability is false.
+- `connect` is explicitly read-only in CLI and MCP: it probes and reports only,
+  without queuing a message or mutating inbox state.
+- One-shot `register`, `attach`, `scan`, and `sessions --watch` record only an
+  explicitly supplied positive `WEAVE_CLIENT_PID`; otherwise they use TTL
+  presence rather than persisting the short-lived command's PID.
+- Lifecycle hooks now require an explicit configured identity, strict session-key
+  ownership, or one unique same-host client-PID row before consuming messages or
+  mutating a peer. Guessed basenames are peek-only, hook stdin is capped at 1 MiB,
+  invalid UTF-8 prefixes are discarded, and oversized PreToolUse input produces
+  an explicit deny instead of bypassing the approval decision.
+- Worker dispatch validates its complete execution plan before claiming, uses an
+  atomic queued-only claim on both backends, bounds argv/environment/leases/
+  capture/result payloads, and owns the runner process group. Exit and timeout
+  cleanup is independent of descendant-held pipe EOF; every post-claim failure is
+  fenced into a terminal result instead of leaving a job stuck `running`.
+- The feature-aware CLI/TUI command ledger now includes the `obscura`-gated
+  `web` command, so maximal builds enforce the same help, behavior, docs, status,
+  and risk metadata contract as the default command surface.
+
+## [Unreleased] — feat: collision-proof per-session identity (WL-084)
+
+- Every agent session now launches with a unique mesh identity. The SessionStart
+  hook classifies a same-name registration (`RegisterConflict`): a row owned by
+  THIS launcher session (matching `session_id` key, or the same live client PID
+  when one/both session keys are absent) is updated in place; different nonempty
+  keys remain distinct even under one host PID. A dead/stale row is reclaimed
+  (name continuity across restarts); a row held by another LIVE session is
+  **never stolen** — the new
+  session registers under a deterministic `name-2`/`name-3` alias instead.
+  Pre-WL-084, the second same-basename session silently re-bound the first
+  one's pane and stole its messages.
+- New `peers.client_session` column (both backends, idempotent migration):
+  the launcher's per-session id (Claude Code hook `session_id`), so every hook
+  event of a session resolves to the SAME row even when the alias was
+  uniquified — prompt/stop drains now deliver the right inbox by key, and a
+  key-resolved identity counts as explicit (safe to mark read). Empty keys
+  preserve the stored mapping (CLI/spawn callers can't wipe it). Surfaced as
+  `client_session` in `peers --json`.
+- SessionStart announces the assigned identity on stdout (context injection)
+  and best-effort appends `export WEAVE_SESSION='<name>'` to `$CLAUDE_ENV_FILE`
+  so CLI sends from inside the session resolve the same name.
+- The MCP server lazily re-pins a GUESSED default identity to the row owned by
+  its own client process (`serve` gained `me_default_is_guess`), so MCP tools
+  agree with the hooks even when the server boots before SessionStart.
+
+## [Unreleased] — fix: hook presence tracked the dying hook process (WL-084)
+
+- `weave hook session` stored its OWN pid, which exits milliseconds later —
+  every hook-registered peer read `[stale] process_dead` moments after
+  registration. Presence now tracks the first long-lived ancestor of the hook
+  (the `claude`/agent client process) via a dependency-free `/proc` ancestry
+  walk (`WEAVE_CLIENT_PID` overrides; non-Linux falls back to TTL presence).
+
+## [Unreleased] — fix: ignore exited zellij sessions in liveness
+
+- Fixed zellij liveness detection so `zellij list-sessions` rows marked
+  `(EXITED - attach to resurrect)` no longer make `weave connect`, `peers`,
+  or delivery planning report a false live/injectable target.
+- Added a regression test for the observed exited/current zellij session listing
+  shape while preserving live/current zellij sessions as injectable.
+
 ## [Unreleased] — test: deepen command-surface coverage gate (WL-083)
 
 - Expanded the enforced `weave tui --json --pane commands` ledger from MCP/status metadata to a command coverage contract: every top-level command now carries help-smoke, behavior coverage, docs surface, TUI exposure, and risk/write classification fields.
@@ -675,6 +754,32 @@
   `max_tokens` for safety.
 - **Tests:** store round-trip tests for both backends; unconfigured-endpoint and
   secret-redaction tests for the LLM module.
+
+### Fixed
+- **TLS + feature propagation:** optional `reqwest` clients now compile with the
+  rustls/webpki-roots backend, and the top-level `llm` feature also enables the
+  MCP LLM handlers. The default build still compiles neither `reqwest` nor rustls.
+- **MCP:** `weave_thread_summarize` and `weave_summarize_text` now call the
+  configured provider; thread summaries use one shared, display-limit-independent
+  200-message snapshot and refresh the durable cache, retain a good cache on
+  refresh failure, persist the effective model name, reject missing threads, and
+  are advertised only in `llm` builds.
+- **config/client hardening:** all five documented `WEAVE_LLM_*` overlays now take
+  effect through `Config::load`; input caps count Unicode scalars and clamp to
+  `1..=16000`, request timeouts clamp to `1..=300` seconds, empty provider results
+  fail loudly, redirects are refused, and provider error bodies, credentials, and
+  endpoint/Location URLs are not echoed. Raw responses are bounded to 64 KiB
+  before JSON decode; summary output is bounded to 16,000 Unicode scalars,
+  whitespace-normalized to one paragraph, and rejected on non-whitespace controls.
+- **cache correctness (both backends):** summary reads require a live root and the
+  current persistent message generation. Message insert/update/delete triggers,
+  clear, retention GC, and expiry sweep invalidate the whole cache; expiry is
+  swept before lookup, and provider results use an atomic generation-conditional
+  write so a concurrent reply/update/delete cannot publish stale text. Legacy
+  caches migrate with generation `-1` and fail closed. Ephemeral snapshots are
+  never cached and cannot emit after mutation or deadline expiry.
+- **CLI:** feature-off `thread --summarize` now errors explicitly and `--refresh`
+  requires `--summarize`.
 
 ## [Unreleased] — message priority & contact policies (WL-031 + WL-032)
 

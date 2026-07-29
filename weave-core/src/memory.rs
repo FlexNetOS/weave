@@ -634,12 +634,10 @@ fn extract_keywords(body: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
 
-    static FS_LOCK: Mutex<()> = Mutex::new(());
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn tmp_memory_dir() -> PathBuf {
+    fn tmp_memory_dir() -> (PathBuf, crate::testenv::EnvVarGuard) {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "weave-memory-test-{}-{}-{}",
@@ -647,8 +645,9 @@ mod tests {
             crate::model::now(),
             n
         ));
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-        dir.join("weave").join("memory")
+        let xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        (dir.join("weave").join("memory"), xdg)
     }
 
     fn cleanup(dir: &Path) {
@@ -657,7 +656,6 @@ mod tests {
 
     #[test]
     fn sanitize_key_accepts_good_rejects_bad() {
-        let _guard = FS_LOCK.lock().unwrap();
         assert_eq!(sanitize_key("foo-bar_123").unwrap(), "foo-bar_123");
         assert!(sanitize_key("../etc").is_err());
         assert!(sanitize_key("foo/bar").is_err());
@@ -669,8 +667,8 @@ mod tests {
 
     #[test]
     fn memory_roundtrip() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(
             &scope,
@@ -689,8 +687,8 @@ mod tests {
 
     #[test]
     fn memory_search_substring() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "a", "A", &[], "alpha content").unwrap();
         memory_write(&scope, "b", "B", &[], "beta content").unwrap();
@@ -702,8 +700,8 @@ mod tests {
 
     #[test]
     fn memory_search_tag_priority() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "only-body", "X", &[], "rusty body").unwrap();
         memory_write(&scope, "has-tag", "Y", &["rusty".into()], "other body").unwrap();
@@ -716,8 +714,8 @@ mod tests {
 
     #[test]
     fn memory_list_and_delete() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "x", "X", &[], "body").unwrap();
         memory_write(&scope, "y", "Y", &[], "body").unwrap();
@@ -732,8 +730,8 @@ mod tests {
 
     #[test]
     fn memory_path_is_under_config_dir() {
-        let _guard = FS_LOCK.lock().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/weave-cfg-test");
+        let _env = crate::testenv::lock_env();
+        let _xdg = crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", "/tmp/weave-cfg-test");
         let p = memory_path(&MemoryScope::Global, "foo").unwrap();
         assert!(p.starts_with("/tmp/weave-cfg-test/weave/memory/"));
         let p = memory_path(&MemoryScope::Project("weave".into()), "bar").unwrap();
@@ -742,7 +740,6 @@ mod tests {
 
     #[test]
     fn parse_entry_handles_empty_body() {
-        let _guard = FS_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("weave-mem-parse-{}", crate::model::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.md");
@@ -759,7 +756,6 @@ mod tests {
 
     #[test]
     fn parse_entry_rejects_no_frontmatter() {
-        let _guard = FS_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("weave-mem-parse2-{}", crate::model::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.md");
@@ -770,8 +766,8 @@ mod tests {
 
     #[test]
     fn path_traversal_rejected() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         assert!(memory_write(&scope, "../../../etc/passwd", "T", &[], "B").is_err());
         cleanup(&base);
@@ -779,8 +775,8 @@ mod tests {
 
     #[test]
     fn oversized_body_rejected() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         let big = "x".repeat(MAX_BODY_BYTES + 1);
         assert!(memory_write(&scope, "big", "T", &[], &big).is_err());
@@ -789,8 +785,8 @@ mod tests {
 
     #[test]
     fn bad_tag_chars_stripped() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(&scope, "tags", "T", &["foo;rm -rf".into()], "B").unwrap();
         let e = memory_read(&scope, "tags").unwrap();
@@ -800,8 +796,8 @@ mod tests {
 
     #[test]
     fn build_context_prefix_smoke() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let scope = MemoryScope::Global;
         memory_write(
             &scope,
@@ -819,8 +815,8 @@ mod tests {
 
     #[test]
     fn build_context_prefix_no_match_returns_empty() {
-        let _guard = FS_LOCK.lock().unwrap();
-        let base = tmp_memory_dir();
+        let _env = crate::testenv::lock_env();
+        let (base, _xdg) = tmp_memory_dir();
         let prefix = build_context_prefix("me", "default", "xyz abc", 3);
         assert_eq!(prefix, "");
         cleanup(&base);

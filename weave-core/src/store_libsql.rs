@@ -122,7 +122,8 @@ const SCHEMA: &[&str] = &[
         description    TEXT NOT NULL DEFAULT '',
         description_ts INTEGER NOT NULL DEFAULT 0,
         birth_cert     TEXT,
-        contact_policy TEXT NOT NULL DEFAULT 'open'
+        contact_policy TEXT NOT NULL DEFAULT 'open',
+        client_session TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS outbox (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,8 +289,29 @@ const SCHEMA: &[&str] = &[
         text        TEXT NOT NULL,
         model       TEXT NOT NULL DEFAULT '',
         created_ts  INTEGER NOT NULL,
-        refreshed_ts INTEGER NOT NULL
+        refreshed_ts INTEGER NOT NULL,
+        generation  INTEGER NOT NULL DEFAULT -1
     )",
+    "CREATE TABLE IF NOT EXISTS summary_state (
+        singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+        generation INTEGER NOT NULL
+    )",
+    "INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0)",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+     AFTER INSERT ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+     AFTER UPDATE ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+     AFTER DELETE ON messages BEGIN
+         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+         DELETE FROM summaries;
+     END",
 ];
 
 /// Resolve the wall-clock bound (Duration) for a single REMOTE network call (connect
@@ -516,6 +538,7 @@ fn row_to_peer(r: &libsql::Row) -> Result<Peer> {
         description_ts: r.get::<i64>(15)?,
         birth_cert: r.get::<Option<String>>(16).ok().flatten(),
         contact_policy: r.get::<String>(17).unwrap_or_else(|_| "open".to_string()),
+        client_session: r.get::<String>(18).unwrap_or_default(),
     })
 }
 
@@ -744,6 +767,23 @@ impl LibsqlStore {
                 )
                 .await
                 .context("adding birth_cert column")?;
+            }
+            // Migration (WL-084): launcher-session key for collision-proof
+            // identity. '' == unknown, matching `Peer::client_session`'s empty
+            // default (mirrors the sqlite migrate). Constant DDL, idempotent.
+            let mut it = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('peers') WHERE name='client_session'",
+                    (),
+                )
+                .await?;
+            if it.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE peers ADD COLUMN client_session TEXT NOT NULL DEFAULT ''",
+                    (),
+                )
+                .await
+                .context("adding client_session column")?;
             }
             // Migration (P5): the wake-hook watermark table. Tracks the last
             // unread message id that triggered a block for each reader. Created
@@ -1129,12 +1169,72 @@ impl LibsqlStore {
                     text        TEXT NOT NULL,
                     model       TEXT NOT NULL DEFAULT '',
                     created_ts  INTEGER NOT NULL,
-                    refreshed_ts INTEGER NOT NULL
+                    refreshed_ts INTEGER NOT NULL,
+                    generation  INTEGER NOT NULL DEFAULT -1
                 )",
                 (),
             )
             .await
             .context("creating summaries table")?;
+            let mut summary_columns = conn
+                .query(
+                    "SELECT 1 FROM pragma_table_info('summaries') WHERE name='generation'",
+                    (),
+                )
+                .await?;
+            if summary_columns.next().await?.is_none() {
+                conn.execute(
+                    "ALTER TABLE summaries
+                     ADD COLUMN generation INTEGER NOT NULL DEFAULT -1",
+                    (),
+                )
+                .await
+                .context("adding summaries.generation column")?;
+            }
+            drop(summary_columns);
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS summary_state (
+                    singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    generation INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("creating summary generation state")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0)",
+                (),
+            )
+            .await
+            .context("initializing summary generation state")?;
+            for (ddl, context) in [
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+                     AFTER INSERT ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-insert invalidation trigger",
+                ),
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+                     AFTER UPDATE ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-update invalidation trigger",
+                ),
+                (
+                    "CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+                     AFTER DELETE ON messages BEGIN
+                         UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+                         DELETE FROM summaries;
+                     END",
+                    "creating summary message-delete invalidation trigger",
+                ),
+            ] {
+                conn.execute(ddl, ()).await.context(context)?;
+            }
             // A local libsql DB file must not be world/group readable (message
             // bodies). Mirror SqliteStore's 0600 hardening; no-op on the remote path.
             #[cfg(unix)]
@@ -1884,6 +1984,7 @@ impl Store for LibsqlStore {
                     None => 0,
                 }
             };
+            tx.execute("DELETE FROM summaries", ()).await?;
             tx.execute("DELETE FROM messages", ()).await?;
             tx.execute("DELETE FROM reads", ()).await?;
             tx.execute("DELETE FROM wake_acks", ()).await?;
@@ -1944,7 +2045,8 @@ impl Store for LibsqlStore {
                 params(vec![cutoff.into()]),
             )
             .await?;
-            tx.execute(
+            let retention_deleted = tx
+                .execute(
                 "DELETE FROM messages WHERE ts < ?1",
                 params(vec![cutoff.into()]),
             )
@@ -1959,11 +2061,18 @@ impl Store for LibsqlStore {
                 params(vec![expiry_cut.into()]),
             )
             .await?;
-            tx.execute(
-                "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
-                params(vec![expiry_cut.into()]),
-            )
-            .await?;
+            let expiry_deleted = tx
+                .execute(
+                    "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                    params(vec![expiry_cut.into()]),
+                )
+                .await?;
+            // A summary represents the whole thread, so any removed root or
+            // reply invalidates every cache entry. Keep invalidation atomic with
+            // message deletion; the returned count remains `n` above.
+            if retention_deleted > 0 || expiry_deleted > 0 {
+                tx.execute("DELETE FROM summaries", ()).await?;
+            }
             // P6: prune the delivery trace by the SAME cutoff so it is bounded by the
             // existing retention pass (no new sweeper). Mirrors SqliteStore::gc.
             tx.execute(
@@ -2146,6 +2255,7 @@ impl Store for LibsqlStore {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String> {
         self.guard_writable()?;
         check_ident("peer name", name)?;
@@ -2155,6 +2265,9 @@ impl Store for LibsqlStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // Ownership keys are strict/lossless (mirrors sqlite); truncating one can
+        // alias distinct sessions or break later lookup.
+        let client_session = crate::store::client_session_key(client_session)?;
         let circle = if crate::model::circle_valid(circle) {
             circle.to_string()
         } else {
@@ -2189,8 +2302,8 @@ impl Store for LibsqlStore {
                         None => mint_birth_cert()?,
                     };
                     tx.execute(
-                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert, client_session)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                         params(vec![
                             name.into(),
                             mux.into(),
@@ -2205,16 +2318,19 @@ impl Store for LibsqlStore {
                             worktree_id.into(),
                             circle.into(),
                             new_cert.clone().into(),
+                            client_session.clone().into(),
                         ]),
                     )
                     .await?;
                     new_cert
                 }
                 Some(None) => {
+                    // client_session preserve-on-empty (mirrors sqlite; trait doc).
                     let new_cert = mint_birth_cert()?;
                     tx.execute(
-                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
-                         WHERE name=?13",
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12,
+                                          client_session = CASE WHEN ?13 = '' THEN client_session ELSE ?13 END
+                         WHERE name=?14",
                         params(vec![
                             mux.into(),
                             target.into(),
@@ -2228,6 +2344,7 @@ impl Store for LibsqlStore {
                             worktree_id.into(),
                             circle.into(),
                             new_cert.clone().into(),
+                            client_session.clone().into(),
                             name.into(),
                         ]),
                     )
@@ -2242,9 +2359,11 @@ impl Store for LibsqlStore {
                     } else {
                         anyhow::bail!("peer '{name}' already registered; provide --cert to re-register");
                     }
+                    // client_session preserve-on-empty (mirrors sqlite; trait doc).
                     tx.execute(
-                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
-                         WHERE name=?12",
+                        "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11,
+                                          client_session = CASE WHEN ?12 = '' THEN client_session ELSE ?12 END
+                         WHERE name=?13",
                         params(vec![
                             mux.into(),
                             target.into(),
@@ -2257,6 +2376,7 @@ impl Store for LibsqlStore {
                             branch.into(),
                             worktree_id.into(),
                             circle.into(),
+                            client_session.clone().into(),
                             name.into(),
                         ]),
                     )
@@ -2266,6 +2386,30 @@ impl Store for LibsqlStore {
             };
             tx.commit().await?;
             Ok(cert)
+        })
+    }
+
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        let client_session = crate::store::client_session_key(client_session)?;
+        if client_session.is_empty() {
+            return Ok(None);
+        }
+        self.rt.block_on(async {
+            let mut it = self
+                .conn
+                .query(
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE client_session=?1 ORDER BY last_seen DESC LIMIT 1",
+                    params(vec![client_session.into()]),
+                )
+                .await?;
+            match it.next().await? {
+                Some(r) => {
+                    let mut p = row_to_peer(&r)?;
+                    crate::model::expire_description(&mut p, now());
+                    Ok(Some(p))
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -2293,7 +2437,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE name=?1",
                     params(vec![name.into()]),
                 )
                 .await?;
@@ -2316,7 +2460,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers ORDER BY name",
                     (),
                 )
                 .await?;
@@ -2372,7 +2516,7 @@ impl Store for LibsqlStore {
             let holders: Vec<Peer> = {
                 let mut it = tx
                     .query(
-                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+                        "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
                         (),
                     )
                     .await?;
@@ -2431,7 +2575,7 @@ impl Store for LibsqlStore {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+                    "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
                     (),
                 )
                 .await?;
@@ -3732,6 +3876,51 @@ impl Store for LibsqlStore {
         }
     }
 
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>> {
+        self.guard_writable()?;
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("assignee", assignee)?;
+        let ts = now();
+        let attempt_id = new_attempt_id(ts);
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let changed = tx
+                .execute(
+                    "UPDATE jobs SET assignee = ?1, attempt_id = ?2, state = ?3, updated_ts = ?4 \
+                     WHERE id = ?5 AND state = ?6 AND (assignee IS NULL OR assignee = ?1)",
+                    params(vec![
+                        assignee.into(),
+                        attempt_id.into(),
+                        JobState::Running.as_str().into(),
+                        ts.into(),
+                        id.into(),
+                        JobState::Queued.as_str().into(),
+                    ]),
+                )
+                .await?;
+            if changed == 0 {
+                tx.commit().await?;
+                return Ok::<Option<Job>, anyhow::Error>(None);
+            }
+            // Read the row/token inside the transaction. Once commit succeeds,
+            // the caller already owns the complete claim and cannot lose it to a
+            // separate post-commit read failure.
+            let sql = format!("SELECT {JOB_COLS} FROM jobs WHERE id = ?1");
+            let claimed = {
+                let mut rows = tx.query(&sql, params(vec![id.into()])).await?;
+                rows.next().await?.map(|row| row_to_job(&row)).transpose()?
+            }
+            .ok_or_else(|| anyhow::anyhow!("job '{id}' vanished during dispatch claim"))?;
+            tx.commit().await?;
+            Ok(Some(claimed))
+        })
+    }
+
     fn update_job(&self, id: &str, attempt_id: Option<&str>, patch: JobPatch) -> Result<Job> {
         self.guard_writable()?;
         if !job_id_valid(id) {
@@ -4546,6 +4735,9 @@ impl Store for LibsqlStore {
                     params(vec![now.into()]),
                 )
                 .await?;
+            if n > 0 {
+                tx.execute("DELETE FROM summaries", ()).await?;
+            }
             tx.commit().await?;
             Ok::<_, anyhow::Error>(n as usize)
         })
@@ -4735,16 +4927,20 @@ impl Store for LibsqlStore {
     }
 
     fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
+        self.guard_writable()?;
         let ts = now();
         self.rt.block_on(async {
             self.conn
                 .execute(
-                    "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO summaries
+                         (root_id, text, model, created_ts, refreshed_ts, generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5,
+                             (SELECT generation FROM summary_state WHERE singleton = 1))
                  ON CONFLICT(root_id) DO UPDATE SET
                      text = excluded.text,
                      model = excluded.model,
-                     refreshed_ts = excluded.refreshed_ts",
+                     refreshed_ts = excluded.refreshed_ts,
+                     generation = excluded.generation",
                     params(vec![
                         root_id.into(),
                         text.into(),
@@ -4758,13 +4954,78 @@ impl Store for LibsqlStore {
         })
     }
 
+    fn summary_generation(&self) -> Result<i64> {
+        self.rt.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT generation FROM summary_state WHERE singleton = 1",
+                    (),
+                )
+                .await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("summary generation state is missing"))?;
+            Ok::<_, anyhow::Error>(row.get::<i64>(0)?)
+        })
+    }
+
+    fn store_summary_if_generation(
+        &self,
+        root_id: i64,
+        text: &str,
+        model: &str,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        self.guard_writable()?;
+        let ts = now();
+        self.rt.block_on(async {
+            let tx = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO summaries
+                         (root_id, text, model, created_ts, refreshed_ts, generation)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                     WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1)
+                       AND EXISTS (
+                           SELECT 1 FROM summary_state
+                           WHERE singleton = 1 AND generation = ?6
+                       )
+                     ON CONFLICT(root_id) DO UPDATE SET
+                         text = excluded.text,
+                         model = excluded.model,
+                         refreshed_ts = excluded.refreshed_ts,
+                         generation = excluded.generation",
+                    params(vec![
+                        root_id.into(),
+                        text.into(),
+                        model.into(),
+                        ts.into(),
+                        ts.into(),
+                        expected_generation.into(),
+                    ]),
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(changed > 0)
+        })
+    }
+
     fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
         self.rt.block_on(async {
             let mut it = self
                 .conn
                 .query(
-                    "SELECT root_id, text, model, created_ts, refreshed_ts
-                     FROM summaries WHERE root_id = ?1",
+                    "SELECT s.root_id, s.text, s.model, s.created_ts, s.refreshed_ts
+                     FROM summaries s
+                     JOIN messages m ON m.id = s.root_id
+                     JOIN summary_state state
+                       ON state.singleton = 1 AND state.generation = s.generation
+                     WHERE s.root_id = ?1",
                     params(vec![root_id.into()]),
                 )
                 .await?;
@@ -4783,6 +5044,7 @@ impl Store for LibsqlStore {
     }
 
     fn delete_summary(&self, root_id: i64) -> Result<bool> {
+        self.guard_writable()?;
         self.rt.block_on(async {
             let rows = self
                 .conn
@@ -4915,6 +5177,101 @@ mod tests {
         LibsqlStore::open(&cfg).unwrap()
     }
 
+    /// WL-084 (dual-backend parity): mirror of the sqlite backend's
+    /// `client_session_roundtrips_and_preserves_on_empty` — the launcher-session
+    /// key roundtrips, '' preserves, a non-empty key overwrites, and
+    /// `get_peer_by_client_session` never matches the empty key.
+    #[test]
+    fn client_session_roundtrips_and_preserves_on_empty_libsql() {
+        let s = mem();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%1",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            None,
+            "sid-A",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-A");
+        assert_eq!(
+            s.get_peer_by_client_session("sid-A").unwrap().unwrap().name,
+            "a"
+        );
+        let cert = s.get_birth_cert("a").unwrap();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%2",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_peer("a").unwrap().unwrap().client_session,
+            "sid-A",
+            "'' must mean preserve, not wipe"
+        );
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%3",
+            "",
+            Some("/x"),
+            Some(12),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "sid-B",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-B");
+        assert!(s.get_peer_by_client_session("sid-A").unwrap().is_none());
+        s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
+        assert!(s.get_peer_by_client_session("").unwrap().is_none());
+
+        let oversized = "s".repeat(MAX_IDENT + 1);
+        assert!(s
+            .register_peer_full(
+                "rejected",
+                "tmux",
+                "%5",
+                "",
+                None,
+                Some(13),
+                "h",
+                "",
+                "",
+                "",
+                "default",
+                None,
+                &oversized,
+            )
+            .is_err());
+        assert!(s.get_peer("rejected").unwrap().is_none());
+        assert!(s.get_peer_by_client_session("sid\nraw").is_err());
+        assert!(s.get_peer_by_client_session(" sid-B").is_err());
+        assert!(s.get_peer_by_client_session("sid-B ").is_err());
+    }
+
     /// WL-047 (dual-backend parity): byte-identical mirror of the sqlite backend's
     /// `register_peer_full_binds_supplied_cert_else_mints` — the libsql new-peer
     /// INSERT must honor a SUPPLIED birth cert (persist verbatim) and mint when None.
@@ -4938,6 +5295,7 @@ mod tests {
                 "",
                 "default",
                 Some(&cert),
+                "",
             )
             .unwrap();
         assert_eq!(returned, cert, "register returns the supplied cert");
@@ -4949,7 +5307,7 @@ mod tests {
         // None path (backward-compat): a fresh peer mints its own distinct cert.
         let minted = s
             .register_peer_full(
-                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
             )
             .unwrap();
         assert!(check_birth_cert(&minted).is_ok(), "minted cert is valid");
@@ -6017,6 +6375,7 @@ mod tests {
                 "(main)",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -6042,6 +6401,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -6129,6 +6489,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let nrow = s2.get_peer("new").unwrap().unwrap();
@@ -6203,7 +6564,7 @@ mod tests {
         let s = mem();
         let cert = s
             .register_peer_full(
-                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None, "",
             )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
@@ -6222,6 +6583,7 @@ mod tests {
             "",
             "team-a",
             Some(&cert),
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -6237,11 +6599,11 @@ mod tests {
     fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         assert!(matches!(
@@ -6277,7 +6639,7 @@ mod tests {
     fn orchestrator_status_present_and_absent() {
         let s = mem();
         s.register_peer_full(
-            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
@@ -6374,6 +6736,7 @@ mod tests {
             "wt-9",
             "default",
             None,
+            "",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -6428,6 +6791,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -6449,6 +6813,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -6472,6 +6837,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let live = s.get_peer("live").unwrap().unwrap();
@@ -6494,6 +6860,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -6536,6 +6903,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let local = s.get_peer("local").unwrap().unwrap();
@@ -6543,7 +6911,7 @@ mod tests {
 
         // same-host + null pid + recent => AliveLocal (TTL fallback).
         s.register_peer_full(
-            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None,
+            "nullpid", "tmux", "%2", "", None, None, &this, "", "", "", "default", None, "",
         )
         .unwrap();
         let nullpid = s.get_peer("nullpid").unwrap().unwrap();
@@ -6564,6 +6932,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let remote = s.get_peer("remote").unwrap().unwrap();
@@ -6583,6 +6952,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let empty = s.get_peer("empty").unwrap().unwrap();
@@ -6610,6 +6980,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let dead = s.get_peer("dead").unwrap().unwrap();
@@ -6689,6 +7060,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         }
@@ -6707,7 +7079,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
         );
         assert!(
             wr.is_err(),
@@ -6785,6 +7157,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
             rw.send("seed", "seed", None, "hi", None, None).unwrap();
@@ -6822,7 +7195,7 @@ mod tests {
         assert_trapped(
             "register_peer_full",
             ro.register_peer_full(
-                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .map(|_| ()),
         );
@@ -6833,6 +7206,13 @@ mod tests {
         );
         assert_trapped("pull_cursor_set", ro.pull_cursor_set("src", 5));
         assert_trapped("register_key", ro.register_key("id", "pubkey"));
+        assert_trapped("store_summary", ro.store_summary(1, "summary", "model"));
+        assert_trapped(
+            "store_summary_if_generation",
+            ro.store_summary_if_generation(1, "summary", "model", 0)
+                .map(|_| ()),
+        );
+        assert_trapped("delete_summary", ro.delete_summary(1).map(|_| ()));
 
         // A read still works (the failed writes were no-ops).
         assert_eq!(ro.list_peers().unwrap().len(), 1);
@@ -6874,7 +7254,7 @@ mod tests {
         };
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .unwrap();
         {
@@ -6886,7 +7266,7 @@ mod tests {
             let foreign = LibsqlStore::open(&cfg).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
                 )
                 .unwrap();
         }
@@ -7523,6 +7903,105 @@ mod tests {
     }
 
     #[test]
+    fn job_dispatch_claim_is_queued_only_and_preserves_manual_reclaim_libsql() {
+        let s = mem();
+        let j = s.create_job("alice", jspec("task")).unwrap();
+        let first = s.claim_queued_job(&j.id, "worker").unwrap().unwrap();
+        let first_attempt = first.attempt_id.clone().unwrap();
+        assert_eq!(first.state, JobState::Running);
+
+        assert!(
+            s.claim_queued_job(&j.id, "worker").unwrap().is_none(),
+            "a stale/concurrent dispatch cannot reclaim a running row"
+        );
+        let manual = s.claim_job(&j.id, "recovery").unwrap().unwrap();
+        assert_ne!(manual.attempt_id.as_deref(), Some(first_attempt.as_str()));
+        assert_eq!(manual.assignee.as_deref(), Some("recovery"));
+
+        let assigned = s
+            .create_job(
+                "alice",
+                JobSpec {
+                    title: "assigned elsewhere".into(),
+                    assignee: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s
+            .claim_queued_job(&assigned.id, "worker")
+            .unwrap()
+            .is_none());
+        let unchanged = s.get_job(&assigned.id).unwrap().unwrap();
+        assert_eq!(unchanged.state, JobState::Queued);
+        assert!(unchanged.attempt_id.is_none());
+    }
+
+    #[test]
+    fn concurrent_job_dispatch_claim_has_exactly_one_winner_libsql() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-dispatch-claim-race-{}-{}",
+            std::process::id(),
+            crate::model::new_attempt_id(now())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let open = |path: &std::path::Path| {
+            LibsqlStore::open(&Config {
+                db: Some(path.to_string_lossy().into_owned()),
+                backend: Some("libsql".into()),
+                ..Config::default()
+            })
+            .unwrap()
+        };
+        let seed = open(&path);
+        let id = seed.create_job("alice", jspec("race")).unwrap().id;
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for worker in ["worker-a", "worker-b"] {
+            let path = path.clone();
+            let id = id.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = LibsqlStore::open(&Config {
+                    db: Some(path.to_string_lossy().into_owned()),
+                    backend: Some("libsql".into()),
+                    ..Config::default()
+                })
+                .unwrap();
+                barrier.wait();
+                store.claim_queued_job(&id, worker)
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|job| job.is_some()).count(),
+            1,
+            "the state predicate and transition must be one atomic write"
+        );
+
+        let store = open(&path);
+        assert_eq!(
+            store.get_job(&id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn job_text_nul_is_rejected_libsql() {
+        let s = mem();
+        assert!(s.create_job("alice", jspec("bad\0title")).is_err());
+    }
+
+    #[test]
     fn job_stale_attempt_is_fenced_libsql() {
         let s = mem();
         let j = s.create_job("alice", jspec("task")).unwrap();
@@ -7642,6 +8121,7 @@ mod tests {
         let ro = LibsqlStore::open_readonly(&path).unwrap();
         assert!(ro.create_job("alice", jspec("nope")).is_err());
         assert!(ro.claim_job(&j.id, "w").is_err());
+        assert!(ro.claim_queued_job(&j.id, "w").is_err());
         assert!(ro.cancel_job(&j.id, "alice", None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7775,6 +8255,7 @@ mod tests {
             "wt",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();
@@ -7982,6 +8463,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         assert_eq!(
             s.peer_liveness(&p).unwrap(),
@@ -8217,20 +8699,231 @@ mod tests {
     #[test]
     fn summary_roundtrip_libsql() {
         let s = mem();
-        assert!(s.get_summary(1).unwrap().is_none());
-        s.store_summary(1, "summary text", "gpt-4").unwrap();
-        let sum = s.get_summary(1).unwrap().unwrap();
-        assert_eq!(sum.root_id, 1);
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        assert!(s.get_summary(root).unwrap().is_none());
+        s.store_summary(root, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(root).unwrap().unwrap();
+        assert_eq!(sum.root_id, root);
         assert_eq!(sum.text, "summary text");
         assert_eq!(sum.model, "gpt-4");
         // Upsert refreshes
-        s.store_summary(1, "new text", "gpt-3").unwrap();
-        let sum2 = s.get_summary(1).unwrap().unwrap();
+        s.store_summary(root, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(root).unwrap().unwrap();
         assert_eq!(sum2.text, "new text");
         assert_eq!(sum2.model, "gpt-3");
-        assert!(s.delete_summary(1).unwrap());
-        assert!(!s.delete_summary(1).unwrap());
-        assert!(s.get_summary(1).unwrap().is_none());
+        assert!(s.delete_summary(root).unwrap());
+        assert!(!s.delete_summary(root).unwrap());
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.store_summary(root + 10_000, "orphan", "legacy").unwrap();
+        assert!(
+            s.get_summary(root + 10_000).unwrap().is_none(),
+            "a cache row without a live root message must never surface"
+        );
+    }
+
+    #[test]
+    fn legacy_summary_cache_migrates_fail_closed_and_current_generation_roundtrips_libsql() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "weave-libsql-summary-legacy-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let cfg = Config {
+            db: Some(path.to_string_lossy().into_owned()),
+            backend: Some("libsql".to_string()),
+            ..Config::default()
+        };
+
+        let root = {
+            let s = LibsqlStore::open(&cfg).unwrap();
+            let root = s.send("a", "b", None, "root", None, None).unwrap();
+            s.rt.block_on(async {
+                for ddl in [
+                    "DROP TRIGGER summaries_generation_message_insert_v1",
+                    "DROP TRIGGER summaries_generation_message_update_v1",
+                    "DROP TRIGGER summaries_generation_message_delete_v1",
+                    "DROP TABLE summaries",
+                    "DROP TABLE summary_state",
+                    "CREATE TABLE summaries (
+                        root_id      INTEGER PRIMARY KEY,
+                        text         TEXT NOT NULL,
+                        model        TEXT NOT NULL DEFAULT '',
+                        created_ts   INTEGER NOT NULL,
+                        refreshed_ts INTEGER NOT NULL
+                    )",
+                ] {
+                    s.conn.execute(ddl, ()).await?;
+                }
+                let ts = now();
+                s.conn
+                    .execute(
+                        "INSERT INTO summaries
+                             (root_id, text, model, created_ts, refreshed_ts)
+                         VALUES (?1, 'legacy cache', 'legacy-model', ?2, ?2)",
+                        params(vec![root.into(), ts.into()]),
+                    )
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+            root
+        };
+
+        let s = LibsqlStore::open(&cfg).unwrap();
+        let legacy_generation =
+            s.rt.block_on(async {
+                let mut rows = s
+                    .conn
+                    .query(
+                        "SELECT generation FROM summaries WHERE root_id = ?1",
+                        params(vec![root.into()]),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("legacy cache row disappeared"))?;
+                Ok::<i64, anyhow::Error>(row.get(0)?)
+            })
+            .unwrap();
+        assert_eq!(legacy_generation, -1, "legacy cache must migrate stale");
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a pre-generation cache row must fail closed"
+        );
+        let generation = s.summary_generation().unwrap();
+        assert!(s
+            .store_summary_if_generation(root, "current cache", "current-model", generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current cache");
+
+        let before_reply = s.summary_generation().unwrap();
+        s.reply("b", root, "new reply").unwrap();
+        assert!(s.summary_generation().unwrap() > before_reply);
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "migrated invalidation triggers must clear cache on message mutation"
+        );
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_removes_summary_cache_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert_eq!(s.clear_all().unwrap(), 1);
+        assert!(
+            !s.delete_summary(root).unwrap(),
+            "clear_all must delete the underlying cache row"
+        );
+    }
+
+    #[test]
+    fn adding_reply_invalidates_cached_thread_summary_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert!(s.get_summary(root).unwrap().is_some());
+
+        s.reply("b", root, "new reply").unwrap();
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a new descendant makes the cached thread summary stale"
+        );
+    }
+
+    #[test]
+    fn summary_generation_rejects_mutated_or_deleted_snapshots_libsql() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        let (initial_rows, initial_generation) =
+            crate::store::summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(initial_rows.len(), 1);
+
+        let reply = s.reply("b", root, "new reply").unwrap();
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", initial_generation)
+                .unwrap(),
+            "a reply inserted during provider work must reject the stale write"
+        );
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.set_message_expiry(reply, now() - 1).unwrap();
+        let before_delete = s.summary_generation().unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 1);
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", before_delete)
+                .unwrap(),
+            "a reply deleted during provider work must reject the stale write"
+        );
+
+        let (current_rows, current_generation) =
+            crate::store::summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(current_rows.len(), 1, "expired reply is never summarized");
+        assert!(s
+            .store_summary_if_generation(root, "current", "model", current_generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current");
+    }
+
+    #[test]
+    fn gc_message_delete_invalidates_the_whole_summary_cache_libsql() {
+        let s = mem();
+        let old_root = s.send("a", "b", None, "old", None, None).unwrap();
+        let live_root = s.send("c", "d", None, "live", None, None).unwrap();
+        s.rt.block_on(async {
+            s.conn
+                .execute(
+                    "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                    params(vec![old_root.into()]),
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .unwrap();
+        s.store_summary(old_root, "old cached", "model").unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+
+        assert_eq!(s.gc(3600).unwrap(), 1);
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(old_root).unwrap(),
+            "gc must delete cache rows, not merely hide orphan roots"
+        );
+    }
+
+    #[test]
+    fn expiry_sweep_of_root_or_reply_invalidates_the_whole_summary_cache_libsql() {
+        let s = mem();
+        let live_root = s.send("a", "b", None, "live root", None, None).unwrap();
+        let expired_reply = s.reply("b", live_root, "expired reply").unwrap();
+        let expired_root = s.send("c", "d", None, "expired root", None, None).unwrap();
+        s.set_message_expiry(expired_reply, now() - 5).unwrap();
+        s.set_message_expiry(expired_root, now() - 5).unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+        s.store_summary(expired_root, "expired cached", "model")
+            .unwrap();
+
+        assert_eq!(s.sweep_expired_messages().unwrap(), 2);
+        assert!(
+            s.history("a", None, 100)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == live_root),
+            "the summarized root stays live when only its reply expires"
+        );
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(expired_root).unwrap(),
+            "sweep must delete the underlying orphan cache row"
+        );
     }
 
     // ---- WL-037: supersede on the libsql backend (positional-projection trap)

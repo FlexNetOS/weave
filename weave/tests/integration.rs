@@ -13,6 +13,8 @@
 
 mod common;
 
+#[cfg(feature = "llm")]
+use common::serve_llm_responses;
 use common::{
     run, run_env, run_hook, run_hook_args, run_hook_env, run_in_cwd, run_in_cwd_env, run_ok,
     run_ok_env, McpServer, TestDb,
@@ -108,6 +110,8 @@ fn expected_top_level_commands() -> Vec<&'static str> {
         "backup",
         "restore",
         "session",
+        #[cfg(feature = "obscura")]
+        "web",
         "help",
     ]
 }
@@ -2201,6 +2205,20 @@ fn make_fake_tmux(log_path: &Path) -> std::path::PathBuf {
     dir
 }
 
+/// Install an executable candidate that the kernel deterministically cannot launch
+/// because its shebang interpreter is a sibling path proven absent. This exercises
+/// launch-probe failures without depending on host binaries, uid, or Unix permission
+/// class behavior.
+fn install_unlaunchable_program(dir: &Path, name: &str) {
+    let missing_interpreter = dir.join("weave-definitely-missing-interpreter");
+    assert!(!missing_interpreter.exists());
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!{}\n", missing_interpreter.display()))
+        .expect("write unlaunchable test program");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod unlaunchable test program");
+}
+
 /// Build a `weave` command with the fake-mux dir prepended to PATH so the
 /// injector resolves our script instead of any real tmux.
 fn weave_with_fake_path(
@@ -2466,6 +2484,68 @@ fn pretooluse_malformed_stdin_fails_open_blackbox() {
         Some("defer"),
         "malformed stdin ⇒ defer (fail open): {out}"
     );
+}
+
+#[test]
+fn pretooluse_oversized_stdin_denies_blackbox() {
+    let db = TestDb::new();
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "printf bounded"},
+        "padding": "x".repeat(1_100_000),
+    })
+    .to_string();
+    let (ok, out, err) = run_hook(&db, "pretooluse", &payload);
+    assert!(ok, "bounded denial must exit cleanly: {err}");
+    let v = pretooluse_decision(&out);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("deny"),
+        "input size must not turn the approval gate into a defer: {out}"
+    );
+    assert!(
+        err.contains("hook payload exceeds"),
+        "the bounded-input reason remains visible on stderr: {err}"
+    );
+}
+
+/// Size is classified on bytes before UTF-8 decoding. A multibyte character
+/// split exactly by the MAX+1 bounded read must remain an oversized denial, not
+/// fall through the ordinary malformed-input defer policy.
+#[test]
+fn pretooluse_utf8_split_at_size_boundary_denies_blackbox() {
+    const HOOK_LIMIT: usize = 1_048_576;
+    let db = TestDb::new();
+    let mut payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"printf bounded"},"padding":""#.to_vec();
+    assert!(payload.len() < HOOK_LIMIT);
+    payload.resize(HOOK_LIMIT, b'x');
+    payload.extend_from_slice("é".as_bytes());
+    payload.extend_from_slice(br#""}"#);
+
+    let mut hook = common::weave_cmd(&db, &["hook", "pretooluse"]);
+    hook.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut hook = hook.spawn().expect("spawn boundary PreToolUse hook");
+    hook.stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(&payload)
+        .expect("write boundary payload");
+    let output = hook.wait_with_output().expect("wait boundary hook");
+    assert!(output.status.success(), "bounded denial exits cleanly");
+    let stdout = String::from_utf8(output.stdout).expect("pure decision UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v = pretooluse_decision(&stdout);
+    assert_eq!(
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|x| x.as_str()),
+        Some("deny"),
+        "a split UTF-8 boundary must retain oversized classification: {stdout}"
+    );
+    assert!(stderr.contains("hook payload exceeds"), "stderr={stderr:?}");
 }
 
 #[test]
@@ -2781,13 +2861,17 @@ fn hook_prompt_nudges_open_asks() {
     );
 
     // Alpha's prompt hook drains the inbox AND nudges open asks.
-    let mut prompt =
-        weave_with_fake_path(&db, &fake_dir, &[("TMUX_PANE", "%1")], &["hook", "prompt"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn prompt");
+    let mut prompt = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%1"), ("WEAVE_SESSION", "alpha")],
+        &["hook", "prompt"],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn prompt");
     prompt
         .stdin
         .take()
@@ -2830,13 +2914,17 @@ fn hook_prompt_no_nudge_without_open_asks() {
     assert!(reg.status.success());
 
     // Beta runs a prompt hook with no messages and no open asks.
-    let mut prompt =
-        weave_with_fake_path(&db, &fake_dir, &[("TMUX_PANE", "%2")], &["hook", "prompt"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn prompt");
+    let mut prompt = weave_with_fake_path(
+        &db,
+        &fake_dir,
+        &[("TMUX_PANE", "%2"), ("WEAVE_SESSION", "beta")],
+        &["hook", "prompt"],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn prompt");
     prompt
         .stdin
         .take()
@@ -3002,10 +3090,316 @@ fn reply_thread_receipts_roundtrip() {
     );
 }
 
+#[test]
+fn mcp_llm_catalog_matches_top_level_feature() {
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn(&db);
+    let result = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    for name in ["weave_thread_summarize", "weave_summarize_text"] {
+        assert_eq!(
+            names.contains(&name),
+            cfg!(feature = "llm"),
+            "{name} exposure must match the top-level llm feature: {names:?}"
+        );
+    }
+    mcp.shutdown();
+}
+
+#[cfg(feature = "llm")]
+#[test]
+fn mcp_llm_json_rpc_success_uses_configured_provider() {
+    let api_key = "json-rpc-fixture-secret";
+    let success = serde_json::json!({
+        "choices": [{"message": {"content": "  JSON-RPC\n\t summary works  "}}]
+    })
+    .to_string();
+    let (endpoint, _requests, provider) = serve_llm_responses(vec![("200 OK", success)]);
+    let db = TestDb::new();
+    let mut mcp = McpServer::spawn_env(
+        &db,
+        &[
+            ("WEAVE_LLM_ENDPOINT", &endpoint),
+            ("WEAVE_LLM_API_KEY", api_key),
+            ("WEAVE_LLM_TIMEOUT_SECS", "2"),
+        ],
+    );
+
+    let (is_err, text) = mcp.call_tool(
+        "weave_summarize_text",
+        serde_json::json!({"text": "summarize this through real JSON-RPC"}),
+    );
+    assert!(!is_err, "successful provider call was an MCP error: {text}");
+    assert_eq!(text, "JSON-RPC summary works");
+
+    mcp.shutdown();
+    provider.join().unwrap();
+}
+
+#[cfg(feature = "llm")]
+#[test]
+fn cli_summary_limit_does_not_shrink_the_cached_provider_snapshot() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "alice",
+            "--to",
+            "bob",
+            "--body",
+            "canonical root body",
+        ],
+    );
+    run_ok(
+        &db,
+        &[
+            "reply",
+            "--from",
+            "bob",
+            "--in-reply-to",
+            "1",
+            "--body",
+            "canonical reply body",
+        ],
+    );
+    let body = serde_json::json!({
+        "choices": [{"message": {"content": "canonical cached summary"}}]
+    })
+    .to_string();
+    let (endpoint, requests, provider) = serve_llm_responses(vec![("200 OK", body)]);
+    let output = run_ok_env(
+        &db,
+        &["thread", "--root", "1", "--limit", "1", "--summarize"],
+        &[
+            ("WEAVE_LLM_ENDPOINT", &endpoint),
+            ("WEAVE_LLM_API_KEY", "fixture-key"),
+            ("WEAVE_LLM_TIMEOUT_SECS", "2"),
+        ],
+    );
+    assert!(output.contains("canonical cached summary"), "{output}");
+
+    let request = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("record canonical provider request");
+    provider.join().unwrap();
+    let request_body = request.split_once("\r\n\r\n").unwrap().1;
+    let request_body: serde_json::Value = serde_json::from_str(request_body).unwrap();
+    let prompt = request_body["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.contains("canonical root body"), "prompt: {prompt}");
+    assert!(prompt.contains("canonical reply body"), "prompt: {prompt}");
+
+    // No provider configuration is supplied on the second call: this proves the
+    // canonical full-thread result, not the display `--limit`, populated cache.
+    let cached = run_ok(&db, &["thread", "--root", "1", "--summarize"]);
+    assert!(cached.contains("canonical cached summary"), "{cached}");
+}
+
+#[cfg(all(feature = "llm", feature = "sqlite"))]
+#[test]
+fn cli_thread_summary_validates_cached_text_before_output() {
+    use weave_core::store::{SqliteStore, Store};
+
+    let db = TestDb::new();
+    let store = SqliteStore::open(&db.path).unwrap();
+    let root = store
+        .send("alice", "bob", Some("subject"), "hello", None, None)
+        .unwrap();
+
+    store
+        .store_summary(root, "  cached\n\t summary  ", "legacy-model")
+        .unwrap();
+    drop(store);
+    let output = run_ok(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert_eq!(output, format!("thread #{root} summary:\ncached summary\n"));
+
+    let store = SqliteStore::open(&db.path).unwrap();
+    store
+        .store_summary(root, "safe\u{1b}[31munsafe", "legacy-model")
+        .unwrap();
+    drop(store);
+    let (ok, out, err) = run(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert!(!ok, "unsafe cached output must fail, stdout: {out}");
+    assert!(
+        err.contains("control"),
+        "clear cache validation error: {err}"
+    );
+    assert!(!err.contains("[31munsafe"), "cached text leaked: {err}");
+
+    let store = SqliteStore::open(&db.path).unwrap();
+    store
+        .store_summary(root, &"é".repeat(16_001), "legacy-model")
+        .unwrap();
+    drop(store);
+    let (ok, out, err) = run(&db, &["thread", "--root", &root.to_string(), "--summarize"]);
+    assert!(!ok, "oversized cached output must fail, stdout: {out}");
+    assert!(err.contains("16000"), "clear cache size error: {err}");
+}
+
+#[cfg(not(feature = "llm"))]
+#[test]
+fn thread_summarize_errors_when_llm_is_not_compiled() {
+    let db = TestDb::new();
+    run_ok(
+        &db,
+        &["send", "--from", "a", "--to", "b", "--body", "hello"],
+    );
+    let (ok, out, err) = run(&db, &["thread", "--root", "1", "--summarize"]);
+    assert!(!ok, "feature-off summarize must fail, stdout: {out}");
+    assert!(
+        err.contains("compiled without the llm feature"),
+        "clear feature error: {err}"
+    );
+}
+
+#[test]
+fn thread_refresh_requires_summarize_flag() {
+    let db = TestDb::new();
+    let (ok, out, err) = run(&db, &["thread", "--root", "1", "--refresh"]);
+    assert!(!ok, "--refresh alone must be rejected, stdout: {out}");
+    assert!(
+        err.contains("--summarize"),
+        "clap should explain the required flag: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Presence & Live-Connect (Phase 1): attach (B1), connect (C2), heartbeat (A1),
 // doctor non-default-DB hint (FR6).
 // ---------------------------------------------------------------------------
+
+/// A one-shot CLI registration must not persist the short-lived `weave`
+/// subprocess or infer an unrelated ancestor. With no explicit client contract,
+/// presence is PID-unknown and therefore remains live by the normal TTL rule.
+#[test]
+fn cli_register_without_client_pid_is_ttl_live() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "ttl-register"]);
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&peers).expect("peers JSON parses");
+    let peer = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ttl-register")
+        .expect("registered peer exists");
+    assert!(
+        peer["pid"].is_null(),
+        "plain register must store no guessed/short-lived pid: {peer}"
+    );
+    assert_eq!(
+        peer["alive"].as_bool(),
+        Some(true),
+        "a fresh pid-less registration remains TTL-live: {peer}"
+    );
+}
+
+/// `WEAVE_CLIENT_PID` is the sole opt-in PID contract for the plain CLI paths.
+#[test]
+fn cli_register_honors_explicit_client_pid() {
+    let db = TestDb::new();
+    let pid = std::process::id().to_string();
+    run_ok_env(
+        &db,
+        &["register", "--name", "explicit-register"],
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&peers).expect("peers JSON parses");
+    let peer = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "explicit-register")
+        .expect("registered peer exists");
+    assert_eq!(
+        peer["pid"].as_i64(),
+        Some(std::process::id() as i64),
+        "register must honor the explicit long-lived client pid: {peer}"
+    );
+    assert_eq!(peer["alive"].as_bool(), Some(true), "explicit pid is live");
+}
+
+/// Attach follows the same opt-in contract: an explicit client PID is persisted
+/// exactly, without replacing it with ancestry inference.
+#[test]
+fn cli_attach_honors_explicit_client_pid() {
+    let db = TestDb::new();
+    let reg = run_ok(&db, &["register", "--name", "explicit-attach"]);
+    let cert = reg
+        .split("save birth-cert: ")
+        .nth(1)
+        .expect("birth cert in registration output")
+        .trim()
+        .trim_end_matches(')')
+        .to_string();
+    let pid = std::process::id().to_string();
+    run_ok_env(
+        &db,
+        &["attach", "--name", "explicit-attach", "--cert", &cert],
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&peers).expect("peers JSON parses");
+    let peer = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "explicit-attach")
+        .expect("attached peer exists");
+    assert_eq!(
+        peer["pid"].as_i64(),
+        Some(std::process::id() as i64),
+        "attach must honor the explicit long-lived client pid: {peer}"
+    );
+    assert_eq!(peer["alive"].as_bool(), Some(true), "explicit pid is live");
+}
+
+/// `connect` is a read-only capability probe. Its text must describe what WOULD
+/// happen to a future message and must never imply that the probe itself enqueued
+/// something.
+fn assert_connect_describes_only_a_future_message(text: &str) {
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("future message"),
+        "connect must explicitly scope its verdict to a future message: {text:?}"
+    );
+    assert!(
+        lower.contains("deliver") || lower.contains("stor"),
+        "connect must say how that future message would be delivered/stored: {text:?}"
+    );
+    for false_current_state in [
+        "delivery will be queued",
+        "delivery remains queued",
+        "message is queued",
+        "currently queued",
+    ] {
+        assert!(
+            !lower.contains(false_current_state),
+            "a read-only connect probe must not claim current queue state ({false_current_state:?}): {text:?}"
+        );
+    }
+}
+
+/// Read the exact unread message ids without consuming them. Connect tests use
+/// this durable-state snapshot to prove the capability probe neither enqueues a
+/// message nor marks an existing message read.
+fn peek_message_ids(db: &TestDb, me: &str) -> Vec<i64> {
+    let raw = run_ok(db, &["inbox", "--me", me, "--json", "--peek"]);
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("peek inbox JSON parses");
+    value["messages"]
+        .as_array()
+        .expect("peek inbox contains a messages array")
+        .iter()
+        .map(|message| message["id"].as_i64().expect("message id is an integer"))
+        .collect()
+}
 
 /// B1 zero-restart adoption: a peer first registered with NO mux env (so it is
 /// `no-inject`) becomes `injectable` after `weave attach` is run inside a (fake)
@@ -3081,6 +3475,15 @@ fn attach_flips_no_inject_peer_to_injectable_under_fake_mux() {
     );
     assert_eq!(p_after["mux"], "tmux", "mux re-captured: {p_after}");
     assert_eq!(p_after["target"], "%9", "pane id re-captured: {p_after}");
+    assert!(
+        p_after["pid"].is_null(),
+        "plain attach stores no inferred or short-lived process id: {p_after}"
+    );
+    assert_eq!(
+        p_after["alive"].as_bool(),
+        Some(true),
+        "a fresh pid-less attach remains live by TTL: {p_after}"
+    );
 }
 
 /// C2 connect verdict strings under a fake mux:
@@ -3107,6 +3510,20 @@ fn connect_cli_verdict_strings() {
     .expect("spawn register live1");
     assert!(reg.status.success(), "register live1 failed");
 
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "probe-test",
+            "--to",
+            "live1",
+            "--body",
+            "existing live inbox row",
+        ],
+    );
+    let live_before = peek_message_ids(&db, "live1");
+
     let conn = weave_with_fake_path(&db, &fake_dir, &[], &["connect", "--to", "live1"])
         .stdin(Stdio::null())
         .output()
@@ -3121,19 +3538,43 @@ fn connect_cli_verdict_strings() {
         conn_out.contains("connect 'live1': live"),
         "connect to injectable+alive peer reports live: {conn_out:?}"
     );
+    assert_connect_describes_only_a_future_message(&conn_out);
+    assert_eq!(
+        peek_message_ids(&db, "live1"),
+        live_before,
+        "connect must leave an existing live peer inbox byte-for-byte unchanged"
+    );
 
-    // Non-injectable peer 'queued' (registered with no mux) -> not injectable, will
-    // queue, and this is NOT an error (exit 0).
+    // Non-injectable peer 'queued' (registered with no mux) -> not injectable; the
+    // probe describes store delivery for a future message and remains exit 0.
     run_ok(&db, &["register", "--name", "queued"]);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "probe-test",
+            "--to",
+            "queued",
+            "--body",
+            "existing queued inbox row",
+        ],
+    );
+    let queued_before = peek_message_ids(&db, "queued");
     let (ok, out, _err) = run(&db, &["connect", "--to", "queued"]);
     assert!(
         ok,
         "connect to a non-injectable peer is graceful, not an error"
     );
     assert!(
-        out.contains("connect 'queued': not injectable (mux=none)")
-            && out.contains("delivery will be queued"),
-        "connect to mux=none peer reports queue fallback: {out:?}"
+        out.contains("connect 'queued': not injectable (mux=none)"),
+        "connect to mux=none peer reports its capability: {out:?}"
+    );
+    assert_connect_describes_only_a_future_message(&out);
+    assert_eq!(
+        peek_message_ids(&db, "queued"),
+        queued_before,
+        "store-only connect must not create or consume an inbox row"
     );
 
     // Non-existent peer -> hard error (exit non-zero).
@@ -3145,17 +3586,64 @@ fn connect_cli_verdict_strings() {
     );
 }
 
+/// A structurally injectable peer is not `live` when its mux executable resolves
+/// but cannot launch. An explicitly trusted, deterministically broken `osascript`
+/// makes this black-box test independent of host-installed programs.
+#[test]
+fn connect_cli_reports_transport_unavailable_when_mux_cannot_launch() {
+    let db = TestDb::new();
+    let (ok, _out, err) = common::run_stdin_full(
+        &db,
+        &["register", "--name", "mac-shaped"],
+        "",
+        None,
+        &[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_SESSION_ID", "w0t0p0:WEAVE-LIVE-TEST"),
+        ],
+    );
+    assert!(ok, "iTerm2-shaped peer registration failed: {err}");
+
+    let empty_home = unique_tmp_dir("connect-missing-transport-home");
+    let fake_dir = unique_tmp_dir("connect-unlaunchable-transport");
+    install_unlaunchable_program(&fake_dir, "osascript");
+    let fake_dir_string = fake_dir.to_string_lossy().into_owned();
+    let (ok, out, err) = common::run_stdin_full(
+        &db,
+        &["connect", "--to", "mac-shaped"],
+        "",
+        None,
+        &[
+            ("HOME", empty_home.to_str().unwrap()),
+            ("WEAVE_MUX_DIR", fake_dir_string.as_str()),
+        ],
+    );
+    assert!(
+        ok,
+        "missing live transport remains a queueable verdict: {err}"
+    );
+    assert!(
+        out.contains("live transport unavailable")
+            && out.contains("osascript could not be launched/probed from a trusted directory")
+            && out.contains("next inbox drain"),
+        "connect must not promise Live when injection cannot launch its mux: {out:?}"
+    );
+    assert!(
+        !out.contains("a live nudge can be delivered now"),
+        "missing transport must never produce the Live promise: {out:?}"
+    );
+    assert_connect_describes_only_a_future_message(&out);
+}
+
 /// A1 heartbeat-on-read: running `weave peers` with an EXPLICIT identity
 /// (`WEAVE_SESSION`) touches the caller's own `last_seen`. We assert the
 /// heartbeat never regresses `last_seen` (it is `>=` the value at registration).
 /// (last_seen has 1s granularity, so we assert non-regression rather than a
 /// strict increase to stay non-flaky.)
 ///
-/// NOTE (A2): `register` runs in a short-lived subprocess, so the PID it persists
-/// is dead by the time we read back. With A2 real-liveness, a dead-PID peer on the
-/// local host reads `online:false` regardless of recency — so this test asserts
-/// the A1 heartbeat property (`last_seen` non-regression) only. The dead-PID
-/// offline behavior is asserted directly below.
+/// The plain one-shot register path stores no PID, so it is live by TTL while this
+/// test asserts only the A1 heartbeat property (`last_seen` non-regression). The
+/// explicit dead-PID behavior is asserted directly below.
 #[test]
 fn peers_read_heartbeats_explicit_identity() {
     let db = TestDb::new();
@@ -3187,15 +3675,17 @@ fn peers_read_heartbeats_explicit_identity() {
     );
 }
 
-/// A2 real-liveness: a peer whose registering process has exited reads
-/// `online:false` (and `alive:false`) on the local host even though its
-/// `last_seen` is within the TTL window — recency alone is no longer enough. The
-/// `register` subprocess that wrote the row is dead by the time we read it back,
-/// so the persisted local PID fails the `/proc/<pid>` liveness probe.
+/// A2 real-liveness: a peer registered with an explicit dead local PID reads
+/// `online:false` (and `alive:false`) even though `last_seen` is within the TTL
+/// window. This is the opt-in PID contract; a plain one-shot register stores NULL.
 #[test]
 fn peers_dead_local_pid_reads_offline_despite_recency() {
     let db = TestDb::new();
-    run_ok(&db, &["register", "--name", "gone"]);
+    run_ok_env(
+        &db,
+        &["register", "--name", "gone"],
+        &[("WEAVE_CLIENT_PID", "999999999")],
+    );
 
     let j = run_ok(&db, &["peers", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&j).expect("peers --json parses");
@@ -3206,8 +3696,8 @@ fn peers_dead_local_pid_reads_offline_despite_recency() {
         .find(|x| x["name"] == "gone")
         .expect("gone peer present");
 
-    // The row carries a (now-dead) pid and a non-empty host.
-    assert!(row["pid"].as_i64().is_some(), "pid was persisted");
+    // The row carries the exact explicit dead pid and a non-empty host.
+    assert_eq!(row["pid"].as_i64(), Some(999_999_999), "pid was persisted");
     assert!(
         !row["host"].as_str().unwrap_or("").is_empty(),
         "host was persisted"
@@ -3381,47 +3871,118 @@ fn mcp_attach_upserts_and_rejects_bad_identity() {
 }
 
 /// `weave_connect` verdicts over MCP:
-/// - to an injectable peer (a `screen` peer, which has no liveness probe so the
-///   fail-open verdict is `Live` regardless of any installed mux) -> "live",
+/// - to an injectable peer backed by an explicit trusted fake mux -> "live",
 ///   `isError=false`;
+/// - to a structurally injectable peer whose mux is unavailable -> queueable
+///   transport-unavailable verdict (a trusted but unlaunchable fake `osascript`);
 /// - to a `mux=none` peer -> "not injectable" + will-queue, `isError=false`
 ///   (graceful, NOT an error);
 /// - to a non-existent peer -> `isError=true` (the only hard failure).
 #[test]
 fn mcp_connect_verdicts_and_failure_path() {
     let db = TestDb::new();
+    let log = common::unique_db().with_extension("mcp-connect-tmuxlog");
+    let fake_dir = make_fake_tmux(&log);
+    install_unlaunchable_program(&fake_dir, "osascript");
 
-    // Seed an injectable screen peer via the CLI (STY -> screen mux, no probe).
-    let (ok, _o, _e) = common::run_stdin_full(
+    // Seed an injectable tmux peer through the explicitly trusted fake mux.
+    let reg = weave_with_fake_path(
         &db,
-        &["register", "--name", "screenpeer"],
-        "",
-        None,
-        &[("STY", "1234.pts-0.host")],
-    );
-    assert!(ok, "register screen peer failed");
+        &fake_dir,
+        &[("TMUX_PANE", "%7")],
+        &["register", "--name", "livepeer"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .expect("register fake tmux peer");
+    assert!(reg.status.success(), "register fake tmux peer failed");
     // And a non-injectable peer.
     run_ok(&db, &["register", "--name", "queued"]);
+    let (ok, _out, err) = common::run_stdin_full(
+        &db,
+        &["register", "--name", "no-transport"],
+        "",
+        None,
+        &[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_SESSION_ID", "w0t0p0:MCP-TRANSPORT-TEST"),
+        ],
+    );
+    assert!(ok, "register unavailable-transport peer failed: {err}");
 
-    let mut mcp = McpServer::spawn(&db);
+    for recipient in ["livepeer", "queued", "no-transport"] {
+        run_ok(
+            &db,
+            &[
+                "send",
+                "--from",
+                "mcp-probe-test",
+                "--to",
+                recipient,
+                "--body",
+                "existing inbox row before MCP connect",
+            ],
+        );
+    }
+    let live_before = peek_message_ids(&db, "livepeer");
+    let queued_before = peek_message_ids(&db, "queued");
+    let unavailable_before = peek_message_ids(&db, "no-transport");
 
-    // Live verdict (screen is injectable; no probe -> fail-open Live), not an error.
-    let (lerr, ltext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "screenpeer"}));
+    let fake_dir_string = fake_dir.to_string_lossy().into_owned();
+    let empty_home = unique_tmp_dir("mcp-connect-empty-home");
+    let mut mcp = McpServer::spawn_env(
+        &db,
+        &[
+            ("WEAVE_MUX_DIR", fake_dir_string.as_str()),
+            ("HOME", empty_home.to_str().unwrap()),
+        ],
+    );
+
+    // Live verdict through the trusted fake tmux, not an error.
+    let (lerr, ltext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "livepeer"}));
     assert!(!lerr, "connect to a live peer is not an error: {ltext}");
     assert!(
         ltext.contains("is live"),
         "connect reports live verdict: {ltext:?}"
     );
+    assert_connect_describes_only_a_future_message(&ltext);
 
-    // mux=none peer: not injectable, will queue, isError=false (graceful).
+    let (uerr, utext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "no-transport"}));
+    assert!(!uerr, "unavailable transport remains queueable: {utext}");
+    assert!(
+        utext.contains("no live transport")
+            && utext.contains("osascript could not be launched/probed from a trusted directory")
+            && utext.contains("next inbox drain"),
+        "MCP must report the explicit unavailable-transport verdict: {utext:?}"
+    );
+    assert_connect_describes_only_a_future_message(&utext);
+
+    // mux=none peer: not injectable, future store-delivery, isError=false.
     let (qerr, qtext) = mcp.call_tool("weave_connect", serde_json::json!({"to": "queued"}));
     assert!(
         !qerr,
         "connect to a non-injectable peer must NOT be an error: {qtext}"
     );
     assert!(
-        qtext.contains("not injectable") && qtext.contains("delivery will be queued"),
-        "connect reports graceful queue fallback: {qtext:?}"
+        qtext.contains("not injectable"),
+        "connect reports graceful store fallback: {qtext:?}"
+    );
+    assert_connect_describes_only_a_future_message(&qtext);
+
+    assert_eq!(
+        peek_message_ids(&db, "livepeer"),
+        live_before,
+        "MCP live connect must not mutate the inbox"
+    );
+    assert_eq!(
+        peek_message_ids(&db, "queued"),
+        queued_before,
+        "MCP store-only connect must not mutate the inbox"
+    );
+    assert_eq!(
+        peek_message_ids(&db, "no-transport"),
+        unavailable_before,
+        "MCP unavailable-transport connect must not mutate the inbox"
     );
 
     // Non-existent peer: the only hard failure -> isError.
@@ -8612,6 +9173,7 @@ fn hook_notification_responder_ack_is_idempotent_and_non_disruptive() {
         "notification",
         r#"{"cwd":"/proj/bob"}"#,
         &[
+            ("WEAVE_SESSION", "bob"),
             ("WEAVE_RESPONDER_ON_HOOK", "1"),
             ("WEAVE_RESPONDER_STATUS", "will-answer-later"),
         ],
@@ -8639,7 +9201,7 @@ fn hook_notification_responder_ack_is_idempotent_and_non_disruptive() {
         &db,
         "notification",
         r#"{"cwd":"/proj/bob"}"#,
-        &[("WEAVE_RESPONDER_ON_HOOK", "1")],
+        &[("WEAVE_SESSION", "bob"), ("WEAVE_RESPONDER_ON_HOOK", "1")],
     );
     assert!(ok2, "second hook notification responder: {err2}");
     let alice = run_ok(&db, &["inbox", "--me", "alice", "--all"]);
@@ -9401,6 +9963,482 @@ fn cli_job_dispatch_claims_runs_runner_and_records_result() {
     );
 }
 
+fn create_dispatch_test_job(db: &TestDb, title: &str) -> String {
+    let created = run_ok(
+        db,
+        &[
+            "job",
+            "create",
+            "--from",
+            "lead",
+            "--assignee",
+            "worker",
+            "--title",
+            title,
+            "--json",
+        ],
+    );
+    let value: serde_json::Value = serde_json::from_str(&created).expect("create JSON parses");
+    value["job"]["id"].as_str().expect("job id").to_string()
+}
+
+fn dispatch_test_job_json(db: &TestDb, id: &str) -> serde_json::Value {
+    let shown = run_ok(db, &["job", "show", id, "--json"]);
+    serde_json::from_str(&shown).expect("job show JSON parses")
+}
+
+/// An absolute executable outside every trusted directory is rejected before the
+/// worker claims anything. A bad runner choice must leave the durable job available
+/// to a corrected dispatch attempt, not execute it and not strand it `running`.
+#[test]
+fn cli_job_dispatch_rejects_untrusted_runner_before_claim() {
+    let db = TestDb::new();
+    let fixture = common::unique_db().with_extension("untrusted-dispatch");
+    let trusted = fixture.join("trusted");
+    std::fs::create_dir_all(&trusted).expect("create trusted runner dir");
+    let outside = fixture.join("outside-runner");
+    std::fs::write(&outside, b"#!/bin/sh\nexit 0\n").expect("write outside runner");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod outside runner");
+    let id = create_dispatch_test_job(&db, "reject untrusted runner");
+
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            outside.to_str().expect("UTF-8 outside runner"),
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &trusted);
+    let output = dispatch.output().expect("run untrusted dispatch");
+    assert!(
+        !output.status.success(),
+        "an executable outside trusted dirs must be rejected, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let job = dispatch_test_job_json(&db, &id);
+    assert_eq!(
+        job["job"]["state"].as_str(),
+        Some("queued"),
+        "runner trust validation must happen before claim: {job}"
+    );
+    assert!(
+        job["job"]["attempt_id"].is_null(),
+        "a rejected runner must not mint a claim token: {job}"
+    );
+}
+
+/// Metadata validation can succeed and the OS launch can still fail (here the
+/// executable's shebang interpreter is deterministically absent). Once a claim was
+/// minted, that failure must be fenced into a terminal `failed` update rather than
+/// abandoning the row in `running` forever.
+#[test]
+fn cli_job_dispatch_terminalizes_post_claim_launch_failure() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("launch-fail-dispatch");
+    std::fs::create_dir_all(&runner_dir).expect("create runner dir");
+    install_unlaunchable_program(&runner_dir, "cycle-b-launch-fail-runner");
+    let id = create_dispatch_test_job(&db, "terminalize runner launch failure");
+
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "cycle-b-launch-fail-runner",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let output = dispatch.output().expect("run launch-failing dispatch");
+    assert!(
+        !output.status.success(),
+        "the launch error should remain visible to the operator"
+    );
+    let job = dispatch_test_job_json(&db, &id);
+    assert_eq!(
+        job["job"]["state"].as_str(),
+        Some("failed"),
+        "a post-claim launch error must be terminalized: {job}"
+    );
+    assert!(
+        job["job"]["completed_ts"].as_i64().is_some(),
+        "terminal launch failure must carry a completion timestamp: {job}"
+    );
+}
+
+/// Dispatch timeout policy is validated before claim. `u64::MAX` must neither
+/// overflow an `Instant` deadline after claiming nor consume the queued job.
+#[test]
+fn cli_job_dispatch_rejects_huge_timeout_before_claim() {
+    let db = TestDb::new();
+    let id = create_dispatch_test_job(&db, "reject huge runner timeout");
+    let output = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "true",
+            "--timeout",
+            "18446744073709551615",
+            "--once",
+            "--json",
+        ],
+    )
+    .output()
+    .expect("run huge-timeout dispatch");
+    assert!(
+        !output.status.success(),
+        "an unbounded runner timeout must be rejected"
+    );
+    let job = dispatch_test_job_json(&db, &id);
+    assert_eq!(
+        job["job"]["state"].as_str(),
+        Some("queued"),
+        "timeout validation must precede claim: {job}"
+    );
+    assert!(job["job"]["attempt_id"].is_null(), "no claim: {job}");
+}
+
+/// Runner argv receives the same fixed cardinality bound as every other spawn
+/// surface, and cardinality validation must happen before the job is claimed.
+#[test]
+fn cli_job_dispatch_rejects_too_many_runner_args_before_claim() {
+    let db = TestDb::new();
+    let id = create_dispatch_test_job(&db, "reject oversized runner argv");
+    let mut args = vec![
+        "job".to_string(),
+        "dispatch".to_string(),
+        "--as".to_string(),
+        "worker".to_string(),
+        "--runner".to_string(),
+        "true".to_string(),
+    ];
+    for _ in 0..=weave_inject::MAX_SPAWN_ARGS {
+        args.push("--runner-arg".to_string());
+        args.push("bounded".to_string());
+    }
+    args.extend(["--once".to_string(), "--json".to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = common::weave_cmd(&db, &refs)
+        .output()
+        .expect("run oversized-argv dispatch");
+    assert!(
+        !output.status.success(),
+        "runner argv above MAX_SPAWN_ARGS must be rejected"
+    );
+    let job = dispatch_test_job_json(&db, &id);
+    assert_eq!(
+        job["job"]["state"].as_str(),
+        Some("queued"),
+        "argv validation must precede claim: {job}"
+    );
+    assert!(job["job"]["attempt_id"].is_null(), "no claim: {job}");
+}
+
+/// A runner can legitimately emit more than one OS pipe buffer. Weave must drain
+/// stdout while the child runs, retain only its bounded result prefix, and allow a
+/// successful noisy runner to complete instead of deadlocking until timeout.
+#[test]
+fn cli_job_dispatch_drains_and_bounds_noisy_runner_output() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("noisy-dispatch");
+    std::fs::create_dir_all(&runner_dir).expect("create noisy runner dir");
+    let runner = runner_dir.join("cycle-b-noisy-runner");
+    std::fs::write(
+        &runner,
+        b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef0123456789abcdef\\n'; i=$((i + 1)); done\nexit 0\n",
+    )
+    .expect("write noisy runner");
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod noisy runner");
+    let id = create_dispatch_test_job(&db, "drain noisy runner output");
+
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "cycle-b-noisy-runner",
+            "--timeout",
+            "3",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let output = dispatch.output().expect("run noisy dispatch");
+    assert!(
+        output.status.success(),
+        "a successful noisy runner must not pipe-deadlock: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("dispatch report JSON parses");
+    assert_eq!(report["job"]["state"].as_str(), Some("completed"));
+    assert_eq!(report["timed_out"].as_bool(), Some(false));
+
+    let job = dispatch_test_job_json(&db, &id);
+    let result: serde_json::Value = serde_json::from_str(
+        job["job"]["result_json"]
+            .as_str()
+            .expect("stored result JSON string"),
+    )
+    .expect("nested result JSON parses");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .expect("bounded stdout string")
+            .chars()
+            .count()
+            <= 16_384,
+        "stored runner stdout remains bounded: {result}"
+    );
+}
+
+/// A successful runner may launch a helper that creates a new session/process
+/// group and inherits both output pipes. That detached helper is outside the
+/// runner's owned process group, so dispatch completion must be keyed to the
+/// runner leader rather than waiting indefinitely for inherited-pipe EOF.
+#[cfg(unix)]
+#[test]
+fn cli_job_dispatch_does_not_wait_for_detached_descendant_pipe_eof() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("detached-pipe-dispatch");
+    std::fs::create_dir_all(&runner_dir).expect("create detached runner dir");
+    let runner = runner_dir.join("cycle-b-detached-pipe-runner");
+    let sentinel = runner_dir.join("detached-helper-live");
+    let detached_ready = runner_dir.join("detached-helper-ready");
+    std::fs::write(&sentinel, b"live").expect("create detached helper sentinel");
+    std::fs::write(
+        &runner,
+        b"#!/bin/sh\nsetsid sh -c 'printf ready > \"$2\"; i=0; while [ \"$i\" -lt 80 ] && [ -e \"$1\" ]; do sleep 0.1; i=$((i + 1)); done' weave-runner-helper \"$1\" \"$2\" &\ni=0\nwhile [ \"$i\" -lt 50 ] && [ ! -e \"$2\" ]; do sleep 0.02; i=$((i + 1)); done\n[ -e \"$2\" ] || exit 9\nprintf 'runner leader completed\\n'\nprintf 'runner stderr completed\\n' >&2\nexit 0\n",
+    )
+    .expect("write detached-pipe runner");
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod detached-pipe runner");
+    let id = create_dispatch_test_job(&db, "detach helper with inherited pipes");
+
+    let started = std::time::Instant::now();
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "cycle-b-detached-pipe-runner",
+            "--runner-arg",
+            sentinel.to_str().expect("UTF-8 sentinel path"),
+            "--runner-arg",
+            detached_ready.to_str().expect("UTF-8 ready path"),
+            "--timeout",
+            "3",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let output = dispatch.output().expect("run detached-pipe dispatch");
+    let elapsed = started.elapsed();
+    std::fs::remove_file(&sentinel).expect("release detached helper");
+
+    assert!(
+        output.status.success(),
+        "detached inherited pipes must not fail dispatch: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "dispatch waited for detached inherited-pipe EOF: {elapsed:?}"
+    );
+    assert!(
+        detached_ready.exists(),
+        "the helper must complete setsid before the runner leader exits"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("dispatch report JSON parses");
+    assert_eq!(report["job"]["state"].as_str(), Some("completed"));
+    assert_eq!(report["timed_out"].as_bool(), Some(false));
+    assert_eq!(
+        report["job"]["id"].as_str(),
+        Some(id.as_str()),
+        "the intended queued job completed"
+    );
+
+    let job = dispatch_test_job_json(&db, &id);
+    let result: serde_json::Value = serde_json::from_str(
+        job["job"]["result_json"]
+            .as_str()
+            .expect("stored result JSON string"),
+    )
+    .expect("nested result JSON parses");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runner leader completed"),
+        "leader stdout was retained: {result}"
+    );
+    assert!(
+        result["stderr"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runner stderr completed"),
+        "leader stderr was retained: {result}"
+    );
+    let _ = std::fs::remove_dir_all(runner_dir);
+}
+
+/// JSON escaping can expand a retained stream several-fold. Both output pipes are
+/// drained concurrently, and the final durable payload must still respect the
+/// store's byte cap after escaping rather than relying on a raw character cap.
+#[test]
+fn cli_job_dispatch_bounds_escape_heavy_stdout_and_stderr_json() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("escape-heavy-dispatch");
+    std::fs::create_dir_all(&runner_dir).expect("create escape-heavy runner dir");
+    let runner = runner_dir.join("cycle-b-escape-heavy-runner");
+    std::fs::write(
+        &runner,
+        b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 20000 ]; do printf '\\001\\002\\003\\004' ; printf '\\005\\006\\007\\010' >&2; i=$((i + 1)); done\nexit 7\n",
+    )
+    .expect("write escape-heavy runner");
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod escape-heavy runner");
+    let id = create_dispatch_test_job(&db, "bound escape-heavy runner JSON");
+
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "cycle-b-escape-heavy-runner",
+            "--timeout",
+            "3",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let output = dispatch.output().expect("run escape-heavy dispatch");
+    assert!(
+        output.status.success(),
+        "a nonzero runner is a recorded job outcome, not a dispatch lifecycle error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("dispatch report JSON parses");
+    assert_eq!(report["job"]["state"].as_str(), Some("failed"));
+    assert_eq!(report["exit_code"].as_i64(), Some(7));
+
+    let job = dispatch_test_job_json(&db, &id);
+    for field in ["result_json", "error_json"] {
+        let stored = job["job"][field].as_str().expect("stored JSON string");
+        assert!(
+            stored.len() <= weave_core::model::MAX_JOB_JSON,
+            "{field} exceeded the durable byte cap after JSON escaping: {}",
+            stored.len()
+        );
+        serde_json::from_str::<serde_json::Value>(stored)
+            .unwrap_or_else(|err| panic!("{field} remains valid JSON ({err}): {stored:?}"));
+    }
+}
+
+/// Timeout owns and reaps the direct runner process, then persists the ordinary
+/// bounded failed outcome rather than leaving the claimed row `running`.
+#[test]
+fn cli_job_dispatch_timeout_is_bounded_and_terminal() {
+    let db = TestDb::new();
+    let runner_dir = common::unique_db().with_extension("timeout-tree-dispatch");
+    std::fs::create_dir_all(&runner_dir).expect("create timeout runner dir");
+    let runner = runner_dir.join("cycle-b-timeout-tree-runner");
+    let descendant_pid_file = runner_dir.join("descendant.pid");
+    std::fs::write(
+        &runner,
+        b"#!/bin/sh\nsleep 30 &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nwait \"$descendant\"\n",
+    )
+    .expect("write timeout tree runner");
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod timeout tree runner");
+    let id = create_dispatch_test_job(&db, "terminalize runner timeout");
+    let started = std::time::Instant::now();
+    let mut dispatch = common::weave_cmd(
+        &db,
+        &[
+            "job",
+            "dispatch",
+            "--as",
+            "worker",
+            "--runner",
+            "cycle-b-timeout-tree-runner",
+            "--runner-arg",
+            descendant_pid_file.to_str().expect("UTF-8 pid file"),
+            "--timeout",
+            "1",
+            "--once",
+            "--json",
+        ],
+    );
+    dispatch.env("WEAVE_MUX_DIR", &runner_dir);
+    let output = dispatch.output().expect("run timeout dispatch");
+    assert!(
+        output.status.success(),
+        "timeout is a recorded runner outcome"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the direct runner must be terminated and reaped within the configured bound"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("timeout report JSON parses");
+    assert_eq!(report["timed_out"].as_bool(), Some(true));
+    assert_eq!(report["exit_code"].as_i64(), Some(124));
+    assert_eq!(report["job"]["state"].as_str(), Some("failed"));
+
+    let job = dispatch_test_job_json(&db, &id);
+    assert_eq!(job["job"]["state"].as_str(), Some("failed"));
+    assert!(job["job"]["completed_ts"].as_i64().is_some());
+
+    let descendant: i64 = std::fs::read_to_string(&descendant_pid_file)
+        .expect("runner recorded descendant pid")
+        .parse()
+        .expect("descendant pid parses");
+    let descendant_proc = std::path::PathBuf::from(format!("/proc/{descendant}"));
+    let gone_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while descendant_proc.exists() && std::time::Instant::now() < gone_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !descendant_proc.exists(),
+        "timeout cleanup must terminate runner descendants in the owned process group (pid {descendant})"
+    );
+    let _ = std::fs::remove_dir_all(runner_dir);
+}
+
 /// MCP happy path + every documented failure path for the job tools.
 #[test]
 fn mcp_job_tools_happy_and_failure_paths() {
@@ -9953,9 +10991,9 @@ fn ambiguous_shared_target_degrades_to_queue_only_trace() {
     );
 }
 
-/// A peer that recently answered a tracked ask is classified as responsive even if
-/// its original one-shot registration process has already exited. This is the
-/// read-time status layer doctor/scan use to avoid stale-only summaries.
+/// A peer that recently answered a tracked ask is classified as responsive. This
+/// is the read-time status layer doctor/scan use instead of reducing activity to
+/// presence alone.
 #[test]
 fn peers_scan_and_doctor_surface_responsive_status() {
     let db = TestDb::new();
@@ -10011,12 +11049,17 @@ fn peers_scan_and_doctor_surface_responsive_status() {
     );
 }
 
-/// A stale store-only peer gets the explicit registered-stale status rather than
-/// being collapsed into online/offline or the generic non-injectable bucket.
+/// An explicitly PID-tracked store-only peer whose process is dead gets the
+/// registered-stale status. Plain one-shot registration intentionally stores no
+/// PID and is covered separately by the fresh TTL-live contract.
 #[test]
 fn peers_scan_and_doctor_surface_registered_stale_status() {
     let db = TestDb::new();
-    run_ok(&db, &["register", "--name", "cold"]);
+    run_ok_env(
+        &db,
+        &["register", "--name", "cold"],
+        &[("WEAVE_CLIENT_PID", "999999999")],
+    );
 
     let peers_json = run_ok(&db, &["peers", "--json"]);
     let peers: serde_json::Value = serde_json::from_str(&peers_json).expect("peers json");
@@ -15822,4 +16865,663 @@ fn tui_once_and_json_are_default_build_operator_surfaces() {
             );
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WL-084 — collision-proof per-session identity.
+//
+// Every test pins WEAVE_CLIENT_PID explicitly: inside `cargo test` the hook's
+// ancestry walk would otherwise resolve the SAME test-runner process for every
+// fake session, and the conflict classifier would (correctly) treat them as
+// one session. Pid `1` doubles as "a different, always-alive client";
+// `999999999` as "a dead client" (beyond any real pid_max).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Two DIFFERENT live sessions whose cwds share a basename must NOT share a
+/// peer row: the second registers under the deterministic `-2` alias, and each
+/// row carries its own launcher-session key.
+#[test]
+fn wl084_same_basename_live_sessions_get_distinct_identities() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let (ok, out_a, err_a) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wa/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "A failed: {err_a}");
+    assert!(
+        out_a.contains("mesh identity: 'proj'"),
+        "A announces the base name on stdout (context injection): {out_a}"
+    );
+    let (ok, out_b, err_b) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wb/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    assert!(ok, "B failed: {err_b}");
+    assert!(
+        err_b.contains("registered as 'proj-2'"),
+        "B is auto-uniquified with a visible notice: {err_b}"
+    );
+    assert!(
+        out_b.contains("mesh identity: 'proj-2'"),
+        "B announces the uniquified name: {out_b}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        peers.contains("\"proj\"") && peers.contains("\"proj-2\""),
+        "two rows: {peers}"
+    );
+    assert!(
+        peers.contains("sid-A") && peers.contains("sid-B"),
+        "each row keeps its key: {peers}"
+    );
+}
+
+/// Distinct non-empty launcher session IDs remain distinct even when the host
+/// reports one shared client PID (for example, multiple logical sessions inside a
+/// long-lived agent host). PID equality is only a legacy fallback when a session key
+/// is absent; it must not overwrite stronger, contradictory session identity.
+#[test]
+fn wl084_different_session_ids_with_same_pid_do_not_collapse() {
+    let db = TestDb::new();
+    let shared_pid = std::process::id().to_string();
+    let (ok, _out_a, err_a) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/ws-a/proj","session_id":"sid-SHARED-A"}"#,
+        &[("WEAVE_CLIENT_PID", shared_pid.as_str())],
+    );
+    assert!(ok, "first session failed: {err_a}");
+    let (ok, out_b, err_b) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/ws-b/proj","session_id":"sid-SHARED-B"}"#,
+        &[("WEAVE_CLIENT_PID", shared_pid.as_str())],
+    );
+    assert!(ok, "second session failed: {err_b}");
+    assert!(
+        out_b.contains("mesh identity: 'proj-2'") && err_b.contains("registered as 'proj-2'"),
+        "different keyed sessions sharing one pid must be uniquified: stdout={out_b:?} stderr={err_b:?}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        peers.contains("sid-SHARED-A")
+            && peers.contains("sid-SHARED-B")
+            && peers.contains("\"proj-2\""),
+        "both keyed identities remain independently registered: {peers}"
+    );
+}
+
+/// Launcher-session ownership keys are strict and lossless. An oversized key is
+/// refused for both registration and prompt handling, and can never fall back to
+/// the cwd basename to drain a live peer's inbox.
+#[test]
+fn wl084_oversized_session_key_is_rejected_without_foreign_drain() {
+    let db = TestDb::new();
+    let pid_a = std::process::id().to_string();
+    let (ok, _out, err) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wraw-a/proj","session_id":"sid-BASE"}"#,
+        &[("WEAVE_CLIENT_PID", pid_a.as_str())],
+    );
+    assert!(ok, "base session failed: {err}");
+
+    let oversized = format!("sid-{}", "X".repeat(weave_core::store::MAX_IDENT + 32));
+    let payload_b = serde_json::json!({
+        "cwd": "/tmp/wraw-b/proj",
+        "session_id": oversized,
+    })
+    .to_string();
+    let (session_ok, session_out, session_err) =
+        run_hook_env(&db, "session", &payload_b, &[("WEAVE_CLIENT_PID", "1")]);
+    assert!(
+        session_ok,
+        "a refused lifecycle hook exits cleanly: {session_err}"
+    );
+    assert!(
+        session_out.is_empty() && session_err.contains("invalid hook session_id"),
+        "oversized ownership key must be refused before registration: stdout={session_out:?} stderr={session_err:?}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2") && !peers.contains(&"X".repeat(64)),
+        "refused key must not create an alias or be stored: {peers}"
+    );
+
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj",
+            "--body",
+            "BASE-INBOX-MUST-NOT-DRAIN",
+        ],
+    );
+    let (prompt_ok, prompt_out, prompt_err) =
+        run_hook_env(&db, "prompt", &payload_b, &[("WEAVE_CLIENT_PID", "1")]);
+    assert!(
+        prompt_ok,
+        "a refused prompt hook exits cleanly: {prompt_err}"
+    );
+    assert!(
+        prompt_out.is_empty()
+            && prompt_err.contains("invalid hook session_id")
+            && !prompt_out.contains("BASE-INBOX-MUST-NOT-DRAIN"),
+        "oversized key must fail closed before a foreign drain: stdout={prompt_out:?} stderr={prompt_err:?}"
+    );
+
+    let base = run_ok(&db, &["inbox", "--me", "proj", "--peek"]);
+    assert!(
+        base.contains("BASE-INBOX-MUST-NOT-DRAIN"),
+        "base peer's unread message must remain available: {base}"
+    );
+}
+
+/// Control-bearing launcher-session keys are refused by the same strict seam and
+/// cannot silently fall back to another live peer.
+#[test]
+fn wl084_control_session_key_is_rejected_without_foreign_drain() {
+    let db = TestDb::new();
+    let pid_a = std::process::id().to_string();
+    let (ok, _out, err) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wctrl-a/proj","session_id":"sid-BASE-CONTROL"}"#,
+        &[("WEAVE_CLIENT_PID", pid_a.as_str())],
+    );
+    assert!(ok, "base session failed: {err}");
+
+    let payload_b = serde_json::json!({
+        "cwd": "/tmp/wctrl-b/proj",
+        "session_id": "sid-B\nRAW",
+    })
+    .to_string();
+    let (session_ok, session_out, session_err) =
+        run_hook_env(&db, "session", &payload_b, &[("WEAVE_CLIENT_PID", "1")]);
+    assert!(
+        session_ok,
+        "a refused lifecycle hook exits cleanly: {session_err}"
+    );
+    assert!(
+        session_out.is_empty() && session_err.contains("invalid hook session_id"),
+        "control-bearing key must be refused before registration: stdout={session_out:?} stderr={session_err:?}"
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj",
+            "--body",
+            "CONTROL-BASE-MUST-NOT-DRAIN",
+        ],
+    );
+    let (prompt_ok, prompt_out, prompt_err) =
+        run_hook_env(&db, "prompt", &payload_b, &[("WEAVE_CLIENT_PID", "1")]);
+    assert!(
+        prompt_ok,
+        "a refused prompt hook exits cleanly: {prompt_err}"
+    );
+    assert!(
+        prompt_out.is_empty()
+            && prompt_err.contains("invalid hook session_id")
+            && !prompt_out.contains("CONTROL-BASE-MUST-NOT-DRAIN"),
+        "control-key mismatch drained another peer: stdout={prompt_out:?} stderr={prompt_err:?}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2"),
+        "refused key created an alias: {peers}"
+    );
+    let base = run_ok(&db, &["inbox", "--me", "proj", "--peek"]);
+    assert!(base.contains("CONTROL-BASE-MUST-NOT-DRAIN"));
+}
+
+/// A launcher ownership token is lossless: leading/trailing whitespace or a
+/// trailing control byte must be rejected, never trimmed into another session's
+/// valid key and used to consume that peer's inbox.
+#[test]
+fn wl084_session_key_edge_whitespace_cannot_alias_foreign_row() {
+    let db = TestDb::new();
+    let pid_a = std::process::id().to_string();
+    let (ok, _out, err) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wedge-a/proj","session_id":"sid-EDGE"}"#,
+        &[("WEAVE_CLIENT_PID", pid_a.as_str())],
+    );
+    assert!(ok, "base session failed: {err}");
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj",
+            "--body",
+            "EDGE-WHITESPACE-MUST-NOT-DRAIN",
+        ],
+    );
+
+    for malformed in [" sid-EDGE", "sid-EDGE ", "sid-EDGE\n"] {
+        let payload = serde_json::json!({
+            "cwd": "/tmp/wedge-b/other",
+            "session_id": malformed,
+        })
+        .to_string();
+        let (prompt_ok, prompt_out, prompt_err) =
+            run_hook_env(&db, "prompt", &payload, &[("WEAVE_CLIENT_PID", "1")]);
+        assert!(prompt_ok, "refused hook exits cleanly: {prompt_err}");
+        assert!(
+            prompt_out.is_empty() && prompt_err.contains("invalid hook session_id"),
+            "malformed edge whitespace aliased an owned row: key={malformed:?} stdout={prompt_out:?} stderr={prompt_err:?}"
+        );
+    }
+
+    let remaining = run_ok(&db, &["inbox", "--me", "proj", "--peek"]);
+    assert!(remaining.contains("EDGE-WHITESPACE-MUST-NOT-DRAIN"));
+}
+
+/// Hook stdin is bounded before JSON parsing. Even when the accepted prefix names
+/// a valid live session, an oversized payload is ignored as a whole and cannot
+/// consume that session's inbox.
+#[test]
+fn wl084_oversized_hook_payload_cannot_register_or_drain() {
+    let db = TestDb::new();
+    let pid = std::process::id().to_string();
+    let (ok, _out, err) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wbound/proj","session_id":"sid-BOUNDED"}"#,
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    assert!(ok, "base session failed: {err}");
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj",
+            "--body",
+            "OVERSIZED-HOOK-MUST-NOT-DRAIN",
+        ],
+    );
+
+    let oversized = serde_json::json!({
+        "cwd": "/tmp/wbound/proj",
+        "session_id": "sid-BOUNDED",
+        "padding": "x".repeat(1_100_000),
+    })
+    .to_string();
+    let (prompt_ok, prompt_out, prompt_err) = run_hook_env(
+        &db,
+        "prompt",
+        &oversized,
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    assert!(prompt_ok, "bounded refusal exits cleanly: {prompt_err}");
+    assert!(
+        prompt_err.contains("hook payload exceeds")
+            && !prompt_out.contains("OVERSIZED-HOOK-MUST-NOT-DRAIN"),
+        "oversized input must be rejected before identity use: stdout={prompt_out:?} stderr={prompt_err:?}"
+    );
+    let remaining = run_ok(&db, &["inbox", "--me", "proj", "--peek"]);
+    assert!(
+        remaining.contains("OVERSIZED-HOOK-MUST-NOT-DRAIN"),
+        "oversized prompt consumed the durable inbox: {remaining}"
+    );
+}
+
+/// A stdin decoding error may leave a syntactically valid prefix in an I/O
+/// buffer. The hook must discard that prefix instead of treating it as a complete
+/// identity payload, even when an explicit configured identity would otherwise
+/// authorize a read-marking drain.
+#[test]
+fn wl084_invalid_utf8_hook_payload_cannot_drain_valid_prefix() {
+    let db = TestDb::new();
+    run_ok(&db, &["register", "--name", "utf8-peer"]);
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "utf8-peer",
+            "--body",
+            "INVALID-UTF8-MUST-NOT-DRAIN",
+        ],
+    );
+
+    let mut hook = common::weave_cmd(&db, &["hook", "prompt"]);
+    hook.env("WEAVE_SESSION", "utf8-peer")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut hook = hook.spawn().expect("spawn invalid-UTF8 hook");
+    let mut payload = br#"{"cwd":"/tmp/utf8-peer"}"#.to_vec();
+    payload.push(0xff);
+    hook.stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(&payload)
+        .expect("write invalid-UTF8 hook payload");
+    let output = hook.wait_with_output().expect("wait invalid-UTF8 hook");
+    assert!(
+        output.status.success(),
+        "hook must fail closed but exit cleanly"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hook stdin UTF-8 decode error")
+            && !stdout.contains("INVALID-UTF8-MUST-NOT-DRAIN"),
+        "invalid UTF-8 prefix was acted on: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let remaining = run_ok(&db, &["inbox", "--me", "utf8-peer", "--peek"]);
+    assert!(remaining.contains("INVALID-UTF8-MUST-NOT-DRAIN"));
+}
+
+/// A host without launcher session ids may recover identity from one unique
+/// same-host client-PID row. That ownership evidence is strong enough for the
+/// prompt hook to perform its normal read-marking drain.
+#[test]
+fn wl084_missing_session_key_uses_one_unique_client_pid_row() {
+    let db = TestDb::new();
+    let pid = std::process::id().to_string();
+    let (ok, _out, err) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wunique/owned","session_id":"sid-UNIQUE"}"#,
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    assert!(ok, "session registration failed: {err}");
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "owned",
+            "--body",
+            "UNIQUE-PID-DELIVERY",
+        ],
+    );
+
+    let (prompt_ok, prompt_out, prompt_err) = run_hook_env(
+        &db,
+        "prompt",
+        r#"{"cwd":"/tmp/different/guess"}"#,
+        &[("WEAVE_CLIENT_PID", pid.as_str())],
+    );
+    assert!(prompt_ok, "missing-key prompt failed: {prompt_err}");
+    assert!(
+        prompt_out.contains("UNIQUE-PID-DELIVERY") && prompt_out.contains("for 'owned'"),
+        "unique PID ownership must override the cwd guess: {prompt_out:?}"
+    );
+    assert!(
+        peek_message_ids(&db, "owned").is_empty(),
+        "trusted unique-PID prompt must mark its delivered row read"
+    );
+}
+
+/// If more than one local row shares a PID and no launcher session id is present,
+/// PID ownership is ambiguous. The cwd-named inbox may be displayed only as a
+/// non-consuming peek; repeated prompts must leave it unread.
+#[test]
+fn wl084_missing_session_key_with_ambiguous_pid_is_peek_only() {
+    let db = TestDb::new();
+    let pid = std::process::id().to_string();
+    for (cwd, sid) in [
+        ("/tmp/wambiguous/alpha", "sid-AMB-A"),
+        ("/tmp/wambiguous/beta", "sid-AMB-B"),
+    ] {
+        let payload = serde_json::json!({"cwd": cwd, "session_id": sid}).to_string();
+        let (ok, _out, err) = run_hook_env(
+            &db,
+            "session",
+            &payload,
+            &[("WEAVE_CLIENT_PID", pid.as_str())],
+        );
+        assert!(ok, "seed session {sid} failed: {err}");
+    }
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "alpha",
+            "--body",
+            "AMBIGUOUS-PID-PEEK",
+        ],
+    );
+
+    for attempt in 1..=2 {
+        let (ok, out, err) = run_hook_env(
+            &db,
+            "prompt",
+            r#"{"cwd":"/tmp/wambiguous/alpha"}"#,
+            &[("WEAVE_CLIENT_PID", pid.as_str())],
+        );
+        assert!(ok, "ambiguous prompt {attempt} failed: {err}");
+        assert!(
+            out.contains("AMBIGUOUS-PID-PEEK") && err.contains("peeking inbox"),
+            "ambiguous PID must remain non-consuming on attempt {attempt}: stdout={out:?} stderr={err:?}"
+        );
+    }
+    assert_eq!(
+        peek_message_ids(&db, "alpha").len(),
+        1,
+        "ambiguous PID fallback must leave the message unread"
+    );
+}
+
+/// A re-fired SessionStart of the SAME session (same `session_id`) updates its
+/// own row in place — no `-2` alias, still exactly one row for the name.
+#[test]
+fn wl084_same_session_refire_is_idempotent() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let payload = r#"{"cwd":"/tmp/wr/proj","session_id":"sid-R"}"#;
+    let (ok, _o, e1) = run_hook_env(
+        &db,
+        "session",
+        payload,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "first: {e1}");
+    let (ok, out2, e2) = run_hook_env(
+        &db,
+        "session",
+        payload,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "refire: {e2}");
+    assert!(
+        out2.contains("mesh identity: 'proj'"),
+        "refire keeps the base name: {out2}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2"),
+        "no alias minted on refire: {peers}"
+    );
+}
+
+/// A DEAD same-basename row is reclaimed under the same name (name continuity
+/// across restarts), and the reclaiming session's key takes over the row.
+#[test]
+fn wl084_dead_row_is_reclaimed_under_same_name() {
+    let db = TestDb::new();
+    let (ok, _o, e1) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wd/proj","session_id":"sid-OLD"}"#,
+        &[("WEAVE_CLIENT_PID", "999999999")],
+    );
+    assert!(ok, "old: {e1}");
+    let my_pid = std::process::id().to_string();
+    let (ok, out2, e2) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wd2/proj","session_id":"sid-NEW"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "new: {e2}");
+    assert!(
+        out2.contains("mesh identity: 'proj'"),
+        "dead row reclaimed, not aliased: {out2}"
+    );
+    let peers = run_ok(&db, &["peers", "--json"]);
+    assert!(
+        !peers.contains("proj-2"),
+        "no alias for a dead row: {peers}"
+    );
+    assert!(
+        peers.contains("sid-NEW") && !peers.contains("sid-OLD"),
+        "key taken over: {peers}"
+    );
+}
+
+/// The prompt drain of a uniquified session resolves its identity via the
+/// session key — it delivers ITS OWN inbox (the `-2` alias), never the base
+/// name's, even though its cwd basename still says the base name.
+#[test]
+fn wl084_prompt_drain_resolves_by_session_key() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wp/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wq/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    run_ok(
+        &db,
+        &[
+            "send",
+            "--from",
+            "sender",
+            "--to",
+            "proj-2",
+            "--body",
+            "for the alias only",
+        ],
+    );
+    // B (the alias) drains it…
+    let (ok, out_b, err_b) = run_hook_env(
+        &db,
+        "prompt",
+        r#"{"cwd":"/tmp/wq/proj","session_id":"sid-B"}"#,
+        &[("WEAVE_CLIENT_PID", "1")],
+    );
+    assert!(ok, "B prompt: {err_b}");
+    assert!(
+        out_b.contains("for the alias only"),
+        "the alias session receives its message: {out_b}"
+    );
+    // …and A (the base name) never sees it.
+    let (ok, out_a, err_a) = run_hook_env(
+        &db,
+        "prompt",
+        r#"{"cwd":"/tmp/wp/proj","session_id":"sid-A"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "A prompt: {err_a}");
+    assert!(
+        !out_a.contains("for the alias only"),
+        "the base-name session must not drain the alias inbox: {out_a}"
+    );
+}
+
+/// SessionStart appends `export WEAVE_SESSION='<name>'` to $CLAUDE_ENV_FILE
+/// (best-effort identity pinning for the session's shell tool calls), and
+/// skips the write when config/$WEAVE_SESSION already pins the name.
+#[test]
+fn wl084_session_hook_pins_identity_into_claude_env_file() {
+    let db = TestDb::new();
+    let envf = std::env::temp_dir().join(format!("weave-envfile-{}", std::process::id()));
+    let _ = std::fs::remove_file(&envf);
+    let my_pid = std::process::id().to_string();
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/we/proj","session_id":"sid-E"}"#,
+        &[
+            ("WEAVE_CLIENT_PID", my_pid.as_str()),
+            ("CLAUDE_ENV_FILE", envf.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "session: {e}");
+    let written = std::fs::read_to_string(&envf).expect("env file written");
+    assert!(
+        written.contains("export WEAVE_SESSION='proj'"),
+        "identity export appended: {written}"
+    );
+    // Explicit WEAVE_SESSION: no export line is appended (operator's pin wins).
+    let envf2 = std::env::temp_dir().join(format!("weave-envfile2-{}", std::process::id()));
+    let _ = std::fs::remove_file(&envf2);
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/we/proj","session_id":"sid-F"}"#,
+        &[
+            ("WEAVE_CLIENT_PID", "1"),
+            ("WEAVE_SESSION", "pinned-name"),
+            ("CLAUDE_ENV_FILE", envf2.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "pinned session: {e}");
+    assert!(
+        !envf2.exists(),
+        "no env-file write under an explicit WEAVE_SESSION"
+    );
+    let _ = std::fs::remove_file(&envf);
+}
+
+/// Hook-registered presence tracks the CLIENT process, not the hook process:
+/// with a live client pid the fresh row reads alive (`process_alive=true`),
+/// never `stale_reason=process_dead` (the pre-WL-084 bug).
+#[test]
+fn wl084_presence_tracks_client_process_not_hook_process() {
+    let db = TestDb::new();
+    let my_pid = std::process::id().to_string();
+    let (ok, _o, e) = run_hook_env(
+        &db,
+        "session",
+        r#"{"cwd":"/tmp/wl/proj","session_id":"sid-L"}"#,
+        &[("WEAVE_CLIENT_PID", my_pid.as_str())],
+    );
+    assert!(ok, "session: {e}");
+    let peers = run_ok(&db, &["peers"]);
+    assert!(
+        peers.contains("process_alive=true"),
+        "presence keys on the live client pid: {peers}"
+    );
+    assert!(
+        !peers.contains("stale_reason=process_dead"),
+        "the dying-hook-pid bug must not resurface: {peers}"
+    );
 }

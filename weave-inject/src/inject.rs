@@ -44,6 +44,117 @@ pub const MAX_SPAWN_ARG_LEN: usize = 4096;
 /// never hang the caller (the MCP server serves other sessions).
 const INJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum stdout retained from a read-only mux probe. The reader continues
+/// draining after this prefix so a large listing cannot fill the child pipe, but
+/// target matching never needs an unbounded in-memory inventory.
+const MAX_PROBE_OUTPUT_BYTES: usize = 1_048_576;
+
+/// After the command leader exits, spend only a small fixed grace draining bytes
+/// already in flight. This also bounds a detached descendant that keeps writing.
+const POST_LEADER_CAPTURE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+struct ProbeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+enum CaptureRead {
+    Data(usize),
+    Idle,
+    Eof,
+}
+
+/// Pipe reader that can periodically observe a leader-finished signal. On Unix,
+/// `poll(2)` keeps `read` from blocking on an inherited descriptor after the
+/// child leader exits; the non-Unix fallback preserves portable compilation.
+trait CancellableCaptureReader: std::io::Read + Send + 'static {
+    fn read_when_ready(&mut self, buf: &mut [u8], wait: bool) -> std::io::Result<CaptureRead>;
+}
+
+#[cfg(unix)]
+impl<T> CancellableCaptureReader for T
+where
+    T: std::io::Read + std::os::fd::AsRawFd + Send + 'static,
+{
+    fn read_when_ready(&mut self, buf: &mut [u8], wait: bool) -> std::io::Result<CaptureRead> {
+        const POLLIN: std::ffi::c_short = 0x0001;
+        const POLLERR: std::ffi::c_short = 0x0008;
+        const POLLHUP: std::ffi::c_short = 0x0010;
+        const POLLNVAL: std::ffi::c_short = 0x0020;
+
+        #[repr(C)]
+        struct PollFd {
+            fd: std::ffi::c_int,
+            events: std::ffi::c_short,
+            revents: std::ffi::c_short,
+        }
+
+        unsafe extern "C" {
+            #[link_name = "poll"]
+            fn c_poll(fds: *mut PollFd, nfds: usize, timeout: std::ffi::c_int) -> std::ffi::c_int;
+        }
+
+        let mut descriptor = PollFd {
+            fd: self.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        // A short wait avoids a busy loop while the leader is live. Once its
+        // completion signal is visible, a zero-time poll drains only bytes that
+        // are already buffered and never waits for an escaped descendant.
+        let timeout_ms = if wait { 20 } else { 0 };
+        // SAFETY: `descriptor` points to one initialized `pollfd` for the duration
+        // of the call. `poll` mutates only its `revents` field and retains nothing.
+        let ready = unsafe { c_poll(&mut descriptor, 1, timeout_ms) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            return if err.kind() == std::io::ErrorKind::Interrupted {
+                Ok(CaptureRead::Idle)
+            } else {
+                Err(err)
+            };
+        }
+        if ready == 0 {
+            return Ok(CaptureRead::Idle);
+        }
+        if descriptor.revents & POLLNVAL != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "capture pipe descriptor is invalid",
+            ));
+        }
+        if descriptor.revents & (POLLIN | POLLERR | POLLHUP) == 0 {
+            return Ok(CaptureRead::Idle);
+        }
+        match std::io::Read::read(self, buf) {
+            Ok(0) => Ok(CaptureRead::Eof),
+            Ok(n) => Ok(CaptureRead::Data(n)),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(CaptureRead::Idle)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl<T> CancellableCaptureReader for T
+where
+    T: std::io::Read + Send + 'static,
+{
+    fn read_when_ready(&mut self, buf: &mut [u8], _wait: bool) -> std::io::Result<CaptureRead> {
+        match std::io::Read::read(self, buf)? {
+            0 => Ok(CaptureRead::Eof),
+            n => Ok(CaptureRead::Data(n)),
+        }
+    }
+}
+
 /// How much of a message a caller wants delivered live into the recipient's pane.
 ///
 /// Both modes type a *single submitted line* — the difference is what that line
@@ -1002,7 +1113,7 @@ fn json_escape(s: &str) -> String {
 /// either a bare name resolved against [`trusted_dirs`] (like the mux binaries) OR an
 /// absolute path that itself lives under a trusted dir. Returns `None` otherwise, so a
 /// remote spawn cannot launch a binary outside the trusted set.
-fn resolve_trusted_program(prog: &str) -> Option<std::path::PathBuf> {
+pub fn resolve_trusted_program(prog: &str) -> Option<std::path::PathBuf> {
     if prog.is_empty() {
         return None;
     }
@@ -1016,7 +1127,7 @@ fn resolve_trusted_program(prog: &str) -> Option<std::path::PathBuf> {
         // by directory, not by the symlink's destination. (On many distros a trusted
         // `/usr/bin/foo` is itself a symlink into `/usr/lib/...`; following it would
         // wrongly reject a legitimately trusted binary.)
-        if !p.is_file() {
+        if !is_executable_file(p) {
             return None;
         }
         let parent = std::fs::canonicalize(p.parent()?).ok()?;
@@ -1185,6 +1296,65 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetProbe {
+    Alive,
+    Absent,
+    TransportUnavailable,
+}
+
+/// Run the read-only mux probe and retain the distinction that the legacy bool
+/// [`target_alive`] intentionally erases: a missing/unlaunchable/timed-out local
+/// transport is not evidence that the pane is absent, but it also cannot support a
+/// [`Capability::Live`] promise.
+fn target_probe(target: &Target) -> TargetProbe {
+    if !target.injectable() {
+        // `target_alive` has always been advisory/fail-open for targets that cannot
+        // be injected. `capability` classifies this case before consulting the probe.
+        return TargetProbe::Alive;
+    }
+    let bin = target.mux.binary();
+    if !have(bin) {
+        return TargetProbe::TransportUnavailable;
+    }
+    let Some(cmd) = liveness_probe(target) else {
+        // Backends without a pane-existence query still need a real launchability
+        // check. `--version` is read-only; a non-zero exit still proves the OS
+        // launched the trusted program, while spawn/timeout failure cannot promise
+        // live transport.
+        let version = argv(&[bin, "--version"]);
+        return match run_capture(&version, INJECT_TIMEOUT) {
+            Ok(_) => TargetProbe::Alive,
+            Err(_) => TargetProbe::TransportUnavailable,
+        };
+    };
+    match target.mux {
+        Mux::Tmux => match run_bounded(&cmd, INJECT_TIMEOUT) {
+            Ok(true) => TargetProbe::Alive,
+            Ok(false) => TargetProbe::Absent,
+            Err(_) => TargetProbe::TransportUnavailable,
+        },
+        Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
+            match run_capture(&cmd, INJECT_TIMEOUT) {
+                Ok(Some(out)) => {
+                    if id_present(target.mux, &out, target.id.as_str()) {
+                        TargetProbe::Alive
+                    } else {
+                        TargetProbe::Absent
+                    }
+                }
+                // A nonzero listing produced no trustworthy inventory. Preserve
+                // the legacy bool's fail-open behavior through
+                // `TransportUnavailable`, but never promote this failed transport
+                // to a structured `Live` promise.
+                Ok(None) => TargetProbe::TransportUnavailable,
+                Err(_) => TargetProbe::TransportUnavailable,
+            }
+        }
+        Mux::Screen | Mux::ITerm2 | Mux::None => unreachable!("handled above"),
+    }
+}
+
 /// Best-effort liveness pre-check: is `target`'s pane/session still around?
 ///
 /// Used *opportunistically* — a `true` (or "no probe available") means "go
@@ -1194,49 +1364,32 @@ pub fn liveness_probe(target: &Target) -> Option<Vec<String>> {
 /// a missing mux binary, a probe error, or a timeout all return `true` so we
 /// never suppress a delivery just because the probe itself was unavailable.
 pub fn target_alive(target: &Target) -> bool {
-    let Some(cmd) = liveness_probe(target) else {
-        // No probe for this backend — don't gate; let inject try.
-        return true;
-    };
-    let bin = target.mux.binary();
-    if !have(bin) {
-        // Can't probe ⇒ don't suppress; inject() will surface a real error.
-        return true;
-    }
-    match target.mux {
-        // Exit-status probes: 0 ⇒ alive, non-zero ⇒ gone, error/timeout ⇒ assume alive.
-        Mux::Tmux => run_bounded(&cmd, INJECT_TIMEOUT).unwrap_or(true),
-        // Stdout-scan probes: the id must appear in the listing to count as alive,
-        // but any spawn/timeout failure leaves us unsure ⇒ assume alive. We match on
-        // a token/field boundary, never a raw substring, so an id like "2" does not
-        // spuriously match "12", a column header, or a timestamp digit run.
-        Mux::Zellij | Mux::Wezterm | Mux::Kitty => {
-            match run_capture(&cmd, INJECT_TIMEOUT) {
-                Ok(Some(out)) => id_present(target.mux, &out, target.id.as_str()),
-                // Ran but produced nothing usable, or could not be run: don't gate.
-                Ok(None) | Err(_) => true,
-            }
-        }
-        // Unreachable (liveness_probe returned None for these), but be explicit.
-        Mux::Screen | Mux::ITerm2 | Mux::None => true,
-    }
+    !matches!(target_probe(target), TargetProbe::Absent)
 }
 
 /// The delivery capability of a target, as a structured verdict for the `connect`
-/// handshake. Composed purely from the existing [`Target::injectable`] and
-/// [`target_alive`] checks — it adds NO new injector or spawn path.
+/// handshake. Composed from [`Target::injectable`], trusted mux resolution, and
+/// the same bounded read-only probe used by [`target_alive`] — it adds NO new
+/// injector or spawn path.
 ///
 /// The verdict is advisory and degrades gracefully: only [`Capability::Live`]
-/// promises a live nudge; the other two are NOT errors. A registered-but-not-alive
-/// or non-injectable peer still receives every message via the store on its next
-/// hook drain, matching weave's degrade-to-store contract. Because `target_alive`
-/// is fail-open, a probe that cannot run yields `Live` (assume reachable, try) —
-/// never a false `RegisteredNotAlive`.
+/// promises a live nudge; the other verdicts are NOT errors. A transport-unavailable,
+/// registered-but-not-alive, or non-injectable peer still receives every message
+/// via the store on its next hook drain, matching weave's degrade-to-store contract.
+/// A missing, unlaunchable, or timed-out trusted mux executable is reported
+/// separately: injection cannot be promised in that state, so claiming `Live`
+/// would be dishonest. Once the binary launches, inconclusive pane liveness
+/// remains fail-open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     /// Injectable (real mux + valid-looking id) and the liveness probe did not
     /// report the pane/session as gone ⇒ a live nudge can be pushed now.
     Live,
+    /// The target is structurally injectable, but weave cannot resolve or launch
+    /// the mux executable from its trusted directories. Live transport cannot be
+    /// promised until the operator installs/trusts a working mux (for example via
+    /// `WEAVE_MUX_DIR`).
+    TransportUnavailable,
     /// Injectable, but the liveness probe confidently reported the target absent
     /// ⇒ skip the live nudge, deliver via the store on next turn.
     RegisteredNotAlive,
@@ -1244,15 +1397,45 @@ pub enum Capability {
     NotInjectable,
 }
 
-/// Pure capability verdict for `target`, composed from [`Target::injectable`] +
-/// [`target_alive`]. Pure (the only side effect is `target_alive`'s read-only,
-/// fail-open probe) so it is unit-testable and safe to call before deciding
-/// whether to knock or queue.
-pub fn capability(target: &Target) -> Capability {
-    if !target.injectable() {
-        return Capability::NotInjectable;
+impl Capability {
+    /// Whether the pane/session is not confidently known absent. Transport
+    /// availability is deliberately orthogonal: a missing local mux executable
+    /// prevents reachability but says nothing about whether the pane exists, so
+    /// `TransportUnavailable` preserves the injector's fail-open pane verdict.
+    pub fn pane_not_known_absent(self) -> bool {
+        matches!(self, Self::Live | Self::TransportUnavailable)
     }
-    if target_alive(target) {
+}
+
+/// Capability verdict for `target`, composed from [`Target::injectable`], trusted
+/// mux availability, and the same bounded probe as [`target_alive`]. Safe to call
+/// before deciding whether to knock or queue; the only side effects are filesystem
+/// presence checks and a read-only, fail-open liveness/launch probe.
+pub fn capability(target: &Target) -> Capability {
+    let injectable = target.injectable();
+    if !injectable {
+        return capability_from_facts(false, false, false);
+    }
+    match target_probe(target) {
+        TargetProbe::Alive => capability_from_facts(true, true, true),
+        TargetProbe::Absent => capability_from_facts(true, true, false),
+        TargetProbe::TransportUnavailable => capability_from_facts(true, false, false),
+    }
+}
+
+/// Pure truth table beneath [`capability`]. Keeping filesystem/probe facts as
+/// parameters makes the honesty invariant exhaustive and platform-independent in
+/// unit tests: a missing mux transport can never map to [`Capability::Live`].
+fn capability_from_facts(
+    injectable: bool,
+    transport_available: bool,
+    target_is_alive: bool,
+) -> Capability {
+    if !injectable {
+        Capability::NotInjectable
+    } else if !transport_available {
+        Capability::TransportUnavailable
+    } else if target_is_alive {
         Capability::Live
     } else {
         Capability::RegisteredNotAlive
@@ -1276,8 +1459,15 @@ pub fn capability(target: &Target) -> Capability {
 /// capture; an empty/garbled capture never reaches here (it returns `true` upstream).
 fn id_present(mux: Mux, out: &str, id: &str) -> bool {
     match mux {
+        // zellij lists exited sessions too, e.g.
+        // `name [Created ...] (EXITED - attach to resurrect)`. Those session
+        // names are present in `list-sessions` output, but `write-chars` cannot
+        // target them until they are resurrected, so only count non-EXITED rows.
+        Mux::Zellij => out
+            .lines()
+            .any(|line| !line.contains("(EXITED") && line.split_whitespace().any(|tok| tok == id)),
         // Exact whitespace-delimited token anywhere in the listing.
-        Mux::Zellij | Mux::Wezterm => out.split_whitespace().any(|tok| tok == id),
+        Mux::Wezterm => out.split_whitespace().any(|tok| tok == id),
         // Kitty emits JSON; an integer window id appears as `"id": <n>`. Match that
         // field exactly. Fall back to exact-token matching if the output isn't the
         // JSON we expect (defensive: a future kitty format change shouldn't make us
@@ -1348,7 +1538,9 @@ fn json_has_id(out: &str, want: i64) -> Option<bool> {
 /// system/user-tool dirs.
 ///
 /// Precedence: `WEAVE_MUX_DIR` entries come **first**, ahead of the hardcoded
-/// system dirs (`/usr/bin`, …) and the `$HOME/...` tool dirs. `resolve_trusted`
+/// system dirs (`/usr/bin`, …) and the `$HOME/...` tool dirs. The user tool set
+/// includes both `.nix-profile/bin` and LifeOS/Nix-style `.nix-profile/toolbin`.
+/// `resolve_trusted`
 /// returns the first dir that contains the binary, so an explicit opt-in dir wins
 /// over an ambient same-named system binary. This is intentional: a user who sets
 /// `WEAVE_MUX_DIR` is vouching for that dir and means "use *this* mux", and it is
@@ -1360,7 +1552,10 @@ fn trusted_dirs() -> Vec<std::path::PathBuf> {
     // for it by setting this); also how tests point at a fake mux. Listed first so
     // it takes precedence over an ambient same-named system binary below.
     if let Some(extra) = std::env::var_os("WEAVE_MUX_DIR") {
-        v.extend(std::env::split_paths(&extra));
+        // Empty path-list elements mean cwd to many path consumers; relative
+        // entries likewise make trust depend on the caller's cwd. Trust roots
+        // must be explicit absolute directories.
+        v.extend(std::env::split_paths(&extra).filter(|p| p.is_absolute()));
     }
     v.extend(
         ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
@@ -1369,22 +1564,56 @@ fn trusted_dirs() -> Vec<std::path::PathBuf> {
     );
     if let Some(home) = std::env::var_os("HOME") {
         let h = std::path::PathBuf::from(home);
-        v.push(h.join(".cargo/bin"));
-        v.push(h.join(".local/bin"));
-        v.push(h.join(".nix-profile/bin"));
+        // A malformed relative HOME must not turn cwd-relative tool paths into
+        // trusted roots. Real home directories are absolute on supported hosts.
+        if h.is_absolute() {
+            v.push(h.join(".cargo/bin"));
+            v.push(h.join(".local/bin"));
+            v.push(h.join(".nix-profile/bin"));
+            v.push(h.join(".nix-profile/toolbin"));
+        }
     }
     v
 }
 
 /// Resolve `bin` to an absolute path inside a trusted dir, or `None`.
 pub fn resolve_trusted(bin: &str) -> Option<std::path::PathBuf> {
-    if bin.is_empty() {
-        return None;
-    }
+    // This resolver is for command NAMES, never paths. Checking both the
+    // component shape and the raw spelling rejects absolute paths, nested names,
+    // `.`/`..`, `./tool`, and normalized spellings such as `nested/../tool`.
+    let path = std::path::Path::new(bin);
+    let mut components = path.components();
+    let name = match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) if path.as_os_str() == name => name,
+        _ => return None,
+    };
     trusted_dirs()
         .into_iter()
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
+        .map(|d| d.join(name))
+        .find(|p| is_executable_file(p))
+}
+
+/// A trusted-command candidate must be a regular file with at least one executable
+/// mode bit. This is deliberately only a cheap resolution filter: Unix permission
+/// classes, ACLs, mount flags, and executable format still affect the current
+/// process. [`capability`] therefore performs a real bounded read-only launch/probe
+/// before it can promise [`Capability::Live`].
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Is `bin` available as a TRUSTED absolute path (not just anywhere on $PATH)?
@@ -1602,32 +1831,195 @@ fn run_bounded(cmd: &[String], dur: std::time::Duration) -> Result<bool> {
 /// Mirrors `run_bounded`'s timeout/kill discipline so a wedged mux can't hang us.
 fn run_capture(cmd: &[String], dur: std::time::Duration) -> Result<Option<String>> {
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
     // Spawn the probe binary by TRUSTED absolute path, never via ambient $PATH.
     let cmd = trusted_argv(cmd)
         .ok_or_else(|| anyhow::anyhow!("{} is not in a trusted directory", cmd[0]))?;
-    let mut child = Command::new(&cmd[0])
+    let mut command = Command::new(&cmd[0]);
+    command
         .args(&cmd[1..])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    configure_probe_process_group(&mut command);
+    let mut child = command.spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = terminate_probe_process_group(&mut child);
+        let _ = child.wait();
+        bail!("failed to capture {} stdout", cmd[0]);
+    };
+    // Drain concurrently so a large mux listing cannot fill the pipe and block
+    // before exit. Retain only a fixed prefix; continue reading/discarding the
+    // remainder so the child always makes progress.
+    let leader_finished = std::sync::Arc::new(AtomicBool::new(false));
+    let reader_finished = std::sync::Arc::clone(&leader_finished);
+    let reader = std::thread::Builder::new()
+        .name("weave-mux-probe-reader".into())
+        .spawn(move || capture_probe_output(stdout, &reader_finished));
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(err) => {
+            let _ = terminate_probe_process_group(&mut child);
+            let _ = child.wait();
+            return Err(err.into());
+        }
+    };
     let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            // Child exited; drain whatever it wrote. wait_with_output is safe now
-            // that the process has finished, and reads the piped stdout to EOF.
-            let out = child.wait_with_output()?;
-            if status.success() {
-                return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = terminate_probe_process_group(&mut child);
+                let _ = child.wait();
+                leader_finished.store(true, Ordering::Release);
+                let _ = reader.join();
+                return Err(err.into());
             }
-            return Ok(None);
         }
         if start.elapsed() >= dur {
-            let _ = child.kill();
+            let _ = terminate_probe_process_group(&mut child);
             let _ = child.wait();
+            leader_finished.store(true, Ordering::Release);
+            // A descendant may have escaped the original process group with
+            // `setsid` while retaining stdout. The completion signal makes the
+            // poll-based reader independent of EOF even in that case.
+            let _ = reader.join();
             bail!("`{}` timed out after {:?}", cmd.join(" "), dur);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // A short-lived listing command may fork a helper that inherits stdout and
+    // outlives the leader. Tear down only this fresh process group before joining,
+    // otherwise such a helper can hold the pipe open past the wall-clock bound.
+    let termination = terminate_probe_process_group(&mut child);
+    // Reap consistently even though try_wait observed completion, then collect
+    // the bounded prefix. A reader panic is a probe failure, not a Live verdict.
+    let reaped = child.wait();
+    leader_finished.store(true, Ordering::Release);
+    let capture = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{} stdout reader panicked", cmd[0]))??;
+    termination?;
+    reaped?;
+    if status.success() && !capture.truncated {
+        Ok(Some(String::from_utf8_lossy(&capture.bytes).into_owned()))
+    } else {
+        // A truncated listing cannot prove absence: the target may be beyond the
+        // retained prefix. Treat it like an unavailable inventory so structured
+        // capability never emits a false Live/Absent promise.
+        Ok(None)
+    }
+}
+
+fn capture_probe_output<R>(
+    mut stdout: R,
+    leader_finished: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<ProbeCapture>
+where
+    R: CancellableCaptureReader,
+{
+    use std::sync::atomic::Ordering;
+
+    let mut kept = Vec::with_capacity(MAX_PROBE_OUTPUT_BYTES.min(64 * 1024));
+    let mut truncated = false;
+    let mut buf = [0_u8; 8192];
+    let mut finish_observed = None;
+    loop {
+        let finishing = leader_finished.load(Ordering::Acquire);
+        if finishing {
+            let observed = finish_observed.get_or_insert_with(std::time::Instant::now);
+            if observed.elapsed() >= POST_LEADER_CAPTURE_GRACE {
+                break;
+            }
+        }
+        // While live, poll briefly and keep draining concurrently. Once the
+        // leader finishes, use zero-time polls: drain bytes already in the pipe,
+        // then stop at the first idle observation even if another process still
+        // owns a write descriptor. Overflow or the fixed grace deadline also ends
+        // the post-exit drain, bounding a helper that continues writing.
+        match stdout.read_when_ready(&mut buf, !finishing)? {
+            CaptureRead::Data(n) => {
+                if kept.len() < MAX_PROBE_OUTPUT_BYTES {
+                    let take = n.min(MAX_PROBE_OUTPUT_BYTES - kept.len());
+                    kept.extend_from_slice(&buf[..take]);
+                    truncated |= take < n;
+                } else {
+                    truncated = true;
+                }
+                if finishing && truncated {
+                    break;
+                }
+            }
+            CaptureRead::Idle if finishing => break,
+            CaptureRead::Idle => {}
+            CaptureRead::Eof => break,
+        }
+    }
+    Ok(ProbeCapture {
+        bytes: kept,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn configure_probe_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // The read-only probe becomes leader of a fresh group. Any helper it forks
+    // inherits that group, allowing bounded cleanup without touching the caller.
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_probe_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_probe_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    const SIGKILL: std::ffi::c_int = 9;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        #[link_name = "kill"]
+        fn c_kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    let pgid = i32::try_from(child.id())
+        .map_err(|_| std::io::Error::other("probe pid does not fit process-group id"))?;
+    // SAFETY: `pgid` is the positive OS pid returned for the child we placed in a
+    // fresh process group. Its negation addresses exactly that owned group; kill
+    // takes integers only and has no pointer or memory-ownership contract.
+    if unsafe { c_kill(-pgid, SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    match child.kill() {
+        Ok(()) if group_error.raw_os_error() == Some(ESRCH) => Ok(()),
+        Err(direct_error)
+            if group_error.raw_os_error() == Some(ESRCH)
+                && matches!(
+                    direct_error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) =>
+        {
+            Ok(())
+        }
+        Ok(()) | Err(_) => Err(group_error),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_probe_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1648,7 +2040,8 @@ pub trait Injector {
     /// Inject `body` into `target` using the chosen nudge mode.
     fn inject_mode(&self, target: &Target, body: &str, mode: Nudge) -> anyhow::Result<bool>;
 
-    /// Describe how live the target is (live / registered-but-not-alive / not injectable).
+    /// Describe the target transport (live / transport-unavailable /
+    /// registered-but-not-alive / not-injectable).
     fn capability(&self, target: &Target) -> Capability;
 
     /// Check whether a named binary exists on PATH (via `resolve_trusted`).
@@ -1702,6 +2095,16 @@ mod tests {
             id: id.into(),
             ..Default::default()
         }
+    }
+
+    #[cfg(unix)]
+    fn executable_test_program(dir: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write executable test program");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable test program");
     }
 
     #[test]
@@ -2062,6 +2465,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         assert!(Target::from_peer(&p).socket.is_empty());
     }
@@ -2089,6 +2493,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "unix:/tmp/mykitty");
@@ -2135,6 +2540,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let target = Target::from_peer(&p);
         assert_eq!(target.socket, "terminal_3");
@@ -2226,20 +2632,16 @@ mod tests {
         assert!(target_alive(&Target::none()));
     }
 
-    /// Truth table for the pure `capability()` verdict, composed from
-    /// `injectable()` + `target_alive()`. We assert every combination that is
-    /// deterministic without a live mux on the runner:
+    /// Truth table for the pure facts beneath `capability()`. This proves every
+    /// combination without depending on which mux programs happen to be installed
+    /// on the test runner:
     ///
     /// - `mux=none`  ⇒ NotInjectable (not injectable, regardless of id).
     /// - injectable + empty id ⇒ NotInjectable (empty id is not injectable).
-    /// - injectable + unprobed backend ⇒ Live (fail-open: `target_alive` has no
-    ///   probe for `screen`, so it returns true ⇒ verdict Live, never a false
-    ///   `RegisteredNotAlive`). This is the load-bearing fail-open case the plan
-    ///   calls out; it mirrors `target_alive_is_open_for_unprobed_backends`.
-    ///
-    /// The confident-`RegisteredNotAlive` branch requires a probe that runs and
-    /// reports the target *absent*; that needs a (fake) mux and is covered
-    /// end-to-end by the `connect` fake-mux integration test, not here.
+    /// - injectable + unavailable transport ⇒ TransportUnavailable, never Live;
+    /// - injectable + available transport + fail-open/alive probe ⇒ Live;
+    /// - injectable + available transport + confidently absent probe ⇒
+    ///   RegisteredNotAlive.
     #[test]
     fn capability_truth_table() {
         // Non-injectable: mux=none ⇒ NotInjectable.
@@ -2250,19 +2652,230 @@ mod tests {
             Capability::NotInjectable,
             "empty id ⇒ not injectable ⇒ NotInjectable"
         );
-        // Injectable + unprobed backend (screen has no liveness probe) ⇒ fail-open
-        // to Live, never RegisteredNotAlive.
-        let screen = t(Mux::Screen, "1234.pts-0.host");
-        assert!(screen.injectable());
-        assert!(
-            target_alive(&screen),
-            "screen has no probe ⇒ target_alive fail-open true"
+        assert_eq!(
+            capability_from_facts(true, false, true),
+            Capability::TransportUnavailable,
+            "a missing trusted mux binary can never promise Live"
         );
         assert_eq!(
-            capability(&screen),
+            capability_from_facts(true, true, true),
             Capability::Live,
-            "injectable + fail-open alive ⇒ Live"
+            "available transport + fail-open/alive probe ⇒ Live"
         );
+        assert_eq!(
+            capability_from_facts(true, true, false),
+            Capability::RegisteredNotAlive,
+            "available transport + confident absence ⇒ RegisteredNotAlive"
+        );
+        assert!(Capability::Live.pane_not_known_absent());
+        assert!(Capability::TransportUnavailable.pane_not_known_absent());
+        assert!(!Capability::RegisteredNotAlive.pane_not_known_absent());
+        assert!(!Capability::NotInjectable.pane_not_known_absent());
+    }
+
+    /// A listing command that launches but exits nonzero did not produce a usable
+    /// mux inventory. The structured connect capability must therefore refuse a
+    /// `Live` promise, while the legacy advisory bool remains fail-open so a probe
+    /// failure alone never suppresses an attempted delivery.
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_listing_probe_is_transport_unavailable_but_target_alive_fails_open() {
+        let _lock = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-nonzero-listing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake mux dir");
+        for program in ["zellij", "wezterm", "kitten"] {
+            executable_test_program(&dir, program, "#!/bin/sh\nexit 17\n");
+        }
+        let _mux = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_MUX_DIR",
+            dir.to_str().expect("UTF-8 fake mux dir"),
+        );
+
+        for target in [
+            t(Mux::Zellij, "cycle-b-session"),
+            t(Mux::Wezterm, "7"),
+            t(Mux::Kitty, "9"),
+        ] {
+            assert_eq!(
+                capability(&target),
+                Capability::TransportUnavailable,
+                "a nonzero {} listing cannot support a Live promise",
+                target.mux.as_str()
+            );
+            assert!(
+                target_alive(&target),
+                "the advisory bool must remain fail-open for {} probe failure",
+                target.mux.as_str()
+            );
+        }
+
+        for program in ["zellij", "wezterm", "kitten"] {
+            let _ = std::fs::remove_file(dir.join(program));
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// A successful listing larger than the retained prefix is inconclusive, not
+    /// a confident target absence. The reader drains concurrently with bounded
+    /// memory and structured capability remains conservative.
+    #[cfg(unix)]
+    #[test]
+    fn oversized_listing_probe_is_bounded_and_inconclusive() {
+        let _lock = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-large-listing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake mux dir");
+        executable_test_program(
+            &dir,
+            "wezterm",
+            "#!/bin/sh\nhead -c 1100000 /dev/zero | tr '\\0' x\n",
+        );
+        let _mux = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_MUX_DIR",
+            dir.to_str().expect("UTF-8 fake mux dir"),
+        );
+        let target = t(Mux::Wezterm, "7");
+        assert_eq!(capability(&target), Capability::TransportUnavailable);
+        assert!(
+            target_alive(&target),
+            "a truncated inventory remains advisory/fail-open"
+        );
+
+        let _ = std::fs::remove_file(dir.join("wezterm"));
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// A probe leader can exit after a helper calls `setsid`, escapes the probe's
+    /// process group, and retains stdout. Capture completion must depend on the
+    /// leader lifecycle rather than waiting for pipe EOF from that detached helper.
+    #[cfg(unix)]
+    #[test]
+    fn listing_probe_does_not_wait_for_detached_descendant_pipe_eof() {
+        let _lock = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-probe-descendant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake mux dir");
+        let sentinel = dir.join("detached-helper-live");
+        let detached_ready = dir.join("detached-helper-ready");
+        std::fs::write(&sentinel, b"live").expect("create helper sentinel");
+        let body = format!(
+            "#!/bin/sh\nsetsid sh -c 'printf ready > \"$2\"; i=0; while [ \"$i\" -lt 80 ] && [ -e \"$1\" ]; do sleep 0.1; i=$((i + 1)); done' weave-probe-helper '{}' '{}' &\ni=0\nwhile [ \"$i\" -lt 50 ] && [ ! -e '{}' ]; do sleep 0.02; i=$((i + 1)); done\n[ -e '{}' ] || exit 9\nprintf '7\\n'\nexit 0\n",
+            sentinel.display(),
+            detached_ready.display(),
+            detached_ready.display(),
+            detached_ready.display()
+        );
+        executable_test_program(&dir, "wezterm", &body);
+        let _mux = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_MUX_DIR",
+            dir.to_str().expect("UTF-8 fake mux dir"),
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(capability(&t(Mux::Wezterm, "7")), Capability::Live);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "a descendant-held stdout pipe exceeded the bounded probe lifecycle"
+        );
+        assert!(
+            detached_ready.exists(),
+            "the helper must complete setsid before the probe leader exits"
+        );
+
+        std::fs::remove_file(&sentinel).expect("release detached helper");
+        let _ = std::fs::remove_file(&detached_ready);
+        let _ = std::fs::remove_file(dir.join("wezterm"));
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// Trusted resolution rejects a mode-0644 lookalike, while capability goes one
+    /// step further and refuses `Live` when metadata passes the candidate filter but
+    /// the current process cannot actually launch the program.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_resolution_and_actual_launchability_are_distinct() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = weave_core::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!("weave-nonexec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create trusted test dir");
+        let program = dir.join("weave-nonexec-mux");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write test program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod non-executable");
+        let _mux = weave_core::testenv::EnvVarGuard::set(
+            "WEAVE_MUX_DIR",
+            dir.to_str().expect("utf8 temp path"),
+        );
+
+        assert!(!have("weave-nonexec-mux"));
+        assert!(resolve_trusted_program(program.to_str().unwrap()).is_none());
+
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+        assert!(have("weave-nonexec-mux"));
+        assert_eq!(
+            resolve_trusted_program(program.to_str().unwrap()),
+            Some(program.clone())
+        );
+
+        // Executable metadata alone is insufficient: a missing shebang interpreter
+        // makes launch fail for every effective uid, including root-run CI.
+        // Capability must report the transport failure, while the legacy
+        // pane-existence bool remains fail-open.
+        let screen = dir.join("screen");
+        let missing_interpreter = dir.join("weave-definitely-missing-interpreter");
+        assert!(!missing_interpreter.exists());
+        std::fs::write(&screen, format!("#!{}\n", missing_interpreter.display()))
+            .expect("write unlaunchable fake screen");
+        std::fs::set_permissions(&screen, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+        assert!(have("screen"), "candidate filter sees an execute bit");
+        let target = t(Mux::Screen, "1234.pts-0.host");
+        assert_eq!(capability(&target), Capability::TransportUnavailable);
+        assert!(target_alive(&target), "pane liveness remains fail-open");
+
+        std::fs::write(&screen, b"#!/bin/sh\nexit 0\n").expect("repair fake screen");
+        assert_eq!(capability(&target), Capability::Live);
+
+        std::fs::remove_file(program).ok();
+        std::fs::remove_file(screen).ok();
+        std::fs::remove_dir(dir).ok();
+    }
+
+    /// Nix profiles in this workspace expose operator tools in `toolbin`, while
+    /// conventional Nix packages use `bin`; both are trusted user-profile roots.
+    #[test]
+    fn nix_profile_bin_and_toolbin_are_trusted() {
+        let _g = weave_core::testenv::lock_env();
+        let _mux = weave_core::testenv::EnvVarGuard::remove("WEAVE_MUX_DIR");
+        let _home = weave_core::testenv::EnvVarGuard::set("HOME", "/tmp/weave-home");
+        let dirs = trusted_dirs();
+        assert!(dirs.contains(&std::path::PathBuf::from(
+            "/tmp/weave-home/.nix-profile/bin"
+        )));
+        assert!(dirs.contains(&std::path::PathBuf::from(
+            "/tmp/weave-home/.nix-profile/toolbin"
+        )));
     }
 
     /// `WEAVE_MUX_DIR` must take precedence over the hardcoded system dirs so an
@@ -2295,6 +2908,25 @@ mod tests {
             opt_in_idx < usr_bin_idx,
             "WEAVE_MUX_DIR ({opt_in_idx}) must precede /usr/bin ({usr_bin_idx}) in {dirs:?}"
         );
+    }
+
+    /// Trust roots are absolute capabilities. Empty or relative operator entries
+    /// must never become executable search paths relative to the caller's cwd,
+    /// including HOME-derived tool directories.
+    #[test]
+    fn trusted_dirs_ignores_empty_and_relative_configured_roots() {
+        let _g = weave_core::testenv::lock_env();
+        let _home = weave_core::testenv::EnvVarGuard::set("HOME", "relative-home");
+
+        for configured in ["", "relative-mux"] {
+            let mux = weave_core::testenv::EnvVarGuard::set("WEAVE_MUX_DIR", configured);
+            let dirs = trusted_dirs();
+            assert!(
+                dirs.iter().all(|dir| dir.is_absolute()),
+                "WEAVE_MUX_DIR={configured:?} and relative HOME must contribute no relative trust root: {dirs:?}"
+            );
+            drop(mux);
+        }
     }
 
     #[test]
@@ -2342,6 +2974,23 @@ mod tests {
         assert!(
             !id_present(Mux::Zellij, zj, "env"),
             "a prefix of a session name must not match"
+        );
+    }
+
+    #[test]
+    fn zellij_exited_sessions_do_not_count_alive() {
+        let sessions = "\
+judicious-tiger [Created 9h 45m 38s ago] (EXITED - attach to resurrect)
+zippy-brachiosaur [Created 9h 27m 47s ago] (current)
+";
+
+        assert!(
+            !id_present(Mux::Zellij, sessions, "judicious-tiger"),
+            "zellij EXITED sessions are listed by name but cannot receive write-chars"
+        );
+        assert!(
+            id_present(Mux::Zellij, sessions, "zippy-brachiosaur"),
+            "current/live zellij sessions should still count as injectable"
         );
     }
 
@@ -2479,7 +3128,14 @@ mod tests {
         let target = t(Mux::ITerm2, "x");
         assert!(liveness_probe(&target).is_none());
         assert!(target_alive(&target));
-        assert_eq!(capability(&target), Capability::Live);
+        assert_eq!(
+            capability(&target),
+            if have(target.mux.binary()) {
+                Capability::Live
+            } else {
+                Capability::TransportUnavailable
+            }
+        );
     }
 
     /// the unified lock every critical section is exclusive, so the read always sees

@@ -6,11 +6,12 @@
 //! libSQL-compatible, so the file is portable between backends.
 
 use crate::config::StoreSource;
+#[cfg(any(feature = "sqlite", feature = "libsql"))]
+use crate::model::JobState;
 use crate::model::{
     now, Ask, AskGroup, AskKind, AskManyResult, AskRole, AskState, ClaimOutcome, DeliveryTrace,
-    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, JobState, Message,
-    OrchestratorStatus, Peer, PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter,
-    Schedule, ScheduleKind,
+    Intent, Job, JobFilter, JobPatch, JobResultView, JobSpec, Message, OrchestratorStatus, Peer,
+    PermissionStatus, ReviewItem, ReviewItemState, ReviewQueueFilter, Schedule, ScheduleKind,
 };
 use anyhow::Result;
 
@@ -137,6 +138,14 @@ pub trait Store: Send {
     ///   - `birth_cert` arg is `None` → rejects (must provide cert to re-register).
     ///   - `birth_cert` arg mismatches → rejects (identity takeover protection).
     ///   - `birth_cert` arg matches → UPDATEs other fields, returns existing cert.
+    ///
+    /// **Client session key (WL-084):** `client_session` is the launcher-session
+    /// id (e.g. the Claude Code hook payload's `session_id`), strictly validated
+    /// at this seam. Ownership keys are never lossy-truncated or control-stripped:
+    /// two distinct launcher sessions must remain distinct. An EMPTY value means
+    /// "unknown — preserve whatever the row already holds" (so non-hook callers
+    /// can never wipe the mapping); a non-empty value overwrites (the new
+    /// session owns the row after a legitimate takeover).
     #[allow(clippy::too_many_arguments)]
     fn register_peer_full(
         &self,
@@ -152,6 +161,7 @@ pub trait Store: Send {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String>;
 
     /// Register (upsert) a peer without PID/host liveness info or git tags.
@@ -186,9 +196,17 @@ pub trait Store: Send {
             "",
             "default",
             cert.as_deref(),
+            "",
         )
     }
     fn get_peer(&self, name: &str) -> Result<Option<Peer>>;
+
+    /// Resolve the peer row owned by launcher session `client_session` (WL-084).
+    /// `Ok(None)` for an empty/unknown key. When several rows carry the same key
+    /// (possible only via manual writes — registration never fans one session
+    /// out), the most recently seen row wins, so the lookup self-heals toward
+    /// the live one.
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>>;
     fn get_birth_cert(&self, name: &str) -> Result<Option<String>>;
     fn list_peers(&self) -> Result<Vec<Peer>>;
 
@@ -588,6 +606,15 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn claim_job(&self, id: &str, assignee: &str) -> Result<Option<Job>>;
 
+    /// Worker-dispatch claim: atomically transition an eligible `queued` job to
+    /// `running`. Unlike [`Store::claim_job`], this never reclaims an already-
+    /// running job: a stale candidate or concurrent dispatch returns `None`.
+    /// Eligibility is checked in the same guarded update (`assignee` is either
+    /// unset or already equals the worker), so list-then-claim races cannot steal
+    /// a job that was reassigned meanwhile.
+    #[allow(dead_code)]
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>>;
+
     /// P3: apply `patch` to a job, ENFORCING (in the store, so CLI + MCP both
     /// inherit): (1) attempt_id FENCING — if the job is claimed (`attempt_id` set),
     /// the supplied `attempt_id` MUST equal it or the call returns `Err("stale_attempt")`
@@ -849,9 +876,28 @@ pub trait Store: Send {
     #[allow(dead_code)]
     fn list_permissions(&self, me: &str, limit: i64) -> Result<Vec<Ask>>;
 
-    /// WL-033: store or replace a thread summary.
+    /// WL-033: store or replace a thread summary. This is an internal persistence
+    /// primitive; production callers must pass text already validated by
+    /// `llm::normalize_summary_text`. Retrieval paths validate again so legacy
+    /// cache rows cannot bypass terminal/MCP output hardening.
     #[allow(dead_code)]
     fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()>;
+
+    /// Current persistent generation of the message graph used by summary
+    /// snapshots. Every message insert/update/delete advances it transactionally.
+    fn summary_generation(&self) -> Result<i64>;
+
+    /// Atomically persist a summary only when `expected_generation` is still
+    /// current and `root_id` still names a live message. Returns false on a
+    /// concurrent message mutation; production callers must not emit/cache the
+    /// stale provider result in that case.
+    fn store_summary_if_generation(
+        &self,
+        root_id: i64,
+        text: &str,
+        model: &str,
+        expected_generation: i64,
+    ) -> Result<bool>;
 
     /// WL-033: retrieve a cached summary by root message id.
     #[allow(dead_code)]
@@ -870,6 +916,56 @@ pub trait Store: Send {
     /// `bail!`s with a clear message.
     #[allow(dead_code)]
     fn snapshot_to(&self, dest: &std::path::Path) -> Result<()>;
+}
+
+/// Capture a summary input snapshot whose message rows and persistent
+/// generation agree. An opportunistic expiry sweep runs before each attempt;
+/// rows that cross their deadline during the tiny sweep/read window are also
+/// filtered explicitly. One concurrent mutation retries once, then returns a
+/// clear error rather than sending an unstable thread to a provider.
+pub fn summary_thread_snapshot(
+    store: &dyn Store,
+    root_id: i64,
+    limit: i64,
+) -> Result<(Vec<Message>, i64)> {
+    for _ in 0..2 {
+        store.sweep_expired_messages()?;
+        let before = store.summary_generation()?;
+        let rows = store.thread(root_id, limit)?;
+        let after = store.summary_generation()?;
+        if before == after {
+            let cutoff = now();
+            if rows
+                .iter()
+                .any(|message| message.expires_at.is_some_and(|expiry| expiry <= cutoff))
+            {
+                continue;
+            }
+            return Ok((rows, after));
+        }
+    }
+    anyhow::bail!("thread changed while preparing its summary; retry")
+}
+
+/// Validate an ephemeral-containing snapshot after the provider returns. Such
+/// summaries are never cached: generation equality catches DB mutations, while
+/// the explicit deadline check catches time passing without a write/trigger.
+pub fn validate_ephemeral_summary_completion(
+    store: &dyn Store,
+    rows: &[Message],
+    expected_generation: i64,
+) -> Result<()> {
+    if store.summary_generation()? != expected_generation {
+        anyhow::bail!("thread changed while its summary was being generated; retry");
+    }
+    let cutoff = now();
+    if rows
+        .iter()
+        .any(|message| message.expires_at.is_some_and(|expiry| expiry <= cutoff))
+    {
+        anyhow::bail!("thread content expired while its summary was being generated; retry");
+    }
+    Ok(())
 }
 
 /// Resolve a point-to-point recipient token into the human peer alias that the
@@ -1091,6 +1187,116 @@ pub fn pid_alive(_pid: i64) -> bool {
     true
 }
 
+/// Env override for [`client_pid`] (WL-084). Lets tests pin a deterministic
+/// client process and lets exotic launchers that know their session's real
+/// long-lived process better than the ancestry walk export it explicitly.
+pub const CLIENT_PID_ENV: &str = "WEAVE_CLIENT_PID";
+
+/// Read only the explicit long-lived client PID contract. One-shot CLI commands
+/// use this helper instead of ancestry inference: without an override they store
+/// `NULL` and presence falls back to the heartbeat TTL, never to the PID of a
+/// short-lived helper or an unrelated ancestor.
+pub fn explicit_client_pid() -> Option<i64> {
+    std::env::var(CLIENT_PID_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Validate an optional launcher-session ownership key. Exactly empty is the
+/// explicit "unknown" value; a present key must already be bounded,
+/// control-free, and free of leading/trailing whitespace. Unlike descriptive
+/// tags this is strict and lossless: normalizing a token before storage/lookup
+/// could alias two sessions or let a malformed token claim another row.
+pub fn client_session_key(value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if value.trim() != value {
+        anyhow::bail!("client session must not contain leading or trailing whitespace.");
+    }
+    check_ident("client session", value)?;
+    Ok(value.to_string())
+}
+
+/// Wrapper `comm` names that die with a single hook/tool invocation and must
+/// never be mistaken for the session's client process. Shells (Claude Code runs
+/// hook commands via `sh -c`-style wrappers), `env`, `timeout`, the `rtk`
+/// output proxy, and `weave` itself (a hook invoked through a weave wrapper).
+const TRANSIENT_COMMS: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "fish", "nu", "env", "timeout", "rtk", "weave",
+];
+
+/// First long-lived ancestor in an ancestry `chain` of `(pid, comm)` pairs
+/// ordered nearest-first (parent, grandparent, …) — the PURE classifier under
+/// [`client_pid`], parameterized on the parsed chain so it is exhaustively
+/// testable with synthetic process trees. Skips [`TRANSIENT_COMMS`] wrappers,
+/// stops at pid 1 (init — reaching it means every real ancestor already
+/// exited), and returns `None` when nothing qualifies (⇒ presence falls back
+/// to the TTL guess, the same degradation as an unknown pid).
+pub fn first_longlived_ancestor(chain: &[(i64, String)]) -> Option<i64> {
+    for (pid, comm) in chain {
+        if *pid <= 1 {
+            return None;
+        }
+        if !TRANSIENT_COMMS.contains(&comm.as_str()) {
+            return Some(*pid);
+        }
+    }
+    None
+}
+
+/// The pid this session's presence should track (WL-084): the nearest
+/// LONG-LIVED ancestor of the current process — e.g. the `claude`/`node`
+/// process a hook invocation belongs to — NOT the hook process itself, which
+/// exits milliseconds later and would make every hook-registered peer read
+/// `process_dead` (the pre-WL-084 bug). `WEAVE_CLIENT_PID` overrides
+/// (validated > 0); non-Linux targets have no dependency-free ancestry walk
+/// and return `None` (TTL presence, matching [`pid_alive`]'s degradation).
+pub fn client_pid() -> Option<i64> {
+    if let Some(pid) = explicit_client_pid() {
+        return Some(pid);
+    }
+    first_longlived_ancestor(&proc_ancestry(std::process::id() as i64, 8))
+}
+
+/// Walk `/proc/<pid>/status` `PPid:` links up to `max_hops` ancestors, pairing
+/// each with its `/proc/<pid>/comm`. Nearest-first, starting at `start`'s
+/// PARENT. Any read/parse failure ends the walk (fail toward `None` ⇒ TTL
+/// presence). Linux-only, dependency-free (the [`pid_alive`] precedent).
+#[cfg(target_os = "linux")]
+fn proc_ancestry(start: i64, max_hops: usize) -> Vec<(i64, String)> {
+    let mut chain = Vec::new();
+    let mut pid = start;
+    for _ in 0..max_hops {
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<i64>().ok());
+        let ppid = match ppid {
+            Some(p) if p > 0 => p,
+            _ => break,
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        chain.push((ppid, comm));
+        pid = ppid;
+    }
+    chain
+}
+
+/// Non-Linux: no dependency-free ancestry walk; the classifier gets an empty
+/// chain and [`client_pid`] resolves `None` (TTL presence).
+#[cfg(not(target_os = "linux"))]
+fn proc_ancestry(_start: i64, _max_hops: usize) -> Vec<(i64, String)> {
+    Vec::new()
+}
+
 /// Host-aware liveness verdict for a peer (the "A2 — fail-open by host" rule).
 ///
 /// This is the single, PURE classifier behind presence. It takes `this_host`
@@ -1189,10 +1395,69 @@ pub fn is_alive(peer: &Peer) -> bool {
     )
 }
 
+/// Verdict for registering under a name that already has a peer row (WL-084).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RegisterConflict {
+    /// The existing row belongs to THIS launcher session — update it in place
+    /// (idempotent SessionStart re-fire, resume, compact).
+    SameSession,
+    /// The existing row is dead/stale — take the name over (name continuity
+    /// across restarts in the same directory).
+    Reusable,
+    /// The existing row belongs to a DIFFERENT live session (local or remote)
+    /// — do NOT steal it; register under a uniquified name instead.
+    LiveOther,
+}
+
+/// Classify a same-name registration conflict — the PURE decision core behind
+/// hook-time auto-uniquification, parameterized on `this_host`/`now_ts` like
+/// [`liveness_from_fields`] so the full matrix is testable with fixed values.
+///
+/// Ownership evidence, strongest first:
+/// 1. Launcher-session key match (`client_session`) → [`RegisterConflict::SameSession`].
+/// 2. Contradictory nonempty launcher-session keys disable PID fallback: a shared
+///    host process may own several logical sessions and must not collapse them.
+/// 3. When one/both keys are unknown, the same live client pid on this host →
+///    `SameSession` (legacy hosts without session keys retain continuity).
+/// 4. Stale row ([`liveness_from_fields`] — past TTL, or same-host dead pid)
+///    → [`RegisterConflict::Reusable`].
+/// 5. Anything else is a live foreign session → [`RegisterConflict::LiveOther`].
+///    A same-host recent row with an UNKNOWN pid reads live-by-TTL, so two
+///    concurrent pid-less sessions coexist under distinct names rather than
+///    silently swapping one row (fail toward NOT stealing).
+pub fn registration_conflict(
+    existing: &Peer,
+    our_client_session: &str,
+    our_client_pid: Option<i64>,
+    this_host: &str,
+    now_ts: i64,
+) -> RegisterConflict {
+    if !our_client_session.is_empty() && existing.client_session == our_client_session {
+        return RegisterConflict::SameSession;
+    }
+    let contradictory_keys = !our_client_session.is_empty()
+        && !existing.client_session.is_empty()
+        && existing.client_session != our_client_session;
+    if !contradictory_keys {
+        if let (Some(theirs), Some(ours)) = (existing.pid, our_client_pid) {
+            if theirs == ours && existing.host == this_host {
+                return RegisterConflict::SameSession;
+            }
+        }
+    }
+    if liveness_for(existing, this_host, now_ts) == Liveness::Stale {
+        return RegisterConflict::Reusable;
+    }
+    RegisterConflict::LiveOther
+}
+
 /// Hard upper bound on a query `LIMIT`. A negative limit means *unbounded* in
 /// SQLite, so untrusted limits (from MCP/CLI) are clamped here to prevent an
 /// accidental or hostile unbounded fetch.
 pub const MAX_LIMIT: i64 = 10_000;
+/// Canonical bounded thread snapshot used for LLM summaries and their cache.
+/// Display pagination must never shrink or enlarge this provider input contract.
+pub const SUMMARY_THREAD_LIMIT: i64 = 200;
 
 /// Hard upper bound on a stored message body (bytes). Peer-supplied bodies are
 /// untrusted; unbounded ones are a disk + token/RAM DoS once re-rendered into
@@ -1450,6 +1715,9 @@ pub fn clamp_limit(limit: i64) -> i64 {
 /// for the error message. Shared by both backends. (P3)
 #[cfg_attr(not(any(feature = "sqlite", feature = "libsql")), allow(dead_code))]
 pub fn check_job_text(label: &str, value: &str) -> Result<()> {
+    if value.contains('\0') {
+        anyhow::bail!("{label} must not contain NUL bytes.");
+    }
     if value.chars().count() > crate::model::MAX_JOB_TEXT {
         anyhow::bail!(
             "{label} is too long ({} chars; max {}).",
@@ -1542,7 +1810,8 @@ CREATE TABLE IF NOT EXISTS peers (
     description    TEXT NOT NULL DEFAULT '',
     description_ts INTEGER NOT NULL DEFAULT 0,
     birth_cert     TEXT,
-    contact_policy TEXT NOT NULL DEFAULT 'open'
+    contact_policy TEXT NOT NULL DEFAULT 'open',
+    client_session TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS outbox (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1704,8 +1973,29 @@ CREATE TABLE IF NOT EXISTS summaries (
     text        TEXT NOT NULL,
     model       TEXT NOT NULL DEFAULT '',
     created_ts  INTEGER NOT NULL,
-    refreshed_ts INTEGER NOT NULL
+    refreshed_ts INTEGER NOT NULL,
+    generation  INTEGER NOT NULL DEFAULT -1
 );
+CREATE TABLE IF NOT EXISTS summary_state (
+    singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+    generation INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+AFTER INSERT ON messages BEGIN
+    UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+    DELETE FROM summaries;
+END;
+CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+AFTER UPDATE ON messages BEGIN
+    UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+    DELETE FROM summaries;
+END;
+CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+AFTER DELETE ON messages BEGIN
+    UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+    DELETE FROM summaries;
+END;
 ";
 
 #[cfg(feature = "sqlite")]
@@ -1979,6 +2269,7 @@ fn row_to_peer(r: &Row) -> rusqlite::Result<Peer> {
         description_ts: r.get(15)?,
         birth_cert: r.get(16).unwrap_or(None),
         contact_policy: r.get(17).unwrap_or("open".to_string()),
+        client_session: r.get(18).unwrap_or_default(),
     })
 }
 
@@ -2108,6 +2399,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     // a cert get one minted on their next re-registration.
     if !column_exists(conn, "peers", "birth_cert")? {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN birth_cert TEXT;")?;
+    }
+    // WL-084: launcher-session key for collision-proof identity. Holds the
+    // coding-agent host's per-session id (e.g. the Claude Code hook payload's
+    // `session_id`) so every hook event of one session resolves to the SAME
+    // peer row even when the human alias was auto-uniquified. '' == unknown
+    // (legacy row, or a host that sends no session id), matching
+    // `Peer::client_session`'s empty default. Idempotent, constant DDL.
+    if !column_exists(conn, "peers", "client_session")? {
+        conn.execute_batch(
+            "ALTER TABLE peers ADD COLUMN client_session TEXT NOT NULL DEFAULT '';",
+        )?;
     }
     // Wake-hook watermark table (P5): tracks the last unread message id that
     // caused a block for each reader. Created here for legacy DBs that predate
@@ -2441,8 +2743,37 @@ fn migrate(conn: &Connection) -> Result<()> {
             text        TEXT NOT NULL,
             model       TEXT NOT NULL DEFAULT '',
             created_ts  INTEGER NOT NULL,
-            refreshed_ts INTEGER NOT NULL
+            refreshed_ts INTEGER NOT NULL,
+            generation  INTEGER NOT NULL DEFAULT -1
         );",
+    )?;
+    if !column_exists(conn, "summaries", "generation")? {
+        conn.execute_batch(
+            "ALTER TABLE summaries
+             ADD COLUMN generation INTEGER NOT NULL DEFAULT -1;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS summary_state (
+            singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+            generation INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO summary_state (singleton, generation) VALUES (1, 0);
+        CREATE TRIGGER IF NOT EXISTS summaries_generation_message_insert_v1
+        AFTER INSERT ON messages BEGIN
+            UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+            DELETE FROM summaries;
+        END;
+        CREATE TRIGGER IF NOT EXISTS summaries_generation_message_update_v1
+        AFTER UPDATE ON messages BEGIN
+            UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+            DELETE FROM summaries;
+        END;
+        CREATE TRIGGER IF NOT EXISTS summaries_generation_message_delete_v1
+        AFTER DELETE ON messages BEGIN
+            UPDATE summary_state SET generation = generation + 1 WHERE singleton = 1;
+            DELETE FROM summaries;
+        END;",
     )?;
     Ok(())
 }
@@ -3433,9 +3764,15 @@ impl Store for SqliteStore {
     }
 
     fn clear_all(&self) -> Result<i64> {
-        let n = self.total_messages()?;
-        self.conn
-            .execute_batch("DELETE FROM messages; DELETE FROM reads; DELETE FROM wake_acks;")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+        tx.execute_batch(
+            "DELETE FROM summaries;
+             DELETE FROM messages;
+             DELETE FROM reads;
+             DELETE FROM wake_acks;",
+        )?;
+        tx.commit()?;
         Ok(n)
     }
 
@@ -3471,7 +3808,8 @@ impl Store for SqliteStore {
             "DELETE FROM reads WHERE message_id IN (SELECT id FROM messages WHERE ts < ?1)",
             params![cutoff],
         )?;
-        tx.execute("DELETE FROM messages WHERE ts < ?1", params![cutoff])?;
+        let retention_deleted =
+            tx.execute("DELETE FROM messages WHERE ts < ?1", params![cutoff])?;
         // WL-038: fold the ephemeral expiry into the SAME gc pass — delete expired
         // messages (and their reads) even if `ts >= cutoff` (delete-on-sweep). The
         // opportunistic `sweep_expired_messages` covers the between-gc window; this
@@ -3482,10 +3820,17 @@ impl Store for SqliteStore {
                 (SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1)",
             params![expiry_cut],
         )?;
-        tx.execute(
+        let expiry_deleted = tx.execute(
             "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
             params![expiry_cut],
         )?;
+        // A summary represents the whole thread, so deleting either its root or
+        // any reply invalidates every cached summary conservatively. Keep this in
+        // the same transaction as message deletion; the public count remains the
+        // retention-delete count above.
+        if retention_deleted > 0 || expiry_deleted > 0 {
+            tx.execute("DELETE FROM summaries", [])?;
+        }
         // P6: prune the delivery trace by the SAME retention cutoff so it is bounded
         // by the existing gc pass (no new sweeper). Mirrors the `messages` prune;
         // the count returned still reflects messages only (the trace is metadata).
@@ -3559,6 +3904,7 @@ impl Store for SqliteStore {
         worktree_id: &str,
         circle: &str,
         birth_cert: Option<&str>,
+        client_session: &str,
     ) -> Result<String> {
         check_ident("peer name", name)?;
         if let Some(cert) = birth_cert {
@@ -3569,6 +3915,10 @@ impl Store for SqliteStore {
         let repo = sanitize_tag(repo, MAX_REPO_LEN);
         let branch = sanitize_tag(branch, MAX_BRANCH_LEN);
         let worktree_id = sanitize_tag(worktree_id, MAX_WORKTREE_LEN);
+        // WL-084/Cycle B: ownership keys are strict and lossless. A lossy
+        // truncate/control-strip can alias distinct sessions or make the next
+        // hook miss the row it just registered.
+        let client_session = client_session_key(client_session)?;
         // Re-validate the circle at the store seam (defense-in-depth, the
         // check_ident precedent): an invalid value falls back to the default
         // circle rather than being stored raw.
@@ -3597,19 +3947,22 @@ impl Store for SqliteStore {
                     None => mint_birth_cert()?,
                 };
                 tx.execute(
-                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                    params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert],
+                    "INSERT INTO peers (name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, birth_cert, client_session)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![name, mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, &client_session],
                 )?;
                 new_cert
             }
             Some(None) => {
                 // Existing peer without a cert (backward-compat): mint one and UPDATE.
+                // client_session preserve-on-empty: '' means "unknown", so only a
+                // non-empty key overwrites the stored mapping (see the trait doc).
                 let new_cert = mint_birth_cert()?;
                 tx.execute(
-                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12
-                     WHERE name=?13",
-                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, name],
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11, birth_cert=?12,
+                                      client_session = CASE WHEN ?13 = '' THEN client_session ELSE ?13 END
+                     WHERE name=?14",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &new_cert, &client_session, name],
                 )?;
                 new_cert
             }
@@ -3625,10 +3978,12 @@ impl Store for SqliteStore {
                     );
                 }
                 // Cert matches: UPDATE fields, preserve stored cert.
+                // client_session preserve-on-empty (see the trait doc).
                 tx.execute(
-                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11
-                     WHERE name=?12",
-                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, name],
+                    "UPDATE peers SET mux=?1, target=?2, socket=?3, cwd=?4, last_seen=?5, pid=?6, host=?7, repo=?8, branch=?9, worktree_id=?10, circle=?11,
+                                      client_session = CASE WHEN ?12 = '' THEN client_session ELSE ?12 END
+                     WHERE name=?13",
+                    params![mux, target, socket, cwd, now(), pid, host, repo, branch, worktree_id, circle, &client_session, name],
                 )?;
                 stored_cert
             }
@@ -3639,7 +3994,7 @@ impl Store for SqliteStore {
 
     fn get_peer(&self, name: &str) -> Result<Option<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE name=?1",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE name=?1",
         )?;
         let mut it = stmt.query_map(params![name], row_to_peer)?;
         match it.next() {
@@ -3647,6 +4002,25 @@ impl Store for SqliteStore {
                 let mut p = p?;
                 // Read-time TTL: a stale description ages out to "" (daemon-free;
                 // the stored row is left untouched — pure read-time view).
+                crate::model::expire_description(&mut p, now());
+                Ok(Some(p))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_peer_by_client_session(&self, client_session: &str) -> Result<Option<Peer>> {
+        let client_session = client_session_key(client_session)?;
+        if client_session.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE client_session=?1 ORDER BY last_seen DESC LIMIT 1",
+        )?;
+        let mut it = stmt.query_map(params![client_session], row_to_peer)?;
+        match it.next() {
+            Some(p) => {
+                let mut p = p?;
                 crate::model::expire_description(&mut p, now());
                 Ok(Some(p))
             }
@@ -3670,7 +4044,7 @@ impl Store for SqliteStore {
 
     fn list_peers(&self) -> Result<Vec<Peer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers ORDER BY name",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers ORDER BY name",
         )?;
         let mut rows: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3710,7 +4084,7 @@ impl Store for SqliteStore {
         };
         // Current orchestrators in the circle (normalize empty/legacy to default).
         let mut stmt = tx.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -3757,7 +4131,7 @@ impl Store for SqliteStore {
             .unwrap_or(crate::model::DEFAULT_CIRCLE)
             .to_string();
         let mut stmt = self.conn.prepare(
-            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy FROM peers WHERE role='orchestrator'",
+            "SELECT name, mux, target, socket, cwd, last_seen, pid, host, repo, branch, worktree_id, circle, role, turn_state, description, description_ts, birth_cert, contact_policy, client_session FROM peers WHERE role='orchestrator'",
         )?;
         let holders: Vec<Peer> = stmt
             .query_map([], row_to_peer)?
@@ -4850,6 +5224,39 @@ impl Store for SqliteStore {
         self.get_job(id)
     }
 
+    fn claim_queued_job(&self, id: &str, assignee: &str) -> Result<Option<Job>> {
+        if !job_id_valid(id) {
+            anyhow::bail!("invalid job id.");
+        }
+        check_ident("assignee", assignee)?;
+        let ts = now();
+        let attempt_id = new_attempt_id(ts);
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE jobs SET assignee = ?1, attempt_id = ?2, state = ?3, updated_ts = ?4
+             WHERE id = ?5 AND state = ?6 AND (assignee IS NULL OR assignee = ?1)",
+            params![
+                assignee,
+                attempt_id,
+                JobState::Running.as_str(),
+                ts,
+                id,
+                JobState::Queued.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            Ok(None)
+        } else {
+            // Read the claimed row before commit so a committed transition can
+            // never be followed by a fallible read that loses its fencing token.
+            let claimed =
+                tx.query_row("SELECT * FROM jobs WHERE id = ?1", params![id], row_to_job)?;
+            tx.commit()?;
+            Ok(Some(claimed))
+        }
+    }
+
     fn update_job(&self, id: &str, attempt_id: Option<&str>, patch: JobPatch) -> Result<Job> {
         if !job_id_valid(id) {
             anyhow::bail!("invalid job id.");
@@ -5412,6 +5819,9 @@ impl Store for SqliteStore {
             "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
             params![now],
         )?;
+        if n > 0 {
+            tx.execute("DELETE FROM summaries", [])?;
+        }
         tx.commit()?;
         Ok(n)
     }
@@ -5557,21 +5967,65 @@ impl Store for SqliteStore {
     fn store_summary(&self, root_id: i64, text: &str, model: &str) -> Result<()> {
         let ts = now();
         self.conn.execute(
-            "INSERT INTO summaries (root_id, text, model, created_ts, refreshed_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO summaries
+                 (root_id, text, model, created_ts, refreshed_ts, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     (SELECT generation FROM summary_state WHERE singleton = 1))
              ON CONFLICT(root_id) DO UPDATE SET
                  text = excluded.text,
                  model = excluded.model,
-                 refreshed_ts = excluded.refreshed_ts",
+                 refreshed_ts = excluded.refreshed_ts,
+                 generation = excluded.generation",
             params![root_id, text, model, ts, ts],
         )?;
         Ok(())
     }
 
+    fn summary_generation(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT generation FROM summary_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn store_summary_if_generation(
+        &self,
+        root_id: i64,
+        text: &str,
+        model: &str,
+        expected_generation: i64,
+    ) -> Result<bool> {
+        let ts = now();
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "INSERT INTO summaries
+                 (root_id, text, model, created_ts, refreshed_ts, generation)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE EXISTS (SELECT 1 FROM messages WHERE id = ?1)
+               AND EXISTS (
+                   SELECT 1 FROM summary_state
+                   WHERE singleton = 1 AND generation = ?6
+               )
+             ON CONFLICT(root_id) DO UPDATE SET
+                 text = excluded.text,
+                 model = excluded.model,
+                 refreshed_ts = excluded.refreshed_ts,
+                 generation = excluded.generation",
+            params![root_id, text, model, ts, ts, expected_generation],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     fn get_summary(&self, root_id: i64) -> Result<Option<crate::model::Summary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT root_id, text, model, created_ts, refreshed_ts
-             FROM summaries WHERE root_id = ?1",
+            "SELECT s.root_id, s.text, s.model, s.created_ts, s.refreshed_ts
+             FROM summaries s
+             JOIN messages m ON m.id = s.root_id
+             JOIN summary_state state
+               ON state.singleton = 1 AND state.generation = s.generation
+             WHERE s.root_id = ?1",
         )?;
         let row = stmt.query_row(params![root_id], |r| {
             Ok(crate::model::Summary {
@@ -5741,6 +6195,7 @@ mod federation_tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         }
     }
 
@@ -6657,6 +7112,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("envctl").unwrap().unwrap();
@@ -7009,6 +7465,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_client_pid_and_session_key_inputs_are_strict() {
+        let _lock = crate::testenv::lock_env();
+        {
+            let _unset = crate::testenv::EnvVarGuard::remove(CLIENT_PID_ENV);
+            assert_eq!(explicit_client_pid(), None);
+        }
+        for invalid in ["", "0", "-2", "not-a-pid", "9223372036854775808"] {
+            let guard = crate::testenv::EnvVarGuard::set(CLIENT_PID_ENV, invalid);
+            assert_eq!(
+                explicit_client_pid(),
+                None,
+                "invalid explicit client pid {invalid:?} must degrade to TTL"
+            );
+            drop(guard);
+        }
+        {
+            let _valid = crate::testenv::EnvVarGuard::set(CLIENT_PID_ENV, " 42 ");
+            assert_eq!(explicit_client_pid(), Some(42));
+        }
+
+        assert_eq!(client_session_key("").unwrap(), "");
+        assert!(client_session_key("  \t ").is_err());
+        assert!(client_session_key("  sid-A  ").is_err());
+        assert!(client_session_key("sid-A\n").is_err());
+        assert!(client_session_key("sid-A\nraw").is_err());
+        assert!(client_session_key(&"x".repeat(MAX_IDENT)).is_ok());
+        assert!(client_session_key(&"x".repeat(MAX_IDENT + 1)).is_err());
+    }
+
+    #[test]
     fn send_rejects_invalid_idents() {
         let s = mem();
         assert!(
@@ -7107,6 +7593,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         assert_eq!(s.get_peer("k").unwrap().unwrap().socket, "/run/b.sock");
@@ -7139,6 +7626,7 @@ mod tests {
                 "",
                 "default",
                 Some(&cert),
+                "",
             )
             .unwrap();
         assert_eq!(returned, cert, "register returns the supplied cert");
@@ -7151,12 +7639,248 @@ mod tests {
         // valid shape, and NOT the one we supplied above).
         let minted = s
             .register_peer_full(
-                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None,
+                "auto", "tmux", "%1", "", None, None, "h", "", "", "", "default", None, "",
             )
             .unwrap();
         assert!(check_birth_cert(&minted).is_ok(), "minted cert is valid");
         assert_ne!(minted, cert, "the None path mints a fresh, distinct cert");
         assert_eq!(s.get_birth_cert("auto").unwrap().unwrap(), minted);
+    }
+
+    /// WL-084: the launcher-session key roundtrips through registration, is
+    /// PRESERVED by an empty-key re-register (CLI/spawn callers must not wipe
+    /// the mapping), is overwritten by a non-empty key (legitimate takeover),
+    /// and drives `get_peer_by_client_session` (empty key never matches).
+    #[test]
+    fn client_session_roundtrips_and_preserves_on_empty() {
+        let s = mem();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%1",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            None,
+            "sid-A",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-A");
+        assert_eq!(
+            s.get_peer_by_client_session("sid-A").unwrap().unwrap().name,
+            "a"
+        );
+        // Empty-key re-register preserves the stored key.
+        let cert = s.get_birth_cert("a").unwrap();
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%2",
+            "",
+            Some("/x"),
+            Some(11),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_peer("a").unwrap().unwrap().client_session,
+            "sid-A",
+            "'' must mean preserve, not wipe"
+        );
+        // Non-empty key overwrites (the new session owns the row).
+        s.register_peer_full(
+            "a",
+            "tmux",
+            "%3",
+            "",
+            Some("/x"),
+            Some(12),
+            "h",
+            "",
+            "",
+            "",
+            "default",
+            cert.as_deref(),
+            "sid-B",
+        )
+        .unwrap();
+        assert_eq!(s.get_peer("a").unwrap().unwrap().client_session, "sid-B");
+        assert!(s.get_peer_by_client_session("sid-A").unwrap().is_none());
+        // The empty key never matches — legacy rows all store ''.
+        s.register_peer("legacy", "tmux", "%4", "", None).unwrap();
+        assert!(s.get_peer_by_client_session("").unwrap().is_none());
+
+        let oversized = "s".repeat(MAX_IDENT + 1);
+        assert!(s
+            .register_peer_full(
+                "rejected",
+                "tmux",
+                "%5",
+                "",
+                None,
+                Some(13),
+                "h",
+                "",
+                "",
+                "",
+                "default",
+                None,
+                &oversized,
+            )
+            .is_err());
+        assert!(s.get_peer("rejected").unwrap().is_none());
+        assert!(s.get_peer_by_client_session("sid\nraw").is_err());
+        assert!(s.get_peer_by_client_session(" sid-B").is_err());
+        assert!(s.get_peer_by_client_session("sid-B ").is_err());
+    }
+
+    /// WL-084 conflict classifier matrix (pure; fixed host/clock). Ownership
+    /// evidence order: session key > live client pid > liveness verdict.
+    #[test]
+    fn registration_conflict_matrix() {
+        let this_host = crate::config::this_host();
+        let now_ts = now();
+        let base = Peer {
+            name: "p".to_string(),
+            mux: "tmux".to_string(),
+            target: "%1".to_string(),
+            socket: String::new(),
+            cwd: None,
+            last_seen: now_ts,
+            pid: None,
+            host: this_host.clone(),
+            repo: String::new(),
+            branch: String::new(),
+            worktree_id: String::new(),
+            circle: crate::model::DEFAULT_CIRCLE.to_string(),
+            role: crate::model::PeerRole::Peer.as_str().to_string(),
+            turn_state: String::new(),
+            description: String::new(),
+            description_ts: 0,
+            birth_cert: None,
+            contact_policy: "open".to_string(),
+            client_session: String::new(),
+        };
+        // 1. Session-key match wins even when the row would read stale.
+        let keyed = Peer {
+            client_session: "sid-A".into(),
+            last_seen: now_ts - 10_000_000,
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&keyed, "sid-A", None, &this_host, now_ts),
+            RegisterConflict::SameSession
+        );
+        // 2. Different non-empty launcher-session keys remain distinct even when
+        // they report the same live PID. The session key is the stronger identity;
+        // PID equality alone must not collapse two launcher sessions.
+        let keyed_other = Peer {
+            client_session: "sid-OLD".into(),
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(
+                &keyed_other,
+                "sid-NEW",
+                Some(std::process::id() as i64),
+                &this_host,
+                now_ts
+            ),
+            RegisterConflict::LiveOther
+        );
+        // Legacy/unknown session keys still fall back to same-PID continuity.
+        let pid_only = Peer {
+            pid: Some(std::process::id() as i64),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(
+                &pid_only,
+                "sid-NEW",
+                Some(std::process::id() as i64),
+                &this_host,
+                now_ts
+            ),
+            RegisterConflict::SameSession
+        );
+        // 3. Past the TTL window → Reusable (name continuity on restart).
+        let stale = Peer {
+            last_seen: now_ts - 10_000_000,
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&stale, "sid-B", Some(1234), &this_host, now_ts),
+            RegisterConflict::Reusable
+        );
+        // 4. Recent but same-host DEAD pid → Reusable (the probe sees the gap).
+        let dead = Peer {
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&dead, "sid-B", None, &this_host, now_ts),
+            RegisterConflict::Reusable
+        );
+        // 5. Recent + unknown pid → LiveOther (fail toward NOT stealing).
+        assert_eq!(
+            registration_conflict(&base, "sid-B", Some(42), &this_host, now_ts),
+            RegisterConflict::LiveOther
+        );
+        // 6. Recent remote row → LiveOther (never pid-probed; fail open).
+        let remote = Peer {
+            host: format!("{this_host}-elsewhere"),
+            pid: Some(999_999_999),
+            ..base.clone()
+        };
+        assert_eq!(
+            registration_conflict(&remote, "sid-B", None, &this_host, now_ts),
+            RegisterConflict::LiveOther
+        );
+    }
+
+    /// WL-084 ancestry classifier: skips transient wrapper comms, returns the
+    /// first long-lived ancestor, stops at pid 1, and maps an empty chain
+    /// (non-Linux / walk failure) to `None`.
+    #[test]
+    fn first_longlived_ancestor_skips_wrappers_and_stops_at_init() {
+        let chain = |v: &[(i64, &str)]| {
+            v.iter()
+                .map(|(p, c)| (*p, c.to_string()))
+                .collect::<Vec<(i64, String)>>()
+        };
+        // Direct-exec hook: the parent IS the client.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(42, "claude")])),
+            Some(42)
+        );
+        // sh -c wrapper → skip to the node/claude ancestor.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(7, "bash"), (42, "node")])),
+            Some(42)
+        );
+        // rtk proxy under sh under claude.
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(5, "rtk"), (7, "sh"), (42, "claude")])),
+            Some(42)
+        );
+        // Everything transient up to init → None (TTL fallback).
+        assert_eq!(
+            first_longlived_ancestor(&chain(&[(7, "bash"), (1, "systemd")])),
+            None
+        );
+        assert_eq!(first_longlived_ancestor(&[]), None);
     }
 
     /// `sanitize_tag` is lossy-but-total: it strips control chars, truncates to
@@ -7262,6 +7986,7 @@ mod tests {
                 description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
             // Determinism: two evaluations of the same inputs agree.
@@ -7323,6 +8048,7 @@ mod tests {
                 "wt-1",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -7346,6 +8072,7 @@ mod tests {
             "(main)",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -7418,6 +8145,7 @@ mod tests {
                 "(main)",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         let p = s.get_peer("p").unwrap().unwrap();
@@ -7444,6 +8172,7 @@ mod tests {
             "",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p2 = s.get_peer("p").unwrap().unwrap();
@@ -7516,6 +8245,7 @@ mod tests {
             "",
             "default",
             None,
+            "",
         )
         .unwrap();
         let n = s2.get_peer("new").unwrap().unwrap();
@@ -7598,6 +8328,7 @@ mod tests {
             "wt-9",
             "default",
             None,
+            "",
         )
         .unwrap();
         let g = s.get_peer("tagged").unwrap().unwrap();
@@ -7690,7 +8421,7 @@ mod tests {
         let s = mem();
         let cert_p = s
             .register_peer_full(
-                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None,
+                "p", "tmux", "%1", "", None, None, "h", "", "", "", "team-a", None, "",
             )
             .unwrap();
         assert_eq!(s.get_peer("p").unwrap().unwrap().circle, "team-a");
@@ -7711,6 +8442,7 @@ mod tests {
             "",
             "team-a",
             Some(&cert_p),
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -7720,7 +8452,7 @@ mod tests {
         );
         // An invalid circle at the seam falls back to the default circle.
         s.register_peer_full(
-            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm", None,
+            "q", "tmux", "%2", "", None, None, "h", "", "", "", "a/b; rm", None, "",
         )
         .unwrap();
         assert_eq!(s.get_peer("q").unwrap().unwrap().circle, "default");
@@ -7732,11 +8464,11 @@ mod tests {
     fn claim_co_orchestrator_and_force_steals() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         // a claims (no contest) ⇒ Claimed.
@@ -7776,11 +8508,11 @@ mod tests {
     fn list_peers_in_circle_scopes() {
         let s = mem();
         s.register_peer_full(
-            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "a", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.register_peer_full(
-            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c2", None,
+            "b", "tmux", "%2", "", None, None, "h", "", "", "", "c2", None, "",
         )
         .unwrap();
         assert_eq!(s.list_peers_in_circle(Some("c1")).unwrap().len(), 1);
@@ -7803,7 +8535,7 @@ mod tests {
         let path = dir.join("orch.db");
         let s = SqliteStore::open(&path).unwrap();
         s.register_peer_full(
-            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None,
+            "o", "tmux", "%1", "", None, None, "h", "", "", "", "c1", None, "",
         )
         .unwrap();
         s.claim_orchestrator_role("o", None, false).unwrap();
@@ -7857,6 +8589,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
         // (c) NULL pid + recent => true (TTL fallback, no probe).
@@ -7950,6 +8683,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
 
         // same-host + live pid (our own) => AliveLocal.
@@ -8141,6 +8875,7 @@ mod tests {
                 "",
                 "default",
                 None,
+                "",
             )
             .unwrap();
         }
@@ -8153,7 +8888,7 @@ mod tests {
 
         // But ANY write is rejected by the engine, not by convention.
         let wr = ro.register_peer_full(
-            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+            "intruder", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
         );
         assert!(wr.is_err(), "a write through a read-only handle must error");
         let send = ro.send("a", "b", None, "x", None, None);
@@ -8184,14 +8919,14 @@ mod tests {
         let local = SqliteStore::open(&local_path).unwrap();
         local
             .register_peer_full(
-                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None,
+                "me", "tmux", "%1", "", None, None, "boxA", "", "", "", "default", None, "",
             )
             .unwrap();
         {
             let foreign = SqliteStore::open(&foreign_path).unwrap();
             foreign
                 .register_peer_full(
-                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None,
+                    "them", "tmux", "%2", "", None, None, "boxA", "", "", "", "default", None, "",
                 )
                 .unwrap();
         }
@@ -9667,6 +10402,86 @@ mod tests {
     }
 
     #[test]
+    fn job_dispatch_claim_is_queued_only_and_preserves_manual_reclaim() {
+        let s = mem();
+        let j = s.create_job("alice", spec("task")).unwrap();
+        let first = s.claim_queued_job(&j.id, "worker").unwrap().unwrap();
+        let first_attempt = first.attempt_id.clone().unwrap();
+        assert_eq!(first.state, JobState::Running);
+
+        assert!(
+            s.claim_queued_job(&j.id, "worker").unwrap().is_none(),
+            "a stale/concurrent dispatch cannot reclaim a running row"
+        );
+        let manual = s.claim_job(&j.id, "recovery").unwrap().unwrap();
+        assert_ne!(manual.attempt_id.as_deref(), Some(first_attempt.as_str()));
+        assert_eq!(manual.assignee.as_deref(), Some("recovery"));
+
+        let assigned = s
+            .create_job(
+                "alice",
+                JobSpec {
+                    title: "assigned elsewhere".into(),
+                    assignee: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s
+            .claim_queued_job(&assigned.id, "worker")
+            .unwrap()
+            .is_none());
+        let unchanged = s.get_job(&assigned.id).unwrap().unwrap();
+        assert_eq!(unchanged.state, JobState::Queued);
+        assert!(unchanged.attempt_id.is_none());
+    }
+
+    #[test]
+    fn concurrent_job_dispatch_claim_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "weave-dispatch-claim-race-{}-{}",
+            std::process::id(),
+            new_attempt_id(now())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let seed = SqliteStore::open(&path).unwrap();
+        let id = seed.create_job("alice", spec("race")).unwrap().id;
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for worker in ["worker-a", "worker-b"] {
+            let path = path.clone();
+            let id = id.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = SqliteStore::open(&path).unwrap();
+                barrier.wait();
+                store.claim_queued_job(&id, worker)
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|job| job.is_some()).count(),
+            1,
+            "the state predicate and transition must be one atomic write"
+        );
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_job(&id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn job_update_lifecycle_with_matching_attempt_succeeds() {
         let s = mem();
         let j = s.create_job("alice", spec("task")).unwrap();
@@ -9869,6 +10684,10 @@ mod tests {
     #[test]
     fn job_caps_and_id_validation_enforced() {
         let s = mem();
+        assert!(
+            s.create_job("alice", spec("bad\0title")).is_err(),
+            "job text must be safe to copy into a runner environment"
+        );
         // Oversized title rejected.
         let big = "x".repeat(crate::model::MAX_JOB_TEXT + 1);
         assert!(s.create_job("alice", spec(&big)).is_err());
@@ -10144,6 +10963,7 @@ mod tests {
             "wt",
             "default",
             Some(&cert),
+            "",
         )
         .unwrap();
         let p = s.get_peer("a").unwrap().unwrap();
@@ -10188,6 +11008,7 @@ mod tests {
             "wt",
             "default",
             None,
+            "",
         );
         assert!(
             bare.is_err(),
@@ -10215,6 +11036,7 @@ mod tests {
                 "wt",
                 "default",
                 stored.as_deref(),
+                "",
             )
             .expect("self-cert fallback re-registration is idempotent");
         assert_eq!(returned, minted, "re-register preserves the existing cert");
@@ -10238,6 +11060,7 @@ mod tests {
             "wt",
             "default",
             Some("deadbeef"),
+            "",
         );
         assert!(
             takeover.is_err(),
@@ -10323,6 +11146,7 @@ mod tests {
             description_ts: ts,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let ttl = crate::model::DESCRIPTION_TTL_SECS;
         // Exactly at the TTL boundary => expired (>=).
@@ -10420,6 +11244,7 @@ mod tests {
             description_ts: 0,
             birth_cert: None,
             contact_policy: "open".to_string(),
+            client_session: String::new(),
         };
         let liveness = s.peer_liveness(&p).unwrap();
         assert_eq!(
@@ -10871,20 +11696,200 @@ mod tests {
     #[test]
     fn summary_roundtrip() {
         let s = mem();
-        assert!(s.get_summary(1).unwrap().is_none());
-        s.store_summary(1, "summary text", "gpt-4").unwrap();
-        let sum = s.get_summary(1).unwrap().unwrap();
-        assert_eq!(sum.root_id, 1);
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        assert!(s.get_summary(root).unwrap().is_none());
+        s.store_summary(root, "summary text", "gpt-4").unwrap();
+        let sum = s.get_summary(root).unwrap().unwrap();
+        assert_eq!(sum.root_id, root);
         assert_eq!(sum.text, "summary text");
         assert_eq!(sum.model, "gpt-4");
         // Upsert refreshes
-        s.store_summary(1, "new text", "gpt-3").unwrap();
-        let sum2 = s.get_summary(1).unwrap().unwrap();
+        s.store_summary(root, "new text", "gpt-3").unwrap();
+        let sum2 = s.get_summary(root).unwrap().unwrap();
         assert_eq!(sum2.text, "new text");
         assert_eq!(sum2.model, "gpt-3");
-        assert!(s.delete_summary(1).unwrap());
-        assert!(!s.delete_summary(1).unwrap());
-        assert!(s.get_summary(1).unwrap().is_none());
+        assert!(s.delete_summary(root).unwrap());
+        assert!(!s.delete_summary(root).unwrap());
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.store_summary(root + 10_000, "orphan", "legacy").unwrap();
+        assert!(
+            s.get_summary(root + 10_000).unwrap().is_none(),
+            "a cache row without a live root message must never surface"
+        );
+    }
+
+    #[test]
+    fn legacy_summary_cache_migrates_fail_closed_and_current_generation_roundtrips() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("weave-summary-legacy-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        let root = {
+            let s = SqliteStore::open(&path).unwrap();
+            let root = s.send("a", "b", None, "root", None, None).unwrap();
+            s.conn
+                .execute_batch(
+                    "DROP TRIGGER summaries_generation_message_insert_v1;
+                     DROP TRIGGER summaries_generation_message_update_v1;
+                     DROP TRIGGER summaries_generation_message_delete_v1;
+                     DROP TABLE summaries;
+                     DROP TABLE summary_state;
+                     CREATE TABLE summaries (
+                         root_id      INTEGER PRIMARY KEY,
+                         text         TEXT NOT NULL,
+                         model        TEXT NOT NULL DEFAULT '',
+                         created_ts   INTEGER NOT NULL,
+                         refreshed_ts INTEGER NOT NULL
+                     );",
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO summaries
+                         (root_id, text, model, created_ts, refreshed_ts)
+                     VALUES (?1, 'legacy cache', 'legacy-model', ?2, ?2)",
+                    params![root, now()],
+                )
+                .unwrap();
+            root
+        };
+
+        let s = SqliteStore::open(&path).unwrap();
+        assert!(
+            column_exists(&s.conn, "summaries", "generation").unwrap(),
+            "reopen must add summaries.generation"
+        );
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a pre-generation cache row must fail closed"
+        );
+        let generation = s.summary_generation().unwrap();
+        assert!(s
+            .store_summary_if_generation(root, "current cache", "current-model", generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current cache");
+
+        let before_reply = s.summary_generation().unwrap();
+        s.reply("b", root, "new reply").unwrap();
+        assert!(s.summary_generation().unwrap() > before_reply);
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "migrated invalidation triggers must clear cache on message mutation"
+        );
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_removes_summary_cache() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert_eq!(s.clear_all().unwrap(), 1);
+        assert!(
+            !s.delete_summary(root).unwrap(),
+            "clear_all must delete the underlying cache row"
+        );
+    }
+
+    #[test]
+    fn adding_reply_invalidates_cached_thread_summary() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        s.store_summary(root, "cached", "model").unwrap();
+        assert!(s.get_summary(root).unwrap().is_some());
+
+        s.reply("b", root, "new reply").unwrap();
+        assert!(
+            s.get_summary(root).unwrap().is_none(),
+            "a new descendant makes the cached thread summary stale"
+        );
+    }
+
+    #[test]
+    fn summary_generation_rejects_mutated_or_deleted_snapshots() {
+        let s = mem();
+        let root = s.send("a", "b", None, "root", None, None).unwrap();
+        let (initial_rows, initial_generation) = summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(initial_rows.len(), 1);
+
+        let reply = s.reply("b", root, "new reply").unwrap();
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", initial_generation)
+                .unwrap(),
+            "a reply inserted during provider work must reject the stale write"
+        );
+        assert!(s.get_summary(root).unwrap().is_none());
+
+        s.set_message_expiry(reply, now() - 1).unwrap();
+        let before_delete = s.summary_generation().unwrap();
+        assert_eq!(s.sweep_expired_messages().unwrap(), 1);
+        assert!(
+            !s.store_summary_if_generation(root, "stale", "model", before_delete)
+                .unwrap(),
+            "a reply deleted during provider work must reject the stale write"
+        );
+
+        let (current_rows, current_generation) = summary_thread_snapshot(&s, root, 200).unwrap();
+        assert_eq!(current_rows.len(), 1, "expired reply is never summarized");
+        assert!(s
+            .store_summary_if_generation(root, "current", "model", current_generation)
+            .unwrap());
+        assert_eq!(s.get_summary(root).unwrap().unwrap().text, "current");
+    }
+
+    #[test]
+    fn gc_message_delete_invalidates_the_whole_summary_cache() {
+        let s = mem();
+        let old_root = s.send("a", "b", None, "old", None, None).unwrap();
+        let live_root = s.send("c", "d", None, "live", None, None).unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET ts = ts - 100000 WHERE id = ?1",
+                params![old_root],
+            )
+            .unwrap();
+        s.store_summary(old_root, "old cached", "model").unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+
+        assert_eq!(s.gc(3600).unwrap(), 1);
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(old_root).unwrap(),
+            "gc must delete cache rows, not merely hide orphan roots"
+        );
+    }
+
+    #[test]
+    fn expiry_sweep_of_root_or_reply_invalidates_the_whole_summary_cache() {
+        let s = mem();
+        let live_root = s.send("a", "b", None, "live root", None, None).unwrap();
+        let expired_reply = s.reply("b", live_root, "expired reply").unwrap();
+        let expired_root = s.send("c", "d", None, "expired root", None, None).unwrap();
+        s.set_message_expiry(expired_reply, now() - 5).unwrap();
+        s.set_message_expiry(expired_root, now() - 5).unwrap();
+        s.store_summary(live_root, "live cached", "model").unwrap();
+        s.store_summary(expired_root, "expired cached", "model")
+            .unwrap();
+
+        assert_eq!(s.sweep_expired_messages().unwrap(), 2);
+        assert!(
+            s.history("a", None, 100)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == live_root),
+            "the summarized root stays live when only its reply expires"
+        );
+        assert!(s.get_summary(live_root).unwrap().is_none());
+        assert!(
+            !s.delete_summary(expired_root).unwrap(),
+            "sweep must delete the underlying orphan cache row"
+        );
     }
 
     // ---- WL-037: message supersede / successor chains ----------------------

@@ -797,7 +797,8 @@ pub struct Config {
     /// Model name to request from the LLM endpoint. Overlaid by `WEAVE_LLM_MODEL`.
     #[serde(default)]
     pub llm_model: Option<String>,
-    /// Timeout in seconds for a single LLM request. Overlaid by `WEAVE_LLM_TIMEOUT_SECS`.
+    /// Timeout in seconds for a single LLM request. Overlaid by `WEAVE_LLM_TIMEOUT_SECS`
+    /// and clamped to 1..=300 seconds at the request seam.
     #[serde(default)]
     pub llm_timeout_secs: Option<i64>,
     /// Maximum characters of thread text to send to the LLM. Overlaid by
@@ -928,7 +929,7 @@ pub struct Config {
     pub pretooluse_timeout_secs: Option<i64>,
 }
 
-// Manual Debug that REDACTS the libSQL auth token so it can never leak via a
+// Manual Debug that REDACTS every configured credential so none can leak via a
 // `{:?}` in a log line, panic message, or error context.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1184,6 +1185,26 @@ impl Config {
         // session/host discipline — overlay then validate, never store-side trust).
         if let Some(v) = nonempty("WEAVE_CIRCLE") {
             cfg.circle = Some(v);
+        }
+        // WL-033 LLM summarization. Environment values REPLACE the file values,
+        // including the API key (a secret that is never logged here). Invalid
+        // numeric overlays are ignored so a typo cannot silently erase a valid
+        // file-configured timeout/input bound; the LLM client applies the final
+        // safety clamps at its use seam.
+        if let Some(v) = nonempty("WEAVE_LLM_ENDPOINT") {
+            cfg.llm_endpoint = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_API_KEY") {
+            cfg.llm_api_key = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_MODEL") {
+            cfg.llm_model = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_TIMEOUT_SECS").and_then(|s| s.parse::<i64>().ok()) {
+            cfg.llm_timeout_secs = Some(v);
+        }
+        if let Some(v) = nonempty("WEAVE_LLM_MAX_INPUT_CHARS").and_then(|s| s.parse::<i64>().ok()) {
+            cfg.llm_max_input_chars = Some(v);
         }
         // Spawn allowlist (WL-047): WEAVE_SPAWN_DIRS is a path-list (`:`/`;`) of
         // directories a spawned child may be launched in. Split with the platform
@@ -1999,7 +2020,9 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Uncomment and edit only what you want to override. Environment variables
 # (WEAVE_SESSION, WEAVE_BACKEND, WEAVE_DB, WEAVE_LIBSQL_URL,
 # WEAVE_LIBSQL_AUTH_TOKEN, WEAVE_PULL_TOKEN, WEAVE_PULL_TOKEN_<LABEL>,
-# WEAVE_SPAWN_DIRS) take precedence over anything set here.
+# WEAVE_LLM_ENDPOINT, WEAVE_LLM_API_KEY, WEAVE_LLM_MODEL,
+# WEAVE_LLM_TIMEOUT_SECS, WEAVE_LLM_MAX_INPUT_CHARS, WEAVE_SPAWN_DIRS)
+# take precedence over anything set here.
 
 # Default identity for this machine/session. When unset, weave falls back to
 # the basename of the current directory (a *guess* that never marks mail read).
@@ -2144,6 +2167,19 @@ pub const CONFIG_TEMPLATE: &str = "\
 # Overridable via WEAVE_CIRCLE.
 # circle = \"default\"
 
+# LLM THREAD SUMMARIZATION (only with --features llm): an OpenAI-compatible
+# chat-completions endpoint and credentials. The API key is a SECRET and is
+# Debug-redacted; prefer WEAVE_LLM_API_KEY over storing it here. The endpoint,
+# model, timeout, and input cap have matching WEAVE_LLM_* environment overlays.
+# Input is capped by Unicode scalar count and never exceeds the hard 16000-char
+# ceiling even when a larger value is configured. Default model: gpt-4o-mini;
+# default timeout: 30 seconds (clamped to 1..=300); minimum input cap: 1.
+# llm_endpoint = \"https://api.openai.com/v1/chat/completions\"
+# llm_api_key = \"...\"
+# llm_model = \"gpt-4o-mini\"
+# llm_timeout_secs = 30
+# llm_max_input_chars = 16000
+
 # SPAWN ALLOWLIST (WL-047): directories a spawned child agent may be launched in.
 # `weave_spawn_peer` (MCP/remote) REFUSES a spawn whose resolved cwd is not under
 # one of these dirs — empty/unset ⇒ DENY BY DEFAULT on that surface (a remote caller
@@ -2244,6 +2280,11 @@ mod tests {
         assert!(cfg.revoked.is_none());
         assert!(cfg.pull_token.is_none());
         assert!(cfg.circle.is_none());
+        assert!(cfg.llm_endpoint.is_none());
+        assert!(cfg.llm_api_key.is_none());
+        assert!(cfg.llm_model.is_none());
+        assert!(cfg.llm_timeout_secs.is_none());
+        assert!(cfg.llm_max_input_chars.is_none());
     }
 
     /// Every documented placeholder the nudge renderer understands should appear in
@@ -2275,12 +2316,95 @@ mod tests {
             "revoked",
             "pull_token",
             "circle",
+            "llm_endpoint",
+            "llm_api_key",
+            "llm_model",
+            "llm_timeout_secs",
+            "llm_max_input_chars",
         ] {
             assert!(
                 CONFIG_TEMPLATE.contains(key),
                 "template is missing config key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn load_overlays_all_documented_llm_environment_values() {
+        let _g = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-config-llm-overlay-{}-{}",
+            std::process::id(),
+            crate::model::now()
+        ));
+        let weave_dir = dir.join("weave");
+        std::fs::create_dir_all(&weave_dir).unwrap();
+        std::fs::write(
+            weave_dir.join("config.toml"),
+            r#"
+llm_endpoint = "http://file.invalid/v1"
+llm_api_key = "file-secret"
+llm_model = "file-model"
+llm_timeout_secs = 99
+llm_max_input_chars = 999
+"#,
+        )
+        .unwrap();
+
+        let _xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        let _endpoint = crate::testenv::EnvVarGuard::set(
+            "WEAVE_LLM_ENDPOINT",
+            "http://127.0.0.1:4567/v1/chat/completions",
+        );
+        let _key = crate::testenv::EnvVarGuard::set("WEAVE_LLM_API_KEY", "env-secret");
+        let _model = crate::testenv::EnvVarGuard::set("WEAVE_LLM_MODEL", "env-model");
+        let _timeout = crate::testenv::EnvVarGuard::set("WEAVE_LLM_TIMEOUT_SECS", "7");
+        let _max = crate::testenv::EnvVarGuard::set("WEAVE_LLM_MAX_INPUT_CHARS", "3");
+
+        let cfg = Config::load();
+        assert_eq!(
+            cfg.llm_endpoint.as_deref(),
+            Some("http://127.0.0.1:4567/v1/chat/completions")
+        );
+        assert_eq!(cfg.llm_api_key.as_deref(), Some("env-secret"));
+        assert_eq!(cfg.llm_model.as_deref(), Some("env-model"));
+        assert_eq!(cfg.llm_timeout_secs, Some(7));
+        assert_eq!(cfg.llm_max_input_chars, Some(3));
+
+        drop((_max, _timeout, _model, _key, _endpoint, _xdg));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_llm_numeric_environment_values_preserve_file_config() {
+        let _g = crate::testenv::lock_env();
+        let dir = std::env::temp_dir().join(format!(
+            "weave-config-llm-invalid-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let weave_dir = dir.join("weave");
+        std::fs::create_dir_all(&weave_dir).unwrap();
+        std::fs::write(
+            weave_dir.join("config.toml"),
+            "llm_timeout_secs = 9\nllm_max_input_chars = 8\n",
+        )
+        .unwrap();
+        let _xdg =
+            crate::testenv::EnvVarGuard::set("XDG_CONFIG_HOME", dir.to_string_lossy().as_ref());
+        let _timeout = crate::testenv::EnvVarGuard::set("WEAVE_LLM_TIMEOUT_SECS", "not-a-number");
+        let _max = crate::testenv::EnvVarGuard::set("WEAVE_LLM_MAX_INPUT_CHARS", "not-a-number");
+
+        let cfg = Config::load();
+        assert_eq!(cfg.llm_timeout_secs, Some(9));
+        assert_eq!(cfg.llm_max_input_chars, Some(8));
+
+        drop((_max, _timeout, _xdg));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `Config::circle()` (P4): unset ⇒ "default"; a valid value passes through; an
